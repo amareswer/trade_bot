@@ -72,6 +72,12 @@ def print_report(metrics: BacktestMetrics, result: BacktestResult) -> None:
         _row("Best trade",     _pnl(metrics.best_trade))
         _row("Worst trade",    _pnl(metrics.worst_trade))
 
+        sl_exits = sum(1 for f in result.fills if f.side == "SELL" and f.reason == "stop_loss")
+        tp_exits = sum(1 for f in result.fills if f.side == "SELL" and f.reason == "take_profit")
+        st_exits = sum(1 for f in result.fills if f.side == "SELL" and f.reason == "strategy")
+        if sl_exits or tp_exits:
+            _row("Exit reasons",  f"SL={sl_exits}  TP={tp_exits}  strategy={st_exits}")
+
     print(f"\n  {_B}RISK{_R}")
     print(f"  {'─'*46}")
     _row("Max drawdown",    _pct(metrics.max_drawdown_pct))
@@ -95,7 +101,7 @@ def save_csv(result: BacktestResult, directory: str = "logs") -> str:
         writer = csv.writer(f)
         writer.writerow([
             "timestamp", "side", "price", "quantity",
-            "total_value", "pnl", "fee",
+            "total_value", "pnl", "fee", "reason",
         ])
         for fill in result.fills:
             writer.writerow([
@@ -106,6 +112,7 @@ def save_csv(result: BacktestResult, directory: str = "logs") -> str:
                 fill.total_value,
                 fill.pnl if fill.pnl is not None else "",
                 fill.fee,
+                fill.reason,
             ])
 
     return path

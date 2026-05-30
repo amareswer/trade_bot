@@ -168,9 +168,11 @@ class DashboardConfig:
 
 @dataclass
 class BacktestConfig:
-    timeframe: str   = "1h"
-    limit:     int   = 500
-    fee_pct:   float = 0.001   # 0.1% per trade
+    timeframe:       str   = "1h"
+    limit:           int   = 500
+    fee_pct:         float = 0.001   # 0.1% per trade
+    stop_loss_pct:   float = 0.02    # exit if price drops 2% from entry (0 = disabled)
+    take_profit_pct: float = 0.04    # exit if price rises 4% from entry (0 = disabled)
 
     _VALID_TIMEFRAMES = {"1m","5m","15m","30m","1h","2h","4h","6h","12h","1d","1w"}
 
@@ -184,6 +186,10 @@ class BacktestConfig:
             raise ValueError("BACKTEST_LIMIT must be >= 50 candles")
         if not 0 <= self.fee_pct <= 0.01:
             raise ValueError("BACKTEST_FEE_PCT must be between 0% and 1%")
+        if not 0 <= self.stop_loss_pct <= 0.50:
+            raise ValueError("STOP_LOSS_PCT must be between 0% and 50%")
+        if not 0 <= self.take_profit_pct <= 1.0:
+            raise ValueError("TAKE_PROFIT_PCT must be between 0% and 100%")
 
 
 # ---------------------------------------------------------------------------
@@ -278,9 +284,11 @@ def _load() -> AppConfig:
             refresh_s = _int ("DASHBOARD_REFRESH", 30),
         ),
         backtest=BacktestConfig(
-            timeframe = _str  ("BACKTEST_TIMEFRAME", "1h"),
-            limit     = _int  ("BACKTEST_LIMIT",     500),
-            fee_pct   = _float("BACKTEST_FEE_PCT",   0.001),
+            timeframe       = _str  ("BACKTEST_TIMEFRAME", "1h"),
+            limit           = _int  ("BACKTEST_LIMIT",     500),
+            fee_pct         = _float("BACKTEST_FEE_PCT",   0.001),
+            stop_loss_pct   = _float("STOP_LOSS_PCT",      0.02),
+            take_profit_pct = _float("TAKE_PROFIT_PCT",    0.04),
         ),
     )
 

@@ -40,6 +40,7 @@ class FillRecord:
     total_value:  float
     pnl:          float | None   # None for BUY; realized PnL for SELL
     fee:          float
+    reason:       str = "strategy"   # "strategy" | "stop_loss" | "take_profit"
 
 
 @dataclass
@@ -79,6 +80,9 @@ def run(
     daily_loss_limit_pct: float = 0.02,
     max_drawdown_pct:     float = 0.10,
     max_trades_per_day:   int   = 5,
+    # Exit rules
+    stop_loss_pct:        float = 0.02,   # exit if price drops this % from entry (0 = disabled)
+    take_profit_pct:      float = 0.04,   # exit if price rises this % from entry (0 = disabled)
 ) -> BacktestResult:
     """Run a full backtest and return the result."""
 
@@ -113,6 +117,7 @@ def run(
     fills:        list[FillRecord] = []
     total_fees    = 0.0
     warmup_ticks  = 0
+    entry_price:  float = 0.0   # tracks BUY fill price for SL/TP
 
     # ── Main loop ─────────────────────────────────────────────────────
     for i, candle in enumerate(candles):
@@ -126,6 +131,16 @@ def run(
             warmup_ticks += 1
             equity_curve.append(executor.portfolio.total_value(price))
             continue
+
+        # ── Stop-loss / take-profit override ─────────────────────────
+        exit_reason = "strategy"
+        if executor.position > 0 and entry_price > 0:
+            if stop_loss_pct > 0 and price <= entry_price * (1 - stop_loss_pct):
+                raw_signal  = Signal.SELL
+                exit_reason = "stop_loss"
+            elif take_profit_pct > 0 and price >= entry_price * (1 + take_profit_pct):
+                raw_signal  = Signal.SELL
+                exit_reason = "take_profit"
 
         filtered_signal, _ = state_machine.filter_signal(raw_signal)
 
@@ -150,8 +165,10 @@ def run(
                 pnl = None
                 if order.side == OrderSide.BUY:
                     position_manager.on_buy(order.price, order.quantity)
+                    entry_price = order.price
                 else:
                     pnl = position_manager.on_sell(order.price, order.quantity)
+                    entry_price = 0.0
 
                 fills.append(FillRecord(
                     candle_index = i,
@@ -162,6 +179,7 @@ def run(
                     total_value  = order.total_value,
                     pnl          = pnl,
                     fee          = fee,
+                    reason       = exit_reason if order.side == OrderSide.SELL else "strategy",
                 ))
 
         equity_curve.append(executor.portfolio.total_value(price))
