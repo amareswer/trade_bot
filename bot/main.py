@@ -86,6 +86,8 @@ def build_strategy():
             rsi_overbought  = cfg.strategy.rsi_overbought,
             fast_ema_period = cfg.strategy.fast_ema_period,
             slow_ema_period = cfg.strategy.slow_ema_period,
+            adx_period      = cfg.strategy.adx_period,
+            adx_threshold   = cfg.strategy.adx_threshold,
         ))
     return ThresholdStrategy(
         buy_threshold  = cfg.strategy.buy_threshold,

@@ -90,6 +90,8 @@ class StrategyConfig:
     slow_ema_period: int   = 21
     buy_threshold:   float = 0.0
     sell_threshold:  float = 0.0
+    adx_period:      int   = 14
+    adx_threshold:   float = 25.0  # < this = ranging market → HOLD
 
     def __post_init__(self):
         if self.mode not in ("indicator", "threshold"):
@@ -100,6 +102,10 @@ class StrategyConfig:
             raise ValueError("FAST_EMA_PERIOD must be less than SLOW_EMA_PERIOD")
         if self.mode == "threshold" and self.buy_threshold >= self.sell_threshold:
             raise ValueError("BUY_THRESHOLD must be less than SELL_THRESHOLD")
+        if self.adx_period < 2:
+            raise ValueError("ADX_PERIOD must be >= 2")
+        if not 0 < self.adx_threshold <= 100:
+            raise ValueError("ADX_THRESHOLD must be between 0 and 100")
 
 
 @dataclass
@@ -168,8 +174,8 @@ class DashboardConfig:
 
 @dataclass
 class BacktestConfig:
-    timeframe:       str   = "1h"
-    limit:           int   = 500
+    timeframe:       str   = "4h"
+    limit:           int   = 5000    # paginated — up to 5000 candles
     fee_pct:         float = 0.001   # 0.1% per trade
     stop_loss_pct:   float = 0.02    # exit if price drops 2% from entry (0 = disabled)
     take_profit_pct: float = 0.04    # exit if price rises 4% from entry (0 = disabled)
@@ -259,6 +265,8 @@ def _load() -> AppConfig:
             slow_ema_period = _int  ("SLOW_EMA_PERIOD",  21),
             buy_threshold   = _float("BUY_THRESHOLD",    0.0),
             sell_threshold  = _float("SELL_THRESHOLD",   0.0),
+            adx_period      = _int  ("ADX_PERIOD",       14),
+            adx_threshold   = _float("ADX_THRESHOLD",    25.0),
         ),
         risk=RiskConfig(
             risk_per_trade_pct   = _float("RISK_PER_TRADE_PCT",    0.01),
@@ -284,8 +292,8 @@ def _load() -> AppConfig:
             refresh_s = _int ("DASHBOARD_REFRESH", 30),
         ),
         backtest=BacktestConfig(
-            timeframe       = _str  ("BACKTEST_TIMEFRAME", "1h"),
-            limit           = _int  ("BACKTEST_LIMIT",     500),
+            timeframe       = _str  ("BACKTEST_TIMEFRAME", "4h"),
+            limit           = _int  ("BACKTEST_LIMIT",     5000),
             fee_pct         = _float("BACKTEST_FEE_PCT",   0.001),
             stop_loss_pct   = _float("STOP_LOSS_PCT",      0.02),
             take_profit_pct = _float("TAKE_PROFIT_PCT",    0.04),
