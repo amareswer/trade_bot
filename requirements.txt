@@ -1,0 +1,7 @@
+ccxt>=4.0            # unified crypto exchange interface (price feed)
+python-dotenv>=1.0   # load .env into environment
+openai>=1.0          # OpenRouter-compatible client (AI advisory)
+
+# Future additions:
+# pandas>=2.0         # historical data / backtesting
+# numpy>=1.26         # numerical strategies
