@@ -66,10 +66,11 @@ def _bool(key: str, default: bool) -> bool:
 
 @dataclass
 class ExchangeConfig:
-    exchange:      str = "kraken"
-    symbol:        str = "BTC/USDT"
-    feed_mode:     str = "live"    # "live" | "simulated"
-    loop_interval: int = 30        # seconds between ticks
+    exchange:       str = "kraken"
+    symbol:         str = "BTC/USDT"
+    feed_mode:      str = "live"    # "live" | "simulated"
+    loop_interval:  int = 30        # seconds between ticks
+    candle_minutes: int = 240       # aggregation window for live indicator mode
 
     def __post_init__(self):
         if self.feed_mode not in ("live", "simulated"):
@@ -78,6 +79,8 @@ class ExchangeConfig:
             raise ValueError(f"SYMBOL must be 'BASE/QUOTE' format, got '{self.symbol}'")
         if self.loop_interval < 1:
             raise ValueError("LOOP_INTERVAL must be >= 1")
+        if self.candle_minutes < 1:
+            raise ValueError("CANDLE_MINUTES must be >= 1")
 
 
 @dataclass
@@ -226,8 +229,9 @@ class AppConfig:
     def log_startup(self) -> None:
         """Log all config on startup (no secrets logged)."""
         logger.info("─" * 60)
-        logger.info("CONFIG  exchange=%s  symbol=%s  feed=%s",
-            self.exchange.exchange, self.exchange.symbol, self.exchange.feed_mode)
+        logger.info("CONFIG  exchange=%s  symbol=%s  feed=%s  candle=%dmin",
+            self.exchange.exchange, self.exchange.symbol, self.exchange.feed_mode,
+            self.exchange.candle_minutes)
         logger.info("CONFIG  strategy=%s  RSI(%d) %g/%g  EMA(%d/%d)",
             self.strategy.mode, self.strategy.rsi_period,
             self.strategy.rsi_oversold, self.strategy.rsi_overbought,
@@ -251,10 +255,11 @@ class AppConfig:
 def _load() -> AppConfig:
     return AppConfig(
         exchange=ExchangeConfig(
-            exchange      = _str("EXCHANGE",      "kraken"),
-            symbol        = _str("SYMBOL",        "BTC/USDT"),
-            feed_mode     = _str("FEED_MODE",      "live"),
-            loop_interval = _int("LOOP_INTERVAL",  30),
+            exchange       = _str("EXCHANGE",       "kraken"),
+            symbol         = _str("SYMBOL",         "BTC/USDT"),
+            feed_mode      = _str("FEED_MODE",       "live"),
+            loop_interval  = _int("LOOP_INTERVAL",   30),
+            candle_minutes = _int("CANDLE_MINUTES",  240),
         ),
         strategy=StrategyConfig(
             mode            = _str  ("STRATEGY_MODE",    "indicator"),

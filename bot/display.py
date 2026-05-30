@@ -38,6 +38,16 @@ def warmup(tick: int, current: int, total: int, price: float) -> None:
     )
 
 
+# ── Candle aggregation progress ──────────────────────────────────────────────
+
+def building_candle(elapsed_m: int, total_m: int, price: float, tick_n: int) -> None:
+    pbar = _bar(elapsed_m, total_m)
+    print(
+        f"  {_DIM}{_now()}{_R}  #{tick_n:04d}  {_WH}${price:>12,.2f}{_R}"
+        f"  {_DIM}building candle {pbar} {elapsed_m}/{total_m}min{_R}"
+    )
+
+
 # ── Tick (main per-candle line) ───────────────────────────────────────────────
 
 def tick(

@@ -66,6 +66,67 @@ _signal_module.signal(_signal_module.SIGINT, _handle_sigint)
 
 
 # ---------------------------------------------------------------------------
+# Candle aggregator
+# ---------------------------------------------------------------------------
+
+class CandleAggregator:
+    """Accumulates live price ticks into OHLCV candles over a fixed time window.
+
+    Activated only in live + indicator mode so that ADX/RSI receive proper
+    high/low data instead of flat tick-by-tick fake candles.
+    """
+
+    def __init__(self, period_minutes: int) -> None:
+        self._period_s  = period_minutes * 60
+        self._period_m  = period_minutes
+        self._start_ts: float | None = None
+        self._open:  float = 0.0
+        self._high:  float = 0.0
+        self._low:   float = 0.0
+        self._close: float = 0.0
+        self._ticks: int   = 0
+
+    def add_tick(self, price: float) -> "_Candle | None":
+        """Feed one price tick. Returns a complete Candle when the period elapses, else None."""
+        now = time.time()
+        if self._start_ts is None:
+            self._start_ts = now
+            self._open = self._high = self._low = price
+
+        self._high  = max(self._high, price)
+        self._low   = min(self._low,  price)
+        self._close = price
+        self._ticks += 1
+
+        if now - self._start_ts >= self._period_s:
+            candle = _Candle(
+                timestamp = datetime.now(_tz.utc),
+                open      = self._open,
+                high      = self._high,
+                low       = self._low,
+                close     = self._close,
+                volume    = float(self._ticks),
+            )
+            # Reset for the next candle, carrying the current tick as the opening
+            self._start_ts = now
+            self._open = self._high = self._low = price
+            self._close = price
+            self._ticks = 1
+            return candle
+        return None
+
+    @property
+    def elapsed_minutes(self) -> int:
+        if self._start_ts is None:
+            return 0
+        return int((time.time() - self._start_ts) / 60)
+
+    @property
+    def period_minutes(self) -> int:
+        return self._period_m
+
+
+# ---------------------------------------------------------------------------
 # Factories
 # ---------------------------------------------------------------------------
 
@@ -133,6 +194,19 @@ def run():
         print(f"  Dashboard → file://{_DASHBOARD_PATH}\n")
 
     is_indicator = isinstance(strategy, IndicatorStrategy)
+
+    # Candle aggregator — live indicator mode only.
+    # Simulated mode keeps fake flat candles (building a 4h window in real-time
+    # during simulation is impractical; use FEED_MODE=simulated for quick testing).
+    candle_agg: CandleAggregator | None = (
+        CandleAggregator(cfg.exchange.candle_minutes)
+        if is_indicator and cfg.exchange.feed_mode == "live"
+        else None
+    )
+    if candle_agg:
+        print(f"  Candle aggregator: {candle_agg.period_minutes}min windows  "
+              f"(~{candle_agg.period_minutes * 60 // cfg.exchange.loop_interval} ticks/candle)\n")
+
     tick     = 0
     tick_log: deque[dict] = deque(maxlen=200)
 
@@ -152,11 +226,26 @@ def run():
 
         # ── 3. Strategy signal ───────────────────────────────────────
         if is_indicator:
-            _tick_candle = _Candle(
-                timestamp = datetime.now(_tz.utc),
-                open=price, high=price, low=price, close=price, volume=0.0,
-            )
-            raw_signal = strategy.evaluate(_tick_candle)
+            if candle_agg is not None:
+                # Live mode: accumulate ticks until a full candle is ready
+                candle = candle_agg.add_tick(price)
+                if candle is None:
+                    display.building_candle(
+                        candle_agg.elapsed_minutes,
+                        candle_agg.period_minutes,
+                        price,
+                        tick,
+                    )
+                    time.sleep(cfg.exchange.loop_interval)
+                    continue
+                raw_signal = strategy.evaluate(candle)
+            else:
+                # Simulated mode: flat fake candle (high/low/close == price)
+                _tick_candle = _Candle(
+                    timestamp=datetime.now(_tz.utc),
+                    open=price, high=price, low=price, close=price, volume=0.0,
+                )
+                raw_signal = strategy.evaluate(_tick_candle)
         else:
             raw_signal = strategy.evaluate(price)
 
