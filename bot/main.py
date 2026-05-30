@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 from config import cfg
 
 from bot.data.price_feed import SimulatedFeed, CcxtFeed
+from bot.data.historical_feed import Candle as _Candle
 from bot.strategy.threshold_strategy import ThresholdStrategy, Signal
 from bot.strategy.indicator_strategy import IndicatorStrategy, IndicatorConfig
 from bot.execution.executor import PaperExecutor, OrderStatus, OrderSide
@@ -150,7 +151,14 @@ def run():
             continue
 
         # ── 3. Strategy signal ───────────────────────────────────────
-        raw_signal = strategy.evaluate(price)
+        if is_indicator:
+            _tick_candle = _Candle(
+                timestamp = datetime.now(_tz.utc),
+                open=price, high=price, low=price, close=price, volume=0.0,
+            )
+            raw_signal = strategy.evaluate(_tick_candle)
+        else:
+            raw_signal = strategy.evaluate(price)
 
         # ── 4. Warmup guard ──────────────────────────────────────────
         if is_indicator and not strategy.is_warmed_up:
@@ -180,7 +188,7 @@ def run():
                 rsi             = rsi_val,
                 trend           = trend_val,
                 strategy_signal = filtered_signal,
-                recent_prices   = list(strategy._prices) if is_indicator else [price],
+                recent_prices   = list(strategy._closes) if is_indicator else [price],
                 portfolio       = executor.portfolio,
                 symbol          = cfg.exchange.symbol,
             )

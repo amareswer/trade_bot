@@ -129,7 +129,7 @@ def run(
 
         state_machine.tick()
 
-        raw_signal = strategy.evaluate(candle.close, high=candle.high, low=candle.low)
+        raw_signal = strategy.evaluate(candle) if is_indicator else strategy.evaluate(price)
 
         if is_indicator and not strategy.is_warmed_up:
             warmup_ticks += 1

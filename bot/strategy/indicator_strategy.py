@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 
 from bot.strategy.threshold_strategy import Signal
 from bot.indicators.indicators import rsi as calc_rsi, trend as calc_trend, ema as calc_ema, adx as calc_adx
+from bot.data.historical_feed import Candle
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +49,8 @@ class IndicatorConfig:
 
 class IndicatorStrategy:
     """
-    Improved drop-in replacement for the original IndicatorStrategy.
-    Same interface: evaluate(price: float) -> Signal
-
-    Warmup: max(rsi_period + 1, slow_ema_period) + 2 extra ticks for RSI direction.
+    Improved indicator strategy — EMA trend + RSI momentum + ADX regime filter.
+    Interface: evaluate(candle: Candle) -> Signal
     """
 
     def __init__(self, config: IndicatorConfig | None = None):
@@ -62,7 +61,7 @@ class IndicatorStrategy:
             2 * self.config.adx_period + 1,
         ) + 2   # +2 for RSI direction comparison
 
-        self._prices:     deque[float] = deque(maxlen=self._warmup + 50)
+        self._closes:     deque[float] = deque(maxlen=self._warmup + 50)
         self._highs:      deque[float] = deque(maxlen=self._warmup + 50)
         self._lows:       deque[float] = deque(maxlen=self._warmup + 50)
         self._last_rsi:   float | None = None
@@ -82,21 +81,21 @@ class IndicatorStrategy:
             self._warmup,
         )
 
-    def evaluate(self, price: float, high: float | None = None, low: float | None = None) -> Signal:
-        self._prices.append(price)
-        if high is not None and low is not None:
-            self._highs.append(high)
-            self._lows.append(low)
-        prices = list(self._prices)
+    def evaluate(self, candle: Candle) -> Signal:
+        price = candle.close
+        self._closes.append(price)
+        self._highs.append(candle.high)
+        self._lows.append(candle.low)
+        closes = list(self._closes)
 
-        if len(prices) < self._warmup:
+        if len(closes) < self._warmup:
             return Signal.HOLD
 
         # ── Compute indicators ────────────────────────────────────────
-        rsi_val   = calc_rsi(prices, self.config.rsi_period)
-        trend_val = calc_trend(prices, self.config.fast_ema_period, self.config.slow_ema_period)
-        fast_ema  = calc_ema(prices, self.config.fast_ema_period)
-        slow_ema  = calc_ema(prices, self.config.slow_ema_period)
+        rsi_val   = calc_rsi(closes, self.config.rsi_period)
+        trend_val = calc_trend(closes, self.config.fast_ema_period, self.config.slow_ema_period)
+        fast_ema  = calc_ema(closes, self.config.fast_ema_period)
+        slow_ema  = calc_ema(closes, self.config.slow_ema_period)
 
         if rsi_val is None or fast_ema is None or slow_ema is None:
             return Signal.HOLD
@@ -105,12 +104,12 @@ class IndicatorStrategy:
         adx_val: float | None = None
         if len(self._highs) >= 2 * self.config.adx_period + 1:
             adx_val = calc_adx(
-                list(self._highs), list(self._lows), prices,
+                list(self._highs), list(self._lows), closes,
                 self.config.adx_period,
             )
         self._last_adx = adx_val
 
-        if adx_val is not None and adx_val < self.config.adx_threshold:
+        if adx_val is None or adx_val < self.config.adx_threshold:
             return Signal.HOLD   # ranging market — skip
 
         # ── RSI direction (is momentum rising or falling?) ────────────
@@ -126,11 +125,10 @@ class IndicatorStrategy:
         ema_strong     = ema_spread_pct >= self.config.min_ema_spread_pct
 
         logger.info(
-            "price=%.2f RSI=%.1f(%s) trend=%s EMA_spread=%.3f%% strong=%s ADX=%s",
+            "price=%.2f RSI=%.1f(%s) trend=%s EMA_spread=%.3f%% strong=%s ADX=%.1f",
             price, rsi_val,
             "↑" if rsi_rising else ("↓" if rsi_falling else "→"),
-            trend_val, ema_spread_pct * 100, ema_strong,
-            f"{adx_val:.1f}" if adx_val is not None else "n/a",
+            trend_val, ema_spread_pct * 100, ema_strong, adx_val,
         )
 
         # ── BUY conditions ────────────────────────────────────────────
@@ -165,11 +163,11 @@ class IndicatorStrategy:
 
     @property
     def tick_count(self) -> int:
-        return len(self._prices)
+        return len(self._closes)
 
     @property
     def is_warmed_up(self) -> bool:
-        return len(self._prices) >= self._warmup
+        return len(self._closes) >= self._warmup
 
     @property
     def last_rsi(self) -> float | None:
