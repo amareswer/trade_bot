@@ -3,6 +3,14 @@ name: mem-save
 description: Save decisions, fixes, or progress from this session. Always asks before writing.
 ---
 
+## CRITICAL — Path Rule
+
+All files MUST be written using relative paths inside the current project directory.
+CORRECT: `.memory/decisions/auth.md`, `.memory/progress/current.md`
+NEVER write to `~/.claude/` or any absolute path outside the project folder.
+
+---
+
 Save what is relevant from this conversation right now.
 
 **Step 1 — Review the session**
@@ -57,4 +65,4 @@ If a new topic file was created, add it to `.memory/index.md`.
 
 **Step 5 — Confirm what was saved**
 
-Tell the user exactly which files were written or updated.
+Tell the user exactly which files were written or updated with their relative paths.

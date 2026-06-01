@@ -3,6 +3,14 @@ name: mem-recap
 description: Summarize what was covered in this session, then offer to save.
 ---
 
+## CRITICAL — Path Rule
+
+All files MUST be written using relative paths inside the current project directory.
+CORRECT: `.memory/decisions/auth.md`, `.memory/progress/current.md`
+NEVER write to `~/.claude/` or any absolute path outside the project folder.
+
+---
+
 Summarize this session clearly and offer to save relevant items.
 
 **Step 1 — Summarize the session**
@@ -45,3 +53,4 @@ List the specific items worth saving:
 
 If the user says yes, follow the same process as /mem-save.
 Ask for confirmation before writing anything.
+Write all files using relative paths only.
