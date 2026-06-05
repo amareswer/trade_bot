@@ -38,13 +38,12 @@ def warmup(tick: int, current: int, total: int, price: float) -> None:
     )
 
 
-# ── Candle aggregation progress ──────────────────────────────────────────────
+# ── Next candle countdown ─────────────────────────────────────────────────────
 
-def building_candle(elapsed_m: int, total_m: int, price: float, tick_n: int) -> None:
-    pbar = _bar(elapsed_m, total_m)
+def next_candle(price: float, tick_n: int, countdown: str) -> None:
     print(
         f"  {_DIM}{_now()}{_R}  #{tick_n:04d}  {_WH}${price:>12,.2f}{_R}"
-        f"  {_DIM}building candle {pbar} {elapsed_m}/{total_m}min{_R}"
+        f"  {_DIM}next candle in {countdown}{_R}"
     )
 
 

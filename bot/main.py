@@ -17,8 +17,9 @@ import os
 import signal as _signal_module
 import time
 from collections import deque
-from datetime import datetime, timezone as _tz
+from datetime import datetime, timedelta, timezone as _tz
 
+import ccxt as _ccxt
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -66,64 +67,104 @@ _signal_module.signal(_signal_module.SIGINT, _handle_sigint)
 
 
 # ---------------------------------------------------------------------------
-# Candle aggregator
+# Live candle helpers
 # ---------------------------------------------------------------------------
 
-class CandleAggregator:
-    """Accumulates live price ticks into OHLCV candles over a fixed time window.
+def _build_exchange():
+    """Create a ccxt exchange instance for candle fetching."""
+    cls = getattr(_ccxt, cfg.exchange.exchange.lower())
+    return cls({"timeout": 15_000})
 
-    Activated only in live + indicator mode so that ADX/RSI receive proper
-    high/low data instead of flat tick-by-tick fake candles.
+
+def _candle_countdown(timeframe: str) -> str:
+    """Return 'Xh Xm' countdown until the next candle close at a round UTC boundary."""
+    tf_minutes = {
+        "1m": 1, "5m": 5, "15m": 15, "30m": 30,
+        "1h": 60, "2h": 120, "4h": 240, "6h": 360, "12h": 720, "1d": 1440,
+    }
+    period_m = tf_minutes.get(timeframe, 240)
+    now = datetime.now(_tz.utc)
+    now_m = now.hour * 60 + now.minute
+    next_m = ((now_m // period_m) + 1) * period_m
+    base = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    next_close = base + timedelta(minutes=next_m)
+    total_s = max(0, int((next_close - now).total_seconds()))
+    h, rem = divmod(total_s, 3600)
+    m = rem // 60
+    return f"{h}h {m:02d}m" if h else f"{m}m"
+
+
+def _warmup_strategy(strategy, exchange) -> "int | None":
     """
-
-    def __init__(self, period_minutes: int) -> None:
-        self._period_s  = period_minutes * 60
-        self._period_m  = period_minutes
-        self._start_ts: float | None = None
-        self._open:  float = 0.0
-        self._high:  float = 0.0
-        self._low:   float = 0.0
-        self._close: float = 0.0
-        self._ticks: int   = 0
-
-    def add_tick(self, price: float) -> "_Candle | None":
-        """Feed one price tick. Returns a complete Candle when the period elapses, else None."""
-        now = time.time()
-        if self._start_ts is None:
-            self._start_ts = now
-            self._open = self._high = self._low = price
-
-        self._high  = max(self._high, price)
-        self._low   = min(self._low,  price)
-        self._close = price
-        self._ticks += 1
-
-        if now - self._start_ts >= self._period_s:
-            candle = _Candle(
-                timestamp = datetime.now(_tz.utc),
-                open      = self._open,
-                high      = self._high,
-                low       = self._low,
-                close     = self._close,
-                volume    = float(self._ticks),
-            )
-            # Reset for the next candle, carrying the current tick as the opening
-            self._start_ts = now
-            self._open = self._high = self._low = price
-            self._close = price
-            self._ticks = 1
-            return candle
+    Fetch 35 completed candles and warm up the strategy indicators.
+    Returns the timestamp_ms of the last candle fed, or None on failure.
+    """
+    timeframe = cfg.backtest.timeframe
+    print(f"\n  Fetching historical {timeframe} candles for warmup …", flush=True)
+    try:
+        raw = exchange.fetch_ohlcv(cfg.exchange.symbol, timeframe=timeframe, limit=36)
+    except Exception as exc:
+        print(f"  WARNING: historical warmup failed ({exc}) — starting cold", flush=True)
         return None
 
-    @property
-    def elapsed_minutes(self) -> int:
-        if self._start_ts is None:
-            return 0
-        return int((time.time() - self._start_ts) / 60)
+    if len(raw) < 2:
+        print("  WARNING: too few candles returned — starting cold", flush=True)
+        return None
 
-    @property
-    def period_minutes(self) -> int:
-        return self._period_m
+    # raw[-1] is the currently-forming candle; drop it
+    completed = raw[:-1]
+    candles = [
+        _Candle(
+            timestamp=datetime.fromtimestamp(row[0] / 1000, tz=_tz.utc),
+            open=float(row[1]), high=float(row[2]),
+            low=float(row[3]), close=float(row[4]),
+            volume=float(row[5]),
+        )
+        for row in completed
+    ]
+
+    total = len(candles)
+    print(f"  Warming up with {total} × {timeframe} candles …", flush=True)
+    for i, candle in enumerate(candles):
+        strategy.evaluate(candle)
+        display.warmup(i + 1, i + 1, total, candle.close)
+
+    ready = "ready" if strategy.is_warmed_up else "NOT warmed up — too few candles"
+    print(f"  Strategy {ready}.\n", flush=True)
+    return completed[-1][0]   # ts_ms of last completed candle
+
+
+def _fetch_completed_candle(
+    exchange,
+    last_ts_ms: "int | None",
+    timeframe: str,
+) -> "tuple[_Candle | None, int | None]":
+    """
+    Fetch the most recently completed candle.
+    Returns (Candle, ts_ms) when a new candle is available, else (None, None).
+    raw[-1] is still forming; raw[-2] is the last fully closed candle.
+    """
+    try:
+        raw = exchange.fetch_ohlcv(cfg.exchange.symbol, timeframe=timeframe, limit=2)
+    except Exception as exc:
+        logger.warning("live candle fetch error: %s", exc)
+        return None, None
+
+    if len(raw) < 2:
+        return None, None
+
+    row = raw[-2]
+    ts_ms = row[0]
+    if last_ts_ms is not None and ts_ms <= last_ts_ms:
+        return None, None   # same candle as last evaluation
+
+    candle = _Candle(
+        timestamp=datetime.fromtimestamp(ts_ms / 1000, tz=_tz.utc),
+        open=float(row[1]), high=float(row[2]),
+        low=float(row[3]), close=float(row[4]),
+        volume=float(row[5]),
+    )
+    return candle, ts_ms
 
 
 # ---------------------------------------------------------------------------
@@ -195,17 +236,13 @@ def run():
 
     is_indicator = isinstance(strategy, IndicatorStrategy)
 
-    # Candle aggregator — live indicator mode only.
-    # Simulated mode keeps fake flat candles (building a 4h window in real-time
-    # during simulation is impractical; use FEED_MODE=simulated for quick testing).
-    candle_agg: CandleAggregator | None = (
-        CandleAggregator(cfg.exchange.candle_minutes)
-        if is_indicator and cfg.exchange.feed_mode == "live"
-        else None
-    )
-    if candle_agg:
-        print(f"  Candle aggregator: {candle_agg.period_minutes}min windows  "
-              f"(~{candle_agg.period_minutes * 60 // cfg.exchange.loop_interval} ticks/candle)\n")
+    # ── Historical warmup (live + indicator mode only) ────────────────────────
+    live_exchange = None
+    last_candle_ts_ms: "int | None" = None
+
+    if is_indicator and cfg.exchange.feed_mode == "live":
+        live_exchange     = _build_exchange()
+        last_candle_ts_ms = _warmup_strategy(strategy, live_exchange)
 
     tick     = 0
     tick_log: deque[dict] = deque(maxlen=200)
@@ -213,10 +250,10 @@ def run():
     while _running:
         tick += 1
 
-        # ── 1. Advance state machine ─────────────────────────────────
+        # ── 1. Advance state machine ──────────────────────────────────
         state_machine.tick()
 
-        # ── 2. Fetch price ───────────────────────────────────────────
+        # ── 2. Fetch live price (display / dashboard only) ────────────
         try:
             price = feed.get_price()
         except Exception as exc:
@@ -224,32 +261,31 @@ def run():
             time.sleep(cfg.exchange.loop_interval)
             continue
 
-        # ── 3. Strategy signal ───────────────────────────────────────
+        # ── 3. Strategy signal ────────────────────────────────────────
         if is_indicator:
-            if candle_agg is not None:
-                # Live mode: accumulate ticks until a full candle is ready
-                candle = candle_agg.add_tick(price)
+            if live_exchange is not None:
+                # Live mode: evaluate only when a new 4h candle has closed
+                candle, new_ts = _fetch_completed_candle(
+                    live_exchange, last_candle_ts_ms, cfg.backtest.timeframe
+                )
                 if candle is None:
-                    display.building_candle(
-                        candle_agg.elapsed_minutes,
-                        candle_agg.period_minutes,
-                        price,
-                        tick,
-                    )
+                    countdown = _candle_countdown(cfg.backtest.timeframe)
+                    display.next_candle(price, tick, countdown)
                     time.sleep(cfg.exchange.loop_interval)
                     continue
+                last_candle_ts_ms = new_ts
                 raw_signal = strategy.evaluate(candle)
             else:
-                # Simulated mode: flat fake candle (high/low/close == price)
-                _tick_candle = _Candle(
+                # Simulated mode: flat fake candle per tick (quick testing)
+                fake_candle = _Candle(
                     timestamp=datetime.now(_tz.utc),
                     open=price, high=price, low=price, close=price, volume=0.0,
                 )
-                raw_signal = strategy.evaluate(_tick_candle)
+                raw_signal = strategy.evaluate(fake_candle)
         else:
             raw_signal = strategy.evaluate(price)
 
-        # ── 4. Warmup guard ──────────────────────────────────────────
+        # ── 4. Warmup guard (simulated mode; live is pre-warmed above) ─
         if is_indicator and not strategy.is_warmed_up:
             display.warmup(tick, strategy.tick_count, strategy._warmup, price)
             time.sleep(cfg.exchange.loop_interval)
@@ -258,17 +294,17 @@ def run():
         rsi_val   = strategy.last_rsi   if is_indicator else None
         trend_val = strategy.last_trend if is_indicator else None
 
-        # ── 5. Position-aware filter + deduplication ─────────────────
+        # ── 5. Position-aware filter + deduplication ──────────────────
         filtered_signal, filter_reason = state_machine.filter_signal(raw_signal)
 
-        # ── 6. Dynamic position sizing ────────────────────────────────
+        # ── 6. Dynamic position sizing ─────────────────────────────────
         # BUY = % of cash; SELL = close full position (AI can't create new SELLs)
         if filtered_signal == Signal.SELL:
             trade_qty = executor.position
         else:
             trade_qty = cfg.calc_trade_qty(executor.cash, price)
 
-        # ── 7. AI advisory (optional, advisory only) ──────────────────
+        # ── 7. AI advisory (optional, advisory only) ───────────────────
         advice       = None
         final_signal = filtered_signal
         if ai and ai.enabled and filtered_signal != Signal.HOLD:
@@ -283,11 +319,11 @@ def run():
             )
             final_signal = merge_signals(filtered_signal, advice)
 
-        # ── 8. Risk gate ─────────────────────────────────────────────
+        # ── 8. Risk gate ───────────────────────────────────────────────
         approval     = risk.evaluate(final_signal, price, executor.portfolio, trade_qty)
         block_reason = "" if approval else approval.message
 
-        # ── 9. Display tick ──────────────────────────────────────────
+        # ── 9. Display tick ────────────────────────────────────────────
         display.tick(
             tick_n        = tick,
             price         = price,
@@ -311,7 +347,7 @@ def run():
                 advice.reasoning, advice.latency_ms, vetoed,
             )
 
-        # ── 10. Execute ───────────────────────────────────────────────
+        # ── 10. Execute ────────────────────────────────────────────────
         if approval:
             order = executor.execute(final_signal, price, quantity=trade_qty)
             if order:
@@ -332,7 +368,7 @@ def run():
                 else:
                     display.reject(order.reject_reason or "")
 
-        # ── 11. Position summary ──────────────────────────────────────
+        # ── 11. Position summary ───────────────────────────────────────
         display.position_line(
             quantity       = position_manager.quantity,
             symbol         = cfg.exchange.symbol,
@@ -342,7 +378,7 @@ def run():
             cash           = executor.cash,
         )
 
-        # ── 12. Tick log + dashboard ──────────────────────────────────
+        # ── 12. Tick log + dashboard ───────────────────────────────────
         tick_log.append({
             "tick":   tick,
             "time":   datetime.now().strftime("%H:%M:%S"),
