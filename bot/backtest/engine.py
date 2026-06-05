@@ -76,6 +76,8 @@ def run(
     slow_ema_period:      int   = 21,
     adx_period:           int   = 14,
     adx_threshold:        float = 25.0,
+    max_ema_spread_pct:   float = 0.0,
+    rsi_filter_enabled:   bool  = True,
     # Threshold config
     buy_threshold:        float = 0.0,
     sell_threshold:       float = 0.0,
@@ -93,13 +95,15 @@ def run(
     # ── Build components (same as main.py) ───────────────────────────
     if strategy_mode == "indicator":
         strategy = IndicatorStrategy(IndicatorConfig(
-            rsi_period      = rsi_period,
-            rsi_oversold    = rsi_oversold,
-            rsi_overbought  = rsi_overbought,
-            fast_ema_period = fast_ema_period,
-            slow_ema_period = slow_ema_period,
-            adx_period      = adx_period,
-            adx_threshold   = adx_threshold,
+            rsi_period         = rsi_period,
+            rsi_oversold       = rsi_oversold,
+            rsi_overbought     = rsi_overbought,
+            fast_ema_period    = fast_ema_period,
+            slow_ema_period    = slow_ema_period,
+            adx_period         = adx_period,
+            adx_threshold      = adx_threshold,
+            max_ema_spread_pct = max_ema_spread_pct,
+            rsi_filter_enabled = rsi_filter_enabled,
         ))
         is_indicator = True
     else:

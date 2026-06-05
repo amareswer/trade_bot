@@ -42,9 +42,11 @@ class IndicatorConfig:
     rsi_sell_max:        float = 55.0   # RSI must be BELOW this to SELL (momentum falling)
     fast_ema_period:     int   = 9
     slow_ema_period:     int   = 21
-    min_ema_spread_pct:  float = 0.002  # EMAs must be 0.2% apart — filters weak crossovers
+    min_ema_spread_pct:  float = 0.002  # EMAs must be at least this far apart
+    max_ema_spread_pct:  float = 0.0    # EMAs must be no more than this far apart (0 = disabled)
     adx_period:          int   = 14
-    adx_threshold:       float = 25.0  # < threshold = ranging market → HOLD
+    adx_threshold:       float = 25.0   # < threshold = ranging market → HOLD (0 = disabled)
+    rsi_filter_enabled:  bool  = True   # set False to bypass RSI level/direction checks
 
 
 class IndicatorStrategy:
@@ -146,7 +148,10 @@ class IndicatorStrategy:
 
         # ── EMA separation filter ─────────────────────────────────────
         ema_spread_pct = abs(fast_ema - slow_ema) / slow_ema if slow_ema > 0 else 0.0
-        ema_strong     = ema_spread_pct >= self.config.min_ema_spread_pct
+        ema_above_min  = ema_spread_pct >= self.config.min_ema_spread_pct
+        ema_below_max  = (self.config.max_ema_spread_pct <= 0 or
+                          ema_spread_pct <= self.config.max_ema_spread_pct)
+        ema_strong     = ema_above_min and ema_below_max
 
         logger.info(
             "price=%.2f RSI=%.1f(%s) trend=%s EMA_spread=%.3f%% strong=%s ADX=%.1f",
@@ -159,9 +164,10 @@ class IndicatorStrategy:
         if trend_val == "BULLISH":
             if not ema_strong:
                 self.stats["ema_rejected"] += 1
-            elif not (rsi_rising
-                      and rsi_val > self.config.rsi_buy_min
-                      and rsi_val < self.config.rsi_overbought):
+            elif self.config.rsi_filter_enabled and not (
+                    rsi_rising
+                    and rsi_val > self.config.rsi_buy_min
+                    and rsi_val < self.config.rsi_overbought):
                 self.stats["rsi_rejected"] += 1
             else:
                 self.stats["buy_signals"] += 1
@@ -169,9 +175,10 @@ class IndicatorStrategy:
         elif trend_val == "BEARISH":
             if not ema_strong:
                 self.stats["ema_rejected"] += 1
-            elif not (rsi_falling
-                      and rsi_val < self.config.rsi_sell_max
-                      and rsi_val > self.config.rsi_oversold):
+            elif self.config.rsi_filter_enabled and not (
+                    rsi_falling
+                    and rsi_val < self.config.rsi_sell_max
+                    and rsi_val > self.config.rsi_oversold):
                 self.stats["rsi_rejected"] += 1
             else:
                 self.stats["sell_signals"] += 1

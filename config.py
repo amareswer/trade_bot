@@ -93,8 +93,10 @@ class StrategyConfig:
     slow_ema_period: int   = 21
     buy_threshold:   float = 0.0
     sell_threshold:  float = 0.0
-    adx_period:      int   = 14
-    adx_threshold:   float = 25.0  # < this = ranging market → HOLD
+    adx_period:         int   = 14
+    adx_threshold:      float = 25.0  # < this = ranging market → HOLD
+    max_ema_spread_pct: float = 0.0   # 0 = disabled; 0.005 = 0.5% ceiling
+    rsi_filter_enabled: bool  = True  # False = bypass RSI level/direction checks
 
     def __post_init__(self):
         if self.mode not in ("indicator", "threshold"):
@@ -109,6 +111,8 @@ class StrategyConfig:
             raise ValueError("ADX_PERIOD must be >= 2")
         if not 0 <= self.adx_threshold <= 100:
             raise ValueError("ADX_THRESHOLD must be between 0 and 100")
+        if self.max_ema_spread_pct < 0:
+            raise ValueError("MAX_EMA_SPREAD_PCT must be >= 0")
 
 
 @dataclass
@@ -270,8 +274,10 @@ def _load() -> AppConfig:
             slow_ema_period = _int  ("SLOW_EMA_PERIOD",  21),
             buy_threshold   = _float("BUY_THRESHOLD",    0.0),
             sell_threshold  = _float("SELL_THRESHOLD",   0.0),
-            adx_period      = _int  ("ADX_PERIOD",       14),
-            adx_threshold   = _float("ADX_THRESHOLD",    25.0),
+            adx_period          = _int  ("ADX_PERIOD",          14),
+            adx_threshold       = _float("ADX_THRESHOLD",       25.0),
+            max_ema_spread_pct  = _float("MAX_EMA_SPREAD_PCT",  0.0),
+            rsi_filter_enabled  = _bool ("RSI_FILTER_ENABLED",  True),
         ),
         risk=RiskConfig(
             risk_per_trade_pct   = _float("RISK_PER_TRADE_PCT",    0.01),
