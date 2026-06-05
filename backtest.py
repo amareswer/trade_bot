@@ -65,6 +65,35 @@ def main():
     m = metrics_mod.compute(result)
     report.print_report(m, result)
 
+    rs = result.rejection_stats
+    if rs:
+        tradeable = rs.get("candles_seen", 0) - rs.get("warmup_rejected", 0)
+
+        def pct(n: int) -> str:
+            return f"  ({n / tradeable * 100:.1f}%)" if tradeable > 0 else ""
+
+        print()
+        print("  SIGNAL FILTER BREAKDOWN")
+        print("  " + "─" * 46)
+        print(f"  Candles examined          {rs.get('candles_seen', 0):>6}")
+        print(f"  Warmup (skipped)          {rs.get('warmup_rejected', 0):>6}")
+        print(f"  Tradeable candles         {tradeable:>6}")
+        print(f"  ─────────────────────────────────────────")
+        adx_n   = rs.get("adx_rejected", 0)
+        trend_n = rs.get("trend_rejected", 0)
+        ema_n   = rs.get("ema_rejected", 0)
+        rsi_n   = rs.get("rsi_rejected", 0)
+        print(f"  ADX rejected              {adx_n:>6}{pct(adx_n)}")
+        print(f"  Trend rejected (NEUTRAL)  {trend_n:>6}{pct(trend_n)}")
+        print(f"  EMA spread rejected       {ema_n:>6}{pct(ema_n)}")
+        print(f"  RSI rejected              {rsi_n:>6}{pct(rsi_n)}")
+        print(f"  ─────────────────────────────────────────")
+        buy_n  = rs.get("buy_signals", 0)
+        sell_n = rs.get("sell_signals", 0)
+        print(f"  BUY  signals emitted      {buy_n:>6}{pct(buy_n)}")
+        print(f"  SELL signals emitted      {sell_n:>6}{pct(sell_n)}")
+        print()
+
     csv_path = report.save_csv(result)
     print(f"  Saved → {csv_path}\n")
 

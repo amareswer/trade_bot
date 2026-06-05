@@ -69,6 +69,18 @@ class IndicatorStrategy:
         self._last_adx:   float | None = None
         self._prev_rsi:   float | None = None   # RSI one tick ago — for direction
 
+        self.stats: dict[str, int] = {
+            "candles_seen":    0,
+            "warmup_rejected": 0,
+            "adx_rejected":    0,
+            "trend_rejected":  0,
+            "ema_rejected":    0,
+            "rsi_rejected":    0,
+            "buy_signals":     0,
+            "sell_signals":    0,
+            "hold_signals":    0,
+        }
+
         logger.info(
             "IndicatorStrategy (improved) | RSI(%d) ob=%.0f os=%.0f buy_min=%.0f sell_max=%.0f"
             " | EMA(%d/%d) min_spread=%.2f%% | ADX(%d) threshold=%.0f | warmup=%d",
@@ -81,14 +93,24 @@ class IndicatorStrategy:
             self._warmup,
         )
 
-    def evaluate(self, candle: Candle) -> Signal:
+    def evaluate(self, candle) -> Signal:
+        if isinstance(candle, (int, float)):
+            from datetime import datetime, timezone as _tz
+            candle = Candle(
+                timestamp=datetime.now(_tz.utc),
+                open=float(candle), high=float(candle),
+                low=float(candle), close=float(candle), volume=0.0,
+            )
         price = candle.close
         self._closes.append(price)
         self._highs.append(candle.high)
         self._lows.append(candle.low)
         closes = list(self._closes)
 
+        self.stats["candles_seen"] += 1
+
         if len(closes) < self._warmup:
+            self.stats["warmup_rejected"] += 1
             return Signal.HOLD
 
         # ── Compute indicators ────────────────────────────────────────
@@ -98,6 +120,7 @@ class IndicatorStrategy:
         slow_ema  = calc_ema(closes, self.config.slow_ema_period)
 
         if rsi_val is None or fast_ema is None or slow_ema is None:
+            self.stats["warmup_rejected"] += 1
             return Signal.HOLD
 
         # ── ADX market regime filter ──────────────────────────────────
@@ -110,11 +133,12 @@ class IndicatorStrategy:
         self._last_adx = adx_val
 
         if adx_val is None or adx_val < self.config.adx_threshold:
+            self.stats["adx_rejected"] += 1
             return Signal.HOLD   # ranging market — skip
 
         # ── RSI direction (is momentum rising or falling?) ────────────
-        rsi_rising  = self._prev_rsi is not None and rsi_val > self._prev_rsi
-        rsi_falling = self._prev_rsi is not None and rsi_val < self._prev_rsi
+        rsi_rising  = self._last_rsi is not None and rsi_val > self._last_rsi
+        rsi_falling = self._last_rsi is not None and rsi_val < self._last_rsi
 
         self._prev_rsi   = self._last_rsi
         self._last_rsi   = rsi_val
@@ -131,32 +155,31 @@ class IndicatorStrategy:
             trend_val, ema_spread_pct * 100, ema_strong, adx_val,
         )
 
-        # ── BUY conditions ────────────────────────────────────────────
-        # 1. Uptrend confirmed by EMA crossover
-        # 2. EMA spread is meaningful (not a weak/noisy crossover)
-        # 3. RSI is rising (momentum agrees with trend)
-        # 4. RSI is above midline (not just starting from oversold bounce)
-        # 5. RSI has not hit overbought (move not exhausted)
-        if (trend_val == "BULLISH"
-                and ema_strong
-                and rsi_rising
-                and rsi_val > self.config.rsi_buy_min
-                and rsi_val < self.config.rsi_overbought):
-            return Signal.BUY
+        # ── BUY / SELL conditions ─────────────────────────────────────
+        if trend_val == "BULLISH":
+            if not ema_strong:
+                self.stats["ema_rejected"] += 1
+            elif not (rsi_rising
+                      and rsi_val > self.config.rsi_buy_min
+                      and rsi_val < self.config.rsi_overbought):
+                self.stats["rsi_rejected"] += 1
+            else:
+                self.stats["buy_signals"] += 1
+                return Signal.BUY
+        elif trend_val == "BEARISH":
+            if not ema_strong:
+                self.stats["ema_rejected"] += 1
+            elif not (rsi_falling
+                      and rsi_val < self.config.rsi_sell_max
+                      and rsi_val > self.config.rsi_oversold):
+                self.stats["rsi_rejected"] += 1
+            else:
+                self.stats["sell_signals"] += 1
+                return Signal.SELL
+        else:
+            self.stats["trend_rejected"] += 1
 
-        # ── SELL conditions ───────────────────────────────────────────
-        # 1. Downtrend confirmed by EMA crossover
-        # 2. EMA spread is meaningful
-        # 3. RSI is falling (momentum agrees with trend)
-        # 4. RSI is below midline
-        # 5. RSI has not hit oversold (move not exhausted)
-        if (trend_val == "BEARISH"
-                and ema_strong
-                and rsi_falling
-                and rsi_val < self.config.rsi_sell_max
-                and rsi_val > self.config.rsi_oversold):
-            return Signal.SELL
-
+        self.stats["hold_signals"] += 1
         return Signal.HOLD
 
     # ── Read-only properties (same interface as original) ─────────────

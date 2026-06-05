@@ -45,16 +45,17 @@ class FillRecord:
 
 @dataclass
 class BacktestResult:
-    symbol:        str
-    timeframe:     str
-    fee_pct:       float
-    starting_cash: float
-    final_value:   float
-    total_fees:    float
-    fills:         list[FillRecord]
-    equity_curve:  list[float]     # portfolio value after each candle
-    candles:       list[Candle]
-    warmup_ticks:  int
+    symbol:           str
+    timeframe:        str
+    fee_pct:          float
+    starting_cash:    float
+    final_value:      float
+    total_fees:       float
+    fills:            list[FillRecord]
+    equity_curve:     list[float]
+    candles:          list[Candle]
+    warmup_ticks:     int
+    rejection_stats:  dict[str, int] = field(default_factory=dict)
 
 
 def run(
@@ -138,13 +139,18 @@ def run(
 
         # ── Stop-loss / take-profit override ─────────────────────────
         exit_reason = "strategy"
+        exit_price  = price
         if executor.position > 0 and entry_price > 0:
-            if stop_loss_pct > 0 and price <= entry_price * (1 - stop_loss_pct):
+            sl_level = entry_price * (1 - stop_loss_pct) if stop_loss_pct > 0 else None
+            tp_level = entry_price * (1 + take_profit_pct) if take_profit_pct > 0 else None
+            if sl_level is not None and candle.low <= sl_level:
                 raw_signal  = Signal.SELL
                 exit_reason = "stop_loss"
-            elif take_profit_pct > 0 and price >= entry_price * (1 + take_profit_pct):
+                exit_price  = sl_level
+            elif tp_level is not None and candle.high >= tp_level:
                 raw_signal  = Signal.SELL
                 exit_reason = "take_profit"
+                exit_price  = tp_level
 
         filtered_signal, _ = state_machine.filter_signal(raw_signal)
 
@@ -157,7 +163,8 @@ def run(
         approval = risk.evaluate(filtered_signal, price, executor.portfolio, trade_qty, candle.timestamp.date())
 
         if approval:
-            order = executor.execute(filtered_signal, price, quantity=trade_qty)
+            fill_at = exit_price if filtered_signal == Signal.SELL else price
+            order   = executor.execute(filtered_signal, fill_at, quantity=trade_qty)
             if order and order.status == OrderStatus.FILLED:
                 risk.record_fill()
                 state_machine.on_fill(filtered_signal, order.price)
@@ -197,15 +204,20 @@ def run(
         len(candles), warmup_ticks, len(fills), final_value, total_fees,
     )
 
+    rej_stats: dict[str, int] = {}
+    if is_indicator and hasattr(strategy, "stats"):
+        rej_stats = dict(strategy.stats)
+
     return BacktestResult(
-        symbol        = symbol,
-        timeframe     = timeframe,
-        fee_pct       = fee_pct,
-        starting_cash = starting_cash,
-        final_value   = final_value,
-        total_fees    = total_fees,
-        fills         = fills,
-        equity_curve  = equity_curve,
-        candles       = candles,
-        warmup_ticks  = warmup_ticks,
+        symbol          = symbol,
+        timeframe       = timeframe,
+        fee_pct         = fee_pct,
+        starting_cash   = starting_cash,
+        final_value     = final_value,
+        total_fees      = total_fees,
+        fills           = fills,
+        equity_curve    = equity_curve,
+        candles         = candles,
+        warmup_ticks    = warmup_ticks,
+        rejection_stats = rej_stats,
     )

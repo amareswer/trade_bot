@@ -102,7 +102,8 @@ def _warmup_strategy(strategy, exchange) -> "int | None":
     timeframe = cfg.backtest.timeframe
     print(f"\n  Fetching historical {timeframe} candles for warmup …", flush=True)
     try:
-        raw = exchange.fetch_ohlcv(cfg.exchange.symbol, timeframe=timeframe, limit=36)
+        _WARMUP_CANDLES = max(strategy._warmup + 100, 150)
+        raw = exchange.fetch_ohlcv(cfg.exchange.symbol, timeframe=timeframe, limit=_WARMUP_CANDLES + 1)
     except Exception as exc:
         print(f"  WARNING: historical warmup failed ({exc}) — starting cold", flush=True)
         return None
@@ -157,6 +158,20 @@ def _fetch_completed_candle(
     ts_ms = row[0]
     if last_ts_ms is not None and ts_ms <= last_ts_ms:
         return None, None   # same candle as last evaluation
+
+    _TF_MS_MAP = {
+        "1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+        "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000,
+        "6h": 21_600_000, "12h": 43_200_000, "1d": 86_400_000,
+    }
+    tf_ms  = _TF_MS_MAP.get(timeframe, 14_400_000)
+    age_ms = int(datetime.now(_tz.utc).timestamp() * 1000) - ts_ms
+    if last_ts_ms is None and age_ms > 2 * tf_ms:
+        logger.warning(
+            "Stale candle on startup skipped (age=%.1fh) — waiting for next candle close",
+            age_ms / 3_600_000,
+        )
+        return None, int(ts_ms)
 
     candle = _Candle(
         timestamp=datetime.fromtimestamp(ts_ms / 1000, tz=_tz.utc),
@@ -284,6 +299,24 @@ def run():
                 raw_signal = strategy.evaluate(fake_candle)
         else:
             raw_signal = strategy.evaluate(price)
+
+        # ── 3b. Live stop-loss / take-profit ─────────────────────────
+        if is_indicator and position_manager.has_position and position_manager.avg_entry > 0:
+            _entry = position_manager.avg_entry
+            if cfg.backtest.stop_loss_pct > 0 and price <= _entry * (1 - cfg.backtest.stop_loss_pct):
+                raw_signal = Signal.SELL
+                logger.warning(
+                    "STOP LOSS triggered: price=%.2f entry=%.2f sl=%.1f%%",
+                    price, _entry, cfg.backtest.stop_loss_pct * 100,
+                )
+                print(f"           🛑 STOP LOSS   price={price:,.2f}  entry={_entry:,.2f}", flush=True)
+            elif cfg.backtest.take_profit_pct > 0 and price >= _entry * (1 + cfg.backtest.take_profit_pct):
+                raw_signal = Signal.SELL
+                logger.info(
+                    "TAKE PROFIT triggered: price=%.2f entry=%.2f tp=%.1f%%",
+                    price, _entry, cfg.backtest.take_profit_pct * 100,
+                )
+                print(f"           ✅ TAKE PROFIT  price={price:,.2f}  entry={_entry:,.2f}", flush=True)
 
         # ── 4. Warmup guard (simulated mode; live is pre-warmed above) ─
         if is_indicator and not strategy.is_warmed_up:
