@@ -318,6 +318,71 @@ def run():
                 )
                 print(f"           ✅ TAKE PROFIT  price={price:,.2f}  entry={_entry:,.2f}", flush=True)
 
+        # ── 3c. Candle-close diagnostic log ──────────────────────────
+        if is_indicator and live_exchange is not None:
+            _adx_live  = strategy.last_adx
+            _rsi_live  = strategy.last_rsi
+            _trnd_live = strategy.last_trend or "UNKNOWN"
+            from bot.indicators.indicators import ema as _ema_fn
+            _cl = list(strategy._closes)
+            _ef = _ema_fn(_cl, strategy.config.fast_ema_period)
+            _es = _ema_fn(_cl, strategy.config.slow_ema_period)
+            _spread = abs(_ef - _es) / _es * 100 if (_ef and _es and _es > 0) else 0.0
+            _sig_str = raw_signal.value if hasattr(raw_signal, 'value') else str(raw_signal)
+
+            # Determine rejection reason for HOLD signals
+            _reason = ""
+            if _sig_str == "HOLD":
+                if _adx_live is not None and _adx_live < strategy.config.adx_threshold:
+                    _reason = f"ADX {_adx_live:.1f} < {strategy.config.adx_threshold}"
+                elif _trnd_live == "NEUTRAL":
+                    _reason = "trend NEUTRAL"
+                elif _spread > strategy.config.max_ema_spread_pct * 100 and strategy.config.max_ema_spread_pct > 0:
+                    _reason = f"EMA spread {_spread:.3f}% > {strategy.config.max_ema_spread_pct*100:.1f}%"
+                elif _rsi_live is not None:
+                    _reason = f"RSI {_rsi_live:.1f} filtered"
+                else:
+                    _reason = "warmup"
+
+            _rsi_str = f"  RSI={_rsi_live:.1f}" if _rsi_live is not None else "  RSI=n/a"
+            _adx_str = f"  ADX={_adx_live:.1f}" if _adx_live is not None else "  ADX=n/a"
+            print(
+                f"  candle {candle.timestamp.strftime('%Y-%m-%d %H:%M')} UTC"
+                f"  close={price:,.2f}"
+                + _rsi_str
+                + _adx_str,
+                flush=True
+            )
+            print(
+                f"  trend={_trnd_live}"
+                f"  EMA_spread={_spread:.3f}%"
+                f"  signal={_sig_str}"
+                + (f"  [{_reason}]" if _reason else ""),
+                flush=True
+            )
+
+            # Log to CSV for live vs backtest comparison
+            import csv, os as _os
+            _live_log = "logs/live_signals.csv"
+            _write_header = not _os.path.exists(_live_log)
+            with open(_live_log, "a", newline="") as _f:
+                _w = csv.writer(_f)
+                if _write_header:
+                    _w.writerow([
+                        "timestamp", "close", "rsi", "adx",
+                        "trend", "ema_spread_pct", "signal", "reason"
+                    ])
+                _w.writerow([
+                    candle.timestamp.strftime("%Y-%m-%d %H:%M"),
+                    round(price, 2),
+                    round(_rsi_live, 2) if _rsi_live is not None else "",
+                    round(_adx_live, 2) if _adx_live is not None else "",
+                    _trnd_live,
+                    round(_spread, 4),
+                    _sig_str,
+                    _reason,
+                ])
+
         # ── 4. Warmup guard (simulated mode; live is pre-warmed above) ─
         if is_indicator and not strategy.is_warmed_up:
             display.warmup(tick, strategy.tick_count, strategy._warmup, price)
