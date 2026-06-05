@@ -89,6 +89,7 @@ def run(
     # Exit rules
     stop_loss_pct:        float = 0.02,   # exit if price drops this % from entry (0 = disabled)
     take_profit_pct:      float = 0.04,   # exit if price rises this % from entry (0 = disabled)
+    slippage_pct:         float = 0.0,    # per-side slippage as fraction (0.0005 = 0.05%)
 ) -> BacktestResult:
     """Run a full backtest and return the result."""
 
@@ -169,7 +170,14 @@ def run(
         approval = risk.evaluate(filtered_signal, price, executor.portfolio, trade_qty, candle.timestamp.date())
 
         if approval:
-            fill_at = exit_price if filtered_signal == Signal.SELL else price
+            # Apply slippage: buys fill slightly higher, sells slightly lower
+            if slippage_pct > 0:
+                if filtered_signal == Signal.BUY:
+                    fill_at = (exit_price if filtered_signal == Signal.SELL else price) * (1 + slippage_pct)
+                else:
+                    fill_at = (exit_price if filtered_signal == Signal.SELL else price) * (1 - slippage_pct)
+            else:
+                fill_at = exit_price if filtered_signal == Signal.SELL else price
             order   = executor.execute(filtered_signal, fill_at, quantity=trade_qty)
             if order and order.status == OrderStatus.FILLED:
                 risk.record_fill()

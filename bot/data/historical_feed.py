@@ -212,3 +212,23 @@ def fetch_candles_paginated(
         candles[-1].timestamp.strftime("%Y-%m-%d %H:%M"),
     )
     return candles
+
+
+def slice_candles(
+    candles:    list[Candle],
+    start_date: str | None = None,   # "YYYY-MM-DD"
+    end_date:   str | None = None,   # "YYYY-MM-DD" (exclusive)
+) -> list[Candle]:
+    """
+    Return candles within [start_date, end_date).
+    Both bounds are optional. Dates are UTC.
+    """
+    from datetime import datetime, timezone
+    result = candles
+    if start_date:
+        dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        result = [c for c in result if c.timestamp >= dt]
+    if end_date:
+        dt = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        result = [c for c in result if c.timestamp < dt]
+    return result
