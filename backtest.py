@@ -13,6 +13,7 @@ logging.basicConfig(level=logging.WARNING)
 from config import cfg
 from bot.data.historical_feed import fetch_candles_paginated
 from bot.backtest import engine, metrics as metrics_mod, report
+from bot.backtest.attribution import compute_attribution, print_attribution, save_attribution_csv
 
 
 def main():
@@ -96,6 +97,17 @@ def main():
 
     csv_path = report.save_csv(result)
     print(f"  Saved → {csv_path}\n")
+
+    # ── Trade attribution analysis ────────────────────────────────
+    if result.fills:
+        attr_report = compute_attribution(result)
+        print_attribution(attr_report)
+        attr_path = save_attribution_csv(
+            attr_report.records,
+            symbol    = cfg.exchange.symbol,
+            timeframe = cfg.backtest.timeframe,
+        )
+        print(f"  Attribution CSV → {attr_path}\n")
 
 
 if __name__ == "__main__":

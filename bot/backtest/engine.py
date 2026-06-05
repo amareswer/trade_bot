@@ -56,6 +56,7 @@ class BacktestResult:
     candles:          list[Candle]
     warmup_ticks:     int
     rejection_stats:  dict[str, int] = field(default_factory=dict)
+    entry_snapshots:  list[dict]     = field(default_factory=list)
 
 
 def run(
@@ -118,11 +119,12 @@ def run(
     state_machine    = TradingStateMachine(cooldown_ticks=cooldown_ticks)
     position_manager = PositionManager()
 
-    equity_curve: list[float] = []
-    fills:        list[FillRecord] = []
-    total_fees    = 0.0
-    warmup_ticks  = 0
-    entry_price:  float = 0.0   # tracks BUY fill price for SL/TP
+    equity_curve:    list[float]     = []
+    fills:           list[FillRecord] = []
+    total_fees       = 0.0
+    warmup_ticks     = 0
+    entry_price:     float = 0.0   # tracks BUY fill price for SL/TP
+    entry_snapshots: list[dict] = []
 
     # ── Main loop ─────────────────────────────────────────────────────
     for i, candle in enumerate(candles):
@@ -177,6 +179,25 @@ def run(
                 if order.side == OrderSide.BUY:
                     position_manager.on_buy(order.price, order.quantity)
                     entry_price = order.price
+                    # Snapshot indicator state at entry for attribution analysis
+                    # Pull indicator values from strategy properties
+                    # which are guaranteed to be set after evaluate()
+                    _adx  = strategy.last_adx   if is_indicator else None
+                    _rsi  = strategy.last_rsi   if is_indicator else None
+                    _trnd = strategy.last_trend if is_indicator else None
+                    # Recompute EMA values directly from closes list
+                    from bot.indicators.indicators import ema as _ema
+                    _closes_snap = list(strategy._closes)
+                    _ema_fast = _ema(_closes_snap, strategy.config.fast_ema_period)
+                    _ema_slow = _ema(_closes_snap, strategy.config.slow_ema_period)
+                    entry_snapshots.append({
+                        "candle_index": i,
+                        "adx":      _adx,
+                        "rsi":      _rsi,
+                        "ema_fast": _ema_fast,
+                        "ema_slow": _ema_slow,
+                        "trend":    _trnd,
+                    })
                 else:
                     pnl = position_manager.on_sell(order.price, order.quantity)
                     entry_price = 0.0
@@ -220,4 +241,5 @@ def run(
         candles         = candles,
         warmup_ticks    = warmup_ticks,
         rejection_stats = rej_stats,
+        entry_snapshots = entry_snapshots,
     )

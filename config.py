@@ -107,7 +107,7 @@ class StrategyConfig:
             raise ValueError("BUY_THRESHOLD must be less than SELL_THRESHOLD")
         if self.adx_period < 2:
             raise ValueError("ADX_PERIOD must be >= 2")
-        if not 0 < self.adx_threshold <= 100:
+        if not 0 <= self.adx_threshold <= 100:
             raise ValueError("ADX_THRESHOLD must be between 0 and 100")
 
 
