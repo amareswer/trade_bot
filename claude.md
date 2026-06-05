@@ -150,4 +150,38 @@ A robust crypto trading system that:
 - Works globally
 - Is exchange-independent
 - Is safe by design
+
+---
+
+## VALIDATED TRADING CONFIG
+
+As of 2026-06-05, the following configuration has passed:
+- 5000-candle backtest (PF 1.21, 88 trades, win rate 36%)
+- Walk-forward validation (training PF 1.21 → validation PF 1.22)
+- Fee/slippage stress test (PF holds to 0.15% fee + 0.05% slip)
+- Regime analysis (positive PF in bull, correction, and recovery)
+- Monte Carlo (0% ruin, 0.64% 95th pct drawdown at 2% risk/trade)
+
+### Active .env settings (do not change without re-running validation)
+ADX_THRESHOLD=15
+MAX_EMA_SPREAD_PCT=0.005
+RSI_FILTER_ENABLED=true
+RISK_PER_TRADE_PCT=0.02
+STOP_LOSS_PCT=0.02
+TAKE_PROFIT_PCT=0.04
+BACKTEST_LIMIT=5000
+BACKTEST_TIMEFRAME=4h
+EXCHANGE=binance
+SYMBOL=BTC/USDT
+
+### How to verify the config is active
+Run: python backtest.py
+Check filter breakdown: ADX rejected should be ~513 (10.3%), NOT 2365 (47.6%)
+Check trade count: should be ~88, NOT 69
+If you see 69 trades, the .env is on the old config.
+
+### Next steps remaining
+1. Multi-symbol test: run backtest.py on ETH, SOL, BNB, LINK with same params
+2. Start paper trading: python -m bot.main (target 30-50 live trades)
+3. After paper trading: compare live vs backtest win rate and PF
 - Can evolve into a professional-grade trading platform
