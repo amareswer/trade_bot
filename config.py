@@ -95,6 +95,7 @@ class StrategyConfig:
     sell_threshold:  float = 0.0
     adx_period:         int   = 14
     adx_threshold:      float = 25.0  # < this = ranging market → HOLD
+    adx_max:            float = 0.0   # 0 = disabled; 30.0 = reject ADX > 30
     max_ema_spread_pct: float = 0.0   # 0 = disabled; 0.005 = 0.5% ceiling
     rsi_filter_enabled: bool  = True  # False = bypass RSI level/direction checks
 
@@ -276,6 +277,7 @@ def _load() -> AppConfig:
             sell_threshold  = _float("SELL_THRESHOLD",   0.0),
             adx_period          = _int  ("ADX_PERIOD",          14),
             adx_threshold       = _float("ADX_THRESHOLD",       25.0),
+            adx_max             = _float("ADX_MAX",             0.0),
             max_ema_spread_pct  = _float("MAX_EMA_SPREAD_PCT",  0.0),
             rsi_filter_enabled  = _bool ("RSI_FILTER_ENABLED",  True),
         ),

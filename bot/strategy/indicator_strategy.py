@@ -46,6 +46,7 @@ class IndicatorConfig:
     max_ema_spread_pct:  float = 0.0    # EMAs must be no more than this far apart (0 = disabled)
     adx_period:          int   = 14
     adx_threshold:       float = 25.0   # < threshold = ranging market → HOLD (0 = disabled)
+    adx_max:             float = 0.0    # > max = overextended trend → HOLD (0 = disabled)
     rsi_filter_enabled:  bool  = True   # set False to bypass RSI level/direction checks
 
 
@@ -137,6 +138,9 @@ class IndicatorStrategy:
         if adx_val is None or adx_val < self.config.adx_threshold:
             self.stats["adx_rejected"] += 1
             return Signal.HOLD   # ranging market — skip
+        if self.config.adx_max > 0 and adx_val > self.config.adx_max:
+            self.stats["adx_rejected"] += 1
+            return Signal.HOLD   # overextended trend — skip
 
         # ── RSI direction (is momentum rising or falling?) ────────────
         rsi_rising  = self._last_rsi is not None and rsi_val > self._last_rsi

@@ -53,6 +53,7 @@ def main():
         slow_ema_period       = cfg.strategy.slow_ema_period,
         adx_period            = cfg.strategy.adx_period,
         adx_threshold         = cfg.strategy.adx_threshold,
+        adx_max               = cfg.strategy.adx_max,
         max_ema_spread_pct    = cfg.strategy.max_ema_spread_pct,
         rsi_filter_enabled    = cfg.strategy.rsi_filter_enabled,
         buy_threshold         = cfg.strategy.buy_threshold,

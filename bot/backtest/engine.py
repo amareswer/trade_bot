@@ -76,6 +76,7 @@ def run(
     slow_ema_period:      int   = 21,
     adx_period:           int   = 14,
     adx_threshold:        float = 25.0,
+    adx_max:              float = 0.0,
     max_ema_spread_pct:   float = 0.0,
     rsi_filter_enabled:   bool  = True,
     # Threshold config
@@ -103,6 +104,7 @@ def run(
             slow_ema_period    = slow_ema_period,
             adx_period         = adx_period,
             adx_threshold      = adx_threshold,
+            adx_max            = adx_max,
             max_ema_spread_pct = max_ema_spread_pct,
             rsi_filter_enabled = rsi_filter_enabled,
         ))
