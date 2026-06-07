@@ -71,6 +71,10 @@ class ExchangeConfig:
     feed_mode:      str = "live"    # "live" | "simulated"
     loop_interval:  int = 30        # seconds between ticks
     candle_minutes: int = 240       # aggregation window for live indicator mode
+    live_trading:   bool = False
+    dry_run:        bool = False
+    api_key:        str  = ""
+    api_secret:     str  = ""
 
     def __post_init__(self):
         if self.feed_mode not in ("live", "simulated"):
@@ -260,11 +264,15 @@ class AppConfig:
 def _load() -> AppConfig:
     return AppConfig(
         exchange=ExchangeConfig(
-            exchange       = _str("EXCHANGE",       "kraken"),
-            symbol         = _str("SYMBOL",         "BTC/USDT"),
-            feed_mode      = _str("FEED_MODE",       "live"),
-            loop_interval  = _int("LOOP_INTERVAL",   30),
-            candle_minutes = _int("CANDLE_MINUTES",  240),
+            exchange       = _str ("EXCHANGE",       "kraken"),
+            symbol         = _str ("SYMBOL",         "BTC/USDT"),
+            feed_mode      = _str ("FEED_MODE",       "live"),
+            loop_interval  = _int ("LOOP_INTERVAL",   30),
+            candle_minutes = _int ("CANDLE_MINUTES",  240),
+            live_trading   = _bool("LIVE_TRADING",    False),
+            dry_run        = _bool("DRY_RUN",         False),
+            api_key        = _str ("KRAKEN_API_KEY",  ""),
+            api_secret     = _str ("KRAKEN_API_SECRET", ""),
         ),
         strategy=StrategyConfig(
             mode            = _str  ("STRATEGY_MODE",    "indicator"),
