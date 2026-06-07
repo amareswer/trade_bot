@@ -42,6 +42,7 @@ from bot.data.historical_feed import Candle as _Candle
 from bot.strategy.threshold_strategy import ThresholdStrategy, Signal
 from bot.strategy.indicator_strategy import IndicatorStrategy, IndicatorConfig
 from bot.execution.executor import PaperExecutor, OrderStatus, OrderSide
+from bot.execution.live_executor import LiveExecutor
 from bot.risk.risk_manager import RiskManager, RiskConfig
 from bot.state.trade_state import TradingStateMachine
 from bot.portfolio.position_manager import PositionManager
@@ -222,10 +223,27 @@ def run():
 
     feed     = build_feed()
     strategy = build_strategy()
-    executor = PaperExecutor(
-        symbol        = cfg.exchange.symbol,
-        starting_cash = cfg.portfolio.starting_cash,
-    )
+    if cfg.exchange.live_trading:
+        executor = LiveExecutor(
+            exchange_id   = cfg.exchange.exchange,
+            symbol        = cfg.exchange.symbol,
+            api_key       = cfg.exchange.api_key,
+            api_secret    = cfg.exchange.api_secret,
+            starting_cash = cfg.portfolio.starting_cash,
+            dry_run       = cfg.exchange.dry_run,
+        )
+        mode_str = "[DRY RUN] " if cfg.exchange.dry_run else ""
+        print(
+            f"\n  {mode_str}LIVE TRADING ENABLED"
+            f" — real orders will be placed on"
+            f" {cfg.exchange.exchange.upper()}\n",
+            flush=True,
+        )
+    else:
+        executor = PaperExecutor(
+            symbol        = cfg.exchange.symbol,
+            starting_cash = cfg.portfolio.starting_cash,
+        )
     risk = RiskManager(RiskConfig(
         max_position_pct     = cfg.risk.max_position_pct,
         daily_loss_limit_pct = cfg.risk.daily_loss_limit_pct,
