@@ -185,3 +185,12 @@ If you see 69 trades, the .env is on the old config.
 2. Start paper trading: python -m bot.main (target 30-50 live trades)
 3. After paper trading: compare live vs backtest win rate and PF
 - Can evolve into a professional-grade trading platform
+## Exchange Setup
+- Backtesting: EXCHANGE=binance, SYMBOL=BTC/USDT
+- Live trading: EXCHANGE=kraken, SYMBOL=BTC/USD
+- Reason: Kraken OHLCV history limited to ~720 candles, Binance has 5000+
+- Price diff confirmed: 0.048% — negligible
+- Kraken API key: generate at Security → API once KYC clears
+  - Enable: Query Funds, Query Orders, Create Orders, Cancel Orders
+  - Disable: Withdrawals (never enable on bot key)
+  - Restrict to your IP address
