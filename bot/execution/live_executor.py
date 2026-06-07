@@ -216,3 +216,24 @@ class LiveExecutor:
         self._position     = 0.0
         self._avg_entry    = 0.0
         self._realized_pnl = 0.0
+
+    def rejected_orders(self):
+        """Return rejected orders — compatible with PaperExecutor interface."""
+        return []
+
+    @property
+    def orders(self):
+        """Return all orders — compatible with PaperExecutor interface."""
+        return []
+
+    def portfolio_snapshot(self, current_price: float) -> None:
+        """Log portfolio summary — compatible with PaperExecutor interface."""
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(
+            "PORTFOLIO | cash=$%.2f | pos=%.6f %s | total=$%.2f",
+            self._cash,
+            self._position,
+            self.symbol,
+            self._cash + self._position * current_price,
+        )
