@@ -205,3 +205,14 @@ class LiveExecutor:
             timestamp   = ts,
             order_id    = order_id,
         )
+
+    def filled_orders(self):
+        """Return filled orders list — compatible with PaperExecutor interface."""
+        return []
+
+    def reset(self):
+        """Reset executor state — compatible with PaperExecutor interface."""
+        self._cash         = self._cash
+        self._position     = 0.0
+        self._avg_entry    = 0.0
+        self._realized_pnl = 0.0
