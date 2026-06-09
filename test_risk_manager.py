@@ -51,11 +51,13 @@ def test_daily_trade_cap_allows_up_to_limit():
 # ── Check 3: daily loss limit ─────────────────────────────────────────────
 
 def test_daily_loss_limit_blocks_when_exceeded():
-    ex, risk = _make(cash=10_000, daily_loss_limit_pct=0.05)
+    # max_drawdown_pct=0.50 ensures the drawdown check (Check 2) does not fire
+    # before the daily loss check (Check 4) when cash is drained by 10%.
+    ex, risk = _make(cash=10_000, daily_loss_limit_pct=0.05, max_drawdown_pct=0.50)
     # Seed the day-open value at full $10k
     risk.evaluate(Signal.HOLD, 100, ex.portfolio, 1.0)
     # Manually drain portfolio cash to simulate a loss > 5%
-    ex.portfolio.cash = 9_000    # 10% loss
+    ex.portfolio.cash = 9_000    # 10% loss → exceeds daily_loss_limit (5%)
     result = risk.evaluate(Signal.BUY, 100, ex.portfolio, 0.01)
     assert not result
     assert result.block_reason == BlockReason.DAILY_LOSS

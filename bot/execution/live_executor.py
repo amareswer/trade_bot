@@ -11,7 +11,9 @@ swap between them with a single config flag.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 
@@ -20,6 +22,11 @@ import ccxt
 from bot.execution.executor import Order, OrderSide, OrderStatus, Portfolio
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_STATE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "logs", "live_state.json",
+)
 
 
 class LiveExecutor:
@@ -36,10 +43,15 @@ class LiveExecutor:
         api_secret:    str,
         starting_cash: float = 10_000.0,
         dry_run:       bool  = False,
+        state_path:    str   = _DEFAULT_STATE_PATH,
     ):
-        self.symbol    = symbol
-        self.dry_run   = dry_run
-        self._portfolio = Portfolio(cash=starting_cash)
+        self.symbol         = symbol
+        self.dry_run        = dry_run
+        self._starting_cash = starting_cash
+        self._state_path    = state_path
+        self._portfolio     = Portfolio(cash=starting_cash)
+        self._fills:   list[Order] = []
+        self._rejects: list[Order] = []
 
         exchange_cls = getattr(ccxt, exchange_id.lower())
         self._exchange = exchange_cls({
@@ -62,9 +74,26 @@ class LiveExecutor:
                 ) from exc
             logger.error("load_markets() failed (dry-run, continuing without validation): %s", exc)
 
+        # State restore + balance reconciliation.
+        # In live mode: load saved state (position/cost_basis) then override cash
+        # with the actual exchange balance to detect restart drift.
+        # In dry-run: load saved state only (no API call for balance).
+        state_found = self._load_state()
+        if not dry_run:
+            exchange_cash = self._sync_cash()
+            if state_found:
+                diff = abs(exchange_cash - self._portfolio.cash)
+                if diff > 0.50:
+                    logger.warning(
+                        "Balance mismatch on restart: exchange=%.2f %s, "
+                        "saved=%.2f — using exchange balance",
+                        exchange_cash, symbol.split("/")[1], self._portfolio.cash,
+                    )
+            self._portfolio.cash = exchange_cash
+
         logger.info(
-            "LiveExecutor initialized | symbol=%s dry_run=%s",
-            symbol, dry_run,
+            "LiveExecutor ready | symbol=%s dry_run=%s cash=%.2f pos=%.6f",
+            symbol, dry_run, self._portfolio.cash, self._portfolio.position,
         )
 
     # ── Read-only properties ──────────────────────────────────────────
@@ -85,6 +114,96 @@ class LiveExecutor:
     def portfolio(self) -> Portfolio:
         return self._portfolio
 
+    # ── Balance sync ──────────────────────────────────────────────────
+
+    def _sync_cash(self) -> float:
+        """
+        Fetch free balance in the quote currency from the exchange.
+        Falls back to starting_cash on any error.
+        Logs a warning if the expected quote currency is absent (wrong symbol
+        or wrong API key permissions).
+        """
+        quote = self.symbol.split("/")[1]
+        try:
+            balance = self._exchange.fetch_balance()
+            free    = balance.get("free", {})
+            if quote not in free:
+                available = sorted(k for k, v in free.items() if v and float(v or 0) > 0)
+                logger.warning(
+                    "_sync_cash: '%s' not in exchange free balance (non-zero: %s) — "
+                    "check SYMBOL or API key permissions; using starting_cash=%.2f",
+                    quote, available, self._starting_cash,
+                )
+                return self._starting_cash
+            amount = float(free[quote])
+            logger.info("Balance sync: %.2f %s free on exchange", amount, quote)
+            return amount
+        except Exception as exc:
+            logger.warning(
+                "_sync_cash failed: %s — using starting_cash=%.2f",
+                exc, self._starting_cash,
+            )
+            return self._starting_cash
+
+    # ── State persistence ─────────────────────────────────────────────
+
+    def _save_state(self) -> None:
+        """Persist portfolio state to disk so restarts can reconcile."""
+        state = {
+            "symbol":       self.symbol,
+            "cash":         self._portfolio.cash,
+            "position":     self._portfolio.position,
+            "cost_basis":   self._portfolio._cost_basis,
+            "realized_pnl": self._portfolio.realized_pnl,
+            "saved_at":     datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            dirpath = os.path.dirname(self._state_path)
+            if dirpath:
+                os.makedirs(dirpath, exist_ok=True)
+            with open(self._state_path, "w") as f:
+                json.dump(state, f, indent=2)
+            logger.info(
+                "State saved: cash=%.2f pos=%.6f", state["cash"], state["position"],
+            )
+        except Exception as exc:
+            logger.error("Failed to save state: %s", exc)
+
+    def _load_state(self) -> bool:
+        """
+        Load persisted portfolio state.
+        Returns True if state was successfully restored, False if starting fresh.
+        Silently ignores a missing file.
+        """
+        try:
+            with open(self._state_path) as f:
+                state = json.load(f)
+        except FileNotFoundError:
+            logger.info("No saved state at %s — starting fresh", self._state_path)
+            return False
+        except Exception as exc:
+            logger.warning("Could not load saved state: %s", exc)
+            return False
+
+        if state.get("symbol") != self.symbol:
+            logger.warning(
+                "Saved state symbol '%s' != current '%s' — ignoring saved state",
+                state.get("symbol"), self.symbol,
+            )
+            return False
+
+        self._portfolio.cash          = float(state["cash"])
+        self._portfolio.position      = float(state["position"])
+        self._portfolio._cost_basis   = float(state["cost_basis"])
+        self._portfolio.realized_pnl  = float(state["realized_pnl"])
+        logger.info(
+            "State restored: cash=%.2f pos=%.6f cost_basis=%.2f pnl=%.2f (saved %s)",
+            self._portfolio.cash, self._portfolio.position,
+            self._portfolio._cost_basis, self._portfolio.realized_pnl,
+            state.get("saved_at", "?"),
+        )
+        return True
+
     # ── Validation ────────────────────────────────────────────────────
 
     def _validate_order(self, side: OrderSide, quantity: float, price: float) -> None:
@@ -98,12 +217,12 @@ class LiveExecutor:
             logger.warning("Symbol %s not in loaded markets — skipping validation", self.symbol)
             return
 
-        limits    = market.get("limits", {})
-        amt_min   = limits.get("amount", {}).get("min")
-        cost_min  = limits.get("cost",   {}).get("min")
+        limits   = market.get("limits", {})
+        amt_min  = limits.get("amount", {}).get("min")
+        cost_min = limits.get("cost",   {}).get("min")
 
-        base  = self.symbol.split("/")[0]
-        quote = self.symbol.split("/")[1]
+        base     = self.symbol.split("/")[0]
+        quote    = self.symbol.split("/")[1]
         req_cost = quantity * price
 
         errors = []
@@ -140,7 +259,8 @@ class LiveExecutor:
         if signal not in (Signal.BUY, Signal.SELL):
             return None
 
-        side = OrderSide.BUY if signal == Signal.BUY else OrderSide.SELL
+        side  = OrderSide.BUY if signal == Signal.BUY else OrderSide.SELL
+        quote = self.symbol.split("/")[1]
 
         if side == OrderSide.BUY and quantity <= 0:
             logger.warning("LiveExecutor: BUY quantity=0, skipping")
@@ -158,7 +278,7 @@ class LiveExecutor:
             self._validate_order(side, quantity, price)
         except ValueError as exc:
             logger.error("ORDER REJECTED: %s", exc)
-            return Order(
+            order = Order(
                 order_id      = "rejected",
                 symbol        = self.symbol,
                 side          = side,
@@ -168,6 +288,11 @@ class LiveExecutor:
                 created_at    = ts,
                 reject_reason = str(exc),
             )
+            self._rejects.append(order)
+            return order
+
+        fee_cost     = 0.0
+        fee_currency = quote
 
         if self.dry_run:
             logger.warning(
@@ -197,18 +322,19 @@ class LiveExecutor:
                     amount = quantity,
                 )
                 order_id_str = str(raw.get("id", ""))
-                filled_qty   = float(raw.get("filled", 0.0))
+                filled_qty   = float(raw.get("filled") or 0.0)
                 fill_price   = float(raw.get("average") or raw.get("price") or price)
 
                 # Poll up to 3 times for 'closed' status.
-                # If still open after 3 polls, save state with whatever was filled —
-                # never leave cash/position unupdated after a real order was sent.
+                # If still open after 3 polls, use whatever 'filled' amount the
+                # last poll reported — never leave cash/position unupdated after
+                # a real order was sent.
                 last_raw = raw
                 for poll_num in range(1, 4):
                     time.sleep(1)
                     try:
                         last_raw   = self._exchange.fetch_order(order_id_str, self.symbol)
-                        filled_qty = float(last_raw.get("filled", filled_qty))
+                        filled_qty = float(last_raw.get("filled") or filled_qty)
                         if last_raw.get("status") == "closed":
                             fill_price = float(
                                 last_raw.get("average") or
@@ -219,7 +345,7 @@ class LiveExecutor:
                     except Exception as poll_exc:
                         logger.warning("fetch_order poll %d failed: %s", poll_num, poll_exc)
                 else:
-                    filled_qty = float(last_raw.get("filled", filled_qty))
+                    filled_qty = float(last_raw.get("filled") or filled_qty)
                     fill_price = float(
                         last_raw.get("average") or
                         last_raw.get("price")   or
@@ -231,11 +357,16 @@ class LiveExecutor:
                         order_id_str, filled_qty, self.symbol, fill_price,
                     )
 
-                quantity = filled_qty  # use actual filled amount, not requested
+                quantity = filled_qty
+
+                # Extract fee from the final polled response.
+                fee_data     = last_raw.get("fee") or {}
+                fee_cost     = float(fee_data.get("cost") or 0.0)
+                fee_currency = fee_data.get("currency") or quote
 
             except ccxt.InsufficientFunds as exc:
                 logger.error("Insufficient funds: %s", exc)
-                return Order(
+                order = Order(
                     order_id      = "rejected",
                     symbol        = self.symbol,
                     side          = side,
@@ -245,9 +376,11 @@ class LiveExecutor:
                     created_at    = ts,
                     reject_reason = f"Insufficient funds: {exc}",
                 )
+                self._rejects.append(order)
+                return order
             except ccxt.BaseError as exc:
                 logger.error("ccxt order error: %s", exc)
-                return Order(
+                order = Order(
                     order_id      = "rejected",
                     symbol        = self.symbol,
                     side          = side,
@@ -257,6 +390,8 @@ class LiveExecutor:
                     created_at    = ts,
                     reject_reason = f"Exchange error: {exc}",
                 )
+                self._rejects.append(order)
+                return order
 
         total_value = fill_price * quantity
 
@@ -276,7 +411,20 @@ class LiveExecutor:
             if self._portfolio.position == 0:
                 self._portfolio._cost_basis = 0.0
 
-        return Order(
+        # Deduct exchange fee (live only). If fee is in a non-quote currency
+        # (e.g. Kraken fee tokens), skip and log — do not silently mis-account.
+        if fee_cost > 0:
+            if fee_currency != quote:
+                logger.warning(
+                    "Fee currency mismatch: fee=%.6f %s but quote=%s — "
+                    "not deducting (manual reconciliation needed)",
+                    fee_cost, fee_currency, quote,
+                )
+            else:
+                self._portfolio.cash -= fee_cost
+                logger.info("Fee deducted: %.6f %s", fee_cost, quote)
+
+        order = Order(
             order_id   = order_id_str,
             symbol     = self.symbol,
             side       = side,
@@ -286,28 +434,34 @@ class LiveExecutor:
             created_at = ts,
             filled_at  = datetime.now(timezone.utc),
         )
+        self._fills.append(order)
+        self._save_state()
+        return order
 
-    def filled_orders(self) -> list:
-        """Compatible with PaperExecutor interface."""
-        return []
+    # ── Order history ─────────────────────────────────────────────────
 
-    def rejected_orders(self) -> list:
-        """Compatible with PaperExecutor interface."""
-        return []
+    def filled_orders(self) -> list[Order]:
+        return list(self._fills)
+
+    def rejected_orders(self) -> list[Order]:
+        return list(self._rejects)
 
     @property
-    def orders(self) -> list:
-        """Compatible with PaperExecutor interface."""
-        return []
+    def orders(self) -> list[Order]:
+        return list(self._fills) + list(self._rejects)
+
+    # ── Lifecycle ─────────────────────────────────────────────────────
 
     def reset(self) -> None:
-        """Compatible with PaperExecutor interface."""
-        self._portfolio.position     = 0.0
-        self._portfolio._cost_basis  = 0.0
-        self._portfolio.realized_pnl = 0.0
+        """Reset all state back to starting conditions."""
+        self._portfolio.cash          = self._starting_cash
+        self._portfolio.position      = 0.0
+        self._portfolio._cost_basis   = 0.0
+        self._portfolio.realized_pnl  = 0.0
+        self._fills.clear()
+        self._rejects.clear()
 
     def portfolio_snapshot(self, current_price: float) -> None:
-        """Compatible with PaperExecutor interface."""
         logger.info(
             "PORTFOLIO | cash=$%.2f | pos=%.6f %s | total=$%.2f",
             self._portfolio.cash,
