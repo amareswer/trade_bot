@@ -66,7 +66,7 @@ class LiveExecutor:
         self._markets: dict | None = None
         try:
             self._markets = self._exchange.load_markets()
-            logger.info("Markets loaded: %d symbols", len(self._markets))
+            logger.warning("Markets loaded: %d symbols", len(self._markets))
         except Exception as exc:
             if not dry_run:
                 raise RuntimeError(
@@ -80,18 +80,37 @@ class LiveExecutor:
         # In dry-run: load saved state only (no API call for balance).
         state_found = self._load_state()
         if not dry_run:
-            exchange_cash = self._sync_cash()
+            base  = symbol.split("/")[0]
+            quote = symbol.split("/")[1]
+            exchange_cash, sync_error = self._sync_cash()
             if state_found:
                 diff = abs(exchange_cash - self._portfolio.cash)
                 if diff > 0.50:
                     logger.warning(
                         "Balance mismatch on restart: exchange=%.2f %s, "
                         "saved=%.2f — using exchange balance",
-                        exchange_cash, symbol.split("/")[1], self._portfolio.cash,
+                        exchange_cash, quote, self._portfolio.cash,
                     )
             self._portfolio.cash = exchange_cash
 
-        logger.info(
+            # Unmissable startup line — print() bypasses logging so it always
+            # appears in the terminal regardless of log level configuration.
+            if sync_error:
+                print(
+                    f"  LIVE BALANCE: ${self._portfolio.cash:.2f} {quote}"
+                    f" (FALLBACK — fetch_balance FAILED: {sync_error})"
+                    f" | position: {self._portfolio.position:.6f} {base}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"  LIVE BALANCE: ${self._portfolio.cash:.2f} {quote}"
+                    f" | position: {self._portfolio.position:.6f} {base}"
+                    f" | source: {exchange_id} fetch_balance",
+                    flush=True,
+                )
+
+        logger.warning(
             "LiveExecutor ready | symbol=%s dry_run=%s cash=%.2f pos=%.6f",
             symbol, dry_run, self._portfolio.cash, self._portfolio.position,
         )
@@ -116,12 +135,11 @@ class LiveExecutor:
 
     # ── Balance sync ──────────────────────────────────────────────────
 
-    def _sync_cash(self) -> float:
+    def _sync_cash(self) -> tuple[float, str | None]:
         """
         Fetch free balance in the quote currency from the exchange.
-        Falls back to starting_cash on any error.
-        Logs a warning if the expected quote currency is absent (wrong symbol
-        or wrong API key permissions).
+        Returns (cash, error_msg): error_msg is None on success, or the reason
+        we fell back to starting_cash.
         """
         quote = self.symbol.split("/")[1]
         try:
@@ -129,21 +147,19 @@ class LiveExecutor:
             free    = balance.get("free", {})
             if quote not in free:
                 available = sorted(k for k, v in free.items() if v and float(v or 0) > 0)
-                logger.warning(
-                    "_sync_cash: '%s' not in exchange free balance (non-zero: %s) — "
-                    "check SYMBOL or API key permissions; using starting_cash=%.2f",
-                    quote, available, self._starting_cash,
+                msg = (
+                    f"'{quote}' not in exchange free balance "
+                    f"(non-zero currencies: {available}) — check SYMBOL or API key permissions"
                 )
-                return self._starting_cash
+                logger.warning("_sync_cash: %s; using starting_cash=%.2f", msg, self._starting_cash)
+                return self._starting_cash, msg
             amount = float(free[quote])
-            logger.info("Balance sync: %.2f %s free on exchange", amount, quote)
-            return amount
+            logger.warning("Balance sync: %.2f %s free on exchange", amount, quote)
+            return amount, None
         except Exception as exc:
-            logger.warning(
-                "_sync_cash failed: %s — using starting_cash=%.2f",
-                exc, self._starting_cash,
-            )
-            return self._starting_cash
+            msg = str(exc)
+            logger.warning("_sync_cash failed: %s — using starting_cash=%.2f", msg, self._starting_cash)
+            return self._starting_cash, msg
 
     # ── State persistence ─────────────────────────────────────────────
 
@@ -163,7 +179,7 @@ class LiveExecutor:
                 os.makedirs(dirpath, exist_ok=True)
             with open(self._state_path, "w") as f:
                 json.dump(state, f, indent=2)
-            logger.info(
+            logger.warning(
                 "State saved: cash=%.2f pos=%.6f", state["cash"], state["position"],
             )
         except Exception as exc:
@@ -196,7 +212,7 @@ class LiveExecutor:
         self._portfolio.position      = float(state["position"])
         self._portfolio._cost_basis   = float(state["cost_basis"])
         self._portfolio.realized_pnl  = float(state["realized_pnl"])
-        logger.info(
+        logger.warning(
             "State restored: cash=%.2f pos=%.6f cost_basis=%.2f pnl=%.2f (saved %s)",
             self._portfolio.cash, self._portfolio.position,
             self._portfolio._cost_basis, self._portfolio.realized_pnl,
@@ -422,7 +438,7 @@ class LiveExecutor:
                 )
             else:
                 self._portfolio.cash -= fee_cost
-                logger.info("Fee deducted: %.6f %s", fee_cost, quote)
+                logger.warning("Fee deducted: %.6f %s", fee_cost, quote)
 
         order = Order(
             order_id   = order_id_str,

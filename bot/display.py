@@ -19,10 +19,23 @@ _BL = "\033[94m"
 
 # ── Header ───────────────────────────────────────────────────────────────────
 
-def header(exchange: str, symbol: str, cash: float, strategy: str) -> None:
+def header(
+    exchange:     str,
+    symbol:       str,
+    cash:         float,
+    strategy:     str,
+    live_trading: bool = False,
+    dry_run:      bool = False,
+) -> None:
+    if live_trading and not dry_run:
+        mode = f"{_RD}{_B}LIVE{_R} ${cash:,.0f}"
+    elif dry_run:
+        mode = f"{_YL}DRY RUN{_R} ${cash:,.0f}"
+    else:
+        mode = f"paper ${cash:,.0f}"
     line = (
         f"  {_B}Trade Bot{_R}  ▸  {_CY}{exchange.capitalize()}{_R}"
-        f"  ▸  {_B}{_BL}{symbol}{_R}  ▸  strategy={strategy}  ▸  paper ${cash:,.0f}"
+        f"  ▸  {_B}{_BL}{symbol}{_R}  ▸  strategy={strategy}  ▸  {mode}"
     )
     bar = "─" * 62
     print(f"\n{bar}\n{line}\n{bar}\n")

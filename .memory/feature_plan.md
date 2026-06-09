@@ -15,25 +15,73 @@ Running log of feature decisions. Most recent first.
 
 ---
 
-## 2026-06-07 — LiveExecutor (BUILT ✓)
+## 2026-06-09 — Logging, Live-Event Visibility, Banner Fix (BUILT ✓)
 
-**What:** Real order executor for Kraken via ccxt. Interface-identical to PaperExecutor so `main.py` swaps between them with a single config flag (`LIVE_TRADING`).
+**Root cause discovered:** `main.py` called `logging.basicConfig(level=WARNING)` on the root logger, then attached a file handler at INFO. The root-level WARNING filtered all INFO records *before* they reached any handler — so INFO lines never reached `trade_bot.log`. Evidence: log file showed only WARNING entries, newest from Jun 8 despite bot running Jun 9.
 
 **Files changed:**
 
 | File | Change |
 |---|---|
-| `bot/execution/live_executor.py` | NEW — `LiveExecutor` class: connects to exchange via ccxt, places real market orders, tracks cash/position internally, full `PaperExecutor` interface (filled_orders, rejected_orders, reset, orders, portfolio_snapshot) |
-| `bot/main.py` | Added `LiveExecutor` import; executor instantiation now branches on `cfg.exchange.live_trading`; prints `LIVE TRADING ENABLED` or `[DRY RUN] LIVE TRADING ENABLED` banner at startup |
-| `config.py` | Added `live_trading: bool`, `dry_run: bool`, `api_key: str`, `api_secret: str` to `ExchangeConfig`; reads `LIVE_TRADING`, `DRY_RUN`, `KRAKEN_API_KEY`, `KRAKEN_API_SECRET` from `.env` |
+| `bot/main.py` | Fixed logging setup: root logger set to INFO; console StreamHandler at WARNING (terminal stays clean); file handler at INFO (everything recorded); uses explicit `addHandler` instead of `basicConfig` to avoid no-op-if-already-configured trap |
+| `bot/execution/live_executor.py` | `_sync_cash()` now returns `tuple[float, str \| None]` (cash + error_msg) so caller knows if fallback was used; live-critical events upgraded from INFO→WARNING: balance sync, markets loaded, state restored, state saved, fee deducted, LiveExecutor ready; added unmissable `print()` startup line after balance sync |
+| `bot/display.py` | `header()` now accepts `live_trading: bool` and `dry_run: bool`; shows `LIVE $XX` (red+bold) in live mode, `DRY RUN $XX` (yellow) in dry-run, `paper $XX` otherwise |
+| `bot/main.py` | Passes `live_trading` and `dry_run` flags to `display.header()` |
 
-**Activation:** Set `LIVE_TRADING=true` in `.env`. Use `DRY_RUN=true` first to log intended orders without placing them. Only set `DRY_RUN=false` once dry-run behavior is verified over multiple candle cycles.
+**Startup print format (live mode, balance fetch succeeded):**
+```
+  LIVE BALANCE: $100.42 CAD | position: 0.000000 BTC | source: kraken fetch_balance
+```
+**Startup print format (balance fetch failed):**
+```
+  LIVE BALANCE: $100.00 CAD (FALLBACK — fetch_balance FAILED: <error>) | position: 0.000000 BTC
+```
+This is `print()` not `logging` — appears regardless of log level.
 
-**Known gaps — hardening work required before trusting with real money:**
-- **Balance sync:** bot tracks cash internally from `STARTING_CASH`; does not query real exchange balance on startup — restart loses all position state
-- **Min order size:** Kraken enforces per-pair minimums (e.g. 0.0001 BTC); not validated before order submission — small accounts may get exchange rejections
-- **Fee deduction:** exchange fees are not subtracted from bot's tracked cash balance — tracked P&L will diverge from reality over time
-- **Restart recovery:** open positions on the exchange are not detected on restart; bot starts blind with zero position, which could cause double-buying or stranded positions
+**Why live events are now WARNING:** With a broken root level, any INFO-level trade event (fill, fee, balance sync) would have been silently lost from the log file. Real-money events must survive misconfiguration. WARNING is the correct semantic level for "something happened that a human should be able to audit".
+
+**Test result:** 30/30 pytest + 21/21 test_indicators.py. Logging fix verified by emitting test INFO/WARNING records and confirming both appear in the file.
+
+---
+
+## 2026-06-09 — LiveExecutor Hardening (BUILT ✓)
+
+**What:** All hardening items from the 2026-06-07 known-gaps list implemented and test-covered.
+
+**Files changed:**
+
+| File | Change |
+|---|---|
+| `bot/execution/live_executor.py` | Full rewrite: added `_sync_cash()`, `_save_state()`, `_load_state()`, `_validate_order()`; real `_fills`/`_rejects` lists; fee deduction with wrong-currency guard; fetch_order polling (3 polls, partial-fill fallback); `reset()` fixed to restore `starting_cash`; imports `Order/OrderSide/OrderStatus/Portfolio` from `executor.py` |
+| `test_live_executor.py` | NEW — 11 mocked-exchange tests: dry-run fill, min-amount reject, min-cost reject, live BUY/SELL portfolio update, fetch_order polling (close + timeout), fee deduction (quote + wrong currency), state roundtrip, balance sync (success + error), reset() |
+| `test_risk_manager.py` | Fixed `test_daily_loss_limit_blocks_when_exceeded`: added `max_drawdown_pct=0.50` so drawdown check doesn't mask the daily-loss check being tested |
+
+**What each new method does:**
+
+| Method | Description |
+|---|---|
+| `_sync_cash()` | Calls `fetch_balance()`, reads `free[quote_currency]`; warns if currency absent (wrong symbol/API key); falls back to `starting_cash` on any error |
+| `_save_state()` | Writes `{cash, position, cost_basis, realized_pnl, saved_at}` to `logs/live_state.json` after every fill |
+| `_load_state()` | Reads state file on init; validates symbol matches; restores portfolio fields; returns False if file missing/wrong symbol |
+| `_validate_order()` | Checks `limits.amount.min` and `limits.cost.min` from `load_markets()`; rejection message states both requested and minimum with quote-currency amounts |
+| fee deduction | Reads `raw['fee']['cost']` from final polled response; skips if fee currency ≠ quote (logs warning); deducts from cash if quote currency |
+
+**Startup init order:**
+1. `load_markets()` (public endpoint — required; fails fast in live mode if unavailable)
+2. `_load_state()` — restore position/cost_basis from disk if file exists
+3. `_sync_cash()` — override cash with real exchange balance (live mode only); logs mismatch warning if saved cash differs from exchange balance by > $0.50
+
+**state_path** is parameterizable (constructor arg, default `logs/live_state.json`) — allows tests to use temp files.
+
+**Activation:** Set `LIVE_TRADING=true` in `.env`. Use `DRY_RUN=true` for dry-run cycles (validation fires but `create_order` is skipped). Set `DRY_RUN=false` only after verifying dry-run behavior over multiple candle cycles.
+
+**Test coverage:** 30/30 pytest passing (test_executor.py + test_risk_manager.py + test_live_executor.py); test_indicators.py 21/21 via its own runner.
+
+---
+
+## 2026-06-07 — LiveExecutor (BUILT — superseded by 2026-06-09 hardening above)
+
+**Note:** The 2026-06-07 version was the initial build. The 2026-06-09 hardening session completed the remaining items. Do not reference this entry for current feature status — see above.
 
 ---
 

@@ -23,14 +23,24 @@ import ccxt as _ccxt
 from dotenv import load_dotenv
 load_dotenv()
 
-# ── Persistent file logging (INFO level) ─────────────────────────────────────
+# ── Logging setup ────────────────────────────────────────────────────────────
+# Root logger at INFO so INFO records propagate to handlers.
+# Console handler at WARNING keeps the terminal clean.
+# File handler at INFO captures everything for post-mortem review.
+# Previously, basicConfig set root to WARNING, which silently swallowed all
+# INFO records before they reached the file handler. Fixed here.
 _log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
 os.makedirs(_log_dir, exist_ok=True)
 _file_handler = logging.FileHandler(os.path.join(_log_dir, "trade_bot.log"))
 _file_handler.setLevel(logging.INFO)
 _file_handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
-logging.basicConfig(level=logging.WARNING, handlers=[logging.StreamHandler()])
-logging.getLogger().addHandler(_file_handler)
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(logging.WARNING)
+_root_logger = logging.getLogger()
+_root_logger.handlers.clear()
+_root_logger.setLevel(logging.INFO)
+_root_logger.addHandler(_console_handler)
+_root_logger.addHandler(_file_handler)
 
 logger = logging.getLogger(__name__)
 
@@ -263,6 +273,8 @@ def run():
         cfg.exchange.symbol,
         cfg.portfolio.starting_cash,
         cfg.strategy.mode,
+        live_trading = cfg.exchange.live_trading,
+        dry_run      = cfg.exchange.dry_run,
     )
     if cfg.dashboard.enabled:
         print(f"  Dashboard → file://{_DASHBOARD_PATH}\n")
