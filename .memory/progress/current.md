@@ -13,13 +13,12 @@ metadata:
 - `EXCHANGE=kraken`, `SYMBOL=BTC/CAD`
 - `ADX_THRESHOLD=15.0` (validated config — see CLAUDE.md)
 - `LIVE_TRADING=true`, `DRY_RUN=true`
-- `RISK_PER_TRADE_PCT=0.02` (corrected to validated config value)
+- `RISK_PER_TRADE_PCT=0.10` — intentional at $100 CAD capital; Kraken min order is 0.00005 BTC (~$4.50 CAD), so 2% of $100 = $2 would be rejected every time. Revisit when capital is $500+. The backtest-validated config (2%) requires ~$500 minimum capital.
+- `STARTING_CASH=100.0` — matches actual Kraken balance; used as fallback if balance fetch fails
 - `RISK_DAILY_LOSS_LIMIT=0.01`, `RISK_MAX_DRAWDOWN=0.05`
 - `AI_ENABLED=false`
 
 **ADX note:** current.md previously recorded `ADX_THRESHOLD=30.0` — this was stale. The validated config (CLAUDE.md, 2026-06-05) and actual `.env` both say **15.0**. 30 was an earlier experiment.
-
-**Risk note:** `.env` previously had `RISK_PER_TRADE_PCT=0.10` and `DRY_RUN=false`. This conflicted with the validated config (0.02) and predated LiveExecutor hardening. Corrected 2026-06-09 before resuming live testing.
 
 **LiveExecutor built 2026-06-07:** `bot/execution/live_executor.py`. Wired into `main.py` via `cfg.exchange.live_trading` flag. See [[feature-plan]] for known gaps.
 

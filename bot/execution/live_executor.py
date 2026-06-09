@@ -12,36 +12,14 @@ swap between them with a single config flag.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import time
 from datetime import datetime, timezone
-from enum import Enum
 
 import ccxt
 
+from bot.execution.executor import Order, OrderSide, OrderStatus, Portfolio
+
 logger = logging.getLogger(__name__)
-
-
-class OrderSide(str, Enum):
-    BUY  = "BUY"
-    SELL = "SELL"
-
-
-class OrderStatus(str, Enum):
-    FILLED   = "FILLED"
-    REJECTED = "REJECTED"
-    PENDING  = "PENDING"
-
-
-@dataclass
-class Order:
-    side:        OrderSide
-    price:       float
-    quantity:    float
-    total_value: float
-    status:      OrderStatus
-    timestamp:   str
-    order_id:    str = ""
-    raw:         dict | None = None
 
 
 class LiveExecutor:
@@ -59,12 +37,9 @@ class LiveExecutor:
         starting_cash: float = 10_000.0,
         dry_run:       bool  = False,
     ):
-        self.symbol        = symbol
-        self.dry_run       = dry_run
-        self._cash         = starting_cash
-        self._position     = 0.0
-        self._avg_entry    = 0.0
-        self._realized_pnl = 0.0
+        self.symbol    = symbol
+        self.dry_run   = dry_run
+        self._portfolio = Portfolio(cash=starting_cash)
 
         exchange_cls = getattr(ccxt, exchange_id.lower())
         self._exchange = exchange_cls({
@@ -73,6 +48,19 @@ class LiveExecutor:
             "timeout":         15_000,
             "enableRateLimit": True,
         })
+
+        # load_markets is a public endpoint — no API key required.
+        # In live mode, failure is fatal: validation is useless without market data.
+        self._markets: dict | None = None
+        try:
+            self._markets = self._exchange.load_markets()
+            logger.info("Markets loaded: %d symbols", len(self._markets))
+        except Exception as exc:
+            if not dry_run:
+                raise RuntimeError(
+                    f"load_markets() failed — refusing to start in live mode: {exc}"
+                ) from exc
+            logger.error("load_markets() failed (dry-run, continuing without validation): %s", exc)
 
         logger.info(
             "LiveExecutor initialized | symbol=%s dry_run=%s",
@@ -83,28 +71,61 @@ class LiveExecutor:
 
     @property
     def cash(self) -> float:
-        return self._cash
+        return self._portfolio.cash
 
     @property
     def position(self) -> float:
-        return self._position
+        return self._portfolio.position
 
     @property
     def avg_entry(self) -> float:
-        return self._avg_entry
-
-    # ── Portfolio value helper ────────────────────────────────────────
-
-    class _Portfolio:
-        def __init__(self, executor: "LiveExecutor"):
-            self._ex = executor
-
-        def total_value(self, price: float) -> float:
-            return self._ex.cash + self._ex.position * price
+        return self._portfolio._cost_basis
 
     @property
-    def portfolio(self):
-        return self._Portfolio(self)
+    def portfolio(self) -> Portfolio:
+        return self._portfolio
+
+    # ── Validation ────────────────────────────────────────────────────
+
+    def _validate_order(self, side: OrderSide, quantity: float, price: float) -> None:
+        """Check order against exchange minimums. Raises ValueError with a self-explanatory message."""
+        if self._markets is None:
+            logger.warning("Cannot validate order — markets not loaded")
+            return
+
+        market = self._markets.get(self.symbol)
+        if not market:
+            logger.warning("Symbol %s not in loaded markets — skipping validation", self.symbol)
+            return
+
+        limits    = market.get("limits", {})
+        amt_min   = limits.get("amount", {}).get("min")
+        cost_min  = limits.get("cost",   {}).get("min")
+
+        base  = self.symbol.split("/")[0]
+        quote = self.symbol.split("/")[1]
+        req_cost = quantity * price
+
+        errors = []
+
+        if amt_min and quantity < amt_min:
+            min_cost = amt_min * price
+            errors.append(
+                f"requested {quantity:.6f} {base} (${req_cost:.2f} {quote}), "
+                f"Kraken minimum {amt_min:.6f} {base} (~${min_cost:.2f} {quote})"
+                f" — increase RISK_PER_TRADE_PCT or capital"
+            )
+
+        if cost_min and req_cost < cost_min:
+            min_qty = cost_min / price if price > 0 else 0.0
+            errors.append(
+                f"requested {quantity:.6f} {base} (${req_cost:.2f} {quote}), "
+                f"min cost ${cost_min:.2f} {quote} (~{min_qty:.6f} {base})"
+                f" — increase RISK_PER_TRADE_PCT or capital"
+            )
+
+        if errors:
+            raise ValueError("; ".join(errors))
 
     # ── Core execution ────────────────────────────────────────────────
 
@@ -124,12 +145,29 @@ class LiveExecutor:
         if side == OrderSide.BUY and quantity <= 0:
             logger.warning("LiveExecutor: BUY quantity=0, skipping")
             return None
-        if side == OrderSide.SELL and self._position <= 0:
+        if side == OrderSide.SELL and self._portfolio.position <= 0:
             logger.warning("LiveExecutor: SELL with no position, skipping")
             return None
 
-        quantity = self._position if side == OrderSide.SELL else quantity
-        ts       = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        quantity = self._portfolio.position if side == OrderSide.SELL else quantity
+        ts       = datetime.now(timezone.utc)
+
+        # Validate against exchange minimums in both dry-run and live mode.
+        # Dry-run must exercise the rejection path — that is the point of dry-run.
+        try:
+            self._validate_order(side, quantity, price)
+        except ValueError as exc:
+            logger.error("ORDER REJECTED: %s", exc)
+            return Order(
+                order_id      = "rejected",
+                symbol        = self.symbol,
+                side          = side,
+                quantity      = quantity,
+                price         = price,
+                status        = OrderStatus.REJECTED,
+                created_at    = ts,
+                reject_reason = str(exc),
+            )
 
         if self.dry_run:
             logger.warning(
@@ -141,8 +179,10 @@ class LiveExecutor:
                 f" @ ~{price:,.2f}",
                 flush=True,
             )
-            fill_price = price
-            order_id   = "dry_run"
+            fill_price   = price
+            filled_qty   = quantity
+            order_id_str = "dry_run"
+
         else:
             try:
                 logger.warning(
@@ -156,84 +196,122 @@ class LiveExecutor:
                     side   = ccxt_side,
                     amount = quantity,
                 )
-                fill_price = float(
-                    raw.get("average") or
-                    raw.get("price")   or
-                    price
-                )
-                order_id = str(raw.get("id", ""))
-                logger.info("Order filled: %s", raw)
+                order_id_str = str(raw.get("id", ""))
+                filled_qty   = float(raw.get("filled", 0.0))
+                fill_price   = float(raw.get("average") or raw.get("price") or price)
 
-            except ccxt.InsufficientFunds as e:
-                logger.error("Insufficient funds: %s", e)
+                # Poll up to 3 times for 'closed' status.
+                # If still open after 3 polls, save state with whatever was filled —
+                # never leave cash/position unupdated after a real order was sent.
+                last_raw = raw
+                for poll_num in range(1, 4):
+                    time.sleep(1)
+                    try:
+                        last_raw   = self._exchange.fetch_order(order_id_str, self.symbol)
+                        filled_qty = float(last_raw.get("filled", filled_qty))
+                        if last_raw.get("status") == "closed":
+                            fill_price = float(
+                                last_raw.get("average") or
+                                last_raw.get("price")   or
+                                price
+                            )
+                            break
+                    except Exception as poll_exc:
+                        logger.warning("fetch_order poll %d failed: %s", poll_num, poll_exc)
+                else:
+                    filled_qty = float(last_raw.get("filled", filled_qty))
+                    fill_price = float(
+                        last_raw.get("average") or
+                        last_raw.get("price")   or
+                        price
+                    )
+                    logger.warning(
+                        "ORDER %s NOT CLOSED after 3 polls — saving state with "
+                        "partial fill=%.6f %s @ %.2f. Manual verification recommended.",
+                        order_id_str, filled_qty, self.symbol, fill_price,
+                    )
+
+                quantity = filled_qty  # use actual filled amount, not requested
+
+            except ccxt.InsufficientFunds as exc:
+                logger.error("Insufficient funds: %s", exc)
                 return Order(
-                    side=side, price=price, quantity=quantity,
-                    total_value=0, status=OrderStatus.REJECTED,
-                    timestamp=ts,
+                    order_id      = "rejected",
+                    symbol        = self.symbol,
+                    side          = side,
+                    quantity      = quantity,
+                    price         = price,
+                    status        = OrderStatus.REJECTED,
+                    created_at    = ts,
+                    reject_reason = f"Insufficient funds: {exc}",
                 )
-            except ccxt.BaseError as e:
-                logger.error("ccxt order error: %s", e)
+            except ccxt.BaseError as exc:
+                logger.error("ccxt order error: %s", exc)
                 return Order(
-                    side=side, price=price, quantity=quantity,
-                    total_value=0, status=OrderStatus.REJECTED,
-                    timestamp=ts,
+                    order_id      = "rejected",
+                    symbol        = self.symbol,
+                    side          = side,
+                    quantity      = quantity,
+                    price         = price,
+                    status        = OrderStatus.REJECTED,
+                    created_at    = ts,
+                    reject_reason = f"Exchange error: {exc}",
                 )
 
         total_value = fill_price * quantity
 
         if side == OrderSide.BUY:
-            self._cash     -= total_value
-            total_held      = self._position * self._avg_entry + total_value
-            self._position += quantity
-            self._avg_entry = (
-                total_held / self._position if self._position > 0 else 0.0
+            prev_cost = self._portfolio._cost_basis * self._portfolio.position
+            self._portfolio.cash      -= total_value
+            self._portfolio.position  += quantity
+            self._portfolio._cost_basis = (
+                (prev_cost + fill_price * quantity) / self._portfolio.position
+                if self._portfolio.position > 0 else 0.0
             )
         else:
-            pnl                 = (fill_price - self._avg_entry) * quantity
-            self._realized_pnl += pnl
-            self._cash         += total_value
-            self._position      = max(0.0, self._position - quantity)
-            if self._position == 0:
-                self._avg_entry = 0.0
+            pnl = (fill_price - self._portfolio._cost_basis) * quantity
+            self._portfolio.realized_pnl += pnl
+            self._portfolio.cash         += total_value
+            self._portfolio.position      = max(0.0, self._portfolio.position - quantity)
+            if self._portfolio.position == 0:
+                self._portfolio._cost_basis = 0.0
 
         return Order(
-            side        = side,
-            price       = fill_price,
-            quantity    = quantity,
-            total_value = total_value,
-            status      = OrderStatus.FILLED,
-            timestamp   = ts,
-            order_id    = order_id,
+            order_id   = order_id_str,
+            symbol     = self.symbol,
+            side       = side,
+            quantity   = quantity,
+            price      = fill_price,
+            status     = OrderStatus.FILLED,
+            created_at = ts,
+            filled_at  = datetime.now(timezone.utc),
         )
 
-    def filled_orders(self):
-        """Return filled orders list — compatible with PaperExecutor interface."""
+    def filled_orders(self) -> list:
+        """Compatible with PaperExecutor interface."""
         return []
 
-    def reset(self):
-        """Reset executor state — compatible with PaperExecutor interface."""
-        self._cash         = self._cash
-        self._position     = 0.0
-        self._avg_entry    = 0.0
-        self._realized_pnl = 0.0
-
-    def rejected_orders(self):
-        """Return rejected orders — compatible with PaperExecutor interface."""
+    def rejected_orders(self) -> list:
+        """Compatible with PaperExecutor interface."""
         return []
 
     @property
-    def orders(self):
-        """Return all orders — compatible with PaperExecutor interface."""
+    def orders(self) -> list:
+        """Compatible with PaperExecutor interface."""
         return []
 
+    def reset(self) -> None:
+        """Compatible with PaperExecutor interface."""
+        self._portfolio.position     = 0.0
+        self._portfolio._cost_basis  = 0.0
+        self._portfolio.realized_pnl = 0.0
+
     def portfolio_snapshot(self, current_price: float) -> None:
-        """Log portfolio summary — compatible with PaperExecutor interface."""
-        import logging
-        logger = logging.getLogger(__name__)
+        """Compatible with PaperExecutor interface."""
         logger.info(
             "PORTFOLIO | cash=$%.2f | pos=%.6f %s | total=$%.2f",
-            self._cash,
-            self._position,
+            self._portfolio.cash,
+            self._portfolio.position,
             self.symbol,
-            self._cash + self._position * current_price,
+            self._portfolio.total_value(current_price),
         )
