@@ -1,13 +1,31 @@
 ---
 name: execution-layer
-description: "PaperExecutor design — Order lifecycle, Portfolio state, P&L tracking, rejection rules"
+description: "PaperExecutor + LiveExecutor design — Order lifecycle, Portfolio state, P&L tracking, rejection rules, known gaps"
 metadata: 
   node_type: memory
   type: project
   originSessionId: 7b844a82-ebf8-4841-a759-7f5d46ebbd65
 ---
 
-`bot/execution/executor.py` — paper trading engine. No real money, no exchange calls.
+Two executors share an identical interface. `main.py` selects between them via `cfg.exchange.live_trading`.
+
+## LiveExecutor — `bot/execution/live_executor.py`
+
+Built 2026-06-07. Places real market orders on Kraken via ccxt.
+
+**Activation:** `LIVE_TRADING=true` in `.env`. Use `DRY_RUN=true` first.
+
+**Known gaps (hardening work remaining):**
+- No balance sync on startup — tracked cash starts from `STARTING_CASH`, not real exchange balance
+- No min order size validation — Kraken rejections possible on small accounts
+- Fees not deducted from tracked cash — tracked P&L diverges from reality
+- No restart recovery — open exchange positions not detected; bot starts with zero position
+
+---
+
+## PaperExecutor — `bot/execution/executor.py`
+
+Paper trading engine. No real money, no exchange calls.
 
 **Why:** Needed a realistic order lifecycle (not just print statements) with cash guards and P&L so the bot behaves like a real system.
 

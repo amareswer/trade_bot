@@ -15,6 +15,28 @@ Running log of feature decisions. Most recent first.
 
 ---
 
+## 2026-06-07 — LiveExecutor (BUILT ✓)
+
+**What:** Real order executor for Kraken via ccxt. Interface-identical to PaperExecutor so `main.py` swaps between them with a single config flag (`LIVE_TRADING`).
+
+**Files changed:**
+
+| File | Change |
+|---|---|
+| `bot/execution/live_executor.py` | NEW — `LiveExecutor` class: connects to exchange via ccxt, places real market orders, tracks cash/position internally, full `PaperExecutor` interface (filled_orders, rejected_orders, reset, orders, portfolio_snapshot) |
+| `bot/main.py` | Added `LiveExecutor` import; executor instantiation now branches on `cfg.exchange.live_trading`; prints `LIVE TRADING ENABLED` or `[DRY RUN] LIVE TRADING ENABLED` banner at startup |
+| `config.py` | Added `live_trading: bool`, `dry_run: bool`, `api_key: str`, `api_secret: str` to `ExchangeConfig`; reads `LIVE_TRADING`, `DRY_RUN`, `KRAKEN_API_KEY`, `KRAKEN_API_SECRET` from `.env` |
+
+**Activation:** Set `LIVE_TRADING=true` in `.env`. Use `DRY_RUN=true` first to log intended orders without placing them. Only set `DRY_RUN=false` once dry-run behavior is verified over multiple candle cycles.
+
+**Known gaps — hardening work required before trusting with real money:**
+- **Balance sync:** bot tracks cash internally from `STARTING_CASH`; does not query real exchange balance on startup — restart loses all position state
+- **Min order size:** Kraken enforces per-pair minimums (e.g. 0.0001 BTC); not validated before order submission — small accounts may get exchange rejections
+- **Fee deduction:** exchange fees are not subtracted from bot's tracked cash balance — tracked P&L will diverge from reality over time
+- **Restart recovery:** open positions on the exchange are not detected on restart; bot starts blind with zero position, which could cause double-buying or stranded positions
+
+---
+
 ## 2026-05-30 — Candle Aggregator for Live Mode (BUILT ✓)
 
 **Problem:** Fundamental mismatch between backtest (real 4h OHLCV candles) and live mode (single price tick every 30s → fake candle with open=high=low=close=price). ADX needs real high/low to detect trend strength; RSI gets confused by hundreds of near-identical prices. Result: bot never traded in live mode.

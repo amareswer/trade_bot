@@ -24,21 +24,31 @@ Runs locally. No real money is ever spent.
 
 ## 1. Safety First — Read This Before Anything Else
 
-### You cannot lose real money right now
+### Three modes — understand which one you are in
 
-The current bot only does **paper trading**. There is no code to place real orders on any exchange. `PaperExecutor` simulates trades entirely in memory — even if you run the bot right now, zero real money moves. This is by design.
+The bot has three operating modes, controlled entirely by two `.env` flags:
 
-To lose real money, someone would first need to build a `LiveExecutor` that connects to a real exchange account with API keys. That piece does not exist in this codebase yet.
+| `LIVE_TRADING` | `DRY_RUN` | Mode | What happens |
+|---|---|---|---|
+| `false` (default) | — | **Paper trading** | `PaperExecutor` — all trades simulated in memory, zero exchange calls, zero real money possible |
+| `true` | `true` | **Dry run** | `LiveExecutor` connects to the exchange but logs what it *would* place — no orders are submitted |
+| `true` | `false` | **Live trading** | `LiveExecutor` submits real market orders on Kraken — real money moves |
 
-### Even when live trading is added — the risk engine protects you
+**Both flags default to `false`.** A fresh clone cannot place real orders until you explicitly set `LIVE_TRADING=true`.
 
-| Protection | What it does |
-|---|---|
-| `RISK_PER_TRADE_PCT = 0.5%` | Only 0.5% of your balance per trade — position size scales with balance automatically |
-| `RISK_MAX_POSITION_PCT = 3%` | Never puts more than 3% of your balance in one open position |
-| `RISK_DAILY_LOSS_LIMIT = 1%` | Stops new entries the moment you are down 1% in a day — open positions can still be closed |
-| `RISK_MAX_DRAWDOWN = 5%` | Blocks new entries if portfolio drops 5% from its all-time peak — open positions can still be closed |
-| `RISK_MAX_TRADES_PER_DAY = 3` | Hard cap — cannot overtrade and rack up fees |
+> **Before enabling live orders:** run `DRY_RUN=true` first and watch several candle cycles. Verify the printed `[DRY RUN] BUY / SELL` lines match your expectations. Only set `DRY_RUN=false` once you are satisfied.
+
+### The risk engine protects you in every mode
+
+| Protection | Code default | What it does |
+|---|---|---|
+| `RISK_PER_TRADE_PCT = 1%` | `0.01` | Only 1% of your balance per trade — position size scales with balance automatically |
+| `RISK_MAX_POSITION_PCT = 5%` | `0.05` | Never puts more than 5% of your balance in one open position |
+| `RISK_DAILY_LOSS_LIMIT = 2%` | `0.02` | Stops new entries the moment you are down 2% in a day — open positions can still be closed |
+| `RISK_MAX_DRAWDOWN = 10%` | `0.10` | Blocks new entries if portfolio drops 10% from its all-time peak — open positions can still be closed |
+| `RISK_MAX_TRADES_PER_DAY = 5` | `5` | Hard cap — cannot overtrade and rack up fees |
+
+> These are code defaults for a fresh clone with no `.env`. Your `.env` overrides them — check `.env` for what is actually running.
 
 > **SELL always works.** Daily loss and drawdown limits only block new BUY entries — you can always exit an open position.
 
@@ -87,10 +97,21 @@ STEP 3 — Live Trading with a Tiny Amount
   Watch every trade. Understand every decision.
 
   Prerequisites before this step:
-    ✓ LiveExecutor built and tested (not built yet)
+    ✓ LiveExecutor built — bot/execution/live_executor.py
     ✓ Exchange API keys configured with trading permissions
     ✓ Steps 1 and 2 completed successfully
     ✓ You understand why the bot is buying and selling
+    ✓ DRY_RUN=true validated over multiple candle cycles
+
+  Not yet handled by LiveExecutor (hardening work remaining):
+    ✗ Balance sync — bot tracks cash internally; does not query
+      real exchange balance on startup (restart loses position state)
+    ✗ Min order size — Kraken has per-pair minimums (e.g. 0.0001 BTC);
+      not validated before order is submitted
+    ✗ Fee deduction — exchange fees are not subtracted from the
+      bot's tracked cash balance
+    ✗ Restart recovery — open positions on the exchange are not
+      detected on restart; bot starts blind
 
 
 STEP 4 — Scale Up (Optional)
@@ -237,12 +258,14 @@ Stop the bot at any time with `Ctrl+C` — it prints a final summary before exit
 
 | Setting | Default | What it does |
 |---|---|---|
-| `RISK_PER_TRADE_PCT` | `0.005` | **0.5% of cash per trade** — position size calculated dynamically each trade |
-| `RISK_MAX_POSITION_PCT` | `0.03` | Max 3% of portfolio in one open position |
-| `RISK_DAILY_LOSS_LIMIT` | `0.01` | Block new BUYs if portfolio drops 1% today (SELL always allowed) |
-| `RISK_MAX_DRAWDOWN` | `0.05` | Block new BUYs if portfolio drops 5% from all-time peak (SELL always allowed) |
-| `RISK_MAX_TRADES_PER_DAY` | `3` | Hard cap on fills per calendar day |
+| `RISK_PER_TRADE_PCT` | `0.01` | **1% of cash per trade** — position size calculated dynamically each trade |
+| `RISK_MAX_POSITION_PCT` | `0.05` | Max 5% of portfolio in one open position |
+| `RISK_DAILY_LOSS_LIMIT` | `0.02` | Block new BUYs if portfolio drops 2% today (SELL always allowed) |
+| `RISK_MAX_DRAWDOWN` | `0.10` | Block new BUYs if portfolio drops 10% from all-time peak (SELL always allowed) |
+| `RISK_MAX_TRADES_PER_DAY` | `5` | Hard cap on fills per calendar day |
 | `COOLDOWN_TICKS` | `10` | Candles to wait after each trade before the next one |
+
+> **Defaults shown are code defaults** (`config.py` `_load()` function). Your `.env` overrides every value — check `.env` for what is actually running.
 
 ### Portfolio & Other
 
@@ -452,7 +475,7 @@ Price Feed
   → Dynamic Sizing      qty = cash × RISK_PER_TRADE_PCT ÷ price
   → AI Advisory         optional: can downgrade to HOLD, cannot upgrade HOLD
   → Risk Engine         5 checks: halt, max drawdown, daily cap, daily loss, position size
-  → PaperExecutor       simulates the order, updates cash + position
+  → PaperExecutor or LiveExecutor   executes the order, updates cash + position
   → PositionManager     tracks avg entry price and P&L
   → Dashboard + Log     records everything
 ```

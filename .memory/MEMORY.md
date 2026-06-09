@@ -7,7 +7,7 @@
 - [Feature Plan](feature_plan.md) — all planned/deferred/built features with decisions (update every session)
 - [Feedback: Workflow](feedback_workflow.md) — discuss before building; note every change/plan in feature_plan
 - [Risk Layer](risk_layer.md) — RiskManager 5-check approval gate, daily state, SELL bypass rules, config
-- [Execution Layer](execution_layer.md) — PaperExecutor, Order lifecycle, Portfolio, P&L model (weighted avg), rejection rules
+- [Execution Layer](execution_layer.md) — PaperExecutor + LiveExecutor, Order lifecycle, Portfolio, P&L model (weighted avg), rejection rules, LiveExecutor known gaps
 - [State Machine](state_machine.md) — IDLE/LONG/COOLDOWN states, position-aware filtering, dedup, cooldown config
 - [Position Manager](position_manager.md) — weighted avg entry, realized/unrealized PnL, trade history, wiring pattern
 - [Security Audit](security_audit.md) — 2026-05-28 audit findings, all fixes applied, pending key rotation
