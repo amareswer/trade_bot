@@ -451,6 +451,29 @@ def run():
         approval     = risk.evaluate(final_signal, price, executor.portfolio, trade_qty)
         block_reason = "" if approval else approval.message
 
+        # ── 8b. Candle-close structured log (live indicator mode only) ──
+        # One INFO line per candle close, greppable for live-vs-backtest audit.
+        # Format: CANDLE <ts> UTC | close=<px> RSI=<x> ADX=<x> trend=<x> spread=<x>% signal=<raw> -> <action>
+        if is_indicator and live_exchange is not None:
+            _rsi_log = f"{_rsi_live:.1f}" if _rsi_live is not None else "n/a"
+            _adx_log = f"{_adx_live:.1f}" if _adx_live is not None else "n/a"
+            _action  = (
+                final_signal.value
+                if approval else
+                f"BLOCKED[{approval.block_reason.value if approval.block_reason else '?'}]"
+            )
+            logger.info(
+                "CANDLE %s UTC | close=%.2f RSI=%s ADX=%s trend=%s spread=%.3f%% signal=%s -> %s",
+                candle.timestamp.strftime("%Y-%m-%d %H:%M"),
+                price,
+                _rsi_log,
+                _adx_log,
+                _trnd_live,
+                _spread,
+                _sig_str,
+                _action,
+            )
+
         # ── 9. Display tick ────────────────────────────────────────────
         display.tick(
             tick_n        = tick,
