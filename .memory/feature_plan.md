@@ -15,6 +15,29 @@ Running log of feature decisions. Most recent first.
 
 ---
 
+## 2026-06-11 — Position-Size Drift Incident + Startup Guard (BUILT ✓)
+
+**Incident:** First live BUY was blocked. Risk manager reported `0.000113 BTC = 10.03% of portfolio` against `RISK_MAX_POSITION_PCT=10%`. Bot had been running but generating zero fills since launch.
+
+**Root cause (single, confirmed):** `calc_trade_qty` calls `round(qty, 6)`. At price ≈ $88,761:
+- exact qty = 10.00 / 88761 = 0.00011265974…
+- rounded qty = 0.000113 (7th decimal is 6, rounds up)
+- risk check: 0.000113 × 88761 = $10.030 → 10.030% > 10.000% → BLOCKED
+
+The `round(..., 6)` can add up to `0.0000005 × price` to the effective position value — at BTC ~$90k that is $0.045, or 0.045% of a $100 portfolio. A `max_position_pct` equal to `risk_per_trade_pct` is always within this error band and will block on every order.
+
+No price-staleness drift (sizing and check use the same `price` variable from the same tick). No `current_value` drift (first BUY from zero position, so `current_value = cash`).
+
+**Operational fix (already applied):** `RISK_MAX_POSITION_PCT=0.15` in `.env`. With 15% max and 10% per-trade, the rounded position value ($10.03) is well inside the $15 limit.
+
+**Code fix:** Added startup warning in `config.py → log_startup()`: if `max_position_pct <= risk_per_trade_pct * 1.05`, logs a `WARNING` explaining the rounding mechanism and the minimum safe value. Fires on old config (10%/10%), silent on current config (10%/15%).
+
+**Files changed:** `config.py` (`log_startup`)
+
+**Safe threshold:** `RISK_MAX_POSITION_PCT >= RISK_PER_TRADE_PCT * 1.05 + margin`. At $100 capital and BTC ~$90k, 15% gives $5 of headroom above a $10 trade — more than sufficient.
+
+---
+
 ## 2026-06-09 — Logging, Live-Event Visibility, Banner Fix (BUILT ✓)
 
 **Root cause discovered:** `main.py` called `logging.basicConfig(level=WARNING)` on the root logger, then attached a file handler at INFO. The root-level WARNING filtered all INFO records *before* they reached any handler — so INFO lines never reached `trade_bot.log`. Evidence: log file showed only WARNING entries, newest from Jun 8 despite bot running Jun 9.

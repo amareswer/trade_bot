@@ -254,6 +254,25 @@ class AppConfig:
             self.risk.cooldown_ticks)
         logger.info("CONFIG  portfolio  starting_cash=$%.2f  AI=%s",
             self.portfolio.starting_cash, self.ai.enabled)
+
+        # Guard: calc_trade_qty rounds quantity to 6 decimal places. At BTC prices
+        # ~$85k–$95k that rounding can add up to $0.048 to the effective position
+        # value, pushing new_position_pct above max_position_pct even when the two
+        # limits appear equal. If max_position_pct is within 5% of risk_per_trade_pct,
+        # every BUY will be blocked. Operator fix: raise RISK_MAX_POSITION_PCT.
+        if self.risk.max_position_pct <= self.risk.risk_per_trade_pct * 1.05:
+            logger.warning(
+                "CONFIG WARNING: RISK_MAX_POSITION_PCT (%.0f%%) is within 5%% of "
+                "RISK_PER_TRADE_PCT (%.0f%%) — every BUY will likely be blocked. "
+                "qty rounding (6dp) can push new_position_pct up to %.2f%% above the "
+                "intended trade value, exceeding an equal limit on every order. "
+                "Raise RISK_MAX_POSITION_PCT above %.1f%% to fix.",
+                self.risk.max_position_pct * 100,
+                self.risk.risk_per_trade_pct * 100,
+                0.05,
+                self.risk.risk_per_trade_pct * 1.05 * 100,
+            )
+
         logger.info("─" * 60)
 
 
