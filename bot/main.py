@@ -262,6 +262,31 @@ def run():
     ))
     state_machine    = TradingStateMachine(cooldown_ticks=cfg.risk.cooldown_ticks)
     position_manager = PositionManager()
+
+    # ── Restart recovery ──────────────────────────────────────────────────────
+    # LiveExecutor._load_state() restores position/cash from logs/live_state.json,
+    # but PositionManager and TradingStateMachine are always created fresh.
+    # Seed both from executor state so SL/TP, signal filtering, and risk gate
+    # all see the recovered position on the first tick after restart.
+    if cfg.exchange.live_trading and executor.position > 1e-9:
+        position_manager.seed(
+            quantity     = executor.position,
+            avg_entry    = executor.avg_entry,
+            realized_pnl = executor.portfolio.realized_pnl,
+        )
+        state_machine.recover_long(executor.avg_entry)
+        logger.warning(
+            "Recovered position seeded: qty=%.6f entry=%.2f — state machine set to LONG",
+            executor.position, executor.avg_entry,
+        )
+        print(
+            f"  POSITION RECOVERED: {executor.position:.6f}"
+            f" {cfg.exchange.symbol.split('/')[0]}"
+            f" @ ${executor.avg_entry:,.2f}"
+            f" — state machine set to LONG",
+            flush=True,
+        )
+
     ai = AIEngine(
         model          = cfg.ai.model,
         min_confidence = cfg.ai.min_confidence,

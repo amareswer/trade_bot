@@ -5,38 +5,45 @@ metadata:
   type: project
 ---
 
-**Status as of 2026-06-09:** LiveExecutor fully hardened. All hardening items built and test-covered. Bot is paused (DRY_RUN needs to be confirmed before next launch).
+**Status as of 2026-06-12:** Bot is live on Kraken BTC/CAD with an open position. Multi-symbol validation complete. Fee discovery in progress.
 
-**What's running (when launched):** `python -m bot.main` — live Kraken BTC/CAD feed, 4h candles via `_fetch_completed_candle()`, IndicatorStrategy (EMA crossover + RSI + ADX≥15 filter), full risk gate, LiveExecutor.
+**What's running:** `python -m bot.main` — live Kraken BTC/CAD feed, 4h candles, IndicatorStrategy (EMA crossover + RSI + ADX≥15), full risk gate, LiveExecutor (DRY_RUN=false).
 
-**Active .env config (as of 2026-06-09):**
+**Open position (as of 2026-06-11 20:00 UTC):**
+- Entry: 0.000113 BTC/CAD @ $88,870.20
+- Stop-loss: $87,093 (2% below entry) — checked every 30s tick
+- Take-profit: $92,425 (4% above entry) — checked every 30s tick
+- Actual fill fee: $0.0803 CAD = **0.80%** (not 0.26% modeled) — cause under investigation
+
+**Active .env config:**
 - `EXCHANGE=kraken`, `SYMBOL=BTC/CAD`
-- `ADX_THRESHOLD=15.0` (validated config — see CLAUDE.md)
-- `LIVE_TRADING=true`, `DRY_RUN=false` ← **WARNING: real orders will be placed on next launch**
-- `RISK_PER_TRADE_PCT=0.10` — intentional at $100 CAD capital. Kraken min order is 0.00005 BTC (~$4.50 CAD); 2% of $100 = $2 would be rejected every time. The backtest-validated config (2%) requires ~$500 minimum capital. Revisit when capital grows.
-- `STARTING_CASH=100.0` — matches actual Kraken CAD balance; used as fallback if `fetch_balance` fails
-- `RISK_MAX_POSITION_PCT=0.10` — equal to RISK_PER_TRADE_PCT; first BUY passes (10% ≤ 10%), subsequent BUY before a SELL is blocked. Normal in single-position cycle.
-- `RISK_DAILY_LOSS_LIMIT=0.01`, `RISK_MAX_DRAWDOWN=0.05`
+- `LIVE_TRADING=true`, `DRY_RUN=false`
+- `RISK_PER_TRADE_PCT=0.10`, `RISK_MAX_POSITION_PCT=0.15` (raised from 0.10 to clear rounding-drift rejection — see [[live-loop-bugs]])
+- `STARTING_CASH=100.0`
+- `ADX_THRESHOLD=15.0`, `STOP_LOSS_PCT=0.02`, `TAKE_PROFIT_PCT=0.04`
 - `AI_ENABLED=false`
 
-**ADX note:** validated config uses ADX_THRESHOLD=15.0. Backtest fingerprint: running `EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py` should produce ADX rejected = 513 (10.3%). Confirmed 2026-06-09: ADX=513 ✓, trades=67, PF=1.27. Trade count drifted from original 88 to 67 as new candles replaced old at the 5000-candle tail — this is expected and not a regression.
+**Fee situation:**
+Actual Kraken fee 0.80% vs 0.26% modeled. At 0.80%, strategy is net-negative even with PF 1.21 signal quality (fees exceed gross profit at $100 capital). Fee-dict logging added to LiveExecutor — next fill reveals raw ccxt response. Fee levers to investigate: maker orders (0.16%), volume tier, BTC/USD vs BTC/CAD.
 
-**LiveExecutor hardening completed 2026-06-09:**
-All items from the known-gaps list are now implemented:
-- ✅ `_validate_order()` — min amount/cost check against `load_markets()`, runs in dry-run too
-- ✅ `load_markets()` at init, fail-fast in live mode
-- ✅ fetch_order polling (3 polls, partial-fill fallback with loud WARNING)
-- ✅ `_sync_cash()` — fetches `free[CAD]` from Kraken, warns on wrong currency, falls back to `STARTING_CASH`
-- ✅ `_save_state()` / `_load_state()` — `logs/live_state.json` persists cash/position/cost_basis/pnl across restarts; symbol mismatch guard
-- ✅ Fee deduction — reads `raw['fee']['cost']`; skips if fee currency ≠ quote (warns); deducts from cash if quote currency
-- ✅ `_fills` / `_rejects` lists — `filled_orders()` and `rejected_orders()` return real history
-- ✅ `reset()` fixed — restores `_starting_cash` (not zero)
-- ✅ Imports `Order/OrderSide/OrderStatus/Portfolio` from `executor.py` — eliminates enum type mismatch with `main.py`
-- ✅ `test_live_executor.py` — 11 tests, 30/30 total pytest passing
+**Multi-symbol validation complete (2026-06-11):**
+See [[multi-symbol-validation]] for full results.
+- ETH: first expansion symbol (PF 1.20/1.22 — most stable across regimes)
+- SOL, BNB: watchlist (strong currently, regime-dependent historically)
+- LINK: permanently excluded (PF 0.95/0.92 — never profitable)
+- BTC: weakest current-regime symbol (PF 0.45 on same Nov25–Jun26 dates where ETH=1.22)
+- Decision: no symbol changes until fee fix proven
 
-**Before next launch:**
-1. Confirm `DRY_RUN=true` or `DRY_RUN=false` is intentional in `.env`
-2. Verify actual Kraken CAD balance matches `STARTING_CASH=100.0` (or update it)
-3. If restarting after trades: `logs/live_state.json` will be loaded automatically; Kraken balance synced via `_sync_cash()` on startup
+**Dashboard:** now renders every 30s (was only at 4h candle closes — see [[live-loop-bugs]]). Shows live position panel with SL/TP levels, mode badge (LIVE/DRY RUN/PAPER), regime gauge, last 10 candle evaluations.
 
-**Deferred:** Multi-asset trading — design discussed, not built. Requires validated single-symbol live trading first.
+**Backtest validation fingerprint:**
+`EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py` → ADX rejected = 513 (10.3%) confirms validated config. Trade count is 67 (not original 88) due to rolling 5000-candle window — expected.
+
+**Next steps:**
+1. Confirm fee-dict structure on next fill — determine if 0.80% is real CAD surcharge or extraction bug
+2. Investigate maker orders on Kraken as fee lever (limit orders → 0.16%)
+3. Hold current position through SL/TP; do not change params mid-trade
+4. After position closes: compare live fill vs backtest metrics (win rate, fees, hold time)
+5. Once fee path below 0.20% is confirmed: consider ETH expansion
+
+**Deferred:** Multi-asset trading design discussed; requires single-symbol validation + fee fix first.

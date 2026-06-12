@@ -50,6 +50,21 @@ class PositionManager:
         self._realized_pnl: float              = 0.0
         self._history:      list[TradeRecord]  = []
 
+    # ── Restart recovery ─────────────────────────────────────────────
+
+    def seed(self, quantity: float, avg_entry: float, realized_pnl: float = 0.0) -> None:
+        """
+        Seed position state from persisted executor state on restart.
+        Does NOT create a trade record — this is recovery, not a new fill.
+        """
+        self._quantity     = quantity
+        self._avg_entry    = avg_entry
+        self._realized_pnl = realized_pnl
+        logger.warning(
+            "PositionManager seeded: qty=%.6f avg_entry=%.2f realized_pnl=%.2f",
+            quantity, avg_entry, realized_pnl,
+        )
+
     # ── Fill handlers ────────────────────────────────────────────────
 
     def on_buy(self, price: float, quantity: float) -> None:

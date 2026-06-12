@@ -15,6 +15,12 @@ Running log of feature decisions. Most recent first.
 
 ---
 
+## 2026-06-10 to 2026-06-12 — First Live Fill + Critical Bug Fixes + Multi-Symbol Validation
+
+The bot executed its first live fill (BUY 0.000113 BTC/CAD @ $88,870.20), which immediately revealed three bugs: (1) intra-candle SL/TP never fired between 4h closes — same `continue`-path issue as the earlier SL/TP gap; (2) the dashboard only rendered at candle closes for the same reason — fixed by extracting a `_render_dashboard()` helper called on every 30s tick using sticky indicator values; (3) the first BUY was initially blocked by position-size rounding drift (`round(qty,6) × price > max_position_pct` even at equal limits), fixed by raising `RISK_MAX_POSITION_PCT=0.15` and adding a startup warning. Fee discovery: actual Kraken charge was 0.80% (not 0.26% modeled) — raw fee-dict logging added; cause under investigation (likely BTC/CAD FX surcharge). Multi-symbol validation ran frozen params against ETH/SOL/BNB/LINK at two windows and two fee rates: strategy generalizes (ETH chosen as first expansion symbol for cross-regime robustness, LINK permanently excluded), but fee rate remains the gating constraint — everything is net-negative at 0.80% even with good signal quality. Details in [[multi-symbol-validation]] and [[live-loop-bugs]].
+
+---
+
 ## 2026-06-11 — Intra-Candle SL/TP + Fee Logging (BUILT ✓)
 
 **Gap fixed:** Live loop's `continue` (on "no new candle") fired before step 3b, so SL/TP only ran at 4h closes. A new intra-candle block now runs on every 30s tick, before the candle-availability check. Full execution pipeline: `risk.evaluate → executor.execute → position_manager.on_sell → display.fill`. Approval tested via `_ic_approval.approved` (explicit, consistent with `ApprovalResult` field name even though `__bool__` also exists).

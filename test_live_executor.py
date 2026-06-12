@@ -400,6 +400,93 @@ def test_reset_restores_starting_cash():
     assert len(ex.filled_orders()) == 0
 
 
+# ---------------------------------------------------------------------------
+# Test 12: restart recovery — executor, position_manager, state_machine consistent
+# ---------------------------------------------------------------------------
+
+def test_restart_recovery_seeds_position_manager_and_state_machine():
+    """
+    After a restart with a persisted position:
+    - executor.position > 0  (loaded from state file)
+    - position_manager.has_position is True, qty and avg_entry match executor
+    - state_machine.state is LONG
+    - intra-candle SL/TP gate (has_position check) would fire correctly
+    - state machine would allow SELL and block BUY
+    """
+    from bot.portfolio.position_manager import PositionManager
+    from bot.state.trade_state import TradingStateMachine, TradingState
+    from bot.strategy.threshold_strategy import Signal
+
+    # Simulate executor loaded from state file with an open position
+    with tempfile.TemporaryDirectory() as tmpdir:
+        state_path = os.path.join(tmpdir, "state.json")
+
+        # Write a state file as if a BUY was previously filled
+        import json
+        json.dump({
+            "symbol":       "BTC/CAD",
+            "cash":         89.88,
+            "position":     0.000113,
+            "cost_basis":   88870.20,
+            "realized_pnl": 0.0,
+            "fees_paid":    0.0803,
+            "saved_at":     "2026-06-11T20:00:08+00:00",
+        }, open(state_path, "w"))
+
+        mock_ex = MagicMock()
+        mock_ex.load_markets.return_value = _DEFAULT_MARKETS
+        mock_ex.fetch_balance.return_value = {"free": {"CAD": 89.88}}
+
+        with patch.object(le_mod.ccxt, "kraken") as mock_cls:
+            mock_cls.return_value = mock_ex
+            executor = LiveExecutor(
+                exchange_id="kraken", symbol="BTC/CAD",
+                api_key="k", api_secret="s",
+                starting_cash=100.0, dry_run=False,
+                state_path=state_path,
+            )
+
+    # Verify executor loaded the position from state file
+    assert abs(executor.position - 0.000113) < 1e-9
+    assert abs(executor.avg_entry - 88870.20) < 0.01
+
+    # Simulate what main.py's recovery block does
+    position_manager = PositionManager()
+    state_machine    = TradingStateMachine(cooldown_ticks=6)
+
+    assert not position_manager.has_position        # fresh — not yet seeded
+    assert state_machine.state == TradingState.IDLE # fresh — not yet recovered
+
+    position_manager.seed(
+        quantity     = executor.position,
+        avg_entry    = executor.avg_entry,
+        realized_pnl = executor.portfolio.realized_pnl,
+    )
+    state_machine.recover_long(executor.avg_entry)
+
+    # Post-recovery assertions — all three components are consistent
+    assert position_manager.has_position
+    assert abs(position_manager.quantity  - executor.position)  < 1e-9
+    assert abs(position_manager.avg_entry - executor.avg_entry) < 0.01
+    assert abs(position_manager.realized_pnl - 0.0)             < 0.01
+
+    assert state_machine.state          == TradingState.LONG
+    assert state_machine.last_action    == Signal.BUY
+    assert abs(state_machine.last_trade_price - executor.avg_entry) < 0.01
+    assert state_machine.cooldown_remaining == 0
+
+    # Signal filtering: SELL passes, BUY blocked (position already open)
+    sell_sig, reason = state_machine.filter_signal(Signal.SELL)
+    assert sell_sig == Signal.SELL,  f"SELL should pass LONG state, got: {reason}"
+
+    buy_sig, reason = state_machine.filter_signal(Signal.BUY)
+    assert buy_sig == Signal.HOLD,   f"BUY should be blocked in LONG state, got: {reason}"
+
+    # history is empty — seed/recover_long create no fake trade records
+    assert len(state_machine.history)  == 0
+    assert len(position_manager.history) == 0
+
+
 if __name__ == "__main__":
     import sys
     import traceback

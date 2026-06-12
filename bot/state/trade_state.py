@@ -135,6 +135,21 @@ class TradingStateMachine:
             prev.value, self.state.value, action.value, price, self.cooldown_remaining,
         )
 
+    # ── Restart recovery ─────────────────────────────────────────────
+
+    def recover_long(self, entry_price: float) -> None:
+        """
+        Force state to LONG on restart when a position is loaded from disk.
+        Does NOT add a history entry — this is recovery, not a new fill.
+        """
+        self.state              = TradingState.LONG
+        self.last_action        = Signal.BUY
+        self.last_trade_price   = entry_price
+        self.cooldown_remaining = 0
+        logger.warning(
+            "State machine recovered to LONG | entry=%.2f", entry_price,
+        )
+
     # ── Read-only helpers ────────────────────────────────────────────
 
     @property
