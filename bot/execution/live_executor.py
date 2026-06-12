@@ -50,8 +50,9 @@ class LiveExecutor:
         self._starting_cash = starting_cash
         self._state_path    = state_path
         self._portfolio     = Portfolio(cash=starting_cash)
-        self._fills:   list[Order] = []
-        self._rejects: list[Order] = []
+        self._fills:      list[Order] = []
+        self._rejects:    list[Order] = []
+        self._fees_paid:  float       = 0.0
 
         exchange_cls = getattr(ccxt, exchange_id.lower())
         self._exchange = exchange_cls({
@@ -133,6 +134,10 @@ class LiveExecutor:
     def portfolio(self) -> Portfolio:
         return self._portfolio
 
+    @property
+    def fees_paid(self) -> float:
+        return self._fees_paid
+
     # ── Balance sync ──────────────────────────────────────────────────
 
     def _sync_cash(self) -> tuple[float, str | None]:
@@ -171,6 +176,7 @@ class LiveExecutor:
             "position":     self._portfolio.position,
             "cost_basis":   self._portfolio._cost_basis,
             "realized_pnl": self._portfolio.realized_pnl,
+            "fees_paid":    self._fees_paid,
             "saved_at":     datetime.now(timezone.utc).isoformat(),
         }
         try:
@@ -212,6 +218,7 @@ class LiveExecutor:
         self._portfolio.position      = float(state["position"])
         self._portfolio._cost_basis   = float(state["cost_basis"])
         self._portfolio.realized_pnl  = float(state["realized_pnl"])
+        self._fees_paid               = float(state.get("fees_paid", 0.0))
         logger.warning(
             "State restored: cash=%.2f pos=%.6f cost_basis=%.2f pnl=%.2f (saved %s)",
             self._portfolio.cash, self._portfolio.position,
@@ -440,6 +447,7 @@ class LiveExecutor:
                 )
             else:
                 self._portfolio.cash -= fee_cost
+                self._fees_paid      += fee_cost
                 logger.warning("Fee deducted: %.6f %s", fee_cost, quote)
 
         order = Order(

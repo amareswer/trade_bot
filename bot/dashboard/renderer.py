@@ -40,9 +40,15 @@ def write(
     unrealized_pnl:  float,
     realized_pnl:    float,
     total_value:     float,
-    fills:           list[dict],   # [{time, side, qty, price, total, pnl}]
-    tick_log:        list[dict],   # [{tick, time, price, signal, rsi, trend, state, reason}]
-    refresh_s:       int = 30,
+    fills:           list[dict],       # [{time, side, qty, price, total, pnl}]
+    tick_log:        list[dict],       # [{tick, time, price, signal, rsi, trend, state, reason}]
+    candle_log:      list[dict] = None,# [{ts, close, rsi, adx, trend, spread, signal, action, reason}]
+    refresh_s:       int   = 30,
+    live_trading:    bool  = False,
+    dry_run:         bool  = False,
+    stop_loss_pct:   float = 0.0,
+    take_profit_pct: float = 0.0,
+    fees_paid:       float = 0.0,
 ) -> None:
     html = _render(
         exchange=exchange, symbol=symbol, strategy=strategy,
@@ -52,7 +58,12 @@ def write(
         cash=cash, position=position, avg_entry=avg_entry,
         unrealized_pnl=unrealized_pnl, realized_pnl=realized_pnl,
         total_value=total_value,
-        fills=fills, tick_log=tick_log, refresh_s=refresh_s,
+        fills=fills, tick_log=tick_log,
+        candle_log=candle_log or [],
+        refresh_s=refresh_s,
+        live_trading=live_trading, dry_run=dry_run,
+        stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct,
+        fees_paid=fees_paid,
     )
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -60,7 +71,7 @@ def write(
 
 
 # ---------------------------------------------------------------------------
-# Internal
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _fmt_pnl(v: float) -> str:
@@ -88,23 +99,197 @@ def _trend_color(t: Optional[str]) -> str:
 
 
 def _rsi_color(r: Optional[float]) -> str:
-    if r is None:  return "#8b949e"
-    if r > 70:     return "#f85149"
-    if r < 30:     return "#3fb950"
+    if r is None: return "#8b949e"
+    if r > 70:    return "#f85149"
+    if r < 30:    return "#3fb950"
     return "#e3b341"
 
 
-def _render(**kw) -> str:
-    now        = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    rsi_str    = f"{kw['rsi']:.1f}" if kw['rsi'] is not None else "—"
-    trend_str  = kw['trend'] or "—"
-    pos_str    = f"{kw['position']:.4f}" if kw['position'] > 0 else "—"
-    entry_str  = f"${kw['avg_entry']:,.2f}" if kw['avg_entry'] > 0 else "—"
-    rsi_col    = _rsi_color(kw['rsi'])
-    trend_col  = _trend_color(kw['trend'])
-    cd_str     = f"({kw['cooldown']} left)" if kw['cooldown'] > 0 else ""
+def _pct_color(pct: float, warn: float = 1.0, danger: float = 0.5) -> str:
+    """Green when far, yellow when within warn%, red when within danger%."""
+    if pct <= danger: return "#f85149"
+    if pct <= warn:   return "#d29922"
+    return "#3fb950"
 
-    # ── Fills table rows ───────────────────────────────────────────────
+
+def _render(**kw) -> str:
+    now       = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rsi_str   = f"{kw['rsi']:.1f}" if kw['rsi'] is not None else "—"
+    trend_str = kw['trend'] or "—"
+    pos_str   = f"{kw['position']:.6f}" if kw['position'] > 0 else "—"
+    entry_str = f"${kw['avg_entry']:,.2f}" if kw['avg_entry'] > 0 else "—"
+    rsi_col   = _rsi_color(kw['rsi'])
+    trend_col = _trend_color(kw['trend'])
+    cd_str    = f"({kw['cooldown']} left)" if kw['cooldown'] > 0 else ""
+
+    # ── Mode badge ─────────────────────────────────────────────────────────
+    if kw['live_trading'] and not kw['dry_run']:
+        mode_badge = '<span class="badge" style="background:#f8514933;color:#f85149;border:1px solid #f8514966;font-size:13px">● LIVE</span>'
+        mode_text  = "Live Trading"
+    elif kw['dry_run']:
+        mode_badge = '<span class="badge" style="background:#d2992233;color:#d29922;border:1px solid #d2992266;font-size:13px">◌ DRY RUN</span>'
+        mode_text  = "Dry Run"
+    else:
+        mode_badge = '<span class="badge" style="background:#8b949e22;color:#8b949e;border:1px solid #8b949e44">PAPER</span>'
+        mode_text  = "Paper Trading"
+
+    # ── Position protection panel ──────────────────────────────────────────
+    pos_panel = ""
+    if kw['position'] > 0 and kw['avg_entry'] > 0:
+        entry     = kw['avg_entry']
+        price     = kw['price']
+        sl_pct    = kw['stop_loss_pct']
+        tp_pct    = kw['take_profit_pct']
+
+        if sl_pct > 0 and tp_pct > 0:
+            sl_level = entry * (1 - sl_pct)
+            tp_level = entry * (1 + tp_pct)
+
+            pct_above_sl = (price - sl_level) / price * 100
+            pct_below_tp = (tp_level - price) / price * 100
+
+            sl_col = _pct_color(pct_above_sl, warn=1.0, danger=0.5)
+
+            # Progress bar: where is price between SL and TP?
+            total_range  = tp_level - sl_level
+            bar_fill_pct = max(0.0, min(100.0, (price - sl_level) / total_range * 100))
+            entry_mark   = max(0.0, min(100.0, (entry - sl_level) / total_range * 100))
+
+            # Bar color: red zone (left), green zone (right), entry marker
+            pos_panel = f"""
+  <!-- Position protection panel -->
+  <div class="section" style="margin-bottom:20px;border-color:#30363d">
+    <h2>Open Position — Protection Levels</h2>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:16px">
+
+      <div class="info-card">
+        <div class="info-row">
+          <span class="info-key">Entry</span>
+          <span class="info-val">${entry:,.2f}</span>
+        </div>
+        <div class="info-row">
+          <span class="info-key">Current</span>
+          <span class="info-val" style="color:#e6edf3">${price:,.2f}</span>
+        </div>
+        <div class="info-row">
+          <span class="info-key">Move from entry</span>
+          <span class="info-val" style="color:{'#3fb950' if price >= entry else '#f85149'}">{(price - entry) / entry * 100:+.2f}%</span>
+        </div>
+      </div>
+
+      <div class="info-card" style="border-color:{sl_col}66">
+        <div class="info-row">
+          <span class="info-key">Stop Loss ({sl_pct*100:.0f}%)</span>
+          <span class="info-val">${sl_level:,.2f}</span>
+        </div>
+        <div class="info-row">
+          <span class="info-key">Distance to SL</span>
+          <span class="info-val" style="color:{sl_col}">{pct_above_sl:+.2f}%</span>
+        </div>
+        <div class="info-row">
+          <span class="info-key">Trigger below</span>
+          <span style="color:#8b949e;font-size:11px">${sl_level:,.2f}</span>
+        </div>
+      </div>
+
+      <div class="info-card" style="border-color:#3fb95066">
+        <div class="info-row">
+          <span class="info-key">Take Profit ({tp_pct*100:.0f}%)</span>
+          <span class="info-val">${tp_level:,.2f}</span>
+        </div>
+        <div class="info-row">
+          <span class="info-key">Distance to TP</span>
+          <span class="info-val" style="color:#3fb950">{pct_below_tp:+.2f}%</span>
+        </div>
+        <div class="info-row">
+          <span class="info-key">Trigger above</span>
+          <span style="color:#8b949e;font-size:11px">${tp_level:,.2f}</span>
+        </div>
+      </div>
+
+    </div>
+    <!-- SL → price → TP bar -->
+    <div style="position:relative;height:20px;border-radius:4px;overflow:hidden;background:#21262d">
+      <!-- SL zone: left portion in red tint -->
+      <div style="position:absolute;left:0;top:0;height:100%;width:{entry_mark:.1f}%;background:linear-gradient(to right,#f8514922,#f8514911)"></div>
+      <!-- TP zone: right portion in green tint -->
+      <div style="position:absolute;left:{entry_mark:.1f}%;top:0;height:100%;width:{100-entry_mark:.1f}%;background:linear-gradient(to right,#3fb95011,#3fb95022)"></div>
+      <!-- Current price marker -->
+      <div style="position:absolute;left:calc({bar_fill_pct:.1f}% - 2px);top:0;width:4px;height:100%;background:#e6edf3;border-radius:2px"></div>
+      <!-- Entry marker -->
+      <div style="position:absolute;left:calc({entry_mark:.1f}% - 1px);top:0;width:2px;height:100%;background:#8b949e66"></div>
+    </div>
+    <div style="display:flex;justify-content:space-between;margin-top:4px;font-size:10px;color:#8b949e">
+      <span>SL ${sl_level:,.0f}</span>
+      <span style="color:#e6edf3">▲ current ${price:,.0f}</span>
+      <span>TP ${tp_level:,.0f}</span>
+    </div>
+  </div>"""
+
+    # ── Regime stats from candle_log ───────────────────────────────────────
+    candle_log = kw['candle_log']
+    n_candles  = len(candle_log)
+    last_adx   = candle_log[-1]['adx']    if candle_log else None
+    last_spread= candle_log[-1]['spread'] if candle_log else None
+
+    if n_candles > 0:
+        reasons = [c.get('reason', '') or '' for c in candle_log]
+        n_adx    = sum(1 for r in reasons if r.startswith('ADX'))
+        n_spread = sum(1 for r in reasons if 'EMA spread' in r)
+        n_rsi    = sum(1 for r in reasons if r.startswith('RSI'))
+        n_trend  = sum(1 for r in reasons if 'trend' in r)
+        n_action = sum(1 for c in candle_log if c.get('action', 'HOLD') not in ('HOLD',))
+        adx_pct    = n_adx    / n_candles * 100
+        spread_pct = n_spread / n_candles * 100
+        action_pct = n_action / n_candles * 100
+
+        adx_str    = f"{last_adx:.1f}" if last_adx is not None else "—"
+        spread_str = f"{last_spread:.3f}%" if last_spread is not None else "—"
+        adx_col    = "#3fb950" if last_adx and last_adx >= 20 else "#d29922" if last_adx else "#8b949e"
+        spread_col = "#f85149" if last_spread and last_spread > 0.8 else "#d29922" if last_spread and last_spread > 0.4 else "#3fb950"
+
+        regime_card = f"""
+    <div class="info-card">
+      <div style="font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">
+        Regime ({n_candles} candles)
+      </div>
+      <div class="info-row">
+        <span class="info-key">ADX</span>
+        <span class="info-val" style="color:{adx_col}">{adx_str}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-key">EMA Spread</span>
+        <span class="info-val" style="color:{spread_col}">{spread_str}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-key">ADX filtered</span>
+        <span style="color:#8b949e;font-size:12px">{adx_pct:.0f}%</span>
+      </div>
+      <div class="info-row">
+        <span class="info-key">Spread filtered</span>
+        <span style="color:#8b949e;font-size:12px">{spread_pct:.0f}%</span>
+      </div>
+      <div class="info-row">
+        <span class="info-key">Actionable</span>
+        <span style="color:{'#3fb950' if action_pct > 10 else '#8b949e'};font-size:12px">{action_pct:.0f}%</span>
+      </div>
+    </div>"""
+    else:
+        adx_str = last_spread_str = "—"
+        regime_card = """
+    <div class="info-card">
+      <div style="font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">Regime</div>
+      <div style="color:#8b949e;font-size:12px">No candle data yet</div>
+    </div>"""
+
+    # ── Fees / P&L ─────────────────────────────────────────────────────────
+    fees_paid   = kw['fees_paid']
+    realized    = kw['realized_pnl']
+    net_pnl     = realized - fees_paid
+    fees_str    = f'<span style="color:#f85149">-${fees_paid:,.4f}</span>' if fees_paid > 0 else '<span style="color:#8b949e">$0.00</span>'
+    net_str     = _fmt_pnl(net_pnl)
+
+    # ── Fills table rows ───────────────────────────────────────────────────
     if kw['fills']:
         fill_rows = ""
         for f in reversed(kw['fills']):
@@ -122,7 +307,47 @@ def _render(**kw) -> str:
     else:
         fill_rows = '<tr><td colspan="6" style="color:#8b949e;text-align:center">No fills yet</td></tr>'
 
-    # ── Tick log rows ──────────────────────────────────────────────────
+    # ── Candle evaluations table (last 10) ─────────────────────────────────
+    if candle_log:
+        candle_rows = ""
+        for c in reversed(list(candle_log)[-10:]):
+            rsi_c    = _rsi_color(c.get('rsi'))
+            rsi_disp = f'<span style="color:{rsi_c}">{c["rsi"]}</span>' if c.get('rsi') is not None else "—"
+            adx_disp = f'{c["adx"]}' if c.get('adx') is not None else "—"
+            tr_col   = _trend_color(c.get('trend'))
+            sp_val   = c.get('spread', 0)
+            sp_col   = "#f85149" if sp_val > 0.8 else "#d29922" if sp_val > 0.4 else "#8b949e"
+            act      = c.get('action', '—')
+            act_col  = "#3fb950" if act == "BUY" else "#f85149" if act == "SELL" else "#8b949e"
+            reason_disp = f'<span style="color:#8b949e;font-size:10px">{c.get("reason","")}</span>' if c.get("reason") else ""
+            candle_rows += f"""
+            <tr>
+              <td style="color:#8b949e;font-size:11px">{c['ts']} UTC</td>
+              <td style="color:#e6edf3">${c['close']:,.2f}</td>
+              <td>{rsi_disp}</td>
+              <td style="color:#8b949e">{adx_disp}</td>
+              <td style="color:{tr_col}">{c.get('trend','—')}</td>
+              <td style="color:{sp_col}">{sp_val:.3f}%</td>
+              <td>{_signal_badge(c.get('signal','HOLD'))}</td>
+              <td style="color:{act_col};font-weight:600">{act}{reason_disp}</td>
+            </tr>"""
+        candle_section = f"""
+  <div class="section">
+    <h2>Last {min(10, len(candle_log))} Candle Evaluations</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Candle Close</th><th>Price</th><th>RSI</th><th>ADX</th>
+          <th>Trend</th><th>Spread</th><th>Signal</th><th>Action / Reason</th>
+        </tr>
+      </thead>
+      <tbody>{candle_rows}</tbody>
+    </table>
+  </div>"""
+    else:
+        candle_section = ""
+
+    # ── Tick log rows ──────────────────────────────────────────────────────
     tick_rows = ""
     for t in reversed(kw['tick_log'][-30:]):
         reason_cell = f'<span style="color:#8b949e;font-size:11px">{t["reason"]}</span>' if t['reason'] else ""
@@ -168,7 +393,7 @@ def _render(**kw) -> str:
     }}
     .cards {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
       gap: 12px; margin-bottom: 24px;
     }}
     .card {{
@@ -181,7 +406,7 @@ def _render(**kw) -> str:
     .card-sub   {{ font-size: 11px; color: #8b949e; margin-top: 4px; }}
     .state-row {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
       gap: 12px; margin-bottom: 24px;
     }}
     .info-card {{
@@ -214,6 +439,7 @@ def _render(**kw) -> str:
     .pulse {{ display: inline-block; width: 8px; height: 8px; border-radius: 50%;
               background: #3fb950; margin-right: 6px;
               animation: pulse 2s ease-in-out infinite; }}
+    .pulse-red {{ background: #f85149; }}
     @keyframes pulse {{
       0%, 100% {{ opacity: 1; }}
       50%       {{ opacity: 0.3; }}
@@ -226,10 +452,11 @@ def _render(**kw) -> str:
   <div class="header">
     <div>
       <div class="header-title">
-        <span class="pulse"></span>
+        <span class="pulse{' pulse-red' if kw['live_trading'] and not kw['dry_run'] else ''}"></span>
         {kw['exchange'].capitalize()} &nbsp;·&nbsp; {kw['symbol']}
+        &nbsp;&nbsp;{mode_badge}
       </div>
-      <div class="header-sub">Paper Trading &nbsp;·&nbsp; Strategy: {kw['strategy']} &nbsp;·&nbsp; Tick #{kw['tick']:,}</div>
+      <div class="header-sub">{mode_text} &nbsp;·&nbsp; Strategy: {kw['strategy']} &nbsp;·&nbsp; Tick #{kw['tick']:,}</div>
     </div>
     <div style="text-align:right">
       <div style="font-size:26px;font-weight:700;color:#e6edf3">${kw['price']:,.2f}</div>
@@ -237,32 +464,35 @@ def _render(**kw) -> str:
     </div>
   </div>
 
+  {pos_panel}
+
   <!-- Metric cards -->
   <div class="cards">
     <div class="card">
       <div class="card-label">Cash</div>
-      <div class="card-value">${kw['cash']:,.0f}</div>
+      <div class="card-value">${kw['cash']:,.2f}</div>
     </div>
     <div class="card">
       <div class="card-label">Position</div>
-      <div class="card-value">{pos_str}</div>
+      <div class="card-value" style="font-size:18px">{pos_str}</div>
       <div class="card-sub">avg entry {entry_str}</div>
     </div>
     <div class="card">
       <div class="card-label">Unrealized P&amp;L</div>
-      <div class="card-value">{_fmt_pnl(kw['unrealized_pnl'])}</div>
+      <div class="card-value" style="font-size:18px">{_fmt_pnl(kw['unrealized_pnl'])}</div>
     </div>
     <div class="card">
       <div class="card-label">Realized P&amp;L</div>
-      <div class="card-value">{_fmt_pnl(kw['realized_pnl'])}</div>
+      <div class="card-value" style="font-size:18px">{_fmt_pnl(realized)}</div>
+      <div class="card-sub">fees {fees_str} &nbsp;·&nbsp; net {net_str}</div>
     </div>
     <div class="card">
       <div class="card-label">Total Value</div>
-      <div class="card-value">${kw['total_value']:,.0f}</div>
+      <div class="card-value">${kw['total_value']:,.2f}</div>
     </div>
   </div>
 
-  <!-- State / indicators row -->
+  <!-- State / indicators / regime row -->
   <div class="state-row">
     <div class="info-card">
       <div class="info-row">
@@ -284,15 +514,26 @@ def _render(**kw) -> str:
         <span class="info-val" style="color:{rsi_col}">{rsi_str}</span>
       </div>
       <div class="info-row">
-        <span class="info-key">EMA Trend</span>
+        <span class="info-key">Trend</span>
         <span class="info-val" style="color:{trend_col}">{trend_str}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-key">ADX</span>
+        <span class="info-val" style="color:{'#3fb950' if last_adx and last_adx >= 20 else '#d29922' if last_adx else '#8b949e'}">{f"{last_adx:.1f}" if last_adx is not None else "—"}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-key">EMA Spread</span>
+        <span class="info-val" style="color:{'#f85149' if last_spread and last_spread > 0.8 else '#d29922' if last_spread and last_spread > 0.4 else '#8b949e'}">{f"{last_spread:.3f}%" if last_spread is not None else "—"}</span>
       </div>
       <div class="info-row">
         <span class="info-key">Fills today</span>
         <span class="info-val">{len(kw['fills'])}</span>
       </div>
     </div>
+    {regime_card}
   </div>
+
+  {candle_section}
 
   <!-- Trade history -->
   <div class="section">
@@ -308,7 +549,7 @@ def _render(**kw) -> str:
     </table>
   </div>
 
-  <!-- Tick log -->
+  <!-- Recent ticks -->
   <div class="section">
     <h2>Recent Ticks (last 30)</h2>
     <table>

@@ -289,8 +289,9 @@ def run():
         live_exchange     = _build_exchange()
         last_candle_ts_ms = _warmup_strategy(strategy, live_exchange)
 
-    tick     = 0
-    tick_log: deque[dict] = deque(maxlen=200)
+    tick        = 0
+    tick_log:   deque[dict] = deque(maxlen=200)
+    candle_log: deque[dict] = deque(maxlen=50)
 
     while _running:
         tick += 1
@@ -523,6 +524,17 @@ def run():
                 _sig_str,
                 _action,
             )
+            candle_log.append({
+                "ts":     candle.timestamp.strftime("%Y-%m-%d %H:%M"),
+                "close":  price,
+                "rsi":    round(_rsi_live, 1) if _rsi_live is not None else None,
+                "adx":    round(_adx_live, 1) if _adx_live is not None else None,
+                "trend":  _trnd_live,
+                "spread": round(_spread, 3),
+                "signal": _sig_str,
+                "action": _action,
+                "reason": _reason,
+            })
 
         # ── 9. Display tick ────────────────────────────────────────────
         display.tick(
@@ -628,7 +640,13 @@ def run():
                 total_value    = executor.portfolio.total_value(price),
                 fills          = fills_data,
                 tick_log       = list(tick_log),
+                candle_log     = list(candle_log),
                 refresh_s      = cfg.dashboard.refresh_s,
+                live_trading   = cfg.exchange.live_trading,
+                dry_run        = cfg.exchange.dry_run,
+                stop_loss_pct  = cfg.backtest.stop_loss_pct,
+                take_profit_pct= cfg.backtest.take_profit_pct,
+                fees_paid      = getattr(executor, "fees_paid", 0.0),
             )
 
         time.sleep(cfg.exchange.loop_interval)
