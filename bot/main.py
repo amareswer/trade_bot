@@ -309,6 +309,56 @@ def run():
         # ── 3. Strategy signal ────────────────────────────────────────
         if is_indicator:
             if live_exchange is not None:
+                # ── Intra-candle SL/TP: runs on every 30s tick ────────────
+                # Must live here, before the candle-availability continue,
+                # otherwise SL/TP only fires at 4h closes.
+                if position_manager.has_position and position_manager.avg_entry > 0:
+                    _ic_entry = position_manager.avg_entry
+                    _ic_sl = (cfg.backtest.stop_loss_pct > 0
+                              and price <= _ic_entry * (1 - cfg.backtest.stop_loss_pct))
+                    _ic_tp = (cfg.backtest.take_profit_pct > 0
+                              and price >= _ic_entry * (1 + cfg.backtest.take_profit_pct))
+                    if _ic_sl or _ic_tp:
+                        if _ic_sl:
+                            logger.warning(
+                                "STOP LOSS triggered: price=%.2f entry=%.2f sl=%.1f%%",
+                                price, _ic_entry, cfg.backtest.stop_loss_pct * 100,
+                            )
+                            print(f"           \U0001f6d1 STOP LOSS   price={price:,.2f}  entry={_ic_entry:,.2f}", flush=True)
+                        else:
+                            logger.warning(
+                                "TAKE PROFIT triggered: price=%.2f entry=%.2f tp=%.1f%%",
+                                price, _ic_entry, cfg.backtest.take_profit_pct * 100,
+                            )
+                            print(f"           ✅ TAKE PROFIT  price={price:,.2f}  entry={_ic_entry:,.2f}", flush=True)
+                        _ic_qty      = executor.position
+                        _ic_approval = risk.evaluate(Signal.SELL, price, executor.portfolio, _ic_qty)
+                        if _ic_approval.approved:
+                            _ic_order = executor.execute(Signal.SELL, price, quantity=_ic_qty)
+                            if _ic_order and _ic_order.status == OrderStatus.FILLED:
+                                risk.record_fill()
+                                state_machine.on_fill(Signal.SELL, _ic_order.price)
+                                _ic_pnl = position_manager.on_sell(_ic_order.price, _ic_order.quantity)
+                                display.fill(
+                                    _ic_order.side.value, _ic_order.quantity,
+                                    cfg.exchange.symbol, _ic_order.price,
+                                    _ic_order.total_value, _ic_pnl,
+                                )
+                        else:
+                            logger.warning(
+                                "SL/TP SELL blocked by risk gate: %s", _ic_approval.message,
+                            )
+                        display.position_line(
+                            quantity       = position_manager.quantity,
+                            symbol         = cfg.exchange.symbol,
+                            avg_entry      = position_manager.avg_entry,
+                            unrealized_pnl = position_manager.unrealized_pnl(price),
+                            realized_pnl   = position_manager.realized_pnl,
+                            cash           = executor.cash,
+                        )
+                        time.sleep(cfg.exchange.loop_interval)
+                        continue
+
                 # Live mode: evaluate only when a new 4h candle has closed
                 candle, new_ts = _fetch_completed_candle(
                     live_exchange, last_candle_ts_ms, cfg.backtest.timeframe
@@ -342,7 +392,7 @@ def run():
                 print(f"           🛑 STOP LOSS   price={price:,.2f}  entry={_entry:,.2f}", flush=True)
             elif cfg.backtest.take_profit_pct > 0 and price >= _entry * (1 + cfg.backtest.take_profit_pct):
                 raw_signal = Signal.SELL
-                logger.info(
+                logger.warning(
                     "TAKE PROFIT triggered: price=%.2f entry=%.2f tp=%.1f%%",
                     price, _entry, cfg.backtest.take_profit_pct * 100,
                 )

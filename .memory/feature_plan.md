@@ -15,6 +15,21 @@ Running log of feature decisions. Most recent first.
 
 ---
 
+## 2026-06-11 — Intra-Candle SL/TP + Fee Logging (BUILT ✓)
+
+**Gap fixed:** Live loop's `continue` (on "no new candle") fired before step 3b, so SL/TP only ran at 4h closes. A new intra-candle block now runs on every 30s tick, before the candle-availability check. Full execution pipeline: `risk.evaluate → executor.execute → position_manager.on_sell → display.fill`. Approval tested via `_ic_approval.approved` (explicit, consistent with `ApprovalResult` field name even though `__bool__` also exists).
+
+**Live vs backtest SL/TP behaviour difference — note for live-vs-backtest comparison:**
+The backtest engine checks SL/TP against the candle CLOSE price only (once per 4h). The live loop checks against the Kraken spot ticker every 30 seconds. Consequence: live will exit slightly earlier and more sensitively than the backtest — if price dips below the stop intra-candle and recovers by close, live triggers the stop and backtest does not. This is intentional and safer (real capital is at risk). When comparing live win rate and PF against backtest numbers, expect live to show slightly more stop-loss exits and marginally lower win rate on the same signals. Not a bug; document when reconciling.
+
+**Fee logging added:** `logger.warning("Fee dict from exchange: %s", fee_data)` added in `live_executor.py` at fee extraction point. Next fill will log the raw ccxt fee structure from Kraken for inspection.
+
+**Fee finding:** Actual Kraken fee on first live fill was 0.80% (not 0.26% modelled). Most likely Kraken's BTC/CAD surcharge (CAD settlement adds ~0.54% on top of 0.26% taker). Backtest at 0.80% fee: PF 1.21 (signals intact) but net −4.99% — fees 3× gross profit. Strategy is not viable at 0.80%; maker orders (0.16%) or Binance (0.10%) required.
+
+**Files changed:** `bot/main.py` (intra-candle SL/TP block), `bot/execution/live_executor.py` (fee dict logging)
+
+---
+
 ## 2026-06-11 — Position-Size Drift Incident + Startup Guard (BUILT ✓)
 
 **Incident:** First live BUY was blocked. Risk manager reported `0.000113 BTC = 10.03% of portfolio` against `RISK_MAX_POSITION_PCT=10%`. Bot had been running but generating zero fills since launch.

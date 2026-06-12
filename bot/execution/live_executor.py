@@ -376,7 +376,9 @@ class LiveExecutor:
                 quantity = filled_qty
 
                 # Extract fee from the final polled response.
+                # Log the raw dict so the true fee structure is auditable.
                 fee_data     = last_raw.get("fee") or {}
+                logger.warning("Fee dict from exchange: %s", fee_data)
                 fee_cost     = float(fee_data.get("cost") or 0.0)
                 fee_currency = fee_data.get("currency") or quote
 
