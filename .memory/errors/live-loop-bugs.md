@@ -1,13 +1,15 @@
 ---
 name: live-loop-bugs
-description: "Three continue-path bugs and a logging misconfiguration found during Jun 10–12 live trading"
+description: "Five bugs found during Jun 10–12 live trading: continue-path issues, logging misconfiguration, restart state fragmentation"
 metadata:
   type: project
 ---
 
-All four bugs found and fixed 2026-06-10 to 2026-06-12 during the first live run.
+All five bugs found and fixed 2026-06-10 to 2026-06-12 during the first live run.
 
-**Why:** The main loop uses `continue` to skip candle evaluation when no new 4h candle is ready. Several critical checks were placed AFTER that `continue`, meaning they only ran at 4h closes rather than every 30s tick.
+**Why (bugs 1–2):** The main loop uses `continue` to skip candle evaluation when no new 4h candle is ready. Several critical checks were placed AFTER that `continue`, meaning they only ran at 4h closes rather than every 30s tick.
+
+**Pattern (bugs 1, 2, 5):** "Component A updated, downstream component B never informed." This has now appeared five times in this project. Any time a new component is wired in or state is persisted, explicitly audit every downstream consumer that reads that state.
 
 ---
 
@@ -61,3 +63,22 @@ Sticky vars initialized to `"HOLD"` / `None` / `None` before the loop. `_render_
 **Fix:** Rebuilt logging in `main.py`: `root_logger.setLevel(INFO)`, `console_handler.setLevel(WARNING)`, `file_handler.setLevel(INFO)`. Root at INFO, console stays clean, file captures everything. Also upgraded live-critical LiveExecutor events to WARNING (balance sync, state save/restore, fee deduction, order placement) so they survive even a misconfigured root level.
 
 **How to apply:** In any Python project, the root logger level is a gate — it must be ≤ the lowest handler level, or records are silently dropped before handlers see them.
+
+---
+
+## Bug 5: Restart recovery seeded LiveExecutor only — PositionManager and TradingStateMachine started fresh
+
+**Symptom:** After restart with an open position (0.000113 BTC @ $88,870), the 2026-06-12 08:00 candle close showed state machine IDLE and display "no open position". A duplicate BUY signal fired and was only blocked by the 15% position cap (the risk gate computed 19.08% — executor correctly knew about the position, but nothing else did). The open position had no functioning SL/TP and no exit path at all.
+
+**Root cause:** `LiveExecutor._load_state()` correctly restores position/cash/cost_basis from `logs/live_state.json` on startup. But `PositionManager` and `TradingStateMachine` are always created fresh in `run()` and were never seeded from executor state. Consequences:
+- `position_manager.has_position == False` → intra-candle SL/TP gate never fires
+- `state_machine.state == IDLE` → `filter_signal(SELL)` returns HOLD ("no active position to sell")
+- `state_machine.state == IDLE` → BUY signals pass the state machine filter, only stopped by risk position cap
+
+**Detected at:** 2026-06-12 08:00 UTC candle close. Position had been live and unprotected since the 2026-06-11 20:00 UTC restart, approximately 12 hours.
+
+**Fix:** Added `PositionManager.seed(quantity, avg_entry, realized_pnl)` and `TradingStateMachine.recover_long(entry_price)` — both set internal state without creating fake trade records. In `main.py run()`, after both objects are created, if `cfg.exchange.live_trading and executor.position > 1e-9`: call both seed methods, log WARNING, and print `POSITION RECOVERED` to terminal. Test added: `test_restart_recovery_seeds_position_manager_and_state_machine` asserts all three components consistent (executor.position == pm.quantity, state=LONG, history lists empty).
+
+**How to apply:** Any time LiveExecutor state is persisted and loaded on restart, audit every downstream consumer of that state. Current consumers that must be seeded: PositionManager (for P&L / SL/TP gate), TradingStateMachine (for signal filtering). Future consumers (e.g. RiskManager's peak tracking for max drawdown) may also need seeding.
+
+**Pattern note:** This is the fifth instance of "component A updated, downstream component B never informed" in this project. The pattern appears when components are added incrementally — each component works in isolation but state flow between them is only audited at integration time. Any new component that reads position/cash state must be explicitly seeded on restart.

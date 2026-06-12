@@ -39,6 +39,12 @@ See [[multi-symbol-validation]] for full results.
 **Backtest validation fingerprint:**
 `EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py` → ADX rejected = 513 (10.3%) confirms validated config. Trade count is 67 (not original 88) due to rolling 5000-candle window — expected.
 
+**Restart checklist — restart-with-position is only valid if ALL of the following appear:**
+1. `LIVE BALANCE: $XX.XX CAD | position: 0.000113 BTC | source: kraken fetch_balance` — confirms _sync_cash ran
+2. `POSITION RECOVERED: 0.000113 BTC @ $88,870.20 — state machine set to LONG` — confirms seeding ran; **if this line is absent, SL/TP and SELL exit are broken**
+3. Dashboard and terminal display show position (not "no open position") and state=LONG
+4. Balance line alone is insufficient — a missing POSITION RECOVERED line means PositionManager and/or TradingStateMachine were not seeded and the position is unprotected
+
 **Next steps:**
 1. Confirm fee-dict structure on next fill — determine if 0.80% is real CAD surcharge or extraction bug
 2. Investigate maker orders on Kraken as fee lever (limit orders → 0.16%)
