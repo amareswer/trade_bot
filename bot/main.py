@@ -293,6 +293,70 @@ def run():
     tick_log:   deque[dict] = deque(maxlen=200)
     candle_log: deque[dict] = deque(maxlen=50)
 
+    # Sticky indicator values — updated each candle close, displayed between closes
+    _dash_signal = "HOLD"
+    _dash_rsi    = None
+    _dash_trend  = None
+    _dash_filter = ""
+    _dash_block  = ""
+
+    def _render_dashboard(sig: str, rsi_v, trend_v) -> None:
+        """Write dashboard.html with current portfolio state.
+
+        Called on every 30s tick (no-candle path uses sticky values;
+        candle-close path uses fresh values). Wrapped in try/except so a
+        renderer bug logs a WARNING instead of crashing the bot.
+        """
+        if not cfg.dashboard.enabled:
+            return
+        fills_data = [
+            {
+                "time":  o.filled_at.astimezone().strftime("%H:%M:%S") if o.filled_at else "—",
+                "side":  o.side.value,
+                "qty":   o.quantity,
+                "price": o.price,
+                "total": o.total_value,
+                "pnl":   next(
+                    (r.pnl for r in reversed(position_manager.history)
+                     if r.action == o.side.value and abs(r.price - o.price) < 0.01),
+                    None,
+                ),
+            }
+            for o in executor.filled_orders()
+        ]
+        try:
+            _dashboard.write(
+                path            = _DASHBOARD_PATH,
+                exchange        = cfg.exchange.exchange,
+                symbol          = cfg.exchange.symbol,
+                strategy        = cfg.strategy.mode,
+                tick            = tick,
+                price           = price,
+                signal          = sig,
+                rsi             = rsi_v,
+                trend           = trend_v,
+                state           = state_machine.state.value,
+                cooldown        = state_machine.cooldown_remaining,
+                last_trade      = state_machine.last_trade_label,
+                cash            = executor.cash,
+                position        = position_manager.quantity,
+                avg_entry       = position_manager.avg_entry,
+                unrealized_pnl  = position_manager.unrealized_pnl(price),
+                realized_pnl    = position_manager.realized_pnl,
+                total_value     = executor.portfolio.total_value(price),
+                fills           = fills_data,
+                tick_log        = list(tick_log),
+                candle_log      = list(candle_log),
+                refresh_s       = cfg.dashboard.refresh_s,
+                live_trading    = cfg.exchange.live_trading,
+                dry_run         = cfg.exchange.dry_run,
+                stop_loss_pct   = cfg.backtest.stop_loss_pct,
+                take_profit_pct = cfg.backtest.take_profit_pct,
+                fees_paid       = getattr(executor, "fees_paid", 0.0),
+            )
+        except Exception as exc:
+            logger.warning("Dashboard render failed: %s", exc)
+
     while _running:
         tick += 1
 
@@ -357,6 +421,17 @@ def run():
                             realized_pnl   = position_manager.realized_pnl,
                             cash           = executor.cash,
                         )
+                        tick_log.append({
+                            "tick":   tick,
+                            "time":   datetime.now().strftime("%H:%M:%S"),
+                            "price":  price,
+                            "signal": "SELL",
+                            "rsi":    _dash_rsi,
+                            "trend":  _dash_trend,
+                            "state":  state_machine.state.value,
+                            "reason": "SL/TP exit",
+                        })
+                        _render_dashboard("SELL", _dash_rsi, _dash_trend)
                         time.sleep(cfg.exchange.loop_interval)
                         continue
 
@@ -367,6 +442,17 @@ def run():
                 if candle is None:
                     countdown = _candle_countdown(cfg.backtest.timeframe)
                     display.next_candle(price, tick, countdown)
+                    tick_log.append({
+                        "tick":   tick,
+                        "time":   datetime.now().strftime("%H:%M:%S"),
+                        "price":  price,
+                        "signal": _dash_signal,
+                        "rsi":    _dash_rsi,
+                        "trend":  _dash_trend,
+                        "state":  state_machine.state.value,
+                        "reason": _dash_filter or _dash_block,
+                    })
+                    _render_dashboard(_dash_signal, _dash_rsi, _dash_trend)
                     time.sleep(cfg.exchange.loop_interval)
                     continue
                 last_candle_ts_ms = new_ts
@@ -592,6 +678,12 @@ def run():
         )
 
         # ── 12. Tick log + dashboard ───────────────────────────────────
+        # Update stickies so the next no-candle tick renders fresh values.
+        _dash_signal = final_signal.value
+        _dash_rsi    = rsi_val
+        _dash_trend  = trend_val
+        _dash_filter = filter_reason
+        _dash_block  = block_reason
         tick_log.append({
             "tick":   tick,
             "time":   datetime.now().strftime("%H:%M:%S"),
@@ -602,52 +694,7 @@ def run():
             "state":  state_machine.state.value,
             "reason": filter_reason or block_reason,
         })
-
-        if cfg.dashboard.enabled:
-            fills_data = [
-                {
-                    "time":  o.filled_at.astimezone().strftime("%H:%M:%S") if o.filled_at else "—",
-                    "side":  o.side.value,
-                    "qty":   o.quantity,
-                    "price": o.price,
-                    "total": o.total_value,
-                    "pnl":   next(
-                        (r.pnl for r in reversed(position_manager.history)
-                         if r.action == o.side.value and abs(r.price - o.price) < 0.01),
-                        None,
-                    ),
-                }
-                for o in executor.filled_orders()
-            ]
-            _dashboard.write(
-                path           = _DASHBOARD_PATH,
-                exchange       = cfg.exchange.exchange,
-                symbol         = cfg.exchange.symbol,
-                strategy       = cfg.strategy.mode,
-                tick           = tick,
-                price          = price,
-                signal         = final_signal.value,
-                rsi            = rsi_val,
-                trend          = trend_val,
-                state          = state_machine.state.value,
-                cooldown       = state_machine.cooldown_remaining,
-                last_trade     = state_machine.last_trade_label,
-                cash           = executor.cash,
-                position       = position_manager.quantity,
-                avg_entry      = position_manager.avg_entry,
-                unrealized_pnl = position_manager.unrealized_pnl(price),
-                realized_pnl   = position_manager.realized_pnl,
-                total_value    = executor.portfolio.total_value(price),
-                fills          = fills_data,
-                tick_log       = list(tick_log),
-                candle_log     = list(candle_log),
-                refresh_s      = cfg.dashboard.refresh_s,
-                live_trading   = cfg.exchange.live_trading,
-                dry_run        = cfg.exchange.dry_run,
-                stop_loss_pct  = cfg.backtest.stop_loss_pct,
-                take_profit_pct= cfg.backtest.take_profit_pct,
-                fees_paid      = getattr(executor, "fees_paid", 0.0),
-            )
+        _render_dashboard(final_signal.value, rsi_val, trend_val)
 
         time.sleep(cfg.exchange.loop_interval)
 
