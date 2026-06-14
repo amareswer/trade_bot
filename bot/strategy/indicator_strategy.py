@@ -9,22 +9,31 @@ Signal logic:
   BUY  — BULLISH trend + EMA spread > min_ema_spread_pct
           + RSI rising (momentum confirms)
           + RSI not overbought
+          + price above regime EMA (bull regime confirmed)
+          + regime EMA slope rising (trend not rolling over)
   SELL — BEARISH trend + EMA spread > min_ema_spread_pct
           + RSI falling (momentum confirms)
           + RSI not oversold
-  HOLD — anything else (flat market, weak crossover, conflicting signals)
+  HOLD — anything else (flat market, weak crossover, conflicting signals,
+          bear regime detected, or regime EMA slope falling)
 
 Key additions:
   1. EMA separation filter  — ignore weak crossovers (noise)
   2. RSI direction filter   — only trade when RSI momentum agrees with trend
   3. RSI midline filter     — on BUY, RSI must be above 45 (not just "not overbought")
                               on SELL, RSI must be below 55 (not just "not oversold")
+  4. Regime EMA filter      — BUY only when price > regime_ema_period EMA
+                              (filters bear market entries)
+  5. Regime EMA slope filter — BUY only when EMA200 is rising (slope > 0 over 24h)
+                               prevents entries during dead-cat bounces
+                               (only active when regime_ema_slope_filter=True)
 """
 from __future__ import annotations
 
 import logging
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Optional
 
 from bot.strategy.threshold_strategy import Signal
 from bot.indicators.indicators import rsi as calc_rsi, trend as calc_trend, ema as calc_ema, adx as calc_adx
@@ -35,50 +44,59 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class IndicatorConfig:
-    rsi_period:          int   = 14
-    rsi_overbought:      float = 65.0
-    rsi_oversold:        float = 35.0
-    rsi_buy_min:         float = 45.0   # RSI must be ABOVE this to BUY  (momentum rising)
-    rsi_sell_max:        float = 55.0   # RSI must be BELOW this to SELL (momentum falling)
-    fast_ema_period:     int   = 9
-    slow_ema_period:     int   = 21
-    min_ema_spread_pct:  float = 0.002  # EMAs must be at least this far apart
-    max_ema_spread_pct:  float = 0.0    # EMAs must be no more than this far apart (0 = disabled)
-    adx_period:          int   = 14
-    adx_threshold:       float = 25.0   # < threshold = ranging market → HOLD (0 = disabled)
-    adx_max:             float = 0.0    # > max = overextended trend → HOLD (0 = disabled)
-    rsi_filter_enabled:  bool  = True   # set False to bypass RSI level/direction checks
+    rsi_period:               int   = 14
+    rsi_overbought:           float = 65.0
+    rsi_oversold:             float = 35.0
+    rsi_buy_min:              float = 45.0   # RSI must be ABOVE this to BUY  (momentum rising)
+    rsi_sell_max:             float = 55.0   # RSI must be BELOW this to SELL (momentum falling)
+    fast_ema_period:          int   = 9
+    slow_ema_period:          int   = 21
+    min_ema_spread_pct:       float = 0.002  # EMAs must be at least this far apart
+    max_ema_spread_pct:       float = 0.0    # EMAs must be no more than this far apart (0 = disabled)
+    adx_period:               int   = 14
+    adx_threshold:            float = 25.0   # < threshold = ranging market → HOLD (0 = disabled)
+    adx_max:                  float = 0.0    # > max = overextended trend → HOLD (0 = disabled)
+    rsi_filter_enabled:       bool  = True   # set False to bypass RSI level/direction checks
+    regime_ema_period:        int   = 200    # BUY only when price > this EMA (0 = disabled)
+    regime_ema_slope_filter:  bool  = False  # BUY only when EMA200 slope > 0 (rising)
 
 
 class IndicatorStrategy:
     """
-    Improved indicator strategy — EMA trend + RSI momentum + ADX regime filter.
+    Improved indicator strategy — EMA trend + RSI momentum + ADX regime filter
+    + long-period regime EMA filter to block bear market entries
+    + optional regime EMA slope filter to block dead-cat bounce entries.
     Interface: evaluate(candle: Candle) -> Signal
     """
 
-    def __init__(self, config: IndicatorConfig | None = None):
+    def __init__(self, config: Optional[IndicatorConfig] = None):
         self.config   = config or IndicatorConfig()
         self._warmup  = max(
             self.config.rsi_period + 1,
             self.config.slow_ema_period,
             2 * self.config.adx_period + 1,
+            self.config.regime_ema_period if self.config.regime_ema_period > 0 else 0,
         ) + 2   # +2 for RSI direction comparison
 
-        self._closes:     deque[float] = deque(maxlen=self._warmup + 50)
-        self._highs:      deque[float] = deque(maxlen=self._warmup + 50)
-        self._lows:       deque[float] = deque(maxlen=self._warmup + 50)
-        self._last_rsi:   float | None = None
-        self._last_trend: str   | None = None
-        self._last_adx:   float | None = None
-        self._prev_rsi:   float | None = None   # RSI one tick ago — for direction
+        # Deque sized to hold enough candles for all indicators including regime EMA
+        # +6 extra so slope comparison (6 candles = 24h) always has data
+        buf = max(self._warmup + 50, self.config.regime_ema_period + 16)
+        self._closes:     deque = deque(maxlen=buf)
+        self._highs:      deque = deque(maxlen=buf)
+        self._lows:       deque = deque(maxlen=buf)
+        self._last_rsi:   Optional[float] = None
+        self._last_trend: Optional[str]   = None
+        self._last_adx:   Optional[float] = None
+        self._prev_rsi:   Optional[float] = None   # RSI one tick ago — for direction
 
-        self.stats: dict[str, int] = {
+        self.stats: dict = {
             "candles_seen":    0,
             "warmup_rejected": 0,
             "adx_rejected":    0,
             "trend_rejected":  0,
             "ema_rejected":    0,
             "rsi_rejected":    0,
+            "regime_rejected": 0,
             "buy_signals":     0,
             "sell_signals":    0,
             "hold_signals":    0,
@@ -86,13 +104,16 @@ class IndicatorStrategy:
 
         logger.info(
             "IndicatorStrategy (improved) | RSI(%d) ob=%.0f os=%.0f buy_min=%.0f sell_max=%.0f"
-            " | EMA(%d/%d) min_spread=%.2f%% | ADX(%d) threshold=%.0f | warmup=%d",
+            " | EMA(%d/%d) min_spread=%.2f%% | ADX(%d) threshold=%.0f"
+            " | regime_ema=%d slope_filter=%s | warmup=%d",
             self.config.rsi_period,
             self.config.rsi_overbought, self.config.rsi_oversold,
             self.config.rsi_buy_min,    self.config.rsi_sell_max,
             self.config.fast_ema_period, self.config.slow_ema_period,
             self.config.min_ema_spread_pct * 100,
             self.config.adx_period, self.config.adx_threshold,
+            self.config.regime_ema_period,
+            self.config.regime_ema_slope_filter,
             self._warmup,
         )
 
@@ -127,7 +148,7 @@ class IndicatorStrategy:
             return Signal.HOLD
 
         # ── ADX market regime filter ──────────────────────────────────
-        adx_val: float | None = None
+        adx_val: Optional[float] = None
         if len(self._highs) >= 2 * self.config.adx_period + 1:
             adx_val = calc_adx(
                 list(self._highs), list(self._lows), closes,
@@ -141,6 +162,32 @@ class IndicatorStrategy:
         if self.config.adx_max > 0 and adx_val > self.config.adx_max:
             self.stats["adx_rejected"] += 1
             return Signal.HOLD   # overextended trend — skip
+
+        # ── Regime EMA filter (bull/bear macro filter) ────────────────
+        # Only allow BUY when price is above the long-period EMA.
+        # SELL signals are not filtered — always allow exits.
+        if self.config.regime_ema_period > 0:
+            regime_ema = calc_ema(closes, self.config.regime_ema_period)
+
+            if regime_ema is not None and price < regime_ema:
+                # Price is below regime EMA → bear regime → block BUY
+                if trend_val == "BULLISH":
+                    self.stats["regime_rejected"] += 1
+                    return Signal.HOLD
+
+            # ── Regime EMA slope filter (Project 2) ──────────────────
+            # Only enter when EMA200 is rising — prevents dead-cat bounce entries.
+            # Compares EMA200 now vs EMA200 24h ago (6 × 4h candles).
+            # Only active when regime_ema_slope_filter=True.
+            if (self.config.regime_ema_slope_filter
+                    and regime_ema is not None
+                    and trend_val == "BULLISH"
+                    and len(closes) >= self.config.regime_ema_period + 6):
+                regime_ema_prev = calc_ema(closes[:-6], self.config.regime_ema_period)
+                if regime_ema_prev is not None and regime_ema < regime_ema_prev:
+                    # EMA200 is still falling — regime not yet confirmed rising
+                    self.stats["regime_rejected"] += 1
+                    return Signal.HOLD
 
         # ── RSI direction (is momentum rising or falling?) ────────────
         rsi_rising  = self._last_rsi is not None and rsi_val > self._last_rsi
@@ -176,6 +223,7 @@ class IndicatorStrategy:
             else:
                 self.stats["buy_signals"] += 1
                 return Signal.BUY
+
         elif trend_val == "BEARISH":
             if not ema_strong:
                 self.stats["ema_rejected"] += 1
@@ -187,30 +235,31 @@ class IndicatorStrategy:
             else:
                 self.stats["sell_signals"] += 1
                 return Signal.SELL
+
         else:
             self.stats["trend_rejected"] += 1
 
         self.stats["hold_signals"] += 1
         return Signal.HOLD
 
-    # ── Read-only properties (same interface as original) ─────────────
+    # ── Read-only properties used by main.py / display ───────────────
 
     @property
-    def tick_count(self) -> int:
-        return len(self._closes)
+    def last_rsi(self) -> Optional[float]:
+        return self._last_rsi
+
+    @property
+    def last_trend(self) -> Optional[str]:
+        return self._last_trend
+
+    @property
+    def last_adx(self) -> Optional[float]:
+        return self._last_adx
 
     @property
     def is_warmed_up(self) -> bool:
         return len(self._closes) >= self._warmup
 
     @property
-    def last_rsi(self) -> float | None:
-        return self._last_rsi
-
-    @property
-    def last_trend(self) -> str | None:
-        return self._last_trend
-
-    @property
-    def last_adx(self) -> float | None:
-        return self._last_adx
+    def tick_count(self) -> int:
+        return len(self._closes)

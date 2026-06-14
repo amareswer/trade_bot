@@ -210,13 +210,18 @@ def build_feed():
 def build_strategy():
     if cfg.strategy.mode == "indicator":
         return IndicatorStrategy(IndicatorConfig(
-            rsi_period      = cfg.strategy.rsi_period,
-            rsi_oversold    = cfg.strategy.rsi_oversold,
-            rsi_overbought  = cfg.strategy.rsi_overbought,
-            fast_ema_period = cfg.strategy.fast_ema_period,
-            slow_ema_period = cfg.strategy.slow_ema_period,
-            adx_period      = cfg.strategy.adx_period,
-            adx_threshold   = cfg.strategy.adx_threshold,
+            rsi_period               = cfg.strategy.rsi_period,
+            rsi_oversold             = cfg.strategy.rsi_oversold,
+            rsi_overbought           = cfg.strategy.rsi_overbought,
+            fast_ema_period          = cfg.strategy.fast_ema_period,
+            slow_ema_period          = cfg.strategy.slow_ema_period,
+            adx_period               = cfg.strategy.adx_period,
+            adx_threshold            = cfg.strategy.adx_threshold,
+            adx_max                  = cfg.strategy.adx_max,
+            max_ema_spread_pct       = cfg.strategy.max_ema_spread_pct,
+            rsi_filter_enabled       = cfg.strategy.rsi_filter_enabled,
+            regime_ema_period        = cfg.strategy.regime_ema_period,
+            regime_ema_slope_filter  = cfg.strategy.regime_ema_slope_filter,
         ))
     return ThresholdStrategy(
         buy_threshold  = cfg.strategy.buy_threshold,

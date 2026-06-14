@@ -60,53 +60,58 @@ class BacktestResult:
 
 
 def run(
-    candles:              list[Candle],
-    symbol:               str,
-    timeframe:            str,
-    strategy_mode:        str   = "indicator",
-    starting_cash:        float = 10_000.0,
-    risk_per_trade_pct:   float = 0.01,    # dynamic sizing: % of cash per trade
-    fee_pct:              float = 0.001,
-    cooldown_ticks:       int   = 10,
+    candles:                  list[Candle],
+    symbol:                   str,
+    timeframe:                str,
+    strategy_mode:            str   = "indicator",
+    starting_cash:            float = 10_000.0,
+    risk_per_trade_pct:       float = 0.01,
+    fee_pct:                  float = 0.001,
+    cooldown_ticks:           int   = 10,
     # Indicator config
-    rsi_period:           int   = 14,
-    rsi_oversold:         float = 30.0,
-    rsi_overbought:       float = 70.0,
-    fast_ema_period:      int   = 9,
-    slow_ema_period:      int   = 21,
-    adx_period:           int   = 14,
-    adx_threshold:        float = 25.0,
-    adx_max:              float = 0.0,
-    max_ema_spread_pct:   float = 0.0,
-    rsi_filter_enabled:   bool  = True,
+    rsi_period:               int   = 14,
+    rsi_oversold:             float = 30.0,
+    rsi_overbought:           float = 70.0,
+    fast_ema_period:          int   = 9,
+    slow_ema_period:          int   = 21,
+    adx_period:               int   = 14,
+    adx_threshold:            float = 25.0,
+    adx_max:                  float = 0.0,
+    max_ema_spread_pct:       float = 0.0,
+    rsi_filter_enabled:       bool  = True,
     # Threshold config
-    buy_threshold:        float = 0.0,
-    sell_threshold:       float = 0.0,
+    buy_threshold:            float = 0.0,
+    sell_threshold:           float = 0.0,
     # Risk config
-    max_position_pct:     float = 0.05,
-    daily_loss_limit_pct: float = 0.02,
-    max_drawdown_pct:     float = 0.10,
-    max_trades_per_day:   int   = 5,
+    max_position_pct:         float = 0.05,
+    daily_loss_limit_pct:     float = 0.02,
+    max_drawdown_pct:         float = 0.10,
+    max_trades_per_day:       int   = 5,
     # Exit rules
-    stop_loss_pct:        float = 0.02,   # exit if price drops this % from entry (0 = disabled)
-    take_profit_pct:      float = 0.04,   # exit if price rises this % from entry (0 = disabled)
-    slippage_pct:         float = 0.0,    # per-side slippage as fraction (0.0005 = 0.05%)
+    stop_loss_pct:            float = 0.02,
+    take_profit_pct:          float = 0.04,
+    slippage_pct:             float = 0.0,
+    # Regime filter
+    regime_ema_period:        int   = 200,
+    regime_ema_slope_filter:  bool  = False,
 ) -> BacktestResult:
     """Run a full backtest and return the result."""
 
     # ── Build components (same as main.py) ───────────────────────────
     if strategy_mode == "indicator":
         strategy = IndicatorStrategy(IndicatorConfig(
-            rsi_period         = rsi_period,
-            rsi_oversold       = rsi_oversold,
-            rsi_overbought     = rsi_overbought,
-            fast_ema_period    = fast_ema_period,
-            slow_ema_period    = slow_ema_period,
-            adx_period         = adx_period,
-            adx_threshold      = adx_threshold,
-            adx_max            = adx_max,
-            max_ema_spread_pct = max_ema_spread_pct,
-            rsi_filter_enabled = rsi_filter_enabled,
+            rsi_period               = rsi_period,
+            rsi_oversold             = rsi_oversold,
+            rsi_overbought           = rsi_overbought,
+            fast_ema_period          = fast_ema_period,
+            slow_ema_period          = slow_ema_period,
+            adx_period               = adx_period,
+            adx_threshold            = adx_threshold,
+            adx_max                  = adx_max,
+            max_ema_spread_pct       = max_ema_spread_pct,
+            rsi_filter_enabled       = rsi_filter_enabled,
+            regime_ema_period        = regime_ema_period,
+            regime_ema_slope_filter  = regime_ema_slope_filter,
         ))
         is_indicator = True
     else:
@@ -126,11 +131,11 @@ def run(
     state_machine    = TradingStateMachine(cooldown_ticks=cooldown_ticks)
     position_manager = PositionManager()
 
-    equity_curve:    list[float]     = []
+    equity_curve:    list[float]      = []
     fills:           list[FillRecord] = []
     total_fees       = 0.0
     warmup_ticks     = 0
-    entry_price:     float = 0.0   # tracks BUY fill price for SL/TP
+    entry_price:     float = 0.0
     entry_snapshots: list[dict] = []
 
     # ── Main loop ─────────────────────────────────────────────────────
@@ -163,7 +168,6 @@ def run(
 
         filtered_signal, _ = state_machine.filter_signal(raw_signal)
 
-        # Dynamic sizing: BUY = % of cash; SELL = close full position
         if filtered_signal == Signal.SELL:
             trade_qty = executor.position
         else:
@@ -172,7 +176,6 @@ def run(
         approval = risk.evaluate(filtered_signal, price, executor.portfolio, trade_qty, candle.timestamp.date())
 
         if approval:
-            # Apply slippage: buys fill slightly higher, sells slightly lower
             if slippage_pct > 0:
                 if filtered_signal == Signal.BUY:
                     fill_at = (exit_price if filtered_signal == Signal.SELL else price) * (1 + slippage_pct)
@@ -193,13 +196,9 @@ def run(
                 if order.side == OrderSide.BUY:
                     position_manager.on_buy(order.price, order.quantity)
                     entry_price = order.price
-                    # Snapshot indicator state at entry for attribution analysis
-                    # Pull indicator values from strategy properties
-                    # which are guaranteed to be set after evaluate()
                     _adx  = strategy.last_adx   if is_indicator else None
                     _rsi  = strategy.last_rsi   if is_indicator else None
                     _trnd = strategy.last_trend if is_indicator else None
-                    # Recompute EMA values directly from closes list
                     from bot.indicators.indicators import ema as _ema
                     _closes_snap = list(strategy._closes)
                     _ema_fast = _ema(_closes_snap, strategy.config.fast_ema_period)

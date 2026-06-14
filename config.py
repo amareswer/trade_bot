@@ -89,19 +89,21 @@ class ExchangeConfig:
 
 @dataclass
 class StrategyConfig:
-    mode:            str   = "indicator"  # "indicator" | "threshold"
-    rsi_period:      int   = 14
-    rsi_oversold:    float = 30.0
-    rsi_overbought:  float = 70.0
-    fast_ema_period: int   = 9
-    slow_ema_period: int   = 21
-    buy_threshold:   float = 0.0
-    sell_threshold:  float = 0.0
-    adx_period:         int   = 14
-    adx_threshold:      float = 25.0  # < this = ranging market → HOLD
-    adx_max:            float = 0.0   # 0 = disabled; 30.0 = reject ADX > 30
-    max_ema_spread_pct: float = 0.0   # 0 = disabled; 0.005 = 0.5% ceiling
-    rsi_filter_enabled: bool  = True  # False = bypass RSI level/direction checks
+    mode:                    str   = "indicator"  # "indicator" | "threshold"
+    rsi_period:              int   = 14
+    rsi_oversold:            float = 30.0
+    rsi_overbought:          float = 70.0
+    fast_ema_period:         int   = 9
+    slow_ema_period:         int   = 21
+    buy_threshold:           float = 0.0
+    sell_threshold:          float = 0.0
+    adx_period:              int   = 14
+    adx_threshold:           float = 25.0  # < this = ranging market → HOLD
+    adx_max:                 float = 0.0   # 0 = disabled; 30.0 = reject ADX > 30
+    max_ema_spread_pct:      float = 0.0   # 0 = disabled; 0.005 = 0.5% ceiling
+    rsi_filter_enabled:      bool  = True  # False = bypass RSI level/direction checks
+    regime_ema_period:       int   = 200   # BUY only when price > this EMA (0 = disabled)
+    regime_ema_slope_filter: bool  = False # BUY only when EMA200 slope > 0 (rising)
 
     def __post_init__(self):
         if self.mode not in ("indicator", "threshold"):
@@ -118,6 +120,8 @@ class StrategyConfig:
             raise ValueError("ADX_THRESHOLD must be between 0 and 100")
         if self.max_ema_spread_pct < 0:
             raise ValueError("MAX_EMA_SPREAD_PCT must be >= 0")
+        if self.regime_ema_period < 0:
+            raise ValueError("REGIME_EMA_PERIOD must be >= 0 (0 = disabled)")
 
 
 @dataclass
@@ -241,10 +245,12 @@ class AppConfig:
         logger.info("CONFIG  exchange=%s  symbol=%s  feed=%s  candle=%dmin",
             self.exchange.exchange, self.exchange.symbol, self.exchange.feed_mode,
             self.exchange.candle_minutes)
-        logger.info("CONFIG  strategy=%s  RSI(%d) %g/%g  EMA(%d/%d)",
+        logger.info("CONFIG  strategy=%s  RSI(%d) %g/%g  EMA(%d/%d)  regime_ema=%d  slope=%s",
             self.strategy.mode, self.strategy.rsi_period,
             self.strategy.rsi_oversold, self.strategy.rsi_overbought,
-            self.strategy.fast_ema_period, self.strategy.slow_ema_period)
+            self.strategy.fast_ema_period, self.strategy.slow_ema_period,
+            self.strategy.regime_ema_period,
+            self.strategy.regime_ema_slope_filter)
         logger.info("CONFIG  risk  per_trade=%.0f%%  max_pos=%.0f%%  daily_loss=%.0f%%  max_dd=%.0f%%  max_trades=%d/day  cooldown=%d",
             self.risk.risk_per_trade_pct * 100,
             self.risk.max_position_pct * 100,
@@ -255,11 +261,6 @@ class AppConfig:
         logger.info("CONFIG  portfolio  starting_cash=$%.2f  AI=%s",
             self.portfolio.starting_cash, self.ai.enabled)
 
-        # Guard: calc_trade_qty rounds quantity to 6 decimal places. At BTC prices
-        # ~$85k–$95k that rounding can add up to $0.048 to the effective position
-        # value, pushing new_position_pct above max_position_pct even when the two
-        # limits appear equal. If max_position_pct is within 5% of risk_per_trade_pct,
-        # every BUY will be blocked. Operator fix: raise RISK_MAX_POSITION_PCT.
         if self.risk.max_position_pct <= self.risk.risk_per_trade_pct * 1.05:
             logger.warning(
                 "CONFIG WARNING: RISK_MAX_POSITION_PCT (%.0f%%) is within 5%% of "
@@ -294,19 +295,21 @@ def _load() -> AppConfig:
             api_secret     = _str ("KRAKEN_API_SECRET", ""),
         ),
         strategy=StrategyConfig(
-            mode            = _str  ("STRATEGY_MODE",    "indicator"),
-            rsi_period      = _int  ("RSI_PERIOD",       14),
-            rsi_oversold    = _float("RSI_OVERSOLD",     30.0),
-            rsi_overbought  = _float("RSI_OVERBOUGHT",   70.0),
-            fast_ema_period = _int  ("FAST_EMA_PERIOD",  9),
-            slow_ema_period = _int  ("SLOW_EMA_PERIOD",  21),
-            buy_threshold   = _float("BUY_THRESHOLD",    0.0),
-            sell_threshold  = _float("SELL_THRESHOLD",   0.0),
-            adx_period          = _int  ("ADX_PERIOD",          14),
-            adx_threshold       = _float("ADX_THRESHOLD",       25.0),
-            adx_max             = _float("ADX_MAX",             0.0),
-            max_ema_spread_pct  = _float("MAX_EMA_SPREAD_PCT",  0.0),
-            rsi_filter_enabled  = _bool ("RSI_FILTER_ENABLED",  True),
+            mode                    = _str  ("STRATEGY_MODE",           "indicator"),
+            rsi_period              = _int  ("RSI_PERIOD",              14),
+            rsi_oversold            = _float("RSI_OVERSOLD",            30.0),
+            rsi_overbought          = _float("RSI_OVERBOUGHT",          70.0),
+            fast_ema_period         = _int  ("FAST_EMA_PERIOD",         9),
+            slow_ema_period         = _int  ("SLOW_EMA_PERIOD",         21),
+            buy_threshold           = _float("BUY_THRESHOLD",           0.0),
+            sell_threshold          = _float("SELL_THRESHOLD",          0.0),
+            adx_period              = _int  ("ADX_PERIOD",              14),
+            adx_threshold           = _float("ADX_THRESHOLD",           25.0),
+            adx_max                 = _float("ADX_MAX",                 0.0),
+            max_ema_spread_pct      = _float("MAX_EMA_SPREAD_PCT",      0.0),
+            rsi_filter_enabled      = _bool ("RSI_FILTER_ENABLED",      True),
+            regime_ema_period       = _int  ("REGIME_EMA_PERIOD",       200),
+            regime_ema_slope_filter = _bool ("REGIME_EMA_SLOPE_FILTER", False),
         ),
         risk=RiskConfig(
             risk_per_trade_pct   = _float("RISK_PER_TRADE_PCT",    0.01),

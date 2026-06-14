@@ -6,6 +6,15 @@ To change settings, edit .env or config.py.
 
 Run:
     python backtest.py
+
+Date filtering (for regime testing):
+    Set BEFORE_DATE and/or AFTER_DATE below to slice candles by date.
+    Both default to None (full dataset).
+
+    Old half (Mar 2024 → Apr 2025):  BEFORE_DATE = "2025-04-23", AFTER_DATE = None
+    New half (Apr 2025 → Jun 2026):  BEFORE_DATE = None,         AFTER_DATE = "2025-04-23"
+    Bear stress test (Nov 2021–May 2023): BEFORE_DATE = "2023-06-01", AFTER_DATE = None
+    Full dataset:                     BEFORE_DATE = None,         AFTER_DATE = None
 """
 import logging
 logging.basicConfig(level=logging.WARNING)
@@ -14,6 +23,12 @@ from config import cfg
 from bot.data.historical_feed import fetch_candles_paginated
 from bot.backtest import engine, metrics as metrics_mod, report
 from bot.backtest.attribution import compute_attribution, print_attribution, save_attribution_csv
+
+# ── Date filter for regime testing ────────────────────────────────────────────
+# Set to "YYYY-MM-DD" to slice candles, or None to use full dataset.
+BEFORE_DATE = None   # keep candles BEFORE this date (old half / bear test)
+AFTER_DATE  = None   # keep candles FROM this date onward (recent half)
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def main():
@@ -35,35 +50,54 @@ def main():
         f"  ({candles[0].timestamp.strftime('%Y-%m-%d')}"
         f" → {candles[-1].timestamp.strftime('%Y-%m-%d')})"
     )
+
+    # ── Apply date filter if set ──────────────────────────────────────────────
+    if BEFORE_DATE:
+        candles = [c for c in candles if c.timestamp.strftime('%Y-%m-%d') < BEFORE_DATE]
+        print(f"  Date filter: keeping candles BEFORE {BEFORE_DATE} → {len(candles)} candles remain")
+    if AFTER_DATE:
+        candles = [c for c in candles if c.timestamp.strftime('%Y-%m-%d') >= AFTER_DATE]
+        print(f"  Date filter: keeping candles FROM {AFTER_DATE} → {len(candles)} candles remain")
+
+    if not candles:
+        print(f"\n  ERROR: no candles remain after date filter. Check BEFORE_DATE / AFTER_DATE.\n")
+        return
+
+    print(
+        f"  Running on: {candles[0].timestamp.strftime('%Y-%m-%d')}"
+        f" → {candles[-1].timestamp.strftime('%Y-%m-%d')}\n"
+    )
     print(f"  Running backtest …\n")
 
     result = engine.run(
-        candles               = candles,
-        symbol                = cfg.exchange.symbol,
-        timeframe             = cfg.backtest.timeframe,
-        strategy_mode         = cfg.strategy.mode,
-        starting_cash         = cfg.portfolio.starting_cash,
-        risk_per_trade_pct    = cfg.risk.risk_per_trade_pct,
-        fee_pct               = cfg.backtest.fee_pct,
-        cooldown_ticks        = cfg.risk.cooldown_ticks,
-        rsi_period            = cfg.strategy.rsi_period,
-        rsi_oversold          = cfg.strategy.rsi_oversold,
-        rsi_overbought        = cfg.strategy.rsi_overbought,
-        fast_ema_period       = cfg.strategy.fast_ema_period,
-        slow_ema_period       = cfg.strategy.slow_ema_period,
-        adx_period            = cfg.strategy.adx_period,
-        adx_threshold         = cfg.strategy.adx_threshold,
-        adx_max               = cfg.strategy.adx_max,
-        max_ema_spread_pct    = cfg.strategy.max_ema_spread_pct,
-        rsi_filter_enabled    = cfg.strategy.rsi_filter_enabled,
-        buy_threshold         = cfg.strategy.buy_threshold,
-        sell_threshold        = cfg.strategy.sell_threshold,
-        max_position_pct      = cfg.risk.max_position_pct,
-        daily_loss_limit_pct  = cfg.risk.daily_loss_limit_pct,
-        max_drawdown_pct      = cfg.risk.max_drawdown_pct,
-        max_trades_per_day    = cfg.risk.max_trades_per_day,
-        stop_loss_pct         = cfg.backtest.stop_loss_pct,
-        take_profit_pct       = cfg.backtest.take_profit_pct,
+        candles                 = candles,
+        symbol                  = cfg.exchange.symbol,
+        timeframe               = cfg.backtest.timeframe,
+        strategy_mode           = cfg.strategy.mode,
+        starting_cash           = cfg.portfolio.starting_cash,
+        risk_per_trade_pct      = cfg.risk.risk_per_trade_pct,
+        fee_pct                 = cfg.backtest.fee_pct,
+        cooldown_ticks          = cfg.risk.cooldown_ticks,
+        rsi_period              = cfg.strategy.rsi_period,
+        rsi_oversold            = cfg.strategy.rsi_oversold,
+        rsi_overbought          = cfg.strategy.rsi_overbought,
+        fast_ema_period         = cfg.strategy.fast_ema_period,
+        slow_ema_period         = cfg.strategy.slow_ema_period,
+        adx_period              = cfg.strategy.adx_period,
+        adx_threshold           = cfg.strategy.adx_threshold,
+        adx_max                 = cfg.strategy.adx_max,
+        max_ema_spread_pct      = cfg.strategy.max_ema_spread_pct,
+        rsi_filter_enabled      = cfg.strategy.rsi_filter_enabled,
+        buy_threshold           = cfg.strategy.buy_threshold,
+        sell_threshold          = cfg.strategy.sell_threshold,
+        max_position_pct        = cfg.risk.max_position_pct,
+        daily_loss_limit_pct    = cfg.risk.daily_loss_limit_pct,
+        max_drawdown_pct        = cfg.risk.max_drawdown_pct,
+        max_trades_per_day      = cfg.risk.max_trades_per_day,
+        stop_loss_pct           = cfg.backtest.stop_loss_pct,
+        take_profit_pct         = cfg.backtest.take_profit_pct,
+        regime_ema_period       = cfg.strategy.regime_ema_period,
+        regime_ema_slope_filter = cfg.strategy.regime_ema_slope_filter,
     )
 
     m = metrics_mod.compute(result)
@@ -83,14 +117,16 @@ def main():
         print(f"  Warmup (skipped)          {rs.get('warmup_rejected', 0):>6}")
         print(f"  Tradeable candles         {tradeable:>6}")
         print(f"  ─────────────────────────────────────────")
-        adx_n   = rs.get("adx_rejected", 0)
-        trend_n = rs.get("trend_rejected", 0)
-        ema_n   = rs.get("ema_rejected", 0)
-        rsi_n   = rs.get("rsi_rejected", 0)
+        adx_n    = rs.get("adx_rejected", 0)
+        trend_n  = rs.get("trend_rejected", 0)
+        ema_n    = rs.get("ema_rejected", 0)
+        rsi_n    = rs.get("rsi_rejected", 0)
+        regime_n = rs.get("regime_rejected", 0)
         print(f"  ADX rejected              {adx_n:>6}{pct(adx_n)}")
         print(f"  Trend rejected (NEUTRAL)  {trend_n:>6}{pct(trend_n)}")
         print(f"  EMA spread rejected       {ema_n:>6}{pct(ema_n)}")
         print(f"  RSI rejected              {rsi_n:>6}{pct(rsi_n)}")
+        print(f"  Regime EMA rejected       {regime_n:>6}{pct(regime_n)}")
         print(f"  ─────────────────────────────────────────")
         buy_n  = rs.get("buy_signals", 0)
         sell_n = rs.get("sell_signals", 0)
@@ -101,7 +137,7 @@ def main():
     csv_path = report.save_csv(result)
     print(f"  Saved → {csv_path}\n")
 
-    # ── Trade attribution analysis ────────────────────────────────
+    # ── Trade attribution analysis ────────────────────────────────────────────
     if result.fills:
         attr_report = compute_attribution(result)
         print_attribution(attr_report)
