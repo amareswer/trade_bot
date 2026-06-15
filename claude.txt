@@ -1,0 +1,1598 @@
+PROJECT TITLE:
+AI-Powered Hybrid Crypto Trading System (Kraken, Automated, Production-Ready)
+
+---
+
+MISSION:
+
+Build a robust, safe, and scalable crypto trading system that:
+
+1. Uses a hybrid strategy (long-term + automated trading)
+2. Operates 24/7 without constant human monitoring
+3. Protects capital as top priority
+4. Uses AI-assisted decision-making (not blind automation)
+5. Integrates with Kraken using secure API access
+6. Includes full risk management and fail-safe controls
+7. Can be extended in future (multi-coin, dashboard, alerts)
+
+---
+
+CORE STRATEGY:
+
+Use "Core + Trading" model.
+
+LONG-TERM CORE:
+- 60–70% of capital
+- Assets: BTC, ETH only
+- Strategy: Buy and hold
+- No frequent trading
+- Reviewed weekly
+
+TRADING PORTION:
+- 30–40% of capital
+- Automated short-term trades
+- Uses technical indicators + rule-based AI
+
+---
+
+CRITICAL SUCCESS RULES (MUST IMPLEMENT):
+
+1. NEVER trade entire portfolio
+2. ALWAYS enforce stop-loss
+3. MAX risk per trade = 1–2% of total capital
+4. STOP trading after 3 consecutive losses
+5. MAX daily loss = 5%
+6. DO NOT allow more than 3 open trades at once
+7. DO NOT trade during extreme volatility spikes
+8. ALWAYS log every decision (debug + analysis)
+
+---
+
+TECH STACK:
+
+Language:
+- Python 3.11+
+
+Libraries:
+- ccxt (Kraken API)
+- pandas
+- numpy
+- ta (technical indicators)
+- scikit-learn (optional AI model)
+- apscheduler (task scheduling)
+- logging
+- dotenv
+
+Optional:
+- fastapi (API layer)
+- streamlit (dashboard)
+- redis (state management)
+
+---
+
+EXCHANGE CONFIGURATION:
+
+Use Kraken via ccxt:
+
+- Enable rate limiting
+- Handle retry logic
+- Validate symbols before trading
+
+Example:
+- BTC/USD
+- ETH/USD
+
+---
+
+API SECURITY RULES:
+
+- API key must NOT have withdrawal permissions
+- Store keys in .env file
+- Never hardcode secrets
+- Validate balance before every trade
+
+---
+
+SYSTEM MODULES:
+
+1. DATA INGESTION
+- Fetch OHLCV data (1m, 5m, 15m, 1h)
+- Update continuously
+- Handle API failures gracefully
+
+---
+
+2. INDICATORS ENGINE
+
+Implement:
+- RSI (14)
+- Moving Averages (50, 200)
+- MACD
+- Volume spike detection
+
+---
+
+3. STRATEGY ENGINE
+
+BUY SIGNAL:
+- RSI < 30
+- Price above 200 MA
+- Volume increasing
+
+SELL SIGNAL:
+- Profit >= 5%
+OR
+- RSI > 70
+OR
+- Stop-loss (-3%)
+
+---
+
+4. AI COMPONENT (IMPORTANT SIMPLICITY RULE)
+
+Use AI ONLY as assistant, NOT full controller.
+
+Option A (default):
+- Rule-based decisions
+
+Option B (optional ML):
+- Predict short-term direction
+- Features:
+  - RSI
+  - price momentum
+  - volume
+
+AI MUST NOT override risk rules.
+
+---
+
+5. PORTFOLIO MANAGER
+
+- Split capital:
+    core_portion = 0.7
+    trading_portion = 0.3
+
+- Core:
+    BTC, ETH buy & hold
+
+- Trading:
+    Used by bot
+
+---
+
+6. EXECUTION ENGINE
+
+- Place market and limit orders
+- Validate:
+    - sufficient balance
+    - price accuracy
+
+- Handle:
+    - API errors
+    - timeouts
+    - retries
+
+---
+
+7. RISK MANAGEMENT ENGINE (CRITICAL)
+
+Implement:
+
+- Max trade size = 10% of trading capital
+- Stop-loss = 2–3%
+- Take profit = 4–6%
+- Max daily loss cap = 5%
+- Max 3 open trades
+
+CIRCUIT BREAKER:
+- Stop trading if:
+    - 3 consecutive losses
+    OR
+    - daily loss exceeded
+
+---
+
+8. SCHEDULER
+
+Run loop every 1–5 minutes:
+
+- fetch data
+- calculate indicators
+- evaluate signals
+- check risk
+- execute trade
+- log output
+
+---
+
+9. LOGGING SYSTEM
+
+Log:
+- signals
+- trades
+- profits/losses
+- API responses
+- errors
+
+Format:
+- JSON logs
+- CSV trade history
+
+---
+
+10. PAPER TRADING MODE (MANDATORY)
+
+- Simulate trades without real money
+- Toggle using config:
+    PAPER_TRADING = True
+
+---
+
+11. BACKTESTING MODULE
+
+- Run strategy on historical data
+- Output:
+    - total return
+    - drawdown
+    - win rate
+    - Sharpe ratio
+
+---
+
+12. CONFIGURATION (.env)
+
+API_KEY=your_key
+API_SECRET=your_secret
+PAPER_TRADING=True
+MAX_RISK=0.02
+STOP_LOSS=0.03
+TAKE_PROFIT=0.05
+
+---
+
+PROJECT STRUCTURE:
+
+/project
+  /core
+  /strategies
+  /data
+  /logs
+  config.py
+  main.py
+  bot.py
+  indicators.py
+  strategy.py
+  risk.py
+  execution.py
+  ai_model.py
+  backtest.py
+
+---
+
+MAIN LOOP:
+
+while True:
+    get_market_data()
+    calculate_indicators()
+    generate_signal()
+    validate_risk()
+    execute_trade()
+    log_results()
+    sleep(interval)
+
+---
+
+FAIL-SAFE FEATURES:
+
+- No trade if API fails
+- No trade if data invalid
+- Stop if repeated errors
+- Auto-disable on high loss
+
+---
+
+OPTIONAL ENHANCEMENTS:
+
+- Telegram alerts
+- Web dashboard
+- Multi-coin trading
+- Sentiment analysis
+- Auto-rebalancing
+
+---
+
+DEPLOYMENT PLAN:
+
+- Run on VPS (AWS/Ubuntu)
+- Use supervisor or systemd
+- Ensure 24/7 uptime
+- Add monitoring
+
+---
+
+TESTING PLAN:
+
+Phase 1:
+- Paper trading (1 week)
+
+Phase 2:
+- Small capital ($50–$100)
+
+Phase 3:
+- Gradual scaling
+
+---
+
+SUCCESS PRINCIPLES:
+
+- Protect capital first
+- Keep strategy simple
+- Avoid overtrading
+- Improve gradually
+- Monitor performance weekly
+
+---
+
+FINAL GOAL:
+
+Deliver a stable, automated crypto trading system that:
+- runs without supervision
+- minimizes losses
+- captures consistent gains over time
+- can scale safely
+
+---
+
+END OF SPEC
+
+AI MODULE (CRITICAL COMPONENT)
+
+OBJECTIVE:
+Use AI to improve trade decisions by predicting short-term market direction and filtering bad trades.
+
+---
+
+AI DESIGN PRINCIPLES:
+
+1. AI is an assistant, NOT the controller
+2. AI must NOT override risk management
+3. AI must improve probability, not guarantee outcomes
+4. Keep model simple, fast, and explainable
+
+---
+
+AI TASKS:
+
+1. Predict short-term price direction (next 5–30 minutes)
+2. Filter weak signals from strategy engine
+3. Improve trade entry timing
+
+---
+
+MODEL TYPE:
+
+Use lightweight ML model:
+
+Option A (default):
+- Logistic Regression (fast, stable)
+
+Option B:
+- Random Forest (better accuracy)
+
+OPTIONAL (advanced):
+- LSTM (time-series deep learning) → only if needed
+
+---
+
+FEATURE ENGINEERING:
+
+For each candle, generate features:
+
+- RSI value
+- MACD signal
+- Price change (%)
+- Volume change (%)
+- MA50 vs MA200 difference
+- Momentum (last 3 candles)
+- Volatility
+
+Example feature vector:
+[X] = [
+    rsi,
+    macd,
+    price_change,
+    volume_change,
+    ma_diff,
+    momentum,
+    volatility
+]
+
+---
+
+LABELS (TRAINING TARGET):
+
+Binary classification:
+
+- 1 → price goes UP in next N candles
+- 0 → price goes DOWN
+
+---
+
+TRAINING PROCESS:
+
+1. Load historical OHLCV data
+2. Generate indicators
+3. Build feature dataset
+4. Train model
+5. Validate accuracy (~55–65% is realistic)
+
+---
+
+INFERENCE (LIVE TRADING):
+
+For each new candle:
+
+1. Compute features
+2. Run AI model:
+   prediction = model.predict(features)
+
+3. Output:
+   - BUY CONFIDENCE
+   - SELL CONFIDENCE
+
+---
+
+AI + STRATEGY INTEGRATION:
+
+Final decision logic:
+
+IF (strategy_signal == BUY) AND (AI predicts UP):
+    execute trade
+
+IF (strategy_signal == SELL) AND (AI predicts DOWN):
+    execute trade
+
+ELSE:
+    SKIP TRADE
+
+---
+
+CONFIDENCE FILTER (IMPORTANT):
+
+Only trade if:
+
+AI probability > 60%
+
+Example:
+- AI says 0.62 → execute
+- AI says 0.51 → skip
+
+---
+
+MODEL RETRAINING:
+
+- Retrain model every 24 hours
+- Use latest market data
+- Save model to disk
+
+---
+
+FAIL-SAFE RULE:
+
+If AI model fails:
+- fallback to rule-based strategy ONLY
+
+---
+
+PERFORMANCE TRACKING:
+
+Track:
+- AI vs non-AI trade success
+- Accuracy over time
+- Profit contribution from AI
+
+---
+
+FILES:
+
+ai_model.py:
+- train_model()
+- predict_signal()
+- load_model()
+- save_model()
+
+---
+
+GOAL:
+
+AI must:
+- reduce bad trades
+- improve entry timing
+- increase win rate slightly (~5–10%)
+
+NOT:
+- overcomplicate system
+- add instability
+
+MULTI-CURRENCY SUPPORT
+
+OBJECTIVE:
+Enable system to trade multiple crypto pairs efficiently while maintaining risk control.
+
+---
+
+SUPPORTED PAIRS:
+
+Start with:
+- BTC/USD
+- ETH/USD
+
+Scale to:
+- SOL/USD
+- ADA/USD
+- LINK/USD
+
+---
+
+ARCHITECTURE:
+
+System must loop through each symbol:
+
+for symbol in trading_pairs:
+    process_data(symbol)
+    calculate_indicators(symbol)
+    generate_signal(symbol)
+    validate_risk(symbol)
+    execute_trade(symbol)
+
+---
+
+CAPITAL ALLOCATION:
+
+Total capital split:
+
+- 70% → long-term (BTC, ETH)
+- 30% → trading pool
+
+Trading pool split across pairs:
+
+Example:
+- BTC: 40%
+- ETH: 30%
+- SOL: 20%
+- ADA: 10%
+
+---
+
+TRADE LIMITS:
+
+- Max 1 open trade per pair
+- Max 3–5 total trades at once
+
+---
+
+AI MODEL ADJUSTMENT:
+
+- Model must handle multi-symbol input
+OR
+- Train separate models per symbol
+
+(RECOMMENDED: start with one model per symbol)
+
+---
+
+RISK RULES (CRITICAL):
+
+- Risk per trade must remain <= 2%
+- Total exposure must never exceed trading capital
+- Reduce position size when multiple trades active
+
+---
+
+PERFORMANCE TRACKING:
+
+Track per symbol:
+- win rate
+- profit/loss
+- drawdown
+
+---
+
+FAIL-SAFE:
+
+If one asset performs poorly:
+- reduce allocation
+- or disable trading for that asset
+
+---
+
+GOAL:
+
+Maximize opportunity while controlling risk across multiple assets.
+
+
+
+PROJECT TITLE:
+AI-Powered Multi-Currency Crypto Trading System (Kraken, Hybrid, Automated, Production-Ready)
+
+---
+
+MISSION:
+
+Build a robust, scalable, and safe AI-assisted crypto trading system that:
+
+- Runs 24/7 without manual monitoring
+- Uses hybrid strategy (long-term + trading)
+- Works with Kraken API
+- Uses AI for decision improvement (not blind automation)
+- Supports multiple currencies
+- Enforces strict risk management
+- Minimizes losses and ensures long-term stability
+
+---
+
+CORE STRATEGY:
+
+HYBRID MODEL:
+
+1. LONG-TERM CORE (70%)
+- BTC, ETH only
+- Buy & hold
+- No automated trading
+- Weekly review
+
+2. TRADING PORTION (30%)
+- Active trading
+- Multi-currency
+- AI-assisted signals
+- Fully automated
+
+---
+
+CRITICAL SUCCESS RULES (NON-NEGOTIABLE):
+
+1. NEVER risk more than 2% per trade
+2. ALWAYS use stop-loss
+3. NEVER trade entire capital
+4. MAX 3–5 open trades total
+5. STOP after 3 consecutive losses
+6. MAX daily loss = 5%
+7. DO NOT trade during extreme volatility spikes
+8. ALWAYS log every decision
+9. NEVER override risk rules with AI
+10. SIMPLICITY over complexity
+
+---
+
+TECH STACK:
+
+Python 3.11+
+
+Libraries:
+- ccxt (Kraken API)
+- pandas
+- numpy
+- ta
+- scikit-learn
+- apscheduler
+- logging
+- dotenv
+
+Optional:
+- fastapi
+- streamlit
+- redis
+
+---
+
+EXCHANGE CONFIGURATION:
+
+Exchange: Kraken
+
+Requirements:
+- Enable rate limiting
+- Handle retries
+- Validate symbols
+
+Symbols:
+- BTC/USD
+- ETH/USD
+- SOL/USD
+- ADA/USD
+- LINK/USD
+
+---
+
+API SECURITY:
+
+- NO withdrawal permission
+- Store keys in .env
+- Validate balance before trading
+
+---
+
+SYSTEM ARCHITECTURE:
+
+For each symbol:
+
+for symbol in trading_pairs:
+    fetch_data(symbol)
+    calculate_indicators(symbol)
+    generate_strategy_signal(symbol)
+    run_ai_model(symbol)
+    validate_risk(symbol)
+    execute_trade(symbol)
+
+---
+
+MULTI-CURRENCY MANAGEMENT:
+
+Start:
+- BTC/USD
+- ETH/USD
+
+Scale later:
+- SOL/USD
+- ADA/USD
+- LINK/USD
+
+Capital Allocation (Trading Pool):
+
+- BTC: 40%
+- ETH: 30%
+- SOL: 20%
+- ADA: 10%
+
+Rules:
+- Max 1 trade per pair
+- Max 5 total trades
+- Adjust allocation dynamically
+
+---
+
+INDICATORS ENGINE:
+
+- RSI (14)
+- MA50, MA200
+- MACD
+- Volume spikes
+- Volatility
+
+---
+
+STRATEGY ENGINE:
+
+BUY:
+- RSI < 30
+- Price above MA200
+- Volume increasing
+
+SELL:
+- Profit ≥ 5%
+OR
+- RSI > 70
+OR
+- Stop-loss (-3%)
+
+---
+
+AI MODULE:
+
+OBJECTIVE:
+Improve trade accuracy and filter bad signals
+
+---
+
+MODEL:
+
+Default:
+- Logistic Regression
+
+Optional:
+- Random Forest
+
+---
+
+FEATURES:
+
+- RSI
+- MACD
+- Price change %
+- Volume change %
+- MA difference
+- Momentum
+- Volatility
+
+---
+
+LABEL:
+
+- 1 = price goes up
+- 0 = price goes down
+
+---
+
+AI DECISION:
+
+IF strategy == BUY AND AI predicts UP:
+    ALLOW TRADE
+
+IF strategy == SELL AND AI predicts DOWN:
+    ALLOW TRADE
+
+ELSE:
+    SKIP
+
+---
+
+CONFIDENCE FILTER:
+
+Only trade if:
+
+AI probability > 0.60
+
+---
+
+RETRAINING:
+
+- Every 24 hours
+- Use latest market data
+
+---
+
+FAILBACK:
+
+If AI fails:
+→ fallback to rule-based system
+
+---
+
+RISK MANAGEMENT ENGINE:
+
+- Max risk per trade: 2%
+- Stop-loss: 2–3%
+- Take profit: 4–6%
+- Max daily loss: 5%
+- Max open trades: 5
+
+CIRCUIT BREAKER:
+
+Stop trading if:
+- 3 consecutive losses
+- Daily loss exceeded
+
+---
+
+EXECUTION ENGINE:
+
+- Use ccxt Kraken
+- Support:
+  - market orders
+  - limit orders
+
+- Handle:
+  - API failures
+  - retries
+  - slippage
+
+---
+
+SCHEDULER:
+
+Run every 1–5 minutes:
+
+- Fetch data
+- Compute indicators
+- AI prediction
+- Risk validation
+- Execute trade
+- Log everything
+
+---
+
+LOGGING:
+
+Log:
+- signals
+- trades
+- PnL
+- errors
+
+Format:
+- JSON logs
+- CSV trades
+
+---
+
+PAPER TRADING MODE:
+
+Mandatory:
+
+PAPER_TRADING = True
+
+- Simulate trades
+- No real money
+
+---
+
+BACKTESTING:
+
+- Historical simulation
+- Output:
+  - profit
+  - drawdown
+  - win rate
+  - Sharpe ratio
+
+---
+
+CONFIGURATION (.env):
+
+API_KEY=xxx
+API_SECRET=xxx
+PAPER_TRADING=True
+MAX_RISK=0.02
+STOP_LOSS=0.03
+TAKE_PROFIT=0.05
+
+---
+
+PROJECT STRUCTURE:
+
+/project
+  /core
+  /strategies
+  /data
+  /logs
+  config.py
+  main.py
+  bot.py
+  indicators.py
+  strategy.py
+  ai_model.py
+  risk.py
+  execution.py
+  backtest.py
+
+---
+
+MAIN LOOP:
+
+while True:
+    for symbol in symbols:
+        process(symbol)
+    sleep(interval)
+
+---
+
+FAIL-SAFE:
+
+- No trade on API failure
+- No trade on bad data
+- Stop on repeated errors
+- Auto-disable on losses
+
+---
+
+BEST PRACTICES (VERY IMPORTANT):
+
+1. Start with 1–2 coins only
+2. Run paper trading for at least 7 days
+3. Use small capital initially
+4. Monitor logs daily
+5. Avoid overtrading
+6. Do NOT tweak strategy daily
+7. Focus on consistency, not quick profit
+8. Always assume model can fail
+9. Review performance weekly
+10. Gradually scale after proof
+
+---
+
+REAL-WORLD TRADING PRINCIPLES:
+
+- Capital protection > profit
+- Small consistent gains win long-term
+- Losses are normal — control them
+- Discipline beats intelligence
+- Simpler systems perform better
+
+---
+
+DEPLOYMENT:
+
+- VPS (AWS / Ubuntu)
+- Use systemd or supervisor
+- Ensure 24/7 uptime
+- Add monitoring
+
+---
+
+TESTING PLAN:
+
+Phase 1:
+- Paper trading (7–14 days)
+
+Phase 2:
+- Small capital ($50–$100)
+
+Phase 3:
+- Gradual scaling
+
+---
+
+FINAL GOAL:
+
+A fully automated, AI-assisted trading system that:
+
+- Runs continuously
+- Uses multi-currency opportunities
+- Protects capital above all
+- Generates consistent returns over time
+- Requires minimal supervision
+
+---
+
+END OF SPEC
+
+
+create final spec v2
+
+PROJECT TITLE:
+AI-Powered Multi-Currency Crypto Trading System V2 (Kraken, Production-Grade)
+
+---
+
+MISSION:
+
+Build a production-grade automated trading system that:
+
+- Operates 24/7 on crypto markets
+- Uses AI-assisted decision-making
+- Trades multiple assets safely
+- Protects capital above all
+- Handles real-world execution issues
+- Includes monitoring, alerts, and recovery
+- Scales from beginner level to advanced system
+
+---
+
+CORE STRATEGY:
+
+HYBRID MODEL:
+
+1. LONG-TERM CORE (70%)
+- BTC, ETH only
+- Manual or periodic rebalance
+- No automated trading
+
+2. TRADING PORTION (30%)
+- Multi-currency
+- AI-assisted signals
+- Fully automated with strict risk control
+
+---
+
+CRITICAL SUCCESS RULES:
+
+1. Max risk per trade ≤ 2%
+2. Max daily loss ≤ 5%
+3. Stop after 3 consecutive losses
+4. Max open trades = 5
+5. Always use stop-loss
+6. No trade without valid data
+7. AI NEVER overrides risk rules
+8. System must fail safely
+
+---
+
+EXCHANGE CONFIGURATION:
+
+Exchange: Kraken (via ccxt)
+
+Requirements:
+- Enable rate limiting
+- Use WebSocket for market data
+- Use REST for execution
+- Implement retry/backoff logic
+
+---
+
+KRAKEN SPECIFIC RULES:
+
+- Respect API rate limits
+- Batch requests when possible
+- Do NOT spam orders
+- Use limit orders when possible
+- Always place stop-loss ON exchange
+
+(Kraken rate limits can block bot if exceeded) 【1-d15248】
+
+---
+
+MULTI-CURRENCY SYSTEM:
+
+Start:
+- BTC/USD
+- ETH/USD
+
+Scale later:
+- SOL/USD
+- ADA/USD
+- LINK/USD
+
+Rules:
+- Max 1 active trade per symbol
+- Allocate capital dynamically
+- Disable underperforming assets
+
+---
+
+INDICATOR ENGINE:
+
+- RSI (14)
+- MA50, MA200
+- MACD
+- Volume change
+- Volatility (ATR)
+
+---
+
+STRATEGY LOGIC:
+
+BUY:
+- RSI < 30
+- Price above MA200
+- Volume increasing
+
+SELL:
+- Profit ≥ 5%
+OR
+- RSI > 70
+OR
+- Stop-loss (-3%)
+
+---
+
+AI MODULE:
+
+OBJECTIVE:
+Improve signal accuracy and filter bad trades
+
+---
+
+MODEL:
+
+Default:
+- Logistic Regression
+
+Optional:
+- Random Forest
+
+---
+
+FEATURES:
+
+- RSI
+- MACD
+- Price delta
+- Volume delta
+- MA spread
+- Momentum
+- Volatility
+
+---
+
+AI DECISION FLOW:
+
+IF (strategy signal == BUY) AND (AI predicts UP with >60% confidence):
+    allow trade
+
+ELSE:
+    skip trade
+
+---
+
+AI TRAINING BEST PRACTICES:
+
+- Use time-series split (no random split)
+- Prevent data leakage
+- Use walk-forward validation
+- Retrain every 24 hours
+
+(Most ML models fail due to overfitting and leakage) 【2-70a873】
+
+---
+
+MARKET REGIME DETECTION:
+
+Detect:
+- Trending
+- Sideways
+- High volatility
+
+Adjust:
+- Position size
+- Trade frequency
+
+Disable trading if:
+- Extreme volatility
+
+---
+
+RISK MANAGEMENT ENGINE:
+
+- Max risk per trade: 2%
+- Stop-loss: 2–3%
+- Take profit: 4–6%
+- Max open trades: 5
+
+CIRCUIT BREAKER:
+
+Stop trading if:
+- 3 losses in row
+- Daily loss exceeded
+
+---
+
+EXECUTION ENGINE (REAL-WORLD READY):
+
+Handle:
+
+1. Slippage
+2. Partial fills
+3. Latency
+4. Fees
+
+(Live trading differs from backtesting due to slippage/latency) 【3-fe6642】
+
+---
+
+EXECUTION RULES:
+
+- Track slippage per trade
+- Reject trade if slippage too high
+- Adjust profit target for fees
+- Prefer limit orders
+- Avoid illiquid assets
+
+---
+
+FEE MANAGEMENT:
+
+- Include maker/taker fees
+- Deduct in PnL calculations
+- Avoid overtrading
+
+(Ignoring costs leads to strategy failure) 【4-ca41aa】
+
+---
+
+DATA ENGINE:
+
+- Validate OHLC data
+- Detect missing candles
+- Skip corrupted data
+- Maintain historical store
+
+---
+
+BACKTESTING SYSTEM:
+
+- Include:
+    - fees
+    - slippage
+- Use walk-forward testing
+- Track:
+    - Sharpe ratio
+    - drawdown
+
+Expect:
+- live performance 30–50% worse than backtest
+
+---
+
+MONITORING SYSTEM:
+
+Real-time tracking:
+
+- PnL
+- drawdown
+- win rate
+- trade success rate
+- latency
+
+(Monitoring is critical to prevent unseen losses) 【5-d2de30】
+
+---
+
+ALERTING SYSTEM:
+
+Send alerts via:
+
+- Telegram
+- Email
+
+Triggers:
+- trade executed
+- loss threshold hit
+- API failure
+- abnormal behavior
+
+---
+
+LOGGING SYSTEM:
+
+Log everything:
+
+- signals
+- AI decisions
+- trades
+- errors
+- API responses
+
+Format:
+- JSON logs
+- CSV history
+
+---
+
+PERFORMANCE ANALYTICS:
+
+Track:
+
+- per-asset performance
+- AI vs non-AI trades
+- drawdowns
+- weekly reports
+
+---
+
+SECURITY:
+
+- API keys in .env
+- IP whitelist
+- no withdrawal access
+- rotate keys regularly
+- encrypt secrets
+
+---
+
+SYSTEM RESILIENCE:
+
+- Auto-restart on crash
+- Reload open positions
+- Sync with exchange
+- Resume safely
+
+---
+
+MANUAL CONTROL:
+
+- Pause bot
+- Close all trades
+- Override system
+
+---
+
+PROJECT STRUCTURE:
+
+/project
+  /core
+  /strategies
+  /data
+  /logs
+  /models
+  main.py
+  bot.py
+  indicators.py
+  strategy.py
+  ai_model.py
+  execution.py
+  risk.py
+  monitoring.py
+  alerts.py
+  backtest.py
+
+---
+
+MAIN LOOP:
+
+while True:
+  for symbol in symbols:
+    validate_data()
+    compute_indicators()
+    generate_signal()
+    run_ai()
+    validate_risk()
+    execute_trade()
+    log_results()
+  monitor_system()
+  send_alerts()
+  sleep(interval)
+
+---
+
+DEPLOYMENT:
+
+- VPS (AWS / Ubuntu)
+- 24/7 uptime
+- watchdog/restart
+- monitoring enabled
+
+---
+
+TESTING PLAN:
+
+Phase 1:
+- Paper trading (7–14 days)
+
+Phase 2:
+- Small capital
+
+Phase 3:
+- Gradual scaling
+
+---
+
+BEST PRACTICES:
+
+- Start with 1–2 assets
+- Scale gradually
+- Do NOT over-optimize
+- Keep system simple
+- Review weekly
+
+---
+
+FINAL GOAL:
+
+A safe, resilient, AI-assisted trading system that:
+
+- Runs continuously
+- Handles real-world market conditions
+- Minimizes risk
+- Generates consistent returns over time
+
+---
+
+END OF SPEC
+
+
+prompt
+
+claude "
+You are a senior quantitative engineer and AI trading system architect.
+
+Your task is to build a fully working, production-grade AI crypto trading system based on the specification I provide.
+
+CRITICAL INSTRUCTIONS (MUST FOLLOW):
+
+1. DO NOT generate everything at once.
+   - Break the project into clear phases
+   - Build step-by-step
+   - Wait for confirmation before next phase
+
+2. ALWAYS prioritize:
+   - Safety
+   - Risk management
+   - Stability over performance
+
+3. For each phase, provide:
+   - Clean, modular, production-ready Python code
+   - Clear explanation of what the code does
+   - How to run and test it
+   - Edge cases handled
+
+4. Architecture requirements:
+   - Modular design (separate files)
+   - No monolithic scripts
+   - Clear separation of:
+     data layer, strategy, AI, execution, risk, monitoring
+
+5. AI REQUIREMENTS:
+   - Implement a SIMPLE, realistic ML model (logistic regression or random forest)
+   - Prevent data leakage
+   - Use time-series split
+   - Explain training + prediction clearly
+   - DO NOT overcomplicate AI
+
+6. TRADING REALITY:
+   - Include fees, slippage, latency handling
+   - Handle API failures and retries
+   - Validate all data before use
+   - Never assume perfect execution
+
+7. RISK MANAGEMENT:
+   - Enforce all limits strictly
+   - Never allow trade without validation
+   - Implement circuit breakers
+
+8. TESTING FIRST:
+   - Start with PAPER TRADING mode only
+   - Show how to simulate trades
+   - Provide backtesting before live trading
+
+9. KRAKEN INTEGRATION:
+   - Use ccxt for Kraken
+   - Respect rate limits
+   - Implement retry + backoff logic
+   - Use WebSocket where applicable
+
+10. MONITORING:
+   - Include logging from beginning
+   - Add basic alert system (console first, extensible later)
+
+---
+
+DEVELOPMENT PHASES (FOLLOW STRICTLY):
+
+PHASE 1:
+- Project structure
+- Configuration setup
+- Environment setup (.env)
+- Logging system
+
+PHASE 2:
+- Kraken API connection (ccxt)
+- Fetch market data
+- Data validation
+
+PHASE 3:
+- Indicators engine
+
+PHASE 4:
+- Strategy logic (rule-based)
+
+PHASE 5:
+- PAPER trading engine (simulation)
+
+PHASE 6:
+- AI model (training + inference)
+
+PHASE 7:
+- Risk management engine
+
+PHASE 8:
+- Execution engine (real trades disabled by default)
+
+PHASE 9:
+- Monitoring + alerting
+
+PHASE 10:
+- Backtesting system
+
+PHASE 11:
+- Multi-currency support
+
+PHASE 12:
+- Final integration + run loop
+
+---
+
+OUTPUT FORMAT:
+
+For each phase:
+1. Explanation
+2. Code (complete and clean)
+3. How to run
+4. What to verify
+
+---
+
+IMPORTANT:
+
+- Do NOT skip steps
+- Do NOT simplify into a toy example
+- This must be a real, usable system
+- Assume this will run with real money in future
+
+---
+
+Now start with PHASE 1.
+
+Here is the full specification:
+
+[PASTE YOUR FINAL SPEC V2 HERE]
+
+"
