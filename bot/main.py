@@ -385,9 +385,11 @@ def run():
                 refresh_s       = cfg.dashboard.refresh_s,
                 live_trading    = cfg.exchange.live_trading,
                 dry_run         = cfg.exchange.dry_run,
-                stop_loss_pct   = cfg.backtest.stop_loss_pct,
-                take_profit_pct = cfg.backtest.take_profit_pct,
-                fees_paid       = getattr(executor, "fees_paid", 0.0),
+                stop_loss_pct      = cfg.backtest.stop_loss_pct,
+                take_profit_pct    = cfg.backtest.take_profit_pct,
+                fees_paid          = getattr(executor, "fees_paid", 0.0),
+                rsi_filter_enabled = cfg.strategy.rsi_filter_enabled,
+                volume_k           = cfg.strategy.volume_k,
             )
         except Exception as exc:
             logger.warning("Dashboard render failed: %s", exc)

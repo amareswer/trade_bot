@@ -46,9 +46,11 @@ def write(
     refresh_s:       int   = 30,
     live_trading:    bool  = False,
     dry_run:         bool  = False,
-    stop_loss_pct:   float = 0.0,
-    take_profit_pct: float = 0.0,
-    fees_paid:       float = 0.0,
+    stop_loss_pct:      float = 0.0,
+    take_profit_pct:    float = 0.0,
+    fees_paid:          float = 0.0,
+    rsi_filter_enabled: bool  = True,
+    volume_k:           float = 0.0,
 ) -> None:
     html = _render(
         exchange=exchange, symbol=symbol, strategy=strategy,
@@ -64,6 +66,8 @@ def write(
         live_trading=live_trading, dry_run=dry_run,
         stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct,
         fees_paid=fees_paid,
+        rsi_filter_enabled=rsi_filter_enabled,
+        volume_k=volume_k,
     )
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -166,6 +170,14 @@ def _render(**kw) -> str:
         <div class="info-row">
           <span class="info-key">Entry</span>
           <span class="info-val">${entry:,.2f}</span>
+        </div>
+        <div class="info-row">
+          <span class="info-key">Stop-loss</span>
+          <span class="info-val" style="color:#f85149">${sl_level:,.2f}</span>
+        </div>
+        <div class="info-row">
+          <span class="info-key">Take-profit</span>
+          <span class="info-val" style="color:#3fb950">${tp_level:,.2f}</span>
         </div>
         <div class="info-row">
           <span class="info-key">Current</span>
@@ -273,13 +285,21 @@ def _render(**kw) -> str:
         <span class="info-key">Actionable</span>
         <span style="color:{'#3fb950' if action_pct > 10 else '#8b949e'};font-size:12px">{action_pct:.0f}%</span>
       </div>
+      <div class="info-row">
+        <span class="info-key">Volume filter</span>
+        <span style="color:{'#3fb950' if kw['volume_k'] > 0 else '#8b949e'};font-size:12px">{'k=' + f"{kw['volume_k']:.1f}" if kw['volume_k'] > 0 else 'OFF'}</span>
+      </div>
     </div>"""
     else:
         adx_str = last_spread_str = "—"
-        regime_card = """
+        regime_card = f"""
     <div class="info-card">
       <div style="font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">Regime</div>
       <div style="color:#8b949e;font-size:12px">No candle data yet</div>
+      <div class="info-row" style="margin-top:6px">
+        <span class="info-key">Volume filter</span>
+        <span style="color:{'#3fb950' if kw['volume_k'] > 0 else '#8b949e'};font-size:12px">{'k=' + f"{kw['volume_k']:.1f}" if kw['volume_k'] > 0 else 'OFF'}</span>
+      </div>
     </div>"""
 
     # ── Fees / P&L ─────────────────────────────────────────────────────────
@@ -524,6 +544,10 @@ def _render(**kw) -> str:
       <div class="info-row">
         <span class="info-key">EMA Spread</span>
         <span class="info-val" style="color:{'#f85149' if last_spread and last_spread > 0.8 else '#d29922' if last_spread and last_spread > 0.4 else '#8b949e'}">{f"{last_spread:.3f}%" if last_spread is not None else "—"}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-key">RSI filter</span>
+        <span class="info-val" style="color:{'#3fb950' if kw['rsi_filter_enabled'] else '#d29922'}">{'ON' if kw['rsi_filter_enabled'] else 'OFF'}</span>
       </div>
       <div class="info-row">
         <span class="info-key">Fills today</span>

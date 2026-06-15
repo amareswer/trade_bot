@@ -15,6 +15,120 @@ Running log of feature decisions. Most recent first.
 
 ---
 
+## 2026-06-15 — Config Validation + Volume Filter + SL-Based Sizing (BUILT ✓)
+
+Full session of backtesting, parameter sweeps, and live config corrections. No new strategy logic — only parameter validation and two new utility additions.
+
+---
+
+### Volume Filter — Built, Tested, Disabled (VOLUME_K=0)
+
+**What was built:** `volume_k` parameter added end-to-end:
+- `IndicatorConfig.volume_k` — deque `_volumes`, checked in `evaluate()` after RSI gate
+- `StrategyConfig.volume_k` + `_float("VOLUME_K", 1.2)` in `_load()`
+- `engine.py` — new `volume_k` param in `run()`, passed to `IndicatorConfig`
+- `backtest.py` — `volume_k = cfg.strategy.volume_k` in `engine.run()` call
+- `bot/main.py` — `volume_k = cfg.strategy.volume_k` in `build_strategy()`
+- `backtest.py` filter breakdown — `Volume rejected N (X%)` line added
+- `.env` — `VOLUME_K=0`
+
+**Logic:** Current candle volume must be ≥ `volume_k × avg(prior 3 candles volume)`. Disabled when `volume_k=0`. Applied to both BUY and SELL paths after RSI gate.
+
+**Test result (BTC/USDT 4h 5000 candles):**
+
+| VOLUME_K | Trades | PF | Return |
+|---|---|---|---|
+| 0 (off) | 86 | **1.38** | **+1.51%** |
+| 1.2 (on) | 68 | 1.00 | -1.28% |
+
+**Decision: VOLUME_K=0 permanently.** Filter rejected 737 candles (15.4%) but didn't improve trade quality — win rate flat at ~33%, PF dropped 0.38 points. Volume confirmation at 4h timeframe blocks trend continuation entries that were actual winners.
+
+---
+
+### SL-Based Position Sizing — calc_trade_qty_sl() (BUILT ✓)
+
+**Added to AppConfig:**
+```python
+def calc_trade_qty_sl(self, cash, entry_price, stop_loss_price) -> float:
+    # dollar_risk = cash * risk_per_trade_pct
+    # qty = dollar_risk / sl_distance
+    # Falls back to calc_trade_qty() if stop_loss_price=0 or sl_distance~0
+```
+
+**Wired in main.py BUY path:**
+```python
+_sl_price = price * (1 - cfg.backtest.stop_loss_pct) if cfg.backtest.stop_loss_pct > 0 else 0.0
+trade_qty = cfg.calc_trade_qty_sl(executor.cash, price, _sl_price)
+```
+
+**Why:** Fixed-fractional sizing (old method) risks a fixed % of cash regardless of stop distance. SL-based sizing ensures that if the stop is hit, loss = exactly `risk_per_trade_pct × cash` — properly calibrated to the actual risk per trade.
+
+---
+
+### SL/TP Sweep — Best Config Validated (ACTIVE ✓)
+
+Tested 4 SL/TP ratios on BTC/USDT 4h 5000 candles (RSI=true, VOLUME_K=0, ADX=18):
+
+| Config | Ratio | Trades | PF | Max DD | Return |
+|---|---|---|---|---|---|
+| SL=2% TP=4% | 1:2 | 85 | 1.06 | -2.13% | -1.12% |
+| **SL=1.5% TP=4.5%** | **1:3** | **86** | **1.38** | **-1.37%** | **+1.51%** |
+| SL=2% TP=6% | 1:3 | 72 | 1.20 | -1.94% | +0.36% |
+| SL=1% TP=3% | 1:3 | 110 | 0.88 | -3.46% | -3.13% |
+
+**Winner: SL=1.5% / TP=4.5%.** Only config with positive return and max DD < 1.4%. SL=1% killed by BTC 4h candle noise. TP=6% rarely hit — trades reversed before reaching it.
+
+**Updated .env:** `STOP_LOSS_PCT=0.015`, `TAKE_PROFIT_PCT=0.045`
+
+---
+
+### Walk-Forward (5 × 1000 windows, new SL/TP)
+
+| Window | Date Range | Trades | PF | Return |
+|---|---|---|---|---|
+| 5000 (full) | Mar 2024–Jun 2026 | 86 | 1.38 | +1.51% |
+| 4000 | Aug 2024–Jun 2026 | 69 | 1.41 | +1.39% |
+| 3000 | Feb 2025–Jun 2026 | 46 | 1.30 | +0.41% |
+| 2000 | Jul 2025–Jun 2026 | 26 | 1.02 | -0.50% |
+| 1000 | Dec 2025–Jun 2026 | 16 | 1.06 | -0.24% |
+
+**Finding:** Jul 2025–now is choppier (RSI/EMA trend-following underperforms in ranging markets). Not a parameter problem — ADX sweep (18/25/30/35) confirmed no threshold fixes it. Strategy earns in trending periods. Watch live trades against this baseline.
+
+---
+
+### ADX Sweep — ADX=18 Confirmed, No Change
+
+Tested ADX=18/25/30/35 on both 5000 and 2000 candles. ADX=18 is best on every metric in both windows. Higher thresholds don't fix recent underperformance — they just reduce trade count without improving win rate. ADX=18 stays.
+
+---
+
+### RSI_FILTER_ENABLED — Restored to true (BUG FIX)
+
+`RSI_FILTER_ENABLED=false` was set in `.env` around 2026-06-15 06:30 UTC to unblock a signal when RSI was stuck at 51.8. This was a mistake.
+
+**Backtest comparison (BTC/USDT 4h 5000c, ADX=18, SL=1.5%, TP=4.5%):**
+
+| RSI filter | Trades | PF | Max DD | Return |
+|---|---|---|---|---|
+| false (was live) | 107 | 1.19 | -2.16% | -0.10% |
+| true (restored) | 86 | **1.38** | **-1.37%** | **+1.51%** |
+
+Disabling RSI filter adds 21 extra trades that are net-negative (more SL hits, lower PF, higher drawdown). Restored to `RSI_FILTER_ENABLED=true` in `.env` 2026-06-15 ~17:25 UTC.
+
+---
+
+### Live Bot — Restart Confirmed Clean (2026-06-15 17:25 UTC)
+
+All recovery checks passed:
+1. `State restored: cash=89.79 pos=0.000108 cost_basis=92050.90` ✓
+2. `PositionManager seeded: qty=0.000108 avg_entry=92050.90` ✓
+3. `State machine recovered to LONG | entry=92050.90` ✓
+4. Warmup replayed, waiting for next 1h candle ✓
+
+Current position: BUY 0.000108 BTC/CAD @ $92,050.90 | SL ~$90,671 | TP ~$96,143
+
+---
+
 ## Live Trading Watch Items
 
 Three open items requiring manual follow-up or monitoring. Do not close without confirmation.
