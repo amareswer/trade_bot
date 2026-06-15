@@ -155,35 +155,49 @@ A robust crypto trading system that:
 
 ## VALIDATED TRADING CONFIG
 
-As of 2026-06-05, the following configuration has passed:
-- 5000-candle backtest (PF 1.21, 88 trades, win rate 36%)
-- Walk-forward validation (training PF 1.21 → validation PF 1.22)
-- Fee/slippage stress test (PF holds to 0.15% fee + 0.05% slip)
-- Regime analysis (positive PF in bull, correction, and recovery)
-- Monte Carlo (0% ruin, 0.64% 95th pct drawdown at 2% risk/trade)
+As of 2026-06-15, the following configuration has passed:
+- 5000-candle backtest (BTC/USDT 4h, Mar 2024–Jun 2026): PF 1.38, 86 trades, win rate 31.4%, max DD -1.37%, return +1.51%
+- SL/TP sweep (4 configs): SL=1.5% / TP=4.5% confirmed best ratio (1:3)
+- Walk-forward (5 × 1000-candle windows): positive PF across 4000 and 5000 candle windows; recent 6-month window (Jul 2025–now) shows PF ~1.02 — market regime choppier, not a filter problem
+- ADX sweep (18 / 25 / 30 / 35): ADX=18 is best on both full history and recent window
+- RSI filter confirmed ON: RSI_FILTER_ENABLED=false drops PF from 1.38 → 1.19 and return from +1.51% → -0.10%
+- Volume filter tested (VOLUME_K=1.2) and disabled: hurt PF (1.38→1.00), added noise not quality
 
 ### Active .env settings (do not change without re-running validation)
-ADX_THRESHOLD=15
-MAX_EMA_SPREAD_PCT=0.005
+ADX_THRESHOLD=18
 RSI_FILTER_ENABLED=true
-RISK_PER_TRADE_PCT=0.02
-STOP_LOSS_PCT=0.02
-TAKE_PROFIT_PCT=0.04
+VOLUME_K=0
+STOP_LOSS_PCT=0.015
+TAKE_PROFIT_PCT=0.045
 BACKTEST_LIMIT=5000
 BACKTEST_TIMEFRAME=4h
 EXCHANGE=binance
 SYMBOL=BTC/USDT
 
+### Live trading settings (Kraken — separate from backtest)
+EXCHANGE=kraken
+SYMBOL=BTC/CAD
+CANDLE_MINUTES=60
+RISK_PER_TRADE_PCT=0.10   # intentionally high at $100 capital (Kraken min order ~$4.50 CAD)
+STOP_LOSS_PCT=0.015
+TAKE_PROFIT_PCT=0.045
+
 ### How to verify the config is active
-Run: python backtest.py
-Check filter breakdown: ADX rejected should be ~513 (10.3%), NOT 2365 (47.6%)
-Check trade count: should be ~88, NOT 69
-If you see 69 trades, the .env is on the old config.
+Run: EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py
+Expected: ~86 trades, PF ~1.38, return ~+1.51%, max DD ~-1.37%
+If RSI_FILTER_ENABLED=false accidentally: trade count jumps to ~107, PF drops to 1.19
+
+### New code added 2026-06-15
+- `calc_trade_qty_sl(cash, entry_price, stop_loss_price)` on AppConfig — SL-based position sizing
+  (risks exactly risk_per_trade_pct of cash per trade; falls back to calc_trade_qty if SL=0)
+- `volume_k` field wired through IndicatorConfig → StrategyConfig → AppConfig → engine.py → backtest.py → main.py
+  (set VOLUME_K=0 to disable; VOLUME_K=1.2 requires current candle volume ≥ 1.2× avg of prior 3)
 
 ### Next steps remaining
-1. Multi-symbol test: run backtest.py on ETH, SOL, BNB, LINK with same params
-2. Start paper trading: python -m bot.main (target 30-50 live trades)
-3. After paper trading: compare live vs backtest win rate and PF
+1. Accumulate 30–50 live trades on Kraken BTC/CAD — compare live PF/win rate to backtest
+2. Verify Jun 11 position close price on Kraken (History → Trades, SELL ~Jun 14 10:44 UTC)
+3. Investigate Kraken fee: actual 0.80% vs 0.26% modeled — maker orders (limit) may reduce to 0.16%
+4. Once fee confirmed <0.20%: consider ETH/CAD expansion
 - Can evolve into a professional-grade trading platform
 ## Exchange Setup
 - Backtesting: EXCHANGE=binance, SYMBOL=BTC/USDT

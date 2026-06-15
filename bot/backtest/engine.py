@@ -94,6 +94,8 @@ def run(
     # Regime filter
     regime_ema_period:        int   = 200,
     regime_ema_slope_filter:  bool  = False,
+    # Volume filter
+    volume_k:                 float = 1.2,
 ) -> BacktestResult:
     """Run a full backtest and return the result."""
 
@@ -112,6 +114,7 @@ def run(
             rsi_filter_enabled       = rsi_filter_enabled,
             regime_ema_period        = regime_ema_period,
             regime_ema_slope_filter  = regime_ema_slope_filter,
+            volume_k                 = volume_k,
         ))
         is_indicator = True
     else:

@@ -98,6 +98,7 @@ def main():
         take_profit_pct         = cfg.backtest.take_profit_pct,
         regime_ema_period       = cfg.strategy.regime_ema_period,
         regime_ema_slope_filter = cfg.strategy.regime_ema_slope_filter,
+        volume_k                = cfg.strategy.volume_k,
     )
 
     m = metrics_mod.compute(result)
@@ -122,11 +123,13 @@ def main():
         ema_n    = rs.get("ema_rejected", 0)
         rsi_n    = rs.get("rsi_rejected", 0)
         regime_n = rs.get("regime_rejected", 0)
+        vol_n    = rs.get("volume_rejected", 0)
         print(f"  ADX rejected              {adx_n:>6}{pct(adx_n)}")
         print(f"  Trend rejected (NEUTRAL)  {trend_n:>6}{pct(trend_n)}")
         print(f"  EMA spread rejected       {ema_n:>6}{pct(ema_n)}")
         print(f"  RSI rejected              {rsi_n:>6}{pct(rsi_n)}")
         print(f"  Regime EMA rejected       {regime_n:>6}{pct(regime_n)}")
+        print(f"  Volume rejected           {vol_n:>6}{pct(vol_n)}")
         print(f"  ─────────────────────────────────────────")
         buy_n  = rs.get("buy_signals", 0)
         sell_n = rs.get("sell_signals", 0)

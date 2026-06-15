@@ -56,6 +56,7 @@ class IndicatorConfig:
     adx_period:               int   = 14
     adx_threshold:            float = 25.0   # < threshold = ranging market → HOLD (0 = disabled)
     adx_max:                  float = 0.0    # > max = overextended trend → HOLD (0 = disabled)
+    volume_k:                 float = 1.2    # current volume must be >= k * avg(last 3 candles); 0 = disabled
     rsi_filter_enabled:       bool  = True   # set False to bypass RSI level/direction checks
     regime_ema_period:        int   = 200    # BUY only when price > this EMA (0 = disabled)
     regime_ema_slope_filter:  bool  = False  # BUY only when EMA200 slope > 0 (rising)
@@ -84,6 +85,7 @@ class IndicatorStrategy:
         self._closes:     deque = deque(maxlen=buf)
         self._highs:      deque = deque(maxlen=buf)
         self._lows:       deque = deque(maxlen=buf)
+        self._volumes:    deque = deque(maxlen=buf)
         self._last_rsi:   Optional[float] = None
         self._last_trend: Optional[str]   = None
         self._last_adx:   Optional[float] = None
@@ -97,6 +99,7 @@ class IndicatorStrategy:
             "ema_rejected":    0,
             "rsi_rejected":    0,
             "regime_rejected": 0,
+            "volume_rejected": 0,
             "buy_signals":     0,
             "sell_signals":    0,
             "hold_signals":    0,
@@ -129,6 +132,7 @@ class IndicatorStrategy:
         self._closes.append(price)
         self._highs.append(candle.high)
         self._lows.append(candle.low)
+        self._volumes.append(candle.volume)
         closes = list(self._closes)
 
         self.stats["candles_seen"] += 1
@@ -211,6 +215,18 @@ class IndicatorStrategy:
             trend_val, ema_spread_pct * 100, ema_strong, adx_val,
         )
 
+        # ── Volume confirmation ───────────────────────────────────────
+        vols = list(self._volumes)
+        volume_ok = True
+        if self.config.volume_k > 0 and len(vols) >= 4:
+            avg_vol_3 = sum(vols[-4:-1]) / 3
+            curr_vol  = vols[-1]
+            volume_ok = curr_vol >= self.config.volume_k * avg_vol_3
+            logger.info(
+                "volume  curr=%.2f  avg3=%.2f  threshold=%.2f  ok=%s",
+                curr_vol, avg_vol_3, self.config.volume_k * avg_vol_3, volume_ok,
+            )
+
         # ── BUY / SELL conditions ─────────────────────────────────────
         if trend_val == "BULLISH":
             if not ema_strong:
@@ -220,6 +236,8 @@ class IndicatorStrategy:
                     and rsi_val > self.config.rsi_buy_min
                     and rsi_val < self.config.rsi_overbought):
                 self.stats["rsi_rejected"] += 1
+            elif not volume_ok:
+                self.stats["volume_rejected"] += 1
             else:
                 self.stats["buy_signals"] += 1
                 return Signal.BUY
@@ -232,6 +250,8 @@ class IndicatorStrategy:
                     and rsi_val < self.config.rsi_sell_max
                     and rsi_val > self.config.rsi_oversold):
                 self.stats["rsi_rejected"] += 1
+            elif not volume_ok:
+                self.stats["volume_rejected"] += 1
             else:
                 self.stats["sell_signals"] += 1
                 return Signal.SELL

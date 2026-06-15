@@ -62,21 +62,30 @@ test_indicators.py          # 21 tests — SMA, EMA, RSI, trend, IndicatorStrate
 
 ---
 
-## Active config (current .env)
+## Active config (current .env — updated 2026-06-14)
 
 ```
-EXCHANGE=binance
-SYMBOL=BTC/USDT
-STRATEGY_MODE=indicator
-CANDLE_MINUTES=240      # aggregate live ticks into 4h candles
-ADX_THRESHOLD=30.0      # stricter than default 25.0
-BACKTEST_LIMIT=500      # fast iteration
+EXCHANGE=kraken
+SYMBOL=BTC/CAD
+LIVE_TRADING=true
+DRY_RUN=false
+CANDLE_MINUTES=60        # 1h candles (changed from 240 on 2026-06-14)
+ADX_THRESHOLD=18.0       # lowered from 15.0 after zero-trades day (ADX 20-21 was blocking all signals)
+MAX_EMA_SPREAD_PCT=0.0   # disabled
+RSI_OVERBOUGHT=68.0      # tightened from 70.0
+RSI_OVERSOLD=32.0        # tightened from 30.0
+RISK_PER_TRADE_PCT=0.10
+RISK_MAX_POSITION_PCT=0.15
+STARTING_CASH=100.0
 STOP_LOSS_PCT=0.02
 TAKE_PROFIT_PCT=0.04
 AI_ENABLED=false
 ```
 
-Binance with BTC/USDT. `CANDLE_MINUTES=240` means live bot evaluates one real OHLCV candle every 4 hours — matches backtest timeframe exactly.
+**Why Kraken (not Binance):** Binance unavailable in Canada. BTC/CAD is the native pair.
+**Why 1h candles:** Switched from 4h on 2026-06-14 after bot missed a full $89k→$92k move with zero trades. 1h gives 4× more decision points on a $100 account where missed trades are costly.
+**Backtest note:** Config must be validated with `BACKTEST_TIMEFRAME=1h BACKTEST_LIMIT=5000 EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py` before trusting — not yet done as of 2026-06-14.
+**Fee situation:** Actual Kraken fee 0.80% (vs 0.26% modeled). Strategy net-negative at 0.80%; investigating maker orders (0.16%) as fee lever.
 
 ---
 

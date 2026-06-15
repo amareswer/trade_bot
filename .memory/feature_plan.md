@@ -15,6 +15,18 @@ Running log of feature decisions. Most recent first.
 
 ---
 
+## Live Trading Watch Items
+
+Three open items requiring manual follow-up or monitoring. Do not close without confirmation.
+
+- **Verify Jun 11 fill close price on Kraken** — Check History → Trades for a SELL around Jun 14 10:44 UTC. This is needed for accurate realized PnL on trade #1. The bot log shows no SELL was placed by the bot; the Jun 14 test burst sent a real oversized SELL 0.001000 (vs actual position 0.000113) — the position may have been swept as a partial fill. Note: balance evidence in log (Jun 13 23:59 sync shows exchange=99.81 vs saved=89.88) means the position was already gone by Jun 13 23:59 — may have been manually closed between Jun 12 08:20 and Jun 13 23:59 while the bot was stopped.
+
+- **Isolate dev/test runs from production API** — Jun 14 10:44–10:45 test burst sent multiple real live orders to Kraken (several BUY 0.001 and one SELL 0.001 with `dry_run=False`). This should never happen. Fix: test code must use a separate ccxt instance pointed at Kraken's sandbox, or always set `dry_run=True` in test harness. Review `test_live_executor.py` and any ad-hoc test scripts to confirm they cannot reach the production API key.
+
+- **Current open position — monitor until closed** — BUY 0.000108 BTC/CAD @ $92,050.90 (filled Jun 15 07:00 UTC). SL triggers at ~$90,671 (1.5% below entry). TP triggers at ~$96,143 (4.5% above entry). Last candle close: $93,078.80 (+$0.11 unrealized). Bot is LONG, RSI_FILTER_ENABLED now `true` (changed Jun 15) — next SELL signal or SL/TP hit will close it.
+
+---
+
 ## 2026-06-10 to 2026-06-12 — First Live Fill + Critical Bug Fixes + Multi-Symbol Validation
 
 The bot executed its first live fill (BUY 0.000113 BTC/CAD @ $88,870.20), which immediately revealed three bugs: (1) intra-candle SL/TP never fired between 4h closes — same `continue`-path issue as the earlier SL/TP gap; (2) the dashboard only rendered at candle closes for the same reason — fixed by extracting a `_render_dashboard()` helper called on every 30s tick using sticky indicator values; (3) the first BUY was initially blocked by position-size rounding drift (`round(qty,6) × price > max_position_pct` even at equal limits), fixed by raising `RISK_MAX_POSITION_PCT=0.15` and adding a startup warning. Fee discovery: actual Kraken charge was 0.80% (not 0.26% modeled) — raw fee-dict logging added; cause under investigation (likely BTC/CAD FX surcharge). Multi-symbol validation ran frozen params against ETH/SOL/BNB/LINK at two windows and two fee rates: strategy generalizes (ETH chosen as first expansion symbol for cross-regime robustness, LINK permanently excluded), but fee rate remains the gating constraint — everything is net-negative at 0.80% even with good signal quality. Details in [[multi-symbol-validation]] and [[live-loop-bugs]].

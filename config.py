@@ -104,6 +104,7 @@ class StrategyConfig:
     rsi_filter_enabled:      bool  = True  # False = bypass RSI level/direction checks
     regime_ema_period:       int   = 200   # BUY only when price > this EMA (0 = disabled)
     regime_ema_slope_filter: bool  = False # BUY only when EMA200 slope > 0 (rising)
+    volume_k:                float = 1.2   # volume filter multiplier (0 = disabled)
 
     def __post_init__(self):
         if self.mode not in ("indicator", "threshold"):
@@ -239,6 +240,24 @@ class AppConfig:
         trade_value = cash * self.risk.risk_per_trade_pct
         return round(trade_value / price, 6)
 
+    def calc_trade_qty_sl(
+        self,
+        cash:            float,
+        entry_price:     float,
+        stop_loss_price: float,
+    ) -> float:
+        """
+        SL-based sizing: if stop is hit, lose exactly risk_per_trade_pct of cash.
+        Falls back to calc_trade_qty() when stop_loss_price is 0 or sl_distance ~ 0.
+        """
+        if stop_loss_price <= 0 or entry_price <= 0 or cash <= 0:
+            return self.calc_trade_qty(cash, entry_price)
+        sl_distance = abs(entry_price - stop_loss_price)
+        if sl_distance < 1e-9:
+            return self.calc_trade_qty(cash, entry_price)
+        dollar_risk = cash * self.risk.risk_per_trade_pct
+        return round(dollar_risk / sl_distance, 6)
+
     def log_startup(self) -> None:
         """Log all config on startup (no secrets logged)."""
         logger.info("─" * 60)
@@ -310,6 +329,7 @@ def _load() -> AppConfig:
             rsi_filter_enabled      = _bool ("RSI_FILTER_ENABLED",      True),
             regime_ema_period       = _int  ("REGIME_EMA_PERIOD",       200),
             regime_ema_slope_filter = _bool ("REGIME_EMA_SLOPE_FILTER", False),
+            volume_k                = _float("VOLUME_K",                1.2),
         ),
         risk=RiskConfig(
             risk_per_trade_pct   = _float("RISK_PER_TRADE_PCT",    0.01),

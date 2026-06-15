@@ -24,11 +24,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Logging setup ────────────────────────────────────────────────────────────
-# Root logger at INFO so INFO records propagate to handlers.
-# Console handler at WARNING keeps the terminal clean.
-# File handler at INFO captures everything for post-mortem review.
-# Previously, basicConfig set root to WARNING, which silently swallowed all
-# INFO records before they reached the file handler. Fixed here.
 _log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
 os.makedirs(_log_dir, exist_ok=True)
 _file_handler = logging.FileHandler(os.path.join(_log_dir, "trade_bot.log"))
@@ -87,13 +82,23 @@ def _build_exchange():
     return cls({"timeout": 15_000})
 
 
+def _minutes_to_timeframe(minutes: int) -> str:
+    """Convert CANDLE_MINUTES integer to ccxt timeframe string."""
+    mapping = {
+        1: "1m", 5: "5m", 15: "15m", 30: "30m",
+        60: "1h", 120: "2h", 240: "4h",
+        360: "6h", 720: "12h", 1440: "1d",
+    }
+    return mapping.get(minutes, f"{minutes}m")
+
+
 def _candle_countdown(timeframe: str) -> str:
-    """Return 'Xh Xm' countdown until the next candle close at a round UTC boundary."""
+    """Return countdown string until the next candle close at a round UTC boundary."""
     tf_minutes = {
         "1m": 1, "5m": 5, "15m": 15, "30m": 30,
         "1h": 60, "2h": 120, "4h": 240, "6h": 360, "12h": 720, "1d": 1440,
     }
-    period_m = tf_minutes.get(timeframe, 240)
+    period_m = tf_minutes.get(timeframe, cfg.exchange.candle_minutes)
     now = datetime.now(_tz.utc)
     now_m = now.hour * 60 + now.minute
     next_m = ((now_m // period_m) + 1) * period_m
@@ -105,12 +110,15 @@ def _candle_countdown(timeframe: str) -> str:
     return f"{h}h {m:02d}m" if h else f"{m}m"
 
 
-def _warmup_strategy(strategy, exchange) -> "int | None":
+def _warmup_strategy(strategy, exchange, timeframe: str = None) -> "int | None":
     """
-    Fetch 35 completed candles and warm up the strategy indicators.
+    Fetch completed candles and warm up the strategy indicators.
     Returns the timestamp_ms of the last candle fed, or None on failure.
+    timeframe: ccxt timeframe string (e.g. '1h', '4h'). Defaults to cfg.backtest.timeframe.
     """
-    timeframe = cfg.backtest.timeframe
+    if timeframe is None:
+        timeframe = cfg.backtest.timeframe
+
     print(f"\n  Fetching historical {timeframe} candles for warmup …", flush=True)
     try:
         _WARMUP_CANDLES = max(strategy._warmup + 100, 150)
@@ -175,7 +183,7 @@ def _fetch_completed_candle(
         "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000,
         "6h": 21_600_000, "12h": 43_200_000, "1d": 86_400_000,
     }
-    tf_ms  = _TF_MS_MAP.get(timeframe, 14_400_000)
+    tf_ms  = _TF_MS_MAP.get(timeframe, cfg.exchange.candle_minutes * 60_000)
     age_ms = int(datetime.now(_tz.utc).timestamp() * 1000) - ts_ms
     if last_ts_ms is None and age_ms > 2 * tf_ms:
         logger.warning(
@@ -222,6 +230,7 @@ def build_strategy():
             rsi_filter_enabled       = cfg.strategy.rsi_filter_enabled,
             regime_ema_period        = cfg.strategy.regime_ema_period,
             regime_ema_slope_filter  = cfg.strategy.regime_ema_slope_filter,
+            volume_k                 = cfg.strategy.volume_k,
         ))
     return ThresholdStrategy(
         buy_threshold  = cfg.strategy.buy_threshold,
@@ -269,10 +278,6 @@ def run():
     position_manager = PositionManager()
 
     # ── Restart recovery ──────────────────────────────────────────────────────
-    # LiveExecutor._load_state() restores position/cash from logs/live_state.json,
-    # but PositionManager and TradingStateMachine are always created fresh.
-    # Seed both from executor state so SL/TP, signal filtering, and risk gate
-    # all see the recovered position on the first tick after restart.
     if cfg.exchange.live_trading and executor.position > 1e-9:
         position_manager.seed(
             quantity     = executor.position,
@@ -311,13 +316,19 @@ def run():
 
     is_indicator = isinstance(strategy, IndicatorStrategy)
 
+    # ── Derive live candle timeframe from CANDLE_MINUTES ─────────────────────
+    # This is the timeframe used for ALL live candle operations:
+    # warmup fetch, candle polling, and countdown display.
+    # BACKTEST_TIMEFRAME is only used for backtesting, not live trading.
+    _LIVE_TF = _minutes_to_timeframe(cfg.exchange.candle_minutes)
+
     # ── Historical warmup (live + indicator mode only) ────────────────────────
     live_exchange = None
     last_candle_ts_ms: "int | None" = None
 
     if is_indicator and cfg.exchange.feed_mode == "live":
         live_exchange     = _build_exchange()
-        last_candle_ts_ms = _warmup_strategy(strategy, live_exchange)
+        last_candle_ts_ms = _warmup_strategy(strategy, live_exchange, _LIVE_TF)
 
     tick        = 0
     tick_log:   deque[dict] = deque(maxlen=200)
@@ -331,12 +342,6 @@ def run():
     _dash_block  = ""
 
     def _render_dashboard(sig: str, rsi_v, trend_v) -> None:
-        """Write dashboard.html with current portfolio state.
-
-        Called on every 30s tick (no-candle path uses sticky values;
-        candle-close path uses fresh values). Wrapped in try/except so a
-        renderer bug logs a WARNING instead of crashing the bot.
-        """
         if not cfg.dashboard.enabled:
             return
         fills_data = [
@@ -393,7 +398,7 @@ def run():
         # ── 1. Advance state machine ──────────────────────────────────
         state_machine.tick()
 
-        # ── 2. Fetch live price (display / dashboard only) ────────────
+        # ── 2. Fetch live price ───────────────────────────────────────
         try:
             price = feed.get_price()
         except Exception as exc:
@@ -405,8 +410,6 @@ def run():
         if is_indicator:
             if live_exchange is not None:
                 # ── Intra-candle SL/TP: runs on every 30s tick ────────────
-                # Must live here, before the candle-availability continue,
-                # otherwise SL/TP only fires at 4h closes.
                 if position_manager.has_position and position_manager.avg_entry > 0:
                     _ic_entry = position_manager.avg_entry
                     _ic_sl = (cfg.backtest.stop_loss_pct > 0
@@ -465,12 +468,13 @@ def run():
                         time.sleep(cfg.exchange.loop_interval)
                         continue
 
-                # Live mode: evaluate only when a new 4h candle has closed
+                # Live mode: evaluate only when a new candle has closed
+                # Uses _LIVE_TF (derived from CANDLE_MINUTES) — NOT backtest timeframe
                 candle, new_ts = _fetch_completed_candle(
-                    live_exchange, last_candle_ts_ms, cfg.backtest.timeframe
+                    live_exchange, last_candle_ts_ms, _LIVE_TF
                 )
                 if candle is None:
-                    countdown = _candle_countdown(cfg.backtest.timeframe)
+                    countdown = _candle_countdown(_LIVE_TF)
                     display.next_candle(price, tick, countdown)
                     tick_log.append({
                         "tick":   tick,
@@ -488,7 +492,7 @@ def run():
                 last_candle_ts_ms = new_ts
                 raw_signal = strategy.evaluate(candle)
             else:
-                # Simulated mode: flat fake candle per tick (quick testing)
+                # Simulated mode: flat fake candle per tick
                 fake_candle = _Candle(
                     timestamp=datetime.now(_tz.utc),
                     open=price, high=price, low=price, close=price, volume=0.0,
@@ -527,7 +531,6 @@ def run():
             _spread = abs(_ef - _es) / _es * 100 if (_ef and _es and _es > 0) else 0.0
             _sig_str = raw_signal.value if hasattr(raw_signal, 'value') else str(raw_signal)
 
-            # Determine rejection reason for HOLD signals
             _reason = ""
             if _sig_str == "HOLD":
                 if _adx_live is not None and _adx_live < strategy.config.adx_threshold:
@@ -558,7 +561,6 @@ def run():
                 flush=True
             )
 
-            # Log to CSV for live vs backtest comparison
             import csv, os as _os
             _live_log = "logs/live_signals.csv"
             _write_header = not _os.path.exists(_live_log)
@@ -580,7 +582,7 @@ def run():
                     _reason,
                 ])
 
-        # ── 4. Warmup guard (simulated mode; live is pre-warmed above) ─
+        # ── 4. Warmup guard ───────────────────────────────────────────
         if is_indicator and not strategy.is_warmed_up:
             display.warmup(tick, strategy.tick_count, strategy._warmup, price)
             time.sleep(cfg.exchange.loop_interval)
@@ -593,13 +595,13 @@ def run():
         filtered_signal, filter_reason = state_machine.filter_signal(raw_signal)
 
         # ── 6. Dynamic position sizing ─────────────────────────────────
-        # BUY = % of cash; SELL = close full position (AI can't create new SELLs)
         if filtered_signal == Signal.SELL:
             trade_qty = executor.position
         else:
-            trade_qty = cfg.calc_trade_qty(executor.cash, price)
+            _sl_price = price * (1 - cfg.backtest.stop_loss_pct) if cfg.backtest.stop_loss_pct > 0 else 0.0
+            trade_qty = cfg.calc_trade_qty_sl(executor.cash, price, _sl_price)
 
-        # ── 7. AI advisory (optional, advisory only) ───────────────────
+        # ── 7. AI advisory (optional) ──────────────────────────────────
         advice       = None
         final_signal = filtered_signal
         if ai and ai.enabled and filtered_signal != Signal.HOLD:
@@ -618,9 +620,7 @@ def run():
         approval     = risk.evaluate(final_signal, price, executor.portfolio, trade_qty)
         block_reason = "" if approval else approval.message
 
-        # ── 8b. Candle-close structured log (live indicator mode only) ──
-        # One INFO line per candle close, greppable for live-vs-backtest audit.
-        # Format: CANDLE <ts> UTC | close=<px> RSI=<x> ADX=<x> trend=<x> spread=<x>% signal=<raw> -> <action>
+        # ── 8b. Candle-close structured log ───────────────────────────
         if is_indicator and live_exchange is not None:
             _rsi_log = f"{_rsi_live:.1f}" if _rsi_live is not None else "n/a"
             _adx_log = f"{_adx_live:.1f}" if _adx_live is not None else "n/a"
@@ -708,7 +708,6 @@ def run():
         )
 
         # ── 12. Tick log + dashboard ───────────────────────────────────
-        # Update stickies so the next no-candle tick renders fresh values.
         _dash_signal = final_signal.value
         _dash_rsi    = rsi_val
         _dash_trend  = trend_val
