@@ -20,7 +20,7 @@ from typing import Optional
 from stock_bot.ai.verdict          import AIVerdict
 from stock_bot.research.aggregator import ResearchReport
 from stock_bot.research.fear_greed import FearGreedData
-from stock_bot.portfolio.tracker   import PortfolioPosition, PortfolioSummary
+from stock_bot.portfolio.tracker   import PortfolioPosition, PortfolioSummary, PaperSummary, PaperTrade
 from stock_bot.alerts.alert        import Alert
 
 logger = logging.getLogger(__name__)
@@ -305,6 +305,43 @@ def _css() -> str:
       padding: 5px 14px 6px; border-bottom: 1px solid #21262d;
       background: #0d111740;
     }
+    .paper-section { margin-bottom: 20px; }
+    .paper-label {
+      display: inline-block; font-size: 10px; font-weight: 700;
+      padding: 2px 7px; border-radius: 10px; vertical-align: middle;
+      background: #2a2d45; color: #7c8cf8; border: 1px solid #3d4175;
+      margin-left: 8px; letter-spacing: .04em;
+    }
+    .paper-summary-bar {
+      display: flex; gap: 24px; flex-wrap: wrap;
+      padding: 12px 16px; background: #161b22;
+      border: 1px solid #3d4175; border-radius: 8px;
+      margin-bottom: 12px;
+    }
+    .paper-summary-item { display: flex; flex-direction: column; gap: 2px; }
+    .paper-summary-key {
+      font-size: 10px; color: #8b949e;
+      text-transform: uppercase; letter-spacing: .05em;
+    }
+    .paper-summary-val { font-size: 18px; font-weight: 700; }
+    .paper-table-wrap {
+      background: #161b22; border: 1px solid #3d4175;
+      border-radius: 8px; overflow: hidden; overflow-x: auto; margin-bottom: 12px;
+    }
+    .paper-table { width: 100%; border-collapse: collapse; }
+    .paper-table th {
+      text-align: left; padding: 7px 10px;
+      color: #8b949e; font-size: 10px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: .04em;
+      border-bottom: 1px solid #3d4175; white-space: nowrap;
+    }
+    .paper-table td {
+      padding: 9px 10px; border-bottom: 1px solid #21262d;
+      font-size: 12px; color: #c9d1d9; white-space: nowrap;
+    }
+    .paper-table tr:last-child td { border-bottom: none; }
+    .paper-table tr:hover td { background: #1c2128; }
+    .paper-empty { color: #8b949e; font-size: 12px; font-style: italic; padding: 14px 0; text-align: center; }
     .alerts-section { margin-bottom: 20px; }
     .alert-row {
       padding: 10px 14px; border-radius: 6px;
@@ -669,6 +706,128 @@ def _alerts_panel_html(alerts: list[Alert]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Paper trading section
+# ---------------------------------------------------------------------------
+
+def _paper_section_html(paper: PaperSummary) -> str:
+    sc   = paper.starting_cash
+    tv   = paper.total_value
+    ret  = tv - sc
+    ret_pct = (ret / sc * 100) if sc else 0.0
+    ret_s   = "+" if ret >= 0 else ""
+    ret_col = _GREEN if ret >= 0 else _RED
+
+    unr     = paper.unrealized_pnl
+    unr_s   = "+" if unr >= 0 else ""
+    unr_col = _GREEN if unr >= 0 else _RED
+
+    rea     = paper.realized_pnl
+    rea_s   = "+" if rea >= 0 else ""
+    rea_col = _GREEN if rea >= 0 else _RED
+
+    # ── Account summary bar ──────────────────────────────────────────────────
+    n_pos = len(paper.positions)
+    summary_bar = f"""
+    <div class="paper-summary-bar">
+      <div class="paper-summary-item">
+        <span class="paper-summary-key">💵 Cash</span>
+        <span class="paper-summary-val">${paper.cash:,.2f}</span>
+      </div>
+      <div class="paper-summary-item">
+        <span class="paper-summary-key">📦 Open Positions</span>
+        <span class="paper-summary-val">{n_pos}</span>
+      </div>
+      <div class="paper-summary-item">
+        <span class="paper-summary-key">📈 Unrealized P&amp;L</span>
+        <span class="paper-summary-val" style="color:{unr_col}">{unr_s}${unr:,.2f}</span>
+      </div>
+      <div class="paper-summary-item">
+        <span class="paper-summary-key">✅ Realized P&amp;L</span>
+        <span class="paper-summary-val" style="color:{rea_col}">{rea_s}${rea:,.2f}</span>
+      </div>
+      <div class="paper-summary-item">
+        <span class="paper-summary-key">💼 Total Value</span>
+        <span class="paper-summary-val" style="color:{ret_col}">${tv:,.2f} <span style="font-size:13px">({ret_s}{ret_pct:.2f}%)</span></span>
+      </div>
+    </div>"""
+
+    # ── Open positions table ─────────────────────────────────────────────────
+    if paper.positions:
+        pos_rows = ""
+        for p in paper.positions:
+            gl_col = _GREEN if p.gain_loss > 0 else _RED if p.gain_loss < 0 else _MUTED
+            gl_s   = "+" if p.gain_loss >= 0 else ""
+            sig    = p.verdict.signal if p.verdict else "—"
+            sig_col = _SIG_COLOR.get(sig, _MUTED)
+            sig_icon = _SIG_ICON.get(sig, sig)
+            pos_rows += f"""
+          <tr>
+            <td><strong>{_e(p.symbol)}</strong>
+              <span style="color:#8b949e;font-size:10px;margin-left:4px">{_e(p.currency)}</span>
+            </td>
+            <td>{p.shares:g}</td>
+            <td>${p.avg_cost:,.2f}</td>
+            <td>${p.current_price:,.2f}</td>
+            <td style="color:{gl_col};font-weight:600">{gl_s}${p.gain_loss:,.2f}</td>
+            <td style="color:{gl_col};font-weight:600">{gl_s}{p.gain_loss_pct:.1f}%</td>
+            <td><span style="color:{sig_col};font-weight:600">{_e(sig_icon)}</span></td>
+          </tr>"""
+        positions_html = f"""
+    <div class="paper-table-wrap">
+      <table class="paper-table">
+        <thead><tr>
+          <th>Symbol</th><th>Shares</th><th>Avg Cost</th>
+          <th>Current</th><th>P&amp;L $</th><th>P&amp;L %</th><th>AI Signal</th>
+        </tr></thead>
+        <tbody>{pos_rows}</tbody>
+      </table>
+    </div>"""
+    else:
+        positions_html = '<div class="paper-empty">No open positions</div>'
+
+    # ── Recent trades table ──────────────────────────────────────────────────
+    if paper.recent_trades:
+        trade_rows = ""
+        for t in paper.recent_trades:
+            side_col  = _GREEN if t.side == "BUY" else _RED
+            ts        = t.timestamp.split(" ")[1] if " " in t.timestamp else t.timestamp
+            trade_rows += f"""
+          <tr>
+            <td style="color:#8b949e">{_e(ts)}</td>
+            <td><strong>{_e(t.symbol)}</strong></td>
+            <td style="color:{side_col};font-weight:600">{_e(t.side)}</td>
+            <td>{t.shares:g}</td>
+            <td>${t.price:,.2f}</td>
+            <td>${t.total_value:,.2f}</td>
+            <td style="color:#8b949e">{_e(t.reason)}</td>
+          </tr>"""
+        trades_html = f"""
+    <div style="margin-top:6px">
+      <div style="font-size:11px;color:#8b949e;font-weight:600;text-transform:uppercase;
+                  letter-spacing:.05em;margin-bottom:6px">Recent Trades</div>
+      <div class="paper-table-wrap">
+        <table class="paper-table">
+          <thead><tr>
+            <th>Time</th><th>Symbol</th><th>Side</th><th>Shares</th>
+            <th>Price</th><th>Value</th><th>Reason</th>
+          </tr></thead>
+          <tbody>{trade_rows}</tbody>
+        </table>
+      </div>
+    </div>"""
+    else:
+        trades_html = ""
+
+    return f"""
+  <div class="paper-section">
+    <h2>📄 Paper Trading <span class="paper-label">VIRTUAL</span></h2>
+    {summary_bar}
+    {positions_html}
+    {trades_html}
+  </div>"""
+
+
+# ---------------------------------------------------------------------------
 # Main HTML builder
 # ---------------------------------------------------------------------------
 
@@ -678,6 +837,7 @@ def _build_html(
     loop_interval: int,
     portfolio:     Optional[PortfolioSummary] = None,
     alerts:        Optional[list[Alert]]      = None,
+    paper:         Optional[PaperSummary]     = None,
 ) -> str:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -734,6 +894,7 @@ def _build_html(
   </div>"""
 
     portfolio_section = _portfolio_section_html(portfolio) if portfolio else ""
+    paper_section     = _paper_section_html(paper) if paper else ""
     alerts_section    = _alerts_panel_html(alerts or [])
 
     return f"""<!DOCTYPE html>
@@ -751,6 +912,7 @@ def _build_html(
 {_fg_section_html(fear_greed)}
 {_summary_html(results)}
 {portfolio_section}
+{paper_section}
 {_top_picks_html(results)}
 {watchlist_section_html}
 {universe_section_html}
@@ -795,8 +957,9 @@ class DashboardRenderer:
         fear_greed:   FearGreedData,
         portfolio:    Optional[PortfolioSummary] = None,
         alerts:       Optional[list[Alert]]      = None,
+        paper:        Optional[PaperSummary]     = None,
     ) -> None:
-        html_str = _build_html(scan_results, fear_greed, self.loop_interval, portfolio, alerts)
+        html_str = _build_html(scan_results, fear_greed, self.loop_interval, portfolio, alerts, paper)
         os.makedirs(os.path.dirname(os.path.abspath(_OUTPUT_PATH)), exist_ok=True)
         with open(_OUTPUT_PATH, "w", encoding="utf-8") as f:
             f.write(html_str)

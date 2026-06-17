@@ -310,25 +310,42 @@ def run() -> None:
 
                     # ── Paper trading execution ───────────────────────────────
                     if executor is not None and verdict is not None:
-                        px  = symbol_data["last_candle"].close
-                        sig = verdict.signal
-                        cur = "CAD" if symbol.upper().endswith(".TO") else "USD"
+                        px   = symbol_data["last_candle"].close
+                        sig  = verdict.signal
+                        cur  = "CAD" if symbol.upper().endswith(".TO") else "USD"
                         if sig == "BUY" and verdict.confidence >= cfg.paper_min_confidence:
                             if executor.position(symbol) == 0:
-                                alloc  = executor.cash * cfg.paper_risk_pct
-                                shares = round(alloc / px, 4) if px > 0 else 0
+                                # Size on total portfolio value (cash + positions at avg cost)
+                                snap     = executor.positions_snapshot()
+                                pos_val  = sum(sh * co for sh, co in snap.values())
+                                tot_val  = executor.cash + pos_val
+                                alloc    = tot_val * cfg.paper_risk_pct
+                                shares   = round(alloc / px, 4) if px > 0 else 0
                                 if shares > 0:
-                                    order = executor.buy(symbol, shares, px)
+                                    reason = f"BUY {verdict.confidence}% {verdict.trading_style}"
+                                    order  = executor.buy(symbol, shares, px, reason=reason)
                                     if order.status == OrderStatus.FILLED:
-                                        print(f"  📄 PAPER BUY   {shares:.4f} {symbol} @ ${px:,.2f} {cur}  (conf: {verdict.confidence}%)")
+                                        total = round(shares * px, 2)
+                                        print(f"  📄 PAPER BUY:  {symbol}  {shares:.4f} shares @ ${px:,.2f} = ${total:,.2f}")
+                                        print(f"                 Cash remaining: ${executor.cash:,.2f}")
                                     else:
-                                        print(f"  📄 PAPER BUY REJECTED  {symbol}: {order.reject_reason}")
+                                        need = round(shares * px, 2)
+                                        print(f"  📄 REJECTED:   {symbol}  insufficient cash")
+                                        print(f"                 (need ${need:,.2f}  have ${executor.cash:,.2f})")
                         elif sig == "SELL":
                             held = executor.position(symbol)
                             if held > 0:
-                                order = executor.sell(symbol, held, px)
+                                avg  = executor.avg_cost(symbol)
+                                reason = f"SELL {verdict.confidence}% {verdict.trading_style}"
+                                order  = executor.sell(symbol, held, px, reason=reason)
                                 if order.status == OrderStatus.FILLED:
-                                    print(f"  📄 PAPER SELL  {held:.4f} {symbol} @ ${px:,.2f} {cur}  realized_pnl=${executor.realized_pnl():+,.2f}")
+                                    proceeds = round(held * px, 2)
+                                    trade_pnl = round((px - avg) * held, 2)
+                                    pnl_pct   = round((px - avg) / avg * 100, 1) if avg else 0.0
+                                    pnl_s     = "+" if trade_pnl >= 0 else ""
+                                    print(f"  📄 PAPER SELL: {symbol}  {held:.4f} shares @ ${px:,.2f} = ${proceeds:,.2f}")
+                                    print(f"                 Realized P&L: {pnl_s}${trade_pnl:,.2f} ({pnl_s}{pnl_pct}%)")
+                                    print(f"                 Cash remaining: ${executor.cash:,.2f}")
 
                     # Build ScanResult for dashboard
                     macd_note: str | None = None
@@ -369,14 +386,40 @@ def run() -> None:
 
         # Build portfolio summary — paper executor takes precedence over static tracker
         portfolio_summary = None
+        paper_summary     = None
         try:
             if executor is not None:
                 portfolio_summary = executor.build_summary(scan_results)
+                paper_summary     = executor.build_paper_summary(scan_results)
                 executor.log_state({r.symbol: r.price for r in scan_results})
             else:
                 portfolio_summary = tracker.build_summary(scan_results)
         except Exception as exc:
             logger.warning("Portfolio build failed: %s", exc)
+
+        # End-of-cycle paper portfolio summary
+        if executor is not None:
+            try:
+                price_map_cycle = {r.symbol: r.price for r in scan_results}
+                unr     = executor.unrealized_pnl(price_map_cycle)
+                rea     = executor.realized_pnl()
+                tv      = executor.total_value(price_map_cycle)
+                ret_pct = (tv - executor.starting_cash) / executor.starting_cash * 100 if executor.starting_cash else 0.0
+                open_syms = list(executor.positions_snapshot().keys())
+                unr_s   = "+" if unr >= 0 else ""
+                rea_s   = "+" if rea >= 0 else ""
+                ret_s   = "+" if ret_pct >= 0 else ""
+                syms_str = ", ".join(open_syms) if open_syms else "none"
+                print(f"  {'─' * 44}")
+                print(f"  📄 Paper Portfolio Summary")
+                print(f"  💵 Cash:           ${executor.cash:>10,.2f}")
+                print(f"  📦 Open positions: {len(open_syms)} ({syms_str})")
+                print(f"  📈 Unrealized P&L: {unr_s}${unr:,.2f}")
+                print(f"  ✅ Realized P&L:   {rea_s}${rea:,.2f}")
+                print(f"  💼 Total Value:    ${tv:>10,.2f}  ({ret_s}{ret_pct:.2f}%)")
+                print(f"  {'─' * 44}")
+            except Exception as exc:
+                logger.warning("Paper summary print failed: %s", exc)
 
         # Evaluate and deliver alerts
         alerts = []
@@ -389,7 +432,7 @@ def run() -> None:
 
         # Write dashboard
         try:
-            renderer.render(scan_results, fear_greed_data, portfolio_summary, alerts)
+            renderer.render(scan_results, fear_greed_data, portfolio_summary, alerts, paper=paper_summary)
         except Exception as exc:
             logger.warning("Dashboard render failed: %s", exc)
 

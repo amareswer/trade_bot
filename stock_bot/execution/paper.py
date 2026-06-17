@@ -5,16 +5,16 @@ Simulates stock orders against a virtual cash balance.
 Fills are instantaneous at the price provided by the scan cycle (market-order semantics).
 Tracks multiple symbols, weighted average cost basis, realized + unrealized P&L.
 
+Every fill is appended to stock_bot/paper_trades.csv (created on first trade, never overwritten).
+
 No slippage, no commissions, no partial fills modelled — add those when
 moving to a real broker by implementing StockExecutorBase.
-
-To swap in Interactive Brokers:
-    Replace StockPaperExecutor with IBrokerExecutor(StockExecutorBase) in main.py.
-    Everything else — alerts, dashboard, portfolio summary — stays unchanged.
 """
 from __future__ import annotations
 
+import csv
 import logging
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -22,8 +22,20 @@ from typing import Optional
 from stock_bot.execution.base import (
     OrderSide, OrderStatus, StockExecutorBase, StockOrder,
 )
+from stock_bot.portfolio.tracker import (
+    PaperSummary, PaperTrade, PortfolioPosition,
+)
 
 logger = logging.getLogger(__name__)
+
+_TRADES_CSV = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),  # stock_bot/
+    "paper_trades.csv",
+)
+_CSV_HEADER = [
+    "timestamp", "symbol", "side", "shares",
+    "price", "total_value", "cash_remaining", "reason",
+]
 
 
 class StockPaperExecutor(StockExecutorBase):
@@ -35,26 +47,26 @@ class StockPaperExecutor(StockExecutorBase):
     """
 
     def __init__(self, starting_cash: float = 10_000.0) -> None:
-        self._cash:          float                        = starting_cash
-        self._starting_cash: float                        = starting_cash
+        self._cash:          float                          = starting_cash
+        self._starting_cash: float                          = starting_cash
         # {SYMBOL_UPPER: (shares, avg_cost_per_share)}
         self._positions:     dict[str, tuple[float, float]] = {}
-        self._realized_pnl:  float                        = 0.0
-        self._orders:        list[StockOrder]             = []
+        self._realized_pnl:  float                          = 0.0
+        self._orders:        list[StockOrder]               = []
+        self._trade_log:     list[PaperTrade]               = []  # in-memory recent trades
 
-        logger.info(
-            "StockPaperExecutor ready | starting_cash=$%.2f", starting_cash
-        )
+        self._ensure_csv_header()
+        logger.info("StockPaperExecutor ready | starting_cash=$%.2f", starting_cash)
 
     # ── Core operations ───────────────────────────────────────────────────────
 
-    def buy(self, symbol: str, shares: float, price: float) -> StockOrder:
+    def buy(self, symbol: str, shares: float, price: float, reason: str = "") -> StockOrder:
         sym   = symbol.upper()
         order = self._new_order(sym, OrderSide.BUY, shares, price)
         cost  = round(shares * price, 2)
 
         if cost > self._cash + 1e-9:
-            order.status       = OrderStatus.REJECTED
+            order.status        = OrderStatus.REJECTED
             order.reject_reason = (
                 f"Insufficient cash: have ${self._cash:,.2f}, need ${cost:,.2f}"
             )
@@ -71,6 +83,20 @@ class StockPaperExecutor(StockExecutorBase):
             self._cash          -= cost
             order.status    = OrderStatus.FILLED
             order.filled_at = datetime.now(timezone.utc)
+
+            trade = PaperTrade(
+                timestamp      = datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                symbol         = sym,
+                side           = "BUY",
+                shares         = shares,
+                price          = price,
+                total_value    = cost,
+                cash_remaining = self._cash,
+                reason         = reason,
+            )
+            self._trade_log.append(trade)
+            self._log_trade_csv(trade)
+
             logger.info(
                 "PAPER BUY FILLED   %s  %.4f shares @ $%.2f  "
                 "new_pos=%.4f  avg_cost=$%.2f  cash=$%.2f",
@@ -80,7 +106,7 @@ class StockPaperExecutor(StockExecutorBase):
         self._orders.append(order)
         return order
 
-    def sell(self, symbol: str, shares: float, price: float) -> StockOrder:
+    def sell(self, symbol: str, shares: float, price: float, reason: str = "") -> StockOrder:
         sym   = symbol.upper()
         order = self._new_order(sym, OrderSide.SELL, shares, price)
 
@@ -93,17 +119,31 @@ class StockPaperExecutor(StockExecutorBase):
             logger.warning("PAPER SELL REJECTED  %s × %.4f — %s",
                            sym, shares, order.reject_reason)
         else:
-            pnl             = round((price - held_cost) * shares, 2)
-            proceeds        = round(shares * price, 2)
-            self._cash     += proceeds
+            pnl              = round((price - held_cost) * shares, 2)
+            proceeds         = round(shares * price, 2)
+            self._cash      += proceeds
             self._realized_pnl += pnl
-            new_shares      = round(held_shares - shares, 9)
+            new_shares       = round(held_shares - shares, 9)
             if new_shares < 1e-9:
                 del self._positions[sym]
             else:
                 self._positions[sym] = (new_shares, held_cost)
             order.status    = OrderStatus.FILLED
             order.filled_at = datetime.now(timezone.utc)
+
+            trade = PaperTrade(
+                timestamp      = datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                symbol         = sym,
+                side           = "SELL",
+                shares         = shares,
+                price          = price,
+                total_value    = proceeds,
+                cash_remaining = self._cash,
+                reason         = reason,
+            )
+            self._trade_log.append(trade)
+            self._log_trade_csv(trade)
+
             logger.info(
                 "PAPER SELL FILLED  %s  %.4f shares @ $%.2f  "
                 "trade_pnl=$%.2f  total_realized=$%.2f  cash=$%.2f",
@@ -118,6 +158,10 @@ class StockPaperExecutor(StockExecutorBase):
     @property
     def cash(self) -> float:
         return self._cash
+
+    @property
+    def starting_cash(self) -> float:
+        return self._starting_cash
 
     def position(self, symbol: str) -> float:
         return self._positions.get(symbol.upper(), (0.0, 0.0))[0]
@@ -153,6 +197,50 @@ class StockPaperExecutor(StockExecutorBase):
     def filled_orders(self) -> list[StockOrder]:
         return [o for o in self._orders if o.status == OrderStatus.FILLED]
 
+    # ── Paper summary for dashboard ───────────────────────────────────────────
+
+    def build_paper_summary(self, scan_results: list) -> PaperSummary:
+        """Build a full PaperSummary from current state + live scan prices."""
+        price_map   = {r.symbol.upper(): r.price    for r in scan_results}
+        verdict_map = {r.symbol.upper(): r.verdict  for r in scan_results}
+        currency_map= {r.symbol.upper(): r.currency for r in scan_results}
+
+        positions: list[PortfolioPosition] = []
+        for sym, (shares, avg_cost) in self._positions.items():
+            current_price = price_map.get(sym, avg_cost)
+            current_value = round(shares * current_price, 2)
+            total_cost    = round(shares * avg_cost, 2)
+            gain_loss     = round(current_value - total_cost, 2)
+            gain_loss_pct = round((gain_loss / total_cost * 100) if total_cost else 0.0, 2)
+            currency      = currency_map.get(sym, "CAD" if sym.endswith(".TO") else "USD")
+            positions.append(PortfolioPosition(
+                symbol        = sym,
+                shares        = shares,
+                avg_cost      = avg_cost,
+                current_price = current_price,
+                current_value = current_value,
+                total_cost    = total_cost,
+                gain_loss     = gain_loss,
+                gain_loss_pct = gain_loss_pct,
+                currency      = currency,
+                verdict       = verdict_map.get(sym),
+            ))
+
+        unrealized   = round(sum(p.gain_loss for p in positions), 2)
+        pos_mkt_val  = sum(p.current_value for p in positions)
+        total_val    = round(self._cash + pos_mkt_val, 2)
+        recent       = list(reversed(self._trade_log[-10:]))
+
+        return PaperSummary(
+            cash           = self._cash,
+            starting_cash  = self._starting_cash,
+            positions      = positions,
+            realized_pnl   = self._realized_pnl,
+            unrealized_pnl = unrealized,
+            total_value    = total_val,
+            recent_trades  = recent,
+        )
+
     # ── Stats helper ──────────────────────────────────────────────────────────
 
     def log_state(self, prices: dict[str, float] | None = None) -> None:
@@ -166,6 +254,33 @@ class StockPaperExecutor(StockExecutorBase):
             len(self.filled_orders()),
             len(self._positions),
         )
+
+    # ── CSV persistence ───────────────────────────────────────────────────────
+
+    def _ensure_csv_header(self) -> None:
+        if not os.path.exists(_TRADES_CSV):
+            try:
+                with open(_TRADES_CSV, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(_CSV_HEADER)
+                logger.info("Created paper_trades.csv at %s", _TRADES_CSV)
+            except OSError as exc:
+                logger.warning("Could not create paper_trades.csv: %s", exc)
+
+    def _log_trade_csv(self, trade: PaperTrade) -> None:
+        try:
+            with open(_TRADES_CSV, "a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow([
+                    trade.timestamp,
+                    trade.symbol,
+                    trade.side,
+                    f"{trade.shares:.4f}",
+                    f"{trade.price:.4f}",
+                    f"{trade.total_value:.2f}",
+                    f"{trade.cash_remaining:.2f}",
+                    trade.reason,
+                ])
+        except OSError as exc:
+            logger.warning("Could not write to paper_trades.csv: %s", exc)
 
     # ── Internal ─────────────────────────────────────────────────────────────
 

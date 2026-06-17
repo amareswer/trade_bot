@@ -51,6 +51,31 @@ class PortfolioSummary:
     total_gain_loss_pct: float
 
 
+@dataclass
+class PaperTrade:
+    """One filled paper-trade record — written to paper_trades.csv and shown in dashboard."""
+    timestamp:      str    # "YYYY-MM-DD HH:MM:SS"
+    symbol:         str
+    side:           str    # "BUY" | "SELL"
+    shares:         float
+    price:          float
+    total_value:    float
+    cash_remaining: float
+    reason:         str    # e.g. "BUY 72% SWING"
+
+
+@dataclass
+class PaperSummary:
+    """Full paper-portfolio state for one scan cycle, passed to the dashboard renderer."""
+    cash:           float
+    starting_cash:  float
+    positions:      list[PortfolioPosition]  # open positions with live P&L
+    realized_pnl:   float
+    unrealized_pnl: float
+    total_value:    float             # cash + open-position market value
+    recent_trades:  list[PaperTrade]  # last 10 filled, newest first
+
+
 # ---------------------------------------------------------------------------
 # Tracker
 # ---------------------------------------------------------------------------

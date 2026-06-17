@@ -82,12 +82,12 @@ class StockExecutorBase(ABC):
     # ── Core trading operations ───────────────────────────────────────────────
 
     @abstractmethod
-    def buy(self, symbol: str, shares: float, price: float) -> StockOrder:
+    def buy(self, symbol: str, shares: float, price: float, reason: str = "") -> StockOrder:
         """Place a market BUY for `shares` of `symbol` at `price`."""
         ...
 
     @abstractmethod
-    def sell(self, symbol: str, shares: float, price: float) -> StockOrder:
+    def sell(self, symbol: str, shares: float, price: float, reason: str = "") -> StockOrder:
         """Place a market SELL for `shares` of `symbol` at `price`."""
         ...
 

@@ -17,14 +17,26 @@ metadata:
 
 **Running:** `python -m stock_bot.main` — advisory only, no execution
 
-**Phase:** 3 of 6 complete
+**Phase:** 6 of 6 complete (all phases built)
 
 **Active config:**
 - `AI_PROVIDER=ollama_cloud` | `OLLAMA_MODEL=llama3.2` | `OLLAMA_CLOUD_API_KEY` set
 - `WATCHLIST=SHOP.TO,RY.TO,AAPL,NVDA,AC.TO` | `INTERVAL=1d` | `LOOKBACK_DAYS=200`
 - Reddit: no credentials set (sentiment skipped gracefully)
+- `UNIVERSE_ENABLED=false` by default; set to `true` to enable S&P500+TSX60 top-mover scanning
+- Dashboard written to `stock_dashboard.html` in repo root every cycle
 
-**Next phase:** Phase 4 — HTML dashboard
+**What's running (as of 2026-06-16):**
+- Indicators + research + AI verdict per symbol
+- HTML dashboard: two-section layout — 📋 My Watchlist (blue) + 🔥 Top Movers (green)
+- Alerts: terminal box with source tag (watchlist vs top mover)
+- Paper trading: off by default (`PAPER_TRADING_ENABLED=false`)
+- Source separation: `ScanResult.source` + `Alert.source` flow through entire pipeline
+
+**Next steps for stock bot:**
+1. Enable universe scanner (`UNIVERSE_ENABLED=true`) and monitor top-mover quality
+2. Wire Reddit credentials if sentiment data is wanted
+3. Consider Questrade paper API when ready for real broker integration
 
 ---
 

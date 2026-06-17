@@ -15,6 +15,109 @@ Running log of feature decisions. Most recent first.
 
 ---
 
+## 2026-06-16 — Stock Bot Source Separation + Dashboard Visual Sections (BUILT ✓)
+
+Two changes that flow the "where did this symbol come from" tag end-to-end through the pipeline.
+
+### Source Separation — main.py (BUILT ✓)
+
+**Problem (bug fixed):** The main loop iterated `for symbol in watchlist` which was only defined inside the universe refresh block. On the first cycle (elapsed_h < 24h refresh) this variable was undefined → NameError. Fixed by using `all_symbols` everywhere.
+
+**What was built:**
+- `watchlist_symbols` and `universe_symbols` kept as separate lists throughout the loop
+- Universe refresh block now updates `all_symbols` (not a local `watchlist`) and prints both lists separately
+- `for symbol in all_symbols:` — deduplicated union, watchlist first
+- `force_scan = symbol in cfg.watchlist` — watchlist always bypasses screener
+- `ScanResult.source = "watchlist" if symbol in cfg.watchlist else "universe"` — set at creation
+- Terminal header prints: `My Watchlist : ...` and `Top Movers : ...` on separate lines
+
+**Files changed:** `stock_bot/main.py`
+
+### Source Tag in Alerts — notifier.py (BUILT ✓)
+
+Terminal alert box now shows source on the type line:
+```
+🟡 MEDIUM · STRONG_BUY · watchlist
+🟡 MEDIUM · STRONG_BUY · top mover
+```
+
+`Alert.source` and `evaluator._make(source=r.source)` were already wired in a prior session. This session adds the terminal display.
+
+**Files changed:** `stock_bot/alerts/notifier.py`
+
+### Dashboard Visual Sections — renderer.py (BUILT ✓)
+
+Replaced the old single flat card grid with two visually distinct sections:
+
+**Section A — 📋 My Watchlist**
+- Section header background: `#1c2333` (dark blue tint)
+- Card `border-left: 3px solid #388bfd` (blue accent) via `.watchlist-card`
+- Sub-text: "Always scanned every cycle"
+- Only rendered if watchlist has results
+
+**Section B — 🔥 Top Movers**
+- Section header background: `#1c2820` (dark green tint)
+- Card `border-left: 3px solid #2ea043` (green accent) via `.mover-card`
+- Sub-text: "S&P 500 + TSX 60 · ranked by volume × momentum"
+- Only rendered if universe results exist
+
+**New CSS classes:** `.section-header`, `.section-header.watchlist`, `.section-header.movers`, `.section-title`, `.section-badge`, `.section-sub`, `.watchlist-card`, `.mover-card`, `.screened-card`
+
+**`_stock_card_html()`** gains `extra_class: str = ""` param applied to root div.
+
+**Both sections:** sort BUY→HOLD→SELL by confidence independently. If universe disabled → only watchlist section renders (no empty header). Mobile responsive — same `@media` grid.
+
+**Files changed:** `stock_bot/dashboard/renderer.py`
+
+---
+
+## 2026-06-16 — Stock Bot Phases 4 · 5 · 6 (BUILT ✓)
+
+All remaining stock bot phases built. Recap for completeness — detailed build notes to be added if needed.
+
+### Phase 4 — HTML Dashboard (BUILT ✓)
+
+`stock_bot/dashboard/renderer.py` — `DashboardRenderer`, `ScanResult` dataclass.
+
+- Writes `stock_dashboard.html` to repo root after every scan cycle
+- Dark GitHub-palette theme, pure inline CSS, no external deps
+- Sections: Fear & Greed meter, BUY/HOLD/SELL summary grid, top-picks scroll, portfolio table, per-symbol cards, alerts panel
+- `ScanResult.source: str = "watchlist"` field added (default, overridden in Phase 6 universe work)
+- Auto-refresh via `<meta http-equiv="refresh">`
+
+### Phase 5 — Alerts (BUILT ✓)
+
+`stock_bot/alerts/alert.py` — `Alert` dataclass with `source: str` field.
+`stock_bot/alerts/evaluator.py` — `AlertEvaluator`: runs 7 check types each cycle, passes `source=r.source`.
+`stock_bot/alerts/notifier.py` — `AlertNotifier`: terminal colorama box, Gmail SMTP (HIGH only), plyer desktop (HIGH only).
+
+### Phase 6 — Paper Trading + Portfolio + Universe Scanner (BUILT ✓)
+
+`stock_bot/execution/paper.py` — `StockPaperExecutor`: virtual cash, paper buy/sell, realized PnL, `build_summary()`.
+`stock_bot/portfolio/tracker.py` — `PortfolioTracker`: static holdings from `PORTFOLIO` env var, `PortfolioSummary`.
+`stock_bot/data/universe.py` — `StockUniverse`: Wikipedia S&P500+TSX60 fetch, ranked by `volume×|price_change|`, TTL cache.
+`stock_bot/data/screener.py` — `StockScreener`: momentum gate for universe symbols only.
+
+**New config keys added (all in stock_bot/.env):**
+
+| Key | Default | Purpose |
+|---|---|---|
+| `PORTFOLIO` | `""` | `SYM:SHARES:AVGCOST,...` static holdings |
+| `BASE_CURRENCY` | `CAD` | Display currency for portfolio |
+| `ALERT_EMAIL_ENABLED` | `false` | Send HIGH alerts via Gmail |
+| `ALERT_EMAIL_FROM/TO/PASSWORD` | `""` | Gmail SMTP credentials |
+| `ALERT_DESKTOP_ENABLED` | `false` | plyer desktop toasts (HIGH only) |
+| `PAPER_TRADING_ENABLED` | `false` | Enable paper executor |
+| `PAPER_STARTING_CASH` | `10000.0` | Virtual cash at startup |
+| `PAPER_RISK_PCT` | `0.10` | Fraction of cash per paper trade |
+| `PAPER_MIN_CONFIDENCE` | `65` | Min AI conf to trigger paper trade |
+| `UNIVERSE_ENABLED` | `false` | Scan S&P500+TSX60 top movers |
+| `UNIVERSE_SIZE` | `20` | Top N universe symbols per cycle |
+| `UNIVERSE_REFRESH_HOURS` | `24` | Universe TTL in hours |
+| `SCREENER_ENABLED` | `true` | Skip AI on low-momentum universe stocks |
+
+---
+
 ## 2026-06-15 — Stock Bot Phases 1 · 2 · 3 (BUILT ✓)
 
 New module `stock_bot/` added to repo — fully separate from `/bot` (crypto). Advisory-only stock research + AI analysis for NYSE, NASDAQ, TSX.

@@ -193,6 +193,43 @@
       padding: 5px 14px 6px; border-bottom: 1px solid #21262d;
       background: #0d111740;
     }
+    .paper-section { margin-bottom: 20px; }
+    .paper-label {
+      display: inline-block; font-size: 10px; font-weight: 700;
+      padding: 2px 7px; border-radius: 10px; vertical-align: middle;
+      background: #2a2d45; color: #7c8cf8; border: 1px solid #3d4175;
+      margin-left: 8px; letter-spacing: .04em;
+    }
+    .paper-summary-bar {
+      display: flex; gap: 24px; flex-wrap: wrap;
+      padding: 12px 16px; background: #161b22;
+      border: 1px solid #3d4175; border-radius: 8px;
+      margin-bottom: 12px;
+    }
+    .paper-summary-item { display: flex; flex-direction: column; gap: 2px; }
+    .paper-summary-key {
+      font-size: 10px; color: #8b949e;
+      text-transform: uppercase; letter-spacing: .05em;
+    }
+    .paper-summary-val { font-size: 18px; font-weight: 700; }
+    .paper-table-wrap {
+      background: #161b22; border: 1px solid #3d4175;
+      border-radius: 8px; overflow: hidden; overflow-x: auto; margin-bottom: 12px;
+    }
+    .paper-table { width: 100%; border-collapse: collapse; }
+    .paper-table th {
+      text-align: left; padding: 7px 10px;
+      color: #8b949e; font-size: 10px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: .04em;
+      border-bottom: 1px solid #3d4175; white-space: nowrap;
+    }
+    .paper-table td {
+      padding: 9px 10px; border-bottom: 1px solid #21262d;
+      font-size: 12px; color: #c9d1d9; white-space: nowrap;
+    }
+    .paper-table tr:last-child td { border-bottom: none; }
+    .paper-table tr:hover td { background: #1c2128; }
+    .paper-empty { color: #8b949e; font-size: 12px; font-style: italic; padding: 14px 0; text-align: center; }
     .alerts-section { margin-bottom: 20px; }
     .alert-row {
       padding: 10px 14px; border-radius: 6px;
@@ -224,7 +261,7 @@
       <div class="title">📈 Stock Research Bot</div>
     </div>
     <div class="meta">
-      Last updated: 2026-06-16 22:17:34<br>
+      Last updated: 2026-06-16 22:44:21<br>
       Next refresh: <span id="countdown">60s</span>
     </div>
   </div>
@@ -245,31 +282,381 @@
     
       <div class="summary-card" style="border-color:#2ea04333">
         <div class="summary-label">🟢 BUY</div>
-        <div class="summary-count" style="color:#2ea043">12</div>
-        <div class="summary-syms">SHOP.TO · AC.TO · INTC · MU · WDC · SNDK · LRCX · FCX · KLAC · AMAT · NEM · MRNA</div>
+        <div class="summary-count" style="color:#2ea043">9</div>
+        <div class="summary-syms">SHOP.TO · AC.TO · INTC · WDC · SNDK · LRCX · FCX · NEM · MRNA</div>
       </div>
     
       <div class="summary-card" style="border-color:#6e768133">
         <div class="summary-label">⏸ HOLD</div>
         <div class="summary-count" style="color:#6e7681">2</div>
-        <div class="summary-syms">SPCX · QCOM</div>
+        <div class="summary-syms">AAPL · SPCX</div>
       </div>
     
       <div class="summary-card" style="border-color:#f8514933">
         <div class="summary-label">🔴 SELL</div>
-        <div class="summary-count" style="color:#f85149">5</div>
-        <div class="summary-syms">RY.TO · AAPL · NVDA · AMD · UBER</div>
+        <div class="summary-count" style="color:#f85149">8</div>
+        <div class="summary-syms">RY.TO · NVDA · MU · AMD · QCOM · KLAC · AMAT · UBER</div>
       </div>
   </div>
 
+  <div class="portfolio-section">
+    <h2>💼 My Portfolio</h2>
+    
+    <div class="portfolio-summary-bar">
+      <div class="portfolio-summary-item">
+        <span class="portfolio-summary-key">Invested</span>
+        <span class="portfolio-summary-val">$1,599.95</span>
+      </div>
+      <div class="portfolio-summary-item">
+        <span class="portfolio-summary-key">Current Value</span>
+        <span class="portfolio-summary-val">$1,599.95</span>
+      </div>
+      <div class="portfolio-summary-item">
+        <span class="portfolio-summary-key">Total P&amp;L</span>
+        <span class="portfolio-summary-val" style="color:#8b949e">+$0.00 (+0.0%)</span>
+      </div>
+    </div>
+    <div class="portfolio-table-wrap">
+      <table class="portfolio-table">
+        <thead>
+          <tr>
+            <th>Symbol</th><th>Shares</th><th>Avg Cost</th>
+            <th>Current</th><th>P&amp;L $</th><th>P&amp;L %</th>
+            <th>AI Signal</th><th>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+        <tr>
+          <td>
+            <strong>SHOP.TO</strong>
+            <span style="color:#8b949e;font-size:10px;margin-left:4px">CAD</span>
+          </td>
+          <td>1.2619</td>
+          <td>$158.49</td>
+          <td>$158.49</td>
+          <td style="color:#8b949e">+$0.00</td>
+          <td style="color:#8b949e;font-weight:600">+0.0%</td>
+          <td><span style="color:#2ea043;font-weight:600">BUY</span></td>
+          <td style="color:#8b949e;font-size:11px">Consider adding</td>
+        </tr>
+        <tr>
+          <td>
+            <strong>AC.TO</strong>
+            <span style="color:#8b949e;font-size:10px;margin-left:4px">CAD</span>
+          </td>
+          <td>8.7184</td>
+          <td>$22.94</td>
+          <td>$22.94</td>
+          <td style="color:#8b949e">+$0.00</td>
+          <td style="color:#8b949e;font-weight:600">+0.0%</td>
+          <td><span style="color:#2ea043;font-weight:600">BUY</span></td>
+          <td style="color:#8b949e;font-size:11px">Consider adding</td>
+        </tr>
+        <tr>
+          <td>
+            <strong>INTC</strong>
+            <span style="color:#8b949e;font-size:10px;margin-left:4px">USD</span>
+          </td>
+          <td>1.7087</td>
+          <td>$117.05</td>
+          <td>$117.05</td>
+          <td style="color:#8b949e">+$0.00</td>
+          <td style="color:#8b949e;font-weight:600">+0.0%</td>
+          <td><span style="color:#2ea043;font-weight:600">BUY</span></td>
+          <td style="color:#8b949e;font-size:11px">Consider adding</td>
+        </tr>
+        <tr>
+          <td>
+            <strong>SNDK</strong>
+            <span style="color:#8b949e;font-size:10px;margin-left:4px">USD</span>
+          </td>
+          <td>0.1004</td>
+          <td>$1,991.55</td>
+          <td>$1,991.55</td>
+          <td style="color:#8b949e">+$0.00</td>
+          <td style="color:#8b949e;font-weight:600">+0.0%</td>
+          <td><span style="color:#2ea043;font-weight:600">BUY</span></td>
+          <td style="color:#8b949e;font-size:11px">Consider adding</td>
+        </tr>
+        <tr>
+          <td>
+            <strong>LRCX</strong>
+            <span style="color:#8b949e;font-size:10px;margin-left:4px">USD</span>
+          </td>
+          <td>0.5415</td>
+          <td>$369.34</td>
+          <td>$369.34</td>
+          <td style="color:#8b949e">+$0.00</td>
+          <td style="color:#8b949e;font-weight:600">+0.0%</td>
+          <td><span style="color:#2ea043;font-weight:600">BUY</span></td>
+          <td style="color:#8b949e;font-size:11px">Consider adding</td>
+        </tr>
+        <tr>
+          <td>
+            <strong>FCX</strong>
+            <span style="color:#8b949e;font-size:10px;margin-left:4px">USD</span>
+          </td>
+          <td>2.851</td>
+          <td>$70.15</td>
+          <td>$70.15</td>
+          <td style="color:#8b949e">+$0.00</td>
+          <td style="color:#8b949e;font-weight:600">+0.0%</td>
+          <td><span style="color:#2ea043;font-weight:600">BUY</span></td>
+          <td style="color:#8b949e;font-size:11px">Consider adding</td>
+        </tr>
+        <tr>
+          <td>
+            <strong>NEM</strong>
+            <span style="color:#8b949e;font-size:10px;margin-left:4px">USD</span>
+          </td>
+          <td>1.8443</td>
+          <td>$108.44</td>
+          <td>$108.44</td>
+          <td style="color:#8b949e">+$0.00</td>
+          <td style="color:#8b949e;font-weight:600">+0.0%</td>
+          <td><span style="color:#2ea043;font-weight:600">BUY</span></td>
+          <td style="color:#8b949e;font-size:11px">Consider adding</td>
+        </tr>
+        <tr>
+          <td>
+            <strong>MRNA</strong>
+            <span style="color:#8b949e;font-size:10px;margin-left:4px">USD</span>
+          </td>
+          <td>3.6101</td>
+          <td>$55.40</td>
+          <td>$55.40</td>
+          <td style="color:#8b949e">+$0.00</td>
+          <td style="color:#8b949e;font-weight:600">+0.0%</td>
+          <td><span style="color:#2ea043;font-weight:600">BUY</span></td>
+          <td style="color:#8b949e;font-size:11px">Consider adding</td>
+        </tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="paper-section">
+    <h2>📄 Paper Trading <span class="paper-label">VIRTUAL</span></h2>
+    
+    <div class="paper-summary-bar">
+      <div class="paper-summary-item">
+        <span class="paper-summary-key">💵 Cash</span>
+        <span class="paper-summary-val">$8,400.05</span>
+      </div>
+      <div class="paper-summary-item">
+        <span class="paper-summary-key">📦 Open Positions</span>
+        <span class="paper-summary-val">8</span>
+      </div>
+      <div class="paper-summary-item">
+        <span class="paper-summary-key">📈 Unrealized P&amp;L</span>
+        <span class="paper-summary-val" style="color:#3fb950">+$0.00</span>
+      </div>
+      <div class="paper-summary-item">
+        <span class="paper-summary-key">✅ Realized P&amp;L</span>
+        <span class="paper-summary-val" style="color:#3fb950">+$0.00</span>
+      </div>
+      <div class="paper-summary-item">
+        <span class="paper-summary-key">💼 Total Value</span>
+        <span class="paper-summary-val" style="color:#3fb950">$10,000.00 <span style="font-size:13px">(+0.00%)</span></span>
+      </div>
+    </div>
+    
+    <div class="paper-table-wrap">
+      <table class="paper-table">
+        <thead><tr>
+          <th>Symbol</th><th>Shares</th><th>Avg Cost</th>
+          <th>Current</th><th>P&amp;L $</th><th>P&amp;L %</th><th>AI Signal</th>
+        </tr></thead>
+        <tbody>
+          <tr>
+            <td><strong>SHOP.TO</strong>
+              <span style="color:#8b949e;font-size:10px;margin-left:4px">CAD</span>
+            </td>
+            <td>1.2619</td>
+            <td>$158.49</td>
+            <td>$158.49</td>
+            <td style="color:#8b949e;font-weight:600">+$0.00</td>
+            <td style="color:#8b949e;font-weight:600">+0.0%</td>
+            <td><span style="color:#2ea043;font-weight:600">✅ BUY</span></td>
+          </tr>
+          <tr>
+            <td><strong>AC.TO</strong>
+              <span style="color:#8b949e;font-size:10px;margin-left:4px">CAD</span>
+            </td>
+            <td>8.7184</td>
+            <td>$22.94</td>
+            <td>$22.94</td>
+            <td style="color:#8b949e;font-weight:600">+$0.00</td>
+            <td style="color:#8b949e;font-weight:600">+0.0%</td>
+            <td><span style="color:#2ea043;font-weight:600">✅ BUY</span></td>
+          </tr>
+          <tr>
+            <td><strong>INTC</strong>
+              <span style="color:#8b949e;font-size:10px;margin-left:4px">USD</span>
+            </td>
+            <td>1.7087</td>
+            <td>$117.05</td>
+            <td>$117.05</td>
+            <td style="color:#8b949e;font-weight:600">+$0.00</td>
+            <td style="color:#8b949e;font-weight:600">+0.0%</td>
+            <td><span style="color:#2ea043;font-weight:600">✅ BUY</span></td>
+          </tr>
+          <tr>
+            <td><strong>SNDK</strong>
+              <span style="color:#8b949e;font-size:10px;margin-left:4px">USD</span>
+            </td>
+            <td>0.1004</td>
+            <td>$1,991.55</td>
+            <td>$1,991.55</td>
+            <td style="color:#8b949e;font-weight:600">+$0.00</td>
+            <td style="color:#8b949e;font-weight:600">+0.0%</td>
+            <td><span style="color:#2ea043;font-weight:600">✅ BUY</span></td>
+          </tr>
+          <tr>
+            <td><strong>LRCX</strong>
+              <span style="color:#8b949e;font-size:10px;margin-left:4px">USD</span>
+            </td>
+            <td>0.5415</td>
+            <td>$369.34</td>
+            <td>$369.34</td>
+            <td style="color:#8b949e;font-weight:600">+$0.00</td>
+            <td style="color:#8b949e;font-weight:600">+0.0%</td>
+            <td><span style="color:#2ea043;font-weight:600">✅ BUY</span></td>
+          </tr>
+          <tr>
+            <td><strong>FCX</strong>
+              <span style="color:#8b949e;font-size:10px;margin-left:4px">USD</span>
+            </td>
+            <td>2.851</td>
+            <td>$70.15</td>
+            <td>$70.15</td>
+            <td style="color:#8b949e;font-weight:600">+$0.00</td>
+            <td style="color:#8b949e;font-weight:600">+0.0%</td>
+            <td><span style="color:#2ea043;font-weight:600">✅ BUY</span></td>
+          </tr>
+          <tr>
+            <td><strong>NEM</strong>
+              <span style="color:#8b949e;font-size:10px;margin-left:4px">USD</span>
+            </td>
+            <td>1.8443</td>
+            <td>$108.44</td>
+            <td>$108.44</td>
+            <td style="color:#8b949e;font-weight:600">+$0.00</td>
+            <td style="color:#8b949e;font-weight:600">+0.0%</td>
+            <td><span style="color:#2ea043;font-weight:600">✅ BUY</span></td>
+          </tr>
+          <tr>
+            <td><strong>MRNA</strong>
+              <span style="color:#8b949e;font-size:10px;margin-left:4px">USD</span>
+            </td>
+            <td>3.6101</td>
+            <td>$55.40</td>
+            <td>$55.40</td>
+            <td style="color:#8b949e;font-weight:600">+$0.00</td>
+            <td style="color:#8b949e;font-weight:600">+0.0%</td>
+            <td><span style="color:#2ea043;font-weight:600">✅ BUY</span></td>
+          </tr></tbody>
+      </table>
+    </div>
+    
+    <div style="margin-top:6px">
+      <div style="font-size:11px;color:#8b949e;font-weight:600;text-transform:uppercase;
+                  letter-spacing:.05em;margin-bottom:6px">Recent Trades</div>
+      <div class="paper-table-wrap">
+        <table class="paper-table">
+          <thead><tr>
+            <th>Time</th><th>Symbol</th><th>Side</th><th>Shares</th>
+            <th>Price</th><th>Value</th><th>Reason</th>
+          </tr></thead>
+          <tbody>
+          <tr>
+            <td style="color:#8b949e">22:44:21</td>
+            <td><strong>MRNA</strong></td>
+            <td style="color:#3fb950;font-weight:600">BUY</td>
+            <td>3.6101</td>
+            <td>$55.40</td>
+            <td>$200.00</td>
+            <td style="color:#8b949e">BUY 78% LONGTERM</td>
+          </tr>
+          <tr>
+            <td style="color:#8b949e">22:44:08</td>
+            <td><strong>NEM</strong></td>
+            <td style="color:#3fb950;font-weight:600">BUY</td>
+            <td>1.8443</td>
+            <td>$108.44</td>
+            <td>$200.00</td>
+            <td style="color:#8b949e">BUY 68% LONGTERM</td>
+          </tr>
+          <tr>
+            <td style="color:#8b949e">22:43:50</td>
+            <td><strong>FCX</strong></td>
+            <td style="color:#3fb950;font-weight:600">BUY</td>
+            <td>2.851</td>
+            <td>$70.15</td>
+            <td>$200.00</td>
+            <td style="color:#8b949e">BUY 70% LONGTERM</td>
+          </tr>
+          <tr>
+            <td style="color:#8b949e">22:43:45</td>
+            <td><strong>LRCX</strong></td>
+            <td style="color:#3fb950;font-weight:600">BUY</td>
+            <td>0.5415</td>
+            <td>$369.34</td>
+            <td>$200.00</td>
+            <td style="color:#8b949e">BUY 70% LONGTERM</td>
+          </tr>
+          <tr>
+            <td style="color:#8b949e">22:43:33</td>
+            <td><strong>SNDK</strong></td>
+            <td style="color:#3fb950;font-weight:600">BUY</td>
+            <td>0.1004</td>
+            <td>$1,991.55</td>
+            <td>$199.95</td>
+            <td style="color:#8b949e">BUY 82% LONGTERM</td>
+          </tr>
+          <tr>
+            <td style="color:#8b949e">22:43:10</td>
+            <td><strong>INTC</strong></td>
+            <td style="color:#3fb950;font-weight:600">BUY</td>
+            <td>1.7087</td>
+            <td>$117.05</td>
+            <td>$200.00</td>
+            <td style="color:#8b949e">BUY 65% SWING</td>
+          </tr>
+          <tr>
+            <td style="color:#8b949e">22:42:56</td>
+            <td><strong>AC.TO</strong></td>
+            <td style="color:#3fb950;font-weight:600">BUY</td>
+            <td>8.7184</td>
+            <td>$22.94</td>
+            <td>$200.00</td>
+            <td style="color:#8b949e">BUY 68% SWING</td>
+          </tr>
+          <tr>
+            <td style="color:#8b949e">22:42:28</td>
+            <td><strong>SHOP.TO</strong></td>
+            <td style="color:#3fb950;font-weight:600">BUY</td>
+            <td>1.2619</td>
+            <td>$158.49</td>
+            <td>$200.00</td>
+            <td style="color:#8b949e">BUY 68% SWING</td>
+          </tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
 
   <div class="top-picks-section">
     <h2>🔥 Top Picks This Cycle</h2>
     <div class="picks-scroll">
         <div class="pick-pill">
           <span class="pick-sym">SNDK</span>
-          <span class="pick-conf">70%</span>
-          <span class="pick-style">SWING</span>
+          <span class="pick-conf">82%</span>
+          <span class="pick-style">LONGTERM</span>
+        </div>
+        <div class="pick-pill">
+          <span class="pick-sym">MRNA</span>
+          <span class="pick-conf">78%</span>
+          <span class="pick-style">LONGTERM</span>
         </div>
         <div class="pick-pill">
           <span class="pick-sym">LRCX</span>
@@ -282,11 +669,6 @@
           <span class="pick-style">LONGTERM</span>
         </div>
         <div class="pick-pill">
-          <span class="pick-sym">AMAT</span>
-          <span class="pick-conf">70%</span>
-          <span class="pick-style">SWING</span>
-        </div>
-        <div class="pick-pill">
           <span class="pick-sym">SHOP.TO</span>
           <span class="pick-conf">68%</span>
           <span class="pick-style">SWING</span>
@@ -297,17 +679,12 @@
           <span class="pick-style">SWING</span>
         </div>
         <div class="pick-pill">
-          <span class="pick-sym">WDC</span>
+          <span class="pick-sym">NEM</span>
           <span class="pick-conf">68%</span>
-          <span class="pick-style">SWING</span>
+          <span class="pick-style">LONGTERM</span>
         </div>
         <div class="pick-pill">
-          <span class="pick-sym">KLAC</span>
-          <span class="pick-conf">68%</span>
-          <span class="pick-style">SWING</span>
-        </div>
-        <div class="pick-pill">
-          <span class="pick-sym">MU</span>
+          <span class="pick-sym">INTC</span>
           <span class="pick-conf">65%</span>
           <span class="pick-style">SWING</span>
         </div></div>
@@ -335,7 +712,7 @@
         <div class="card-price-val">$158.49</div>
         <div class="card-price-cur">CAD</div>
       </div>
-    </div>
+    </div><div class="port-tag">💼 1.2619 shares @ $158.49 &nbsp;·&nbsp; P&amp;L: <span style="color:#8b949e;font-weight:600">+$0.00 (+0.0%)</span></div>
     <div class="tech-row">
       <div class="tech-item">
         <span class="tech-key">RSI</span>
@@ -355,6 +732,10 @@
       
         <div class="news-item">
           <span class="news-dot">·</span>
+          <span class="news-text">What Shopify (SHOP)&#x27;s US$5 Billion Buyback and AI Commerce Push Means For Shareholders</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
           <span class="news-text">Shopify (SHOP) Backs Management At 2026 Meeting As Shareholders Reject AI Policy</span>
         </div>
         <div class="news-item">
@@ -363,7 +744,7 @@
         </div>
     </div>
     <div class="card-section">
-      <div class="meta-row">💬 News Sentiment: <span style="color:#d29922;font-weight:600">NEUTRAL</span> (+0.00) · 2 headlines</div>
+      <div class="meta-row">💬 News Sentiment: <span style="color:#d29922;font-weight:600">NEUTRAL</span> (+0.00) · 3 headlines</div>
       <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
       <div class="meta-row">📅 Earnings: <span>Aug 05</span> · <span>Beat by 9.1%</span></div>
     </div>
@@ -376,8 +757,8 @@
         </div>
         <span class="conf-pct" style="color:#d29922">68%</span>
       </div>
-      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$175.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$150.00</span></div></div>
-      <div class="verdict-reasoning">Shopify shows bullish momentum with a positive EMA 9/21 crossover and a MACD bullish cross, while the RSI remains neutral at 53.3. Recent earnings beat by 9.1% supports the upside thesis despite a mod</div>
+      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$170.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$142.60</span></div></div>
+      <div class="verdict-reasoning">The EMA 9/21 pattern is bullish and the MACD shows a positive cross, indicating short‑term upside momentum. Additionally, Shopify recently delivered a 9.1% earnings beat, supporting the bullish case, </div>
     </div></div>
 <div class="stock-card watchlist-card">
     <div class="card-header">
@@ -392,7 +773,7 @@
         <div class="card-price-val">$22.94</div>
         <div class="card-price-cur">CAD</div>
       </div>
-    </div>
+    </div><div class="port-tag">💼 8.7184 shares @ $22.94 &nbsp;·&nbsp; P&amp;L: <span style="color:#8b949e;font-weight:600">+$0.00 (+0.0%)</span></div>
     <div class="tech-row">
       <div class="tech-item">
         <span class="tech-key">RSI</span>
@@ -420,11 +801,11 @@
         </div>
         <div class="news-item">
           <span class="news-dot">·</span>
-          <span class="news-text">AC Stock | Air Canada Q4 2020 Earnings Call Disney Cruise Ships (4j1XAtlgpw) - Mshale</span>
+          <span class="news-text">STRONG POTENTIAL : AC STOCK ANALYSIS | AIR CANADA STOCK 15-May (429kkkvucY) - Mshale</span>
         </div>
     </div>
     <div class="card-section">
-      <div class="meta-row">💬 News Sentiment: <span style="color:#3fb950;font-weight:600">POSITIVE</span> (+1.00) · 5 headlines</div>
+      <div class="meta-row">💬 News Sentiment: <span style="color:#3fb950;font-weight:600">POSITIVE</span> (+1.00) · 4 headlines</div>
       <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
       <div class="meta-row">📅 Earnings: <span>Jul 27</span> · <span>Beat by 89.1%</span></div>
     </div>
@@ -437,8 +818,130 @@
         </div>
         <span class="conf-pct" style="color:#d29922">68%</span>
       </div>
-      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$24.50</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$21.80</span></div></div>
-      <div class="verdict-reasoning">The stock shows bullish momentum with a bullish EMA 9/21 crossover and a positive MACD histogram, while RSI is high at 70.9 but not over the 75 threshold. Strong fundamentals are reflected in an 89.1%</div>
+      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$25.20</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$21.30</span></div></div>
+      <div class="verdict-reasoning">The stock shows bullish technicals with a 9/21 EMA uptrend and a positive MACD crossover, while the RSI of 70.9 signals overbought but not extreme conditions. Positive news sentiment (+1.0) and an 89.</div>
+    </div></div>
+<div class="stock-card watchlist-card">
+    <div class="card-header">
+      <div>
+        <div style="margin-bottom:2px">
+          <span class="sig-badge" style="background:#6e768122;color:#6e7681;border:1px solid #6e768155">⏸ HOLD</span>
+        </div>
+        <div class="card-sym">AAPL</div>
+        <div class="card-co">Apple</div>
+      </div>
+      <div class="card-price">
+        <div class="card-price-val">$299.24</div>
+        <div class="card-price-cur">USD</div>
+      </div>
+    </div>
+    <div class="tech-row">
+      <div class="tech-item">
+        <span class="tech-key">RSI</span>
+        <span style="color:#d29922;font-weight:600">52.2</span>
+      </div>
+      <div class="tech-item">
+        <span class="tech-key">Trend</span>
+        <span style="color:#f85149;font-weight:600">BEARISH ↓</span>
+      </div>
+      <div class="tech-item">
+        <span class="tech-key">MACD</span>
+        <span style="color:#f85149">↓ bearish cross</span>
+      </div>
+    </div>
+    <div class="card-section">
+      <div class="section-label">📰 News</div>
+      
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">AAPL Stock Gains — Apple Reportedly Eyes Foldable iPhone, Camera-Equipped AirPods Launches</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Dow Hits Record High On Strong Banks And Industrial Stocks, Nasdaq And S&amp;P 500 Slip On Tec</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Apple (AAPL) Faces Italy DMA Probe Over Cloud Interoperability</span>
+        </div>
+    </div>
+    <div class="card-section">
+      <div class="meta-row">💬 News Sentiment: <span style="color:#3fb950;font-weight:600">POSITIVE</span> (+0.33) · 3 headlines</div>
+      <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
+      <div class="meta-row">📅 Earnings: <span>Jul 30</span> · <span>Beat by 3.6%</span></div>
+    </div>
+    <div class="card-section" style="background:#0d111799">
+      <div class="section-label">🤖 AI Verdict · SWING</div>
+      <div class="verdict-sig-row">
+        <span class="verdict-sig-text" style="color:#6e7681">⏸ HOLD</span>
+        <div class="conf-bar-wrap">
+          <div class="conf-bar" style="width:48%;background:#6e7681"></div>
+        </div>
+        <span class="conf-pct" style="color:#6e7681">48%</span>
+      </div>
+      
+      <div class="verdict-reasoning">The stock faces bearish technical signals, with a bearish EMA 9/21 alignment and a MACD bearish cross despite a neutral RSI of 52.2. Positive news sentiment (+0.333) and a recent earnings beat are off</div>
+    </div></div>
+<div class="stock-card watchlist-card">
+    <div class="card-header">
+      <div>
+        <div style="margin-bottom:2px">
+          <span class="sig-badge" style="background:#f8514922;color:#f85149;border:1px solid #f8514955">❌ SELL</span>
+        </div>
+        <div class="card-sym">NVDA</div>
+        <div class="card-co">Nvidia</div>
+      </div>
+      <div class="card-price">
+        <div class="card-price-val">$207.41</div>
+        <div class="card-price-cur">USD</div>
+      </div>
+    </div>
+    <div class="tech-row">
+      <div class="tech-item">
+        <span class="tech-key">RSI</span>
+        <span style="color:#d29922;font-weight:600">47.5</span>
+      </div>
+      <div class="tech-item">
+        <span class="tech-key">Trend</span>
+        <span style="color:#f85149;font-weight:600">BEARISH ↓</span>
+      </div>
+      <div class="tech-item">
+        <span class="tech-key">MACD</span>
+        <span style="color:#f85149">↓ bearish cross</span>
+      </div>
+    </div>
+    <div class="card-section">
+      <div class="section-label">📰 News</div>
+      
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">SK hynix (KOSE:A000660) Partners With Nvidia On AI Memory And Autonomous Fabs</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Can Nvidia Stock Reach $743 in the Next 12 Months? - The Globe and Mail</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Can Nvidia Stock Reach $743 in the Next 12 Months? - AOL.com</span>
+        </div>
+    </div>
+    <div class="card-section">
+      <div class="meta-row">💬 News Sentiment: <span style="color:#d29922;font-weight:600">NEUTRAL</span> (+0.00) · 5 headlines</div>
+      <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
+      <div class="meta-row">📅 Earnings: <span>Aug 26</span> · <span>Beat by 5.6%</span></div>
+    </div>
+    <div class="card-section" style="background:#0d111799">
+      <div class="section-label">🤖 AI Verdict · SWING</div>
+      <div class="verdict-sig-row">
+        <span class="verdict-sig-text" style="color:#f85149">❌ SELL</span>
+        <div class="conf-bar-wrap">
+          <div class="conf-bar" style="width:68%;background:#d29922"></div>
+        </div>
+        <span class="conf-pct" style="color:#d29922">68%</span>
+      </div>
+      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$180.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$215.00</span></div></div>
+      <div class="verdict-reasoning">NVDA shows bearish momentum with the EMA 9/21 indicating a downtrend and a negative MACD crossover. Coupled with a fear‑biased market sentiment (CNN Fear &amp; Greed Index 39) and low search interest, the</div>
     </div></div>
 <div class="stock-card watchlist-card">
     <div class="card-header">
@@ -498,130 +1001,8 @@
         </div>
         <span class="conf-pct" style="color:#d29922">65%</span>
       </div>
-      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$260.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$290.00</span></div></div>
-      <div class="verdict-reasoning">The RSI of 81.1 indicates the stock is strongly overbought, while the bullish EMA and MACD suggest upward momentum that may soon reverse. Combined with a neutral news sentiment and a fear‑biased marke</div>
-    </div></div>
-<div class="stock-card watchlist-card">
-    <div class="card-header">
-      <div>
-        <div style="margin-bottom:2px">
-          <span class="sig-badge" style="background:#f8514922;color:#f85149;border:1px solid #f8514955">❌ SELL</span>
-        </div>
-        <div class="card-sym">AAPL</div>
-        <div class="card-co">Apple</div>
-      </div>
-      <div class="card-price">
-        <div class="card-price-val">$299.24</div>
-        <div class="card-price-cur">USD</div>
-      </div>
-    </div>
-    <div class="tech-row">
-      <div class="tech-item">
-        <span class="tech-key">RSI</span>
-        <span style="color:#d29922;font-weight:600">52.2</span>
-      </div>
-      <div class="tech-item">
-        <span class="tech-key">Trend</span>
-        <span style="color:#f85149;font-weight:600">BEARISH ↓</span>
-      </div>
-      <div class="tech-item">
-        <span class="tech-key">MACD</span>
-        <span style="color:#f85149">↓ bearish cross</span>
-      </div>
-    </div>
-    <div class="card-section">
-      <div class="section-label">📰 News</div>
-      
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">AAPL Stock Gains — Apple Reportedly Eyes Foldable iPhone, Camera-Equipped AirPods Launches</span>
-        </div>
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Dow Hits Record High On Strong Banks And Industrial Stocks, Nasdaq And S&amp;P 500 Slip On Tec</span>
-        </div>
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Apple (AAPL) Faces Italy DMA Probe Over Cloud Interoperability</span>
-        </div>
-    </div>
-    <div class="card-section">
-      <div class="meta-row">💬 News Sentiment: <span style="color:#3fb950;font-weight:600">POSITIVE</span> (+0.33) · 3 headlines</div>
-      <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
-      <div class="meta-row">📅 Earnings: <span>Jul 30</span> · <span>Beat by 3.6%</span></div>
-    </div>
-    <div class="card-section" style="background:#0d111799">
-      <div class="section-label">🤖 AI Verdict · SWING</div>
-      <div class="verdict-sig-row">
-        <span class="verdict-sig-text" style="color:#f85149">❌ SELL</span>
-        <div class="conf-bar-wrap">
-          <div class="conf-bar" style="width:62%;background:#d29922"></div>
-        </div>
-        <span class="conf-pct" style="color:#d29922">62%</span>
-      </div>
-      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$284.30</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$308.20</span></div></div>
-      <div class="verdict-reasoning">The EMA 9/21 and MACD both indicate a bearish momentum, suggesting downside pressure. However, the recent earnings beat (+3.6%) and mildly positive news sentiment provide some upside cushion, leading </div>
-    </div></div>
-<div class="stock-card watchlist-card">
-    <div class="card-header">
-      <div>
-        <div style="margin-bottom:2px">
-          <span class="sig-badge" style="background:#f8514922;color:#f85149;border:1px solid #f8514955">❌ SELL</span>
-        </div>
-        <div class="card-sym">NVDA</div>
-        <div class="card-co">Nvidia</div>
-      </div>
-      <div class="card-price">
-        <div class="card-price-val">$207.41</div>
-        <div class="card-price-cur">USD</div>
-      </div>
-    </div>
-    <div class="tech-row">
-      <div class="tech-item">
-        <span class="tech-key">RSI</span>
-        <span style="color:#d29922;font-weight:600">47.5</span>
-      </div>
-      <div class="tech-item">
-        <span class="tech-key">Trend</span>
-        <span style="color:#f85149;font-weight:600">BEARISH ↓</span>
-      </div>
-      <div class="tech-item">
-        <span class="tech-key">MACD</span>
-        <span style="color:#f85149">↓ bearish cross</span>
-      </div>
-    </div>
-    <div class="card-section">
-      <div class="section-label">📰 News</div>
-      
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Can Nvidia Stock Reach $743 in the Next 12 Months? - AOL.com</span>
-        </div>
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Red day on Tuesday for NVIDIA stock after losing 2.37% - StockInvest.us</span>
-        </div>
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Can Nvidia Stock Reach $743 in the Next 12 Months? - The Globe and Mail</span>
-        </div>
-    </div>
-    <div class="card-section">
-      <div class="meta-row">💬 News Sentiment: <span style="color:#d29922;font-weight:600">NEUTRAL</span> (+0.00) · 5 headlines</div>
-      <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
-      <div class="meta-row">📅 Earnings: <span>Aug 26</span> · <span>Beat by 5.6%</span></div>
-    </div>
-    <div class="card-section" style="background:#0d111799">
-      <div class="section-label">🤖 AI Verdict · SWING</div>
-      <div class="verdict-sig-row">
-        <span class="verdict-sig-text" style="color:#f85149">❌ SELL</span>
-        <div class="conf-bar-wrap">
-          <div class="conf-bar" style="width:62%;background:#d29922"></div>
-        </div>
-        <span class="conf-pct" style="color:#d29922">62%</span>
-      </div>
-      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$190.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$215.00</span></div></div>
-      <div class="verdict-reasoning">The EMA 9/21 trend is bearish and MACD shows a bearish cross, indicating downward momentum. Coupled with a neutral RSI (47.5) and a fear‑biased market sentiment (CNN Fear &amp; Greed Index 39), the techni</div>
+      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$270.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$285.00</span></div></div>
+      <div class="verdict-reasoning">The RSI is at an extreme 81.1, indicating the stock is deeply overbought, while the MACD remains bullish but may be losing momentum. Coupled with a recent earnings beat of 2.9% and a fear‑driven marke</div>
     </div></div>
   </div>
 
@@ -647,7 +1028,7 @@
         <div class="card-price-val">$1,991.55</div>
         <div class="card-price-cur">USD</div>
       </div>
-    </div>
+    </div><div class="port-tag">💼 0.1004 shares @ $1,991.55 &nbsp;·&nbsp; P&amp;L: <span style="color:#8b949e;font-weight:600">+$0.00 (+0.0%)</span></div>
     <div class="tech-row">
       <div class="tech-item">
         <span class="tech-key">RSI</span>
@@ -667,452 +1048,33 @@
       
         <div class="news-item">
           <span class="news-dot">·</span>
+          <span class="news-text">Sandisk vs. Micron: Which AI Memory Stock Is the Better Buy After Their Monster Runs?</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
           <span class="news-text">Why Did ROKU, SNDK, C Stocks Hit 52-Week Highs Last Week? - Stocktwits</span>
         </div>
         <div class="news-item">
           <span class="news-dot">·</span>
-          <span class="news-text">SanDisk &quot;most overbought stock&quot; warning emerges after hitting an all-time high (SNDK:NASDA</span>
-        </div>
-    </div>
-    <div class="card-section">
-      <div class="meta-row">💬 News Sentiment: <span style="color:#d29922;font-weight:600">NEUTRAL</span> (+0.00) · 2 headlines</div>
-      <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
-      <div class="meta-row">📅 Earnings: <span>Aug 24</span> · <span>Beat by 59.7%</span></div>
-    </div>
-    <div class="card-section" style="background:#0d111799">
-      <div class="section-label">🤖 AI Verdict · SWING</div>
-      <div class="verdict-sig-row">
-        <span class="verdict-sig-text" style="color:#2ea043">✅ BUY</span>
-        <div class="conf-bar-wrap">
-          <div class="conf-bar" style="width:70%;background:#3fb950"></div>
-        </div>
-        <span class="conf-pct" style="color:#3fb950">70%</span>
-      </div>
-      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$2,090.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$1,890.00</span></div></div>
-      <div class="verdict-reasoning">The stock shows a bullish EMA 9/21 alignment and a positive MACD cross, indicating upward momentum. Despite an RSI of 66.6 (leaning overbought), the recent earnings beat of 59.7% and a fear‑driven mar</div>
-    </div></div>
-<div class="stock-card mover-card">
-    <div class="card-header">
-      <div>
-        <div style="margin-bottom:2px">
-          <span class="sig-badge" style="background:#2ea04322;color:#2ea043;border:1px solid #2ea04355">✅ BUY</span>
-        </div>
-        <div class="card-sym">LRCX</div>
-        <div class="card-co">LRCX</div>
-      </div>
-      <div class="card-price">
-        <div class="card-price-val">$369.34</div>
-        <div class="card-price-cur">USD</div>
-      </div>
-    </div>
-    <div class="tech-row">
-      <div class="tech-item">
-        <span class="tech-key">RSI</span>
-        <span style="color:#d29922;font-weight:600">64.6</span>
-      </div>
-      <div class="tech-item">
-        <span class="tech-key">Trend</span>
-        <span style="color:#3fb950;font-weight:600">BULLISH ↑</span>
-      </div>
-      <div class="tech-item">
-        <span class="tech-key">MACD</span>
-        <span style="color:#3fb950">↑ bullish cross</span>
-      </div>
-    </div>
-    <div class="card-section">
-      <div class="section-label">📰 News</div>
-      
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Decoding LRCX Stock&#x27;s Premium Valuation</span>
-        </div>
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Why Lam Research (LRCX) Dipped More Than Broader Market Today</span>
-        </div>
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Lam Research (LRCX) Is Betting On Advanced Packaging For 50% Growth In 2026</span>
-        </div>
-    </div>
-    <div class="card-section">
-      <div class="meta-row">💬 News Sentiment: <span style="color:#3fb950;font-weight:600">POSITIVE</span> (+1.00) · 3 headlines</div>
-      <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
-      <div class="meta-row">📅 Earnings: <span>Jul 29</span> · <span>Beat by 8.1%</span></div>
-    </div>
-    <div class="card-section" style="background:#0d111799">
-      <div class="section-label">🤖 AI Verdict · LONGTERM</div>
-      <div class="verdict-sig-row">
-        <span class="verdict-sig-text" style="color:#2ea043">✅ BUY</span>
-        <div class="conf-bar-wrap">
-          <div class="conf-bar" style="width:70%;background:#3fb950"></div>
-        </div>
-        <span class="conf-pct" style="color:#3fb950">70%</span>
-      </div>
-      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$387.80</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$358.26</span></div></div>
-      <div class="verdict-reasoning">The stock is in a bullish EMA 9/21 alignment and the MACD shows a bullish crossover, indicating upward momentum. Combined with an 8.1% earnings beat and positive news sentiment, the fundamentals suppo</div>
-    </div></div>
-<div class="stock-card mover-card">
-    <div class="card-header">
-      <div>
-        <div style="margin-bottom:2px">
-          <span class="sig-badge" style="background:#2ea04322;color:#2ea043;border:1px solid #2ea04355">✅ BUY</span>
-        </div>
-        <div class="card-sym">FCX</div>
-        <div class="card-co">FCX</div>
-      </div>
-      <div class="card-price">
-        <div class="card-price-val">$70.15</div>
-        <div class="card-price-cur">USD</div>
-      </div>
-    </div>
-    <div class="tech-row">
-      <div class="tech-item">
-        <span class="tech-key">RSI</span>
-        <span style="color:#d29922;font-weight:600">59.8</span>
-      </div>
-      <div class="tech-item">
-        <span class="tech-key">Trend</span>
-        <span style="color:#3fb950;font-weight:600">BULLISH ↑</span>
-      </div>
-      <div class="tech-item">
-        <span class="tech-key">MACD</span>
-        <span style="color:#3fb950">↑ bullish cross</span>
-      </div>
-    </div>
-    <div class="card-section">
-      <div class="section-label">📰 News</div>
-      
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Freeport-McMoRan Stock (US35671D8570): Copper miner in focus amid earnings and sector back</span>
-        </div>
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Copper Tariff Uncertainty Returns As Hudbay Minerals (HBM) And Peers Face Policy Risk Ahea</span>
-        </div>
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Stocks Supported by Lower Crude Oil Prices and Bond Yields</span>
-        </div>
-    </div>
-    <div class="card-section">
-      <div class="meta-row">💬 News Sentiment: <span style="color:#f85149;font-weight:600">NEGATIVE</span> (-1.00) · 5 headlines</div>
-      <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
-      <div class="meta-row">📅 Earnings: <span>Jul 22</span> · <span>Beat by 21.3%</span></div>
-    </div>
-    <div class="card-section" style="background:#0d111799">
-      <div class="section-label">🤖 AI Verdict · LONGTERM</div>
-      <div class="verdict-sig-row">
-        <span class="verdict-sig-text" style="color:#2ea043">✅ BUY</span>
-        <div class="conf-bar-wrap">
-          <div class="conf-bar" style="width:70%;background:#3fb950"></div>
-        </div>
-        <span class="conf-pct" style="color:#3fb950">70%</span>
-      </div>
-      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$75.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$66.50</span></div></div>
-      <div class="verdict-reasoning">The stock shows bullish technical signals (EMA 9/21 uptrend and MACD cross) and recently beat earnings expectations by 21.3%, indicating strong fundamentals. Despite a negative news sentiment and low </div>
-    </div></div>
-<div class="stock-card mover-card">
-    <div class="card-header">
-      <div>
-        <div style="margin-bottom:2px">
-          <span class="sig-badge" style="background:#2ea04322;color:#2ea043;border:1px solid #2ea04355">✅ BUY</span>
-        </div>
-        <div class="card-sym">AMAT</div>
-        <div class="card-co">AMAT</div>
-      </div>
-      <div class="card-price">
-        <div class="card-price-val">$568.23</div>
-        <div class="card-price-cur">USD</div>
-      </div>
-    </div>
-    <div class="tech-row">
-      <div class="tech-item">
-        <span class="tech-key">RSI</span>
-        <span style="color:#f85149;font-weight:600">70.3</span>
-      </div>
-      <div class="tech-item">
-        <span class="tech-key">Trend</span>
-        <span style="color:#3fb950;font-weight:600">BULLISH ↑</span>
-      </div>
-      <div class="tech-item">
-        <span class="tech-key">MACD</span>
-        <span style="color:#3fb950">↑ bullish cross</span>
-      </div>
-    </div>
-    <div class="card-section">
-      <div class="section-label">📰 News</div>
-      
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">What Applied Materials Stock Was Shouting Before The Surge</span>
-        </div>
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">What Applied Materials Stock Was Shouting Before The Surge - Trefis</span>
-        </div>
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Decoding LRCX Stock&#x27;s Premium Valuation</span>
+          <span class="news-text">Stock Market Today: Dow Ends Shy Of 52,000; SpaceX Slashes Its Gain; Lumentum Tumbles</span>
         </div>
     </div>
     <div class="card-section">
       <div class="meta-row">💬 News Sentiment: <span style="color:#3fb950;font-weight:600">POSITIVE</span> (+1.00) · 5 headlines</div>
       <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
-      <div class="meta-row">📅 Earnings: <span>Aug 13</span> · <span>Beat by 6.3%</span></div>
-    </div>
-    <div class="card-section" style="background:#0d111799">
-      <div class="section-label">🤖 AI Verdict · SWING</div>
-      <div class="verdict-sig-row">
-        <span class="verdict-sig-text" style="color:#2ea043">✅ BUY</span>
-        <div class="conf-bar-wrap">
-          <div class="conf-bar" style="width:70%;background:#3fb950"></div>
-        </div>
-        <span class="conf-pct" style="color:#3fb950">70%</span>
-      </div>
-      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$605.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$540.00</span></div></div>
-      <div class="verdict-reasoning">The stock shows bullish technical momentum with a positive MACD cross (+37.9 vs +28.4) and a bullish EMA 9/21 alignment, while news sentiment is strongly positive (+1.0). Although RSI is elevated at 7</div>
-    </div></div>
-<div class="stock-card mover-card">
-    <div class="card-header">
-      <div>
-        <div style="margin-bottom:2px">
-          <span class="sig-badge" style="background:#2ea04322;color:#2ea043;border:1px solid #2ea04355">✅ BUY</span>
-        </div>
-        <div class="card-sym">WDC</div>
-        <div class="card-co">WDC</div>
-      </div>
-      <div class="card-price">
-        <div class="card-price-val">$681.08</div>
-        <div class="card-price-cur">USD</div>
-      </div>
-    </div>
-    <div class="tech-row">
-      <div class="tech-item">
-        <span class="tech-key">RSI</span>
-        <span style="color:#f85149;font-weight:600">73.5</span>
-      </div>
-      <div class="tech-item">
-        <span class="tech-key">Trend</span>
-        <span style="color:#3fb950;font-weight:600">BULLISH ↑</span>
-      </div>
-      <div class="tech-item">
-        <span class="tech-key">MACD</span>
-        <span style="color:#3fb950">↑ bullish cross</span>
-      </div>
-    </div>
-    <div class="card-section">
-      <div class="section-label">📰 News</div>
-      
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Western Digital stock just hit a new all-time high. Here&#x27;s why. - MSN</span>
-        </div>
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Dear Western Digital stock fans, mark your calendars for June 22 - MSN</span>
-        </div>
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Mizuho doubles down on WDC stock as AI storage demand shows no signs of slowing down - MSN</span>
-        </div>
-    </div>
-    <div class="card-section">
-      <div class="meta-row">💬 News Sentiment: <span style="color:#d29922;font-weight:600">NEUTRAL</span> (+0.00) · 5 headlines</div>
-      <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
-      <div class="meta-row">📅 Earnings: <span>Jul 29</span> · <span>Beat by 13.8%</span></div>
-    </div>
-    <div class="card-section" style="background:#0d111799">
-      <div class="section-label">🤖 AI Verdict · SWING</div>
-      <div class="verdict-sig-row">
-        <span class="verdict-sig-text" style="color:#2ea043">✅ BUY</span>
-        <div class="conf-bar-wrap">
-          <div class="conf-bar" style="width:68%;background:#d29922"></div>
-        </div>
-        <span class="conf-pct" style="color:#d29922">68%</span>
-      </div>
-      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$722.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$647.00</span></div></div>
-      <div class="verdict-reasoning">The stock shows bullish momentum with a positive MACD crossover (+41.1 vs signal +32.7) and a bullish EMA 9/21 trend, while the recent earnings beat of 13.8% supports upside potential. However, the RS</div>
-    </div></div>
-<div class="stock-card mover-card">
-    <div class="card-header">
-      <div>
-        <div style="margin-bottom:2px">
-          <span class="sig-badge" style="background:#2ea04322;color:#2ea043;border:1px solid #2ea04355">✅ BUY</span>
-        </div>
-        <div class="card-sym">KLAC</div>
-        <div class="card-co">KLAC</div>
-      </div>
-      <div class="card-price">
-        <div class="card-price-val">$237.33</div>
-        <div class="card-price-cur">USD</div>
-      </div>
-    </div>
-    <div class="tech-row">
-      <div class="tech-item">
-        <span class="tech-key">RSI</span>
-        <span style="color:#d29922;font-weight:600">63.7</span>
-      </div>
-      <div class="tech-item">
-        <span class="tech-key">Trend</span>
-        <span style="color:#3fb950;font-weight:600">BULLISH ↑</span>
-      </div>
-      <div class="tech-item">
-        <span class="tech-key">MACD</span>
-        <span style="color:#3fb950">↑ bullish cross</span>
-      </div>
-    </div>
-    <div class="card-section">
-      <div class="section-label">📰 News</div>
-      
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Marvell Technology, Nova, and KLA Corporation Stocks Trade Down, What You Need To Know</span>
-        </div>
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Decoding LRCX Stock&#x27;s Premium Valuation</span>
-        </div>
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">KLA Corp (KLAC) Shares Fall 7.4% -- What GF Score of 87 Tells In - GuruFocus</span>
-        </div>
-    </div>
-    <div class="card-section">
-      <div class="meta-row">💬 News Sentiment: <span style="color:#d29922;font-weight:600">NEUTRAL</span> (+0.00) · 5 headlines</div>
-      <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
-      <div class="meta-row">📅 Earnings: <span>Jul 30</span> · <span>Beat by 2.2%</span></div>
-    </div>
-    <div class="card-section" style="background:#0d111799">
-      <div class="section-label">🤖 AI Verdict · SWING</div>
-      <div class="verdict-sig-row">
-        <span class="verdict-sig-text" style="color:#2ea043">✅ BUY</span>
-        <div class="conf-bar-wrap">
-          <div class="conf-bar" style="width:68%;background:#d29922"></div>
-        </div>
-        <span class="conf-pct" style="color:#d29922">68%</span>
-      </div>
-      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$250.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$225.50</span></div></div>
-      <div class="verdict-reasoning">The price is supported by a bullish EMA 9/21 trend and a positive MACD cross (+16.263 vs +11.873), indicating upward momentum. Additionally, the firm recently beat earnings by 2.2%, providing fundamen</div>
-    </div></div>
-<div class="stock-card mover-card">
-    <div class="card-header">
-      <div>
-        <div style="margin-bottom:2px">
-          <span class="sig-badge" style="background:#2ea04322;color:#2ea043;border:1px solid #2ea04355">✅ BUY</span>
-        </div>
-        <div class="card-sym">MU</div>
-        <div class="card-co">MU</div>
-      </div>
-      <div class="card-price">
-        <div class="card-price-val">$1,020.76</div>
-        <div class="card-price-cur">USD</div>
-      </div>
-    </div>
-    <div class="tech-row">
-      <div class="tech-item">
-        <span class="tech-key">RSI</span>
-        <span style="color:#d29922;font-weight:600">60.5</span>
-      </div>
-      <div class="tech-item">
-        <span class="tech-key">Trend</span>
-        <span style="color:#3fb950;font-weight:600">BULLISH ↑</span>
-      </div>
-      <div class="tech-item">
-        <span class="tech-key">MACD</span>
-        <span style="color:#f85149">↓ bearish cross</span>
-      </div>
-    </div>
-    <div class="card-section">
-      <div class="section-label">📰 News</div>
-      
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Micron (MU) Falls More Steeply Than Broader Market: What Investors Need to Know</span>
-        </div>
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Micron Technology (MU) Wins HBM4 Supplier Role For Nvidia Vera Rubin AI Platform</span>
-        </div>
-    </div>
-    <div class="card-section">
-      <div class="meta-row">💬 News Sentiment: <span style="color:#d29922;font-weight:600">NEUTRAL</span> (+0.00) · 2 headlines</div>
-      <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
-      <div class="meta-row">📅 Earnings: <span>Jun 24</span> · <span>Beat by 33.2%</span></div>
-    </div>
-    <div class="card-section" style="background:#0d111799">
-      <div class="section-label">🤖 AI Verdict · SWING</div>
-      <div class="verdict-sig-row">
-        <span class="verdict-sig-text" style="color:#2ea043">✅ BUY</span>
-        <div class="conf-bar-wrap">
-          <div class="conf-bar" style="width:65%;background:#d29922"></div>
-        </div>
-        <span class="conf-pct" style="color:#d29922">65%</span>
-      </div>
-      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$1,085.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$970.00</span></div></div>
-      <div class="verdict-reasoning">The 9/21 EMA remains bullish, indicating an underlying uptrend, and the recent 33.2% earnings beat plus the HBM4 supplier win for Nvidia provide strong fundamental upside. At the same time, the MACD b</div>
-    </div></div>
-<div class="stock-card mover-card">
-    <div class="card-header">
-      <div>
-        <div style="margin-bottom:2px">
-          <span class="sig-badge" style="background:#2ea04322;color:#2ea043;border:1px solid #2ea04355">✅ BUY</span>
-        </div>
-        <div class="card-sym">NEM</div>
-        <div class="card-co">NEM</div>
-      </div>
-      <div class="card-price">
-        <div class="card-price-val">$108.44</div>
-        <div class="card-price-cur">USD</div>
-      </div>
-    </div>
-    <div class="tech-row">
-      <div class="tech-item">
-        <span class="tech-key">RSI</span>
-        <span style="color:#d29922;font-weight:600">53.0</span>
-      </div>
-      <div class="tech-item">
-        <span class="tech-key">Trend</span>
-        <span style="color:#f85149;font-weight:600">BEARISH ↓</span>
-      </div>
-      <div class="tech-item">
-        <span class="tech-key">MACD</span>
-        <span style="color:#3fb950">↑ bullish cross</span>
-      </div>
-    </div>
-    <div class="card-section">
-      <div class="section-label">📰 News</div>
-      
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Why Newmont Stock Bumped Higher Today - The Motley Fool</span>
-        </div>
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Why Newmont Stock Bumped Higher Today</span>
-        </div>
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Why Newmont Stock Bumped Higher Today - Yahoo Finance</span>
-        </div>
-    </div>
-    <div class="card-section">
-      <div class="meta-row">💬 News Sentiment: <span style="color:#d29922;font-weight:600">NEUTRAL</span> (+0.00) · 5 headlines</div>
-      <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
-      <div class="meta-row">📅 Earnings: <span>Jul 23</span> · <span>Beat by 33.6%</span></div>
+      <div class="meta-row">📅 Earnings: <span>Aug 24</span> · <span>Beat by 59.7%</span></div>
     </div>
     <div class="card-section" style="background:#0d111799">
       <div class="section-label">🤖 AI Verdict · LONGTERM</div>
       <div class="verdict-sig-row">
         <span class="verdict-sig-text" style="color:#2ea043">✅ BUY</span>
         <div class="conf-bar-wrap">
-          <div class="conf-bar" style="width:62%;background:#d29922"></div>
+          <div class="conf-bar" style="width:82%;background:#3fb950"></div>
         </div>
-        <span class="conf-pct" style="color:#d29922">62%</span>
+        <span class="conf-pct" style="color:#3fb950">82%</span>
       </div>
-      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$115.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$102.00</span></div></div>
-      <div class="verdict-reasoning">The stock recently beat earnings expectations by 33.6% and headlines indicate a price bump, suggesting strong fundamentals. Although the EMA trend is bearish, the bullish MACD cross and neutral RSI (5</div>
+      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$2,150.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$1,890.00</span></div></div>
+      <div class="verdict-reasoning">The stock shows a bullish EMA 9/21 trend and a bullish MACD crossover, indicating strong momentum. Combined with a recent earnings beat of 59.7% and a moderate RSI of 66.6 (well below the overbought t</div>
     </div></div>
 <div class="stock-card mover-card">
     <div class="card-header">
@@ -1127,7 +1089,7 @@
         <div class="card-price-val">$55.40</div>
         <div class="card-price-cur">USD</div>
       </div>
-    </div>
+    </div><div class="port-tag">💼 3.6101 shares @ $55.40 &nbsp;·&nbsp; P&amp;L: <span style="color:#8b949e;font-weight:600">+$0.00 (+0.0%)</span></div>
     <div class="tech-row">
       <div class="tech-item">
         <span class="tech-key">RSI</span>
@@ -1168,12 +1130,195 @@
       <div class="verdict-sig-row">
         <span class="verdict-sig-text" style="color:#2ea043">✅ BUY</span>
         <div class="conf-bar-wrap">
-          <div class="conf-bar" style="width:62%;background:#d29922"></div>
+          <div class="conf-bar" style="width:78%;background:#3fb950"></div>
         </div>
-        <span class="conf-pct" style="color:#d29922">62%</span>
+        <span class="conf-pct" style="color:#3fb950">78%</span>
       </div>
-      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$60.90</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$52.50</span></div></div>
-      <div class="verdict-reasoning">The stock shows bullish technical signals with a positive EMA 9/21 crossover and a bullish MACD while RSI is elevated but not extreme (64.5). Additionally, Moderna recently beat earnings by 70.2% and </div>
+      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$61.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$52.60</span></div></div>
+      <div class="verdict-reasoning">Moderna shows bullish technicals with a positive EMA 9/21 alignment and a bullish MACD cross, while recent news highlights new vaccine launches. The company delivered a strong earnings beat of 70.2% a</div>
+    </div></div>
+<div class="stock-card mover-card">
+    <div class="card-header">
+      <div>
+        <div style="margin-bottom:2px">
+          <span class="sig-badge" style="background:#2ea04322;color:#2ea043;border:1px solid #2ea04355">✅ BUY</span>
+        </div>
+        <div class="card-sym">LRCX</div>
+        <div class="card-co">LRCX</div>
+      </div>
+      <div class="card-price">
+        <div class="card-price-val">$369.34</div>
+        <div class="card-price-cur">USD</div>
+      </div>
+    </div><div class="port-tag">💼 0.5415 shares @ $369.34 &nbsp;·&nbsp; P&amp;L: <span style="color:#8b949e;font-weight:600">+$0.00 (+0.0%)</span></div>
+    <div class="tech-row">
+      <div class="tech-item">
+        <span class="tech-key">RSI</span>
+        <span style="color:#d29922;font-weight:600">64.6</span>
+      </div>
+      <div class="tech-item">
+        <span class="tech-key">Trend</span>
+        <span style="color:#3fb950;font-weight:600">BULLISH ↑</span>
+      </div>
+      <div class="tech-item">
+        <span class="tech-key">MACD</span>
+        <span style="color:#3fb950">↑ bullish cross</span>
+      </div>
+    </div>
+    <div class="card-section">
+      <div class="section-label">📰 News</div>
+      
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Decoding LRCX Stock&#x27;s Premium Valuation</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Decoding LRCX Stock’s Premium Valuation - Trefis</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Why Lam Research (LRCX) Dipped More Than Broader Market Today</span>
+        </div>
+    </div>
+    <div class="card-section">
+      <div class="meta-row">💬 News Sentiment: <span style="color:#d29922;font-weight:600">NEUTRAL</span> (+0.00) · 3 headlines</div>
+      <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
+      <div class="meta-row">📅 Earnings: <span>Jul 29</span> · <span>Beat by 8.1%</span></div>
+    </div>
+    <div class="card-section" style="background:#0d111799">
+      <div class="section-label">🤖 AI Verdict · LONGTERM</div>
+      <div class="verdict-sig-row">
+        <span class="verdict-sig-text" style="color:#2ea043">✅ BUY</span>
+        <div class="conf-bar-wrap">
+          <div class="conf-bar" style="width:70%;background:#3fb950"></div>
+        </div>
+        <span class="conf-pct" style="color:#3fb950">70%</span>
+      </div>
+      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$406.27</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$350.86</span></div></div>
+      <div class="verdict-reasoning">The stock shows bullish momentum with an EMA 9/21 uptrend and a positive MACD cross, while recent earnings beat expectations by 8.1%. Although the RSI is mildly overbought (64.6) and market fear is mo</div>
+    </div></div>
+<div class="stock-card mover-card">
+    <div class="card-header">
+      <div>
+        <div style="margin-bottom:2px">
+          <span class="sig-badge" style="background:#2ea04322;color:#2ea043;border:1px solid #2ea04355">✅ BUY</span>
+        </div>
+        <div class="card-sym">FCX</div>
+        <div class="card-co">FCX</div>
+      </div>
+      <div class="card-price">
+        <div class="card-price-val">$70.15</div>
+        <div class="card-price-cur">USD</div>
+      </div>
+    </div><div class="port-tag">💼 2.851 shares @ $70.15 &nbsp;·&nbsp; P&amp;L: <span style="color:#8b949e;font-weight:600">+$0.00 (+0.0%)</span></div>
+    <div class="tech-row">
+      <div class="tech-item">
+        <span class="tech-key">RSI</span>
+        <span style="color:#d29922;font-weight:600">59.8</span>
+      </div>
+      <div class="tech-item">
+        <span class="tech-key">Trend</span>
+        <span style="color:#3fb950;font-weight:600">BULLISH ↑</span>
+      </div>
+      <div class="tech-item">
+        <span class="tech-key">MACD</span>
+        <span style="color:#3fb950">↑ bullish cross</span>
+      </div>
+    </div>
+    <div class="card-section">
+      <div class="section-label">📰 News</div>
+      
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Freeport-McMoRan Stock (US35671D8570): Copper miner in focus amid earnings and sector back</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Copper Tariff Uncertainty Returns As Hudbay Minerals (HBM) And Peers Face Policy Risk Ahea</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Broader Market Weakens as Energy and Software Stocks Fall</span>
+        </div>
+    </div>
+    <div class="card-section">
+      <div class="meta-row">💬 News Sentiment: <span style="color:#f85149;font-weight:600">NEGATIVE</span> (-1.00) · 5 headlines</div>
+      <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
+      <div class="meta-row">📅 Earnings: <span>Jul 22</span> · <span>Beat by 21.3%</span></div>
+    </div>
+    <div class="card-section" style="background:#0d111799">
+      <div class="section-label">🤖 AI Verdict · LONGTERM</div>
+      <div class="verdict-sig-row">
+        <span class="verdict-sig-text" style="color:#2ea043">✅ BUY</span>
+        <div class="conf-bar-wrap">
+          <div class="conf-bar" style="width:70%;background:#3fb950"></div>
+        </div>
+        <span class="conf-pct" style="color:#3fb950">70%</span>
+      </div>
+      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$73.66</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$66.64</span></div></div>
+      <div class="verdict-reasoning">FCX shows bullish technical momentum with a bullish EMA 9/21 crossover and a positive MACD histogram. The recent earnings beat of 21.3% supports a longer‑term upside despite a mildly negative news sen</div>
+    </div></div>
+<div class="stock-card mover-card">
+    <div class="card-header">
+      <div>
+        <div style="margin-bottom:2px">
+          <span class="sig-badge" style="background:#2ea04322;color:#2ea043;border:1px solid #2ea04355">✅ BUY</span>
+        </div>
+        <div class="card-sym">NEM</div>
+        <div class="card-co">NEM</div>
+      </div>
+      <div class="card-price">
+        <div class="card-price-val">$108.44</div>
+        <div class="card-price-cur">USD</div>
+      </div>
+    </div><div class="port-tag">💼 1.8443 shares @ $108.44 &nbsp;·&nbsp; P&amp;L: <span style="color:#8b949e;font-weight:600">+$0.00 (+0.0%)</span></div>
+    <div class="tech-row">
+      <div class="tech-item">
+        <span class="tech-key">RSI</span>
+        <span style="color:#d29922;font-weight:600">53.0</span>
+      </div>
+      <div class="tech-item">
+        <span class="tech-key">Trend</span>
+        <span style="color:#f85149;font-weight:600">BEARISH ↓</span>
+      </div>
+      <div class="tech-item">
+        <span class="tech-key">MACD</span>
+        <span style="color:#3fb950">↑ bullish cross</span>
+      </div>
+    </div>
+    <div class="card-section">
+      <div class="section-label">📰 News</div>
+      
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Why Newmont Stock Bumped Higher Today - The Motley Fool</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Why Newmont Stock Bumped Higher Today</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Why Newmont Stock Bumped Higher Today - Yahoo Finance</span>
+        </div>
+    </div>
+    <div class="card-section">
+      <div class="meta-row">💬 News Sentiment: <span style="color:#d29922;font-weight:600">NEUTRAL</span> (+0.00) · 5 headlines</div>
+      <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
+      <div class="meta-row">📅 Earnings: <span>Jul 23</span> · <span>Beat by 33.6%</span></div>
+    </div>
+    <div class="card-section" style="background:#0d111799">
+      <div class="section-label">🤖 AI Verdict · LONGTERM</div>
+      <div class="verdict-sig-row">
+        <span class="verdict-sig-text" style="color:#2ea043">✅ BUY</span>
+        <div class="conf-bar-wrap">
+          <div class="conf-bar" style="width:68%;background:#d29922"></div>
+        </div>
+        <span class="conf-pct" style="color:#d29922">68%</span>
+      </div>
+      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$114.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$103.00</span></div></div>
+      <div class="verdict-reasoning">Newmont delivered a strong earnings beat of 33.6%, indicating solid fundamentals that support a longer‑term upside. While the EMA trend is bearish, the MACD bullish cross and neutral RSI suggest momen</div>
     </div></div>
 <div class="stock-card mover-card">
     <div class="card-header">
@@ -1188,7 +1333,7 @@
         <div class="card-price-val">$117.05</div>
         <div class="card-price-cur">USD</div>
       </div>
-    </div>
+    </div><div class="port-tag">💼 1.7087 shares @ $117.05 &nbsp;·&nbsp; P&amp;L: <span style="color:#8b949e;font-weight:600">+$0.00 (+0.0%)</span></div>
     <div class="tech-row">
       <div class="tech-item">
         <span class="tech-key">RSI</span>
@@ -1208,15 +1353,15 @@
       
         <div class="news-item">
           <span class="news-dot">·</span>
-          <span class="news-text">Can Nvidia Stock Reach $743 in the Next 12 Months? - The Globe and Mail</span>
-        </div>
-        <div class="news-item">
-          <span class="news-dot">·</span>
           <span class="news-text">S&amp;P 500, Nasdaq, Dow Futures Edge Higher Ahead Of Fed Rate Decision: INTC, SNAP, SOFI, RUM</span>
         </div>
         <div class="news-item">
           <span class="news-dot">·</span>
           <span class="news-text">Qualcomm Stock&#x27;s Next Chapter Might Be Written In The Cloud</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Sandisk vs. Micron: Which AI Memory Stock Is the Better Buy After Their Monster Runs? - Th</span>
         </div>
     </div>
     <div class="card-section">
@@ -1229,18 +1374,201 @@
       <div class="verdict-sig-row">
         <span class="verdict-sig-text" style="color:#2ea043">✅ BUY</span>
         <div class="conf-bar-wrap">
+          <div class="conf-bar" style="width:65%;background:#d29922"></div>
+        </div>
+        <span class="conf-pct" style="color:#d29922">65%</span>
+      </div>
+      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$125.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$111.20</span></div></div>
+      <div class="verdict-reasoning">The stock is on a bullish EMA 9/21 trend and posted an unprecedented earnings beat, which is reflected in the strongly positive news sentiment. However, the MACD has crossed bearish and the Fear &amp; Gre</div>
+    </div></div>
+<div class="stock-card mover-card">
+    <div class="card-header">
+      <div>
+        <div style="margin-bottom:2px">
+          <span class="sig-badge" style="background:#2ea04322;color:#2ea043;border:1px solid #2ea04355">✅ BUY</span>
+        </div>
+        <div class="card-sym">WDC</div>
+        <div class="card-co">WDC</div>
+      </div>
+      <div class="card-price">
+        <div class="card-price-val">$681.08</div>
+        <div class="card-price-cur">USD</div>
+      </div>
+    </div>
+    <div class="tech-row">
+      <div class="tech-item">
+        <span class="tech-key">RSI</span>
+        <span style="color:#f85149;font-weight:600">73.5</span>
+      </div>
+      <div class="tech-item">
+        <span class="tech-key">Trend</span>
+        <span style="color:#3fb950;font-weight:600">BULLISH ↑</span>
+      </div>
+      <div class="tech-item">
+        <span class="tech-key">MACD</span>
+        <span style="color:#3fb950">↑ bullish cross</span>
+      </div>
+    </div>
+    <div class="card-section">
+      <div class="section-label">📰 News</div>
+      
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Mizuho doubles down on WDC stock as AI storage demand shows no signs of slowing down - MSN</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Western Digital Stock&#x27;s Thousand-Percent Question</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Western Digital Stock’s Thousand-Percent Question - Trefis</span>
+        </div>
+    </div>
+    <div class="card-section">
+      <div class="meta-row">💬 News Sentiment: <span style="color:#d29922;font-weight:600">NEUTRAL</span> (+0.00) · 5 headlines</div>
+      <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
+      <div class="meta-row">📅 Earnings: <span>Jul 29</span> · <span>Beat by 13.8%</span></div>
+    </div>
+    <div class="card-section" style="background:#0d111799">
+      <div class="section-label">🤖 AI Verdict · SWING</div>
+      <div class="verdict-sig-row">
+        <span class="verdict-sig-text" style="color:#2ea043">✅ BUY</span>
+        <div class="conf-bar-wrap">
           <div class="conf-bar" style="width:58%;background:#d29922"></div>
         </div>
         <span class="conf-pct" style="color:#d29922">58%</span>
       </div>
-      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$125.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$110.00</span></div></div>
-      <div class="verdict-reasoning">The stock shows a bullish EMA 9/21 alignment and a strong positive news sentiment (+1.0). However, the MACD has turned bearish, suggesting short‑term pressure, so a swing‑trade approach with modest up</div>
+      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$749.19</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$647.03</span></div></div>
+      <div class="verdict-reasoning">The stock shows bullish EMA 9/21 alignment and a bullish MACD cross, while the latest earnings beat (+13.8%) supports upside. However, the RSI is near overbought (73.5) and the Fear &amp; Greed index indi</div>
     </div></div>
 <div class="stock-card mover-card">
     <div class="card-header">
       <div>
         <div style="margin-bottom:2px">
           <span class="sig-badge" style="background:#6e768122;color:#6e7681;border:1px solid #6e768155">⏸ HOLD</span>
+        </div>
+        <div class="card-sym">SPCX <span style="background:#7d3f0022;color:#e8832a;border:1px solid #e8832a55;border-radius:10px;padding:1px 7px;font-size:10px;font-weight:700;vertical-align:middle">🆕 NEW IPO</span></div>
+        <div class="card-co">SPCX</div>
+      </div>
+      <div class="card-price">
+        <div class="card-price-val">$201.80</div>
+        <div class="card-price-cur">USD</div>
+      </div>
+    </div>
+    <div class="tech-row">
+      <div class="tech-item">
+        <span class="tech-key">RSI</span>
+        <span style="color:#8b949e;font-weight:600">—</span>
+      </div>
+      <div class="tech-item">
+        <span class="tech-key">Trend</span>
+        <span style="color:#8b949e;font-weight:600">NEW IPO —</span>
+      </div>
+      <div class="tech-item">
+        <span class="tech-key">MACD</span>
+        <span style="color:#8b949e">→ —</span>
+      </div>
+    </div>
+    <div class="card-section">
+      <div class="section-label">📰 News</div>
+      
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Dow Jones Futures Rise Before Warsh&#x27;s Fed Debut; SpaceX Keeps Rising, Four Stocks In Buy A</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">SpaceX Hits $2.8 Trillion and Sixth Place, but the Chart Flashes Its First Warning - Mitra</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Why Planet Labs (PL) Stock Is Down Today</span>
+        </div>
+    </div>
+    <div class="card-section">
+      <div class="meta-row">💬 News Sentiment: <span style="color:#3fb950;font-weight:600">POSITIVE</span> (+1.00) · 5 headlines</div>
+      <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
+      <div class="meta-row">📅 Earnings: <span>unknown</span> · <span>No data</span></div>
+    </div>
+    <div class="card-section" style="background:#0d111799">
+      <div class="section-label">🤖 AI Verdict · LONGTERM</div>
+      <div class="verdict-sig-row">
+        <span class="verdict-sig-text" style="color:#6e7681">⏸ HOLD</span>
+        <div class="conf-bar-wrap">
+          <div class="conf-bar" style="width:45%;background:#6e7681"></div>
+        </div>
+        <span class="conf-pct" style="color:#6e7681">45%</span>
+      </div>
+      
+      <div class="verdict-reasoning">SPCX is a brand‑new IPO with no historical price data, RSI, or earnings information, limiting any technical or fundamental edge. While news sentiment is strongly positive (+1.0), Google search interes</div>
+    </div></div>
+<div class="stock-card mover-card">
+    <div class="card-header">
+      <div>
+        <div style="margin-bottom:2px">
+          <span class="sig-badge" style="background:#f8514922;color:#f85149;border:1px solid #f8514955">❌ SELL</span>
+        </div>
+        <div class="card-sym">AMD</div>
+        <div class="card-co">AMD</div>
+      </div>
+      <div class="card-price">
+        <div class="card-price-val">$507.29</div>
+        <div class="card-price-cur">USD</div>
+      </div>
+    </div>
+    <div class="tech-row">
+      <div class="tech-item">
+        <span class="tech-key">RSI</span>
+        <span style="color:#d29922;font-weight:600">56.9</span>
+      </div>
+      <div class="tech-item">
+        <span class="tech-key">Trend</span>
+        <span style="color:#3fb950;font-weight:600">BULLISH ↑</span>
+      </div>
+      <div class="tech-item">
+        <span class="tech-key">MACD</span>
+        <span style="color:#f85149">↓ bearish cross</span>
+      </div>
+    </div>
+    <div class="card-section">
+      <div class="section-label">📰 News</div>
+      
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Cathie Wood Keeps Selling AMD: This Time Ark Dumps Another $12 Millions In Shares - Benzin</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Cathie Wood’s ARK sells AMD stock, continues SRTA sell-off By Investing.com - Investing.co</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">AMD (AMD) Signs Rackspace Deal To Build 30 MW Enterprise AI Cloud</span>
+        </div>
+    </div>
+    <div class="card-section">
+      <div class="meta-row">💬 News Sentiment: <span style="color:#d29922;font-weight:600">NEUTRAL</span> (+0.00) · 3 headlines</div>
+      <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
+      <div class="meta-row">📅 Earnings: <span>Aug 04</span> · <span>Beat by 6.2%</span></div>
+    </div>
+    <div class="card-section" style="background:#0d111799">
+      <div class="section-label">🤖 AI Verdict · SWING</div>
+      <div class="verdict-sig-row">
+        <span class="verdict-sig-text" style="color:#f85149">❌ SELL</span>
+        <div class="conf-bar-wrap">
+          <div class="conf-bar" style="width:62%;background:#d29922"></div>
+        </div>
+        <span class="conf-pct" style="color:#d29922">62%</span>
+      </div>
+      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$470.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$525.00</span></div></div>
+      <div class="verdict-reasoning">The MACD shows a bearish cross despite a bullish EMA, indicating weakening momentum. Coupled with two headlines about Cathie Wood&#x27;s ARK fund dumping AMD shares and a Fear &amp; Greed index in the fear zon</div>
+    </div></div>
+<div class="stock-card mover-card">
+    <div class="card-header">
+      <div>
+        <div style="margin-bottom:2px">
+          <span class="sig-badge" style="background:#f8514922;color:#f85149;border:1px solid #f8514955">❌ SELL</span>
         </div>
         <div class="card-sym">QCOM</div>
         <div class="card-co">QCOM</div>
@@ -1288,75 +1616,14 @@
     <div class="card-section" style="background:#0d111799">
       <div class="section-label">🤖 AI Verdict · SWING</div>
       <div class="verdict-sig-row">
-        <span class="verdict-sig-text" style="color:#6e7681">⏸ HOLD</span>
+        <span class="verdict-sig-text" style="color:#f85149">❌ SELL</span>
         <div class="conf-bar-wrap">
-          <div class="conf-bar" style="width:68%;background:#d29922"></div>
+          <div class="conf-bar" style="width:62%;background:#d29922"></div>
         </div>
-        <span class="conf-pct" style="color:#d29922">68%</span>
+        <span class="conf-pct" style="color:#d29922">62%</span>
       </div>
-      
-      <div class="verdict-reasoning">The EMA 9/21 indicates a bullish trend, but the MACD is below its signal line, signaling a bearish cross and short‑term downside risk. Recent earnings beat (3.5%) supports fundamentals, yet the overal</div>
-    </div></div>
-<div class="stock-card mover-card">
-    <div class="card-header">
-      <div>
-        <div style="margin-bottom:2px">
-          <span class="sig-badge" style="background:#6e768122;color:#6e7681;border:1px solid #6e768155">⏸ HOLD</span>
-        </div>
-        <div class="card-sym">SPCX <span style="background:#7d3f0022;color:#e8832a;border:1px solid #e8832a55;border-radius:10px;padding:1px 7px;font-size:10px;font-weight:700;vertical-align:middle">🆕 NEW IPO</span></div>
-        <div class="card-co">SPCX</div>
-      </div>
-      <div class="card-price">
-        <div class="card-price-val">$201.80</div>
-        <div class="card-price-cur">USD</div>
-      </div>
-    </div>
-    <div class="tech-row">
-      <div class="tech-item">
-        <span class="tech-key">RSI</span>
-        <span style="color:#8b949e;font-weight:600">—</span>
-      </div>
-      <div class="tech-item">
-        <span class="tech-key">Trend</span>
-        <span style="color:#8b949e;font-weight:600">NEW IPO —</span>
-      </div>
-      <div class="tech-item">
-        <span class="tech-key">MACD</span>
-        <span style="color:#8b949e">→ —</span>
-      </div>
-    </div>
-    <div class="card-section">
-      <div class="section-label">📰 News</div>
-      
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">SpaceX Hits $2.8 Trillion and Sixth Place, but the Chart Flashes Its First Warning - Mitra</span>
-        </div>
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Dow Jones Futures Rise Before Warsh&#x27;s Fed Debut; SpaceX Keeps Rising, Four Stocks In Buy A</span>
-        </div>
-        <div class="news-item">
-          <span class="news-dot">·</span>
-          <span class="news-text">Why Planet Labs (PL) Stock Is Down Today</span>
-        </div>
-    </div>
-    <div class="card-section">
-      <div class="meta-row">💬 News Sentiment: <span style="color:#3fb950;font-weight:600">POSITIVE</span> (+1.00) · 5 headlines</div>
-      <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
-      <div class="meta-row">📅 Earnings: <span>unknown</span> · <span>No data</span></div>
-    </div>
-    <div class="card-section" style="background:#0d111799">
-      <div class="section-label">🤖 AI Verdict · SWING</div>
-      <div class="verdict-sig-row">
-        <span class="verdict-sig-text" style="color:#6e7681">⏸ HOLD</span>
-        <div class="conf-bar-wrap">
-          <div class="conf-bar" style="width:45%;background:#6e7681"></div>
-        </div>
-        <span class="conf-pct" style="color:#6e7681">45%</span>
-      </div>
-      
-      <div class="verdict-reasoning">The recent IPO provides virtually no price history and there are no earnings data, increasing uncertainty. While news sentiment is strongly positive (+1.0) and headlines are upbeat, the overall market</div>
+      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$200.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$220.00</span></div></div>
+      <div class="verdict-reasoning">While the EMA 9/21 suggests a short‑term bullish bias, the MACD has turned bearish with the line below its signal, indicating downward momentum. Coupled with a neutral news sentiment, low Google searc</div>
     </div></div>
 <div class="stock-card mover-card">
     <div class="card-header">
@@ -1364,18 +1631,18 @@
         <div style="margin-bottom:2px">
           <span class="sig-badge" style="background:#f8514922;color:#f85149;border:1px solid #f8514955">❌ SELL</span>
         </div>
-        <div class="card-sym">AMD</div>
-        <div class="card-co">AMD</div>
+        <div class="card-sym">AMAT</div>
+        <div class="card-co">AMAT</div>
       </div>
       <div class="card-price">
-        <div class="card-price-val">$507.29</div>
+        <div class="card-price-val">$568.23</div>
         <div class="card-price-cur">USD</div>
       </div>
     </div>
     <div class="tech-row">
       <div class="tech-item">
         <span class="tech-key">RSI</span>
-        <span style="color:#d29922;font-weight:600">56.9</span>
+        <span style="color:#f85149;font-weight:600">70.3</span>
       </div>
       <div class="tech-item">
         <span class="tech-key">Trend</span>
@@ -1383,7 +1650,7 @@
       </div>
       <div class="tech-item">
         <span class="tech-key">MACD</span>
-        <span style="color:#f85149">↓ bearish cross</span>
+        <span style="color:#3fb950">↑ bullish cross</span>
       </div>
     </div>
     <div class="card-section">
@@ -1391,21 +1658,21 @@
       
         <div class="news-item">
           <span class="news-dot">·</span>
-          <span class="news-text">Cathie Wood’s ARK sells AMD stock, continues SRTA sell-off By Investing.com - Investing.co</span>
+          <span class="news-text">What Applied Materials Stock Was Shouting Before The Surge</span>
         </div>
         <div class="news-item">
           <span class="news-dot">·</span>
-          <span class="news-text">AMD (AMD) Signs Rackspace Deal To Build 30 MW Enterprise AI Cloud</span>
+          <span class="news-text">What Applied Materials Stock Was Shouting Before The Surge - Trefis</span>
         </div>
         <div class="news-item">
           <span class="news-dot">·</span>
-          <span class="news-text">AMD deal sparks Rackspace stock surge as company cuts jobs</span>
+          <span class="news-text">Decoding LRCX Stock&#x27;s Premium Valuation</span>
         </div>
     </div>
     <div class="card-section">
-      <div class="meta-row">💬 News Sentiment: <span style="color:#3fb950;font-weight:600">POSITIVE</span> (+1.00) · 3 headlines</div>
+      <div class="meta-row">💬 News Sentiment: <span style="color:#3fb950;font-weight:600">POSITIVE</span> (+1.00) · 5 headlines</div>
       <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
-      <div class="meta-row">📅 Earnings: <span>Aug 04</span> · <span>Beat by 6.2%</span></div>
+      <div class="meta-row">📅 Earnings: <span>Aug 13</span> · <span>Beat by 6.3%</span></div>
     </div>
     <div class="card-section" style="background:#0d111799">
       <div class="section-label">🤖 AI Verdict · SWING</div>
@@ -1416,8 +1683,8 @@
         </div>
         <span class="conf-pct" style="color:#d29922">62%</span>
       </div>
-      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$470.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$520.00</span></div></div>
-      <div class="verdict-reasoning">The MACD is in a bearish cross (29.58 below the 34.36 signal) despite a bullish EMA, signalling short‑term downside momentum. Meanwhile, ARK’s sale of AMD stock adds negative sentiment, outweighing th</div>
+      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$540.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$585.00</span></div></div>
+      <div class="verdict-reasoning">The stock shows bullish EMA and MACD cross, but the RSI is deep in overbought territory (70.3) suggesting a near‑term pullback. Positive news sentiment and a recent earnings beat are outweighed by low</div>
     </div></div>
 <div class="stock-card mover-card">
     <div class="card-header">
@@ -1464,12 +1731,12 @@
         </div>
     </div>
     <div class="card-section">
-      <div class="meta-row">💬 News Sentiment: <span style="color:#d29922;font-weight:600">NEUTRAL</span> (+0.00) · 4 headlines</div>
+      <div class="meta-row">💬 News Sentiment: <span style="color:#d29922;font-weight:600">NEUTRAL</span> (+0.00) · 3 headlines</div>
       <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
       <div class="meta-row">📅 Earnings: <span>Aug 05</span> · <span>Missed by 81.7%</span></div>
     </div>
     <div class="card-section" style="background:#0d111799">
-      <div class="section-label">🤖 AI Verdict · LONGTERM</div>
+      <div class="section-label">🤖 AI Verdict · SWING</div>
       <div class="verdict-sig-row">
         <span class="verdict-sig-text" style="color:#f85149">❌ SELL</span>
         <div class="conf-bar-wrap">
@@ -1478,7 +1745,125 @@
         <span class="conf-pct" style="color:#d29922">62%</span>
       </div>
       <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$65.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$78.00</span></div></div>
-      <div class="verdict-reasoning">Uber missed earnings by a massive 81.7% and the CNN Fear &amp; Greed Index shows fear at 39, indicating weak fundamentals. Additionally, the EMA 9/21 trend is bearish despite a bullish MACD cross, suggest</div>
+      <div class="verdict-reasoning">The EMA 9/21 indicates a bearish trend while the stock recently missed earnings by 81.7%, suggesting momentum to the downside. Combined with a fear‑biased CNN Fear &amp; Greed Index (39) and neutral news </div>
+    </div></div>
+<div class="stock-card mover-card">
+    <div class="card-header">
+      <div>
+        <div style="margin-bottom:2px">
+          <span class="sig-badge" style="background:#f8514922;color:#f85149;border:1px solid #f8514955">❌ SELL</span>
+        </div>
+        <div class="card-sym">MU</div>
+        <div class="card-co">MU</div>
+      </div>
+      <div class="card-price">
+        <div class="card-price-val">$1,020.76</div>
+        <div class="card-price-cur">USD</div>
+      </div>
+    </div>
+    <div class="tech-row">
+      <div class="tech-item">
+        <span class="tech-key">RSI</span>
+        <span style="color:#d29922;font-weight:600">60.5</span>
+      </div>
+      <div class="tech-item">
+        <span class="tech-key">Trend</span>
+        <span style="color:#3fb950;font-weight:600">BULLISH ↑</span>
+      </div>
+      <div class="tech-item">
+        <span class="tech-key">MACD</span>
+        <span style="color:#f85149">↓ bearish cross</span>
+      </div>
+    </div>
+    <div class="card-section">
+      <div class="section-label">📰 News</div>
+      
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Micron (MU) Falls More Steeply Than Broader Market: What Investors Need to Know</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Micron Technology (MU) Wins HBM4 Supplier Role For Nvidia Vera Rubin AI Platform</span>
+        </div>
+    </div>
+    <div class="card-section">
+      <div class="meta-row">💬 News Sentiment: <span style="color:#d29922;font-weight:600">NEUTRAL</span> (+0.00) · 2 headlines</div>
+      <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
+      <div class="meta-row">📅 Earnings: <span>Jun 24</span> · <span>Beat by 33.2%</span></div>
+    </div>
+    <div class="card-section" style="background:#0d111799">
+      <div class="section-label">🤖 AI Verdict · SWING</div>
+      <div class="verdict-sig-row">
+        <span class="verdict-sig-text" style="color:#f85149">❌ SELL</span>
+        <div class="conf-bar-wrap">
+          <div class="conf-bar" style="width:60%;background:#d29922"></div>
+        </div>
+        <span class="conf-pct" style="color:#d29922">60%</span>
+      </div>
+      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$970.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$1,050.00</span></div></div>
+      <div class="verdict-reasoning">The EMA 9/21 shows a bullish trend, but the MACD has crossed bearish (MACD below signal), indicating potential downside momentum. Combined with a fear‑driven market (Fear &amp; Greed Index 39) and mixed n</div>
+    </div></div>
+<div class="stock-card mover-card">
+    <div class="card-header">
+      <div>
+        <div style="margin-bottom:2px">
+          <span class="sig-badge" style="background:#f8514922;color:#f85149;border:1px solid #f8514955">❌ SELL</span>
+        </div>
+        <div class="card-sym">KLAC</div>
+        <div class="card-co">KLAC</div>
+      </div>
+      <div class="card-price">
+        <div class="card-price-val">$237.33</div>
+        <div class="card-price-cur">USD</div>
+      </div>
+    </div>
+    <div class="tech-row">
+      <div class="tech-item">
+        <span class="tech-key">RSI</span>
+        <span style="color:#d29922;font-weight:600">63.7</span>
+      </div>
+      <div class="tech-item">
+        <span class="tech-key">Trend</span>
+        <span style="color:#3fb950;font-weight:600">BULLISH ↑</span>
+      </div>
+      <div class="tech-item">
+        <span class="tech-key">MACD</span>
+        <span style="color:#3fb950">↑ bullish cross</span>
+      </div>
+    </div>
+    <div class="card-section">
+      <div class="section-label">📰 News</div>
+      
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Marvell Technology, Nova, and KLA Corporation Stocks Trade Down, What You Need To Know</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">Decoding LRCX Stock&#x27;s Premium Valuation</span>
+        </div>
+        <div class="news-item">
+          <span class="news-dot">·</span>
+          <span class="news-text">KLA Corp (KLAC) Shares Fall 7.4% -- What GF Score of 87 Tells In - GuruFocus</span>
+        </div>
+    </div>
+    <div class="card-section">
+      <div class="meta-row">💬 News Sentiment: <span style="color:#f85149;font-weight:600">NEGATIVE</span> (-1.00) · 5 headlines</div>
+      <div class="meta-row">📈 Mkt Interest (7d): <span style="color:#8b949e;font-weight:600">15/100</span></div>
+      <div class="meta-row">📅 Earnings: <span>Jul 30</span> · <span>Beat by 2.2%</span></div>
+    </div>
+    <div class="card-section" style="background:#0d111799">
+      <div class="section-label">🤖 AI Verdict · SWING</div>
+      <div class="verdict-sig-row">
+        <span class="verdict-sig-text" style="color:#f85149">❌ SELL</span>
+        <div class="conf-bar-wrap">
+          <div class="conf-bar" style="width:58%;background:#d29922"></div>
+        </div>
+        <span class="conf-pct" style="color:#d29922">58%</span>
+      </div>
+      <div class="verdict-prices"><div class="verdict-price-item"><span class="verdict-price-key">Target</span><span style="color:#3fb950;font-weight:600">$210.00</span></div><div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">$250.00</span></div></div>
+      <div class="verdict-reasoning">Technical indicators (bullish EMA and MACD) suggest upward momentum, but recent news sentiment is strongly negative and the market fear index is low, indicating broader caution. The RSI at 63.7 is not</div>
     </div></div>
   </div>
 
@@ -1491,20 +1876,10 @@
         <span>🟡 MEDIUM</span>
         <span class="alert-type">STRONG_BUY</span>
         <span style="flex:1"></span>
-        <span class="alert-sym">AMAT</span>
-      </div>
-      <div class="alert-msg">STRONG BUY: AMAT @ $568.23 — 70% confidence (SWING)</div>
-      <div class="alert-meta">$568.23 USD · 70% conf · 22:17:34</div>
-    </div>
-    <div class="alert-row medium">
-      <div class="alert-header">
-        <span>🟡 MEDIUM</span>
-        <span class="alert-type">STRONG_BUY</span>
-        <span style="flex:1"></span>
         <span class="alert-sym">FCX</span>
       </div>
       <div class="alert-msg">STRONG BUY: FCX @ $70.15 — 70% confidence (LONGTERM)</div>
-      <div class="alert-meta">$70.15 USD · 70% conf · 22:17:34</div>
+      <div class="alert-meta">$70.15 USD · 70% conf · 22:44:21</div>
     </div>
     <div class="alert-row medium">
       <div class="alert-header">
@@ -1514,7 +1889,17 @@
         <span class="alert-sym">LRCX</span>
       </div>
       <div class="alert-msg">STRONG BUY: LRCX @ $369.34 — 70% confidence (LONGTERM)</div>
-      <div class="alert-meta">$369.34 USD · 70% conf · 22:17:34</div>
+      <div class="alert-meta">$369.34 USD · 70% conf · 22:44:21</div>
+    </div>
+    <div class="alert-row medium">
+      <div class="alert-header">
+        <span>🟡 MEDIUM</span>
+        <span class="alert-type">STRONG_BUY</span>
+        <span style="flex:1"></span>
+        <span class="alert-sym">MRNA</span>
+      </div>
+      <div class="alert-msg">STRONG BUY: MRNA @ $55.40 — 78% confidence (LONGTERM)</div>
+      <div class="alert-meta">$55.40 USD · 78% conf · 22:44:21</div>
     </div>
     <div class="alert-row medium">
       <div class="alert-header">
@@ -1523,14 +1908,14 @@
         <span style="flex:1"></span>
         <span class="alert-sym">SNDK</span>
       </div>
-      <div class="alert-msg">STRONG BUY: SNDK @ $1,991.55 — 70% confidence (SWING)</div>
-      <div class="alert-meta">$1,991.55 USD · 70% conf · 22:17:34</div>
+      <div class="alert-msg">STRONG BUY: SNDK @ $1,991.55 — 82% confidence (LONGTERM)</div>
+      <div class="alert-meta">$1,991.55 USD · 82% conf · 22:44:21</div>
     </div>
   </div>
 
   <footer>
     Data is for informational purposes only. Not financial advice. &nbsp;·&nbsp;
-    Stock Bot v0.4.5 · Phase 4.5 &nbsp;·&nbsp; Updated 2026-06-16 22:17:34
+    Stock Bot v0.4.5 · Phase 4.5 &nbsp;·&nbsp; Updated 2026-06-16 22:44:21
   </footer>
 
   <script>
