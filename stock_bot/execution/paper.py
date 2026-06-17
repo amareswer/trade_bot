@@ -13,6 +13,7 @@ moving to a real broker by implementing StockExecutorBase.
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import os
 import uuid
@@ -28,10 +29,10 @@ from stock_bot.portfolio.tracker import (
 
 logger = logging.getLogger(__name__)
 
-_TRADES_CSV = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)),  # stock_bot/
-    "paper_trades.csv",
-)
+_STOCK_BOT_DIR = os.path.dirname(os.path.dirname(__file__))  # stock_bot/
+_TRADES_CSV    = os.path.join(_STOCK_BOT_DIR, "paper_trades.csv")
+_STATE_JSON    = os.path.join(_STOCK_BOT_DIR, "paper_state.json")
+
 _CSV_HEADER = [
     "timestamp", "symbol", "side", "shares",
     "price", "total_value", "cash_remaining", "reason",
@@ -47,16 +48,19 @@ class StockPaperExecutor(StockExecutorBase):
     """
 
     def __init__(self, starting_cash: float = 10_000.0) -> None:
-        self._cash:          float                          = starting_cash
         self._starting_cash: float                          = starting_cash
-        # {SYMBOL_UPPER: (shares, avg_cost_per_share)}
-        self._positions:     dict[str, tuple[float, float]] = {}
-        self._realized_pnl:  float                          = 0.0
         self._orders:        list[StockOrder]               = []
-        self._trade_log:     list[PaperTrade]               = []  # in-memory recent trades
+        self._trade_log:     list[PaperTrade]               = []
+
+        # Defaults — overwritten by _load_state() if a saved state exists
+        self._cash:         float                           = starting_cash
+        self._positions:    dict[str, tuple[float, float]]  = {}
+        self._realized_pnl: float                           = 0.0
+
+        if not self._load_state():
+            logger.info("StockPaperExecutor starting fresh | cash=$%.2f", starting_cash)
 
         self._ensure_csv_header()
-        logger.info("StockPaperExecutor ready | starting_cash=$%.2f", starting_cash)
 
     # ── Core operations ───────────────────────────────────────────────────────
 
@@ -96,6 +100,7 @@ class StockPaperExecutor(StockExecutorBase):
             )
             self._trade_log.append(trade)
             self._log_trade_csv(trade)
+            self.save_state()
 
             logger.info(
                 "PAPER BUY FILLED   %s  %.4f shares @ $%.2f  "
@@ -143,6 +148,7 @@ class StockPaperExecutor(StockExecutorBase):
             )
             self._trade_log.append(trade)
             self._log_trade_csv(trade)
+            self.save_state()
 
             logger.info(
                 "PAPER SELL FILLED  %s  %.4f shares @ $%.2f  "
@@ -254,6 +260,51 @@ class StockPaperExecutor(StockExecutorBase):
             len(self.filled_orders()),
             len(self._positions),
         )
+
+    # ── State persistence (JSON) ──────────────────────────────────────────────
+
+    def _load_state(self) -> bool:
+        """Load cash/positions/realized_pnl from paper_state.json. Returns True on success."""
+        if not os.path.exists(_STATE_JSON):
+            return False
+        try:
+            with open(_STATE_JSON, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            self._cash         = float(state["cash"])
+            self._realized_pnl = float(state.get("realized_pnl", 0.0))
+            self._positions    = {
+                sym.upper(): (float(v["shares"]), float(v["avg_cost"]))
+                for sym, v in state.get("positions", {}).items()
+            }
+            print("📄 Paper state restored:")
+            print(f"   Cash: ${self._cash:,.2f}")
+            print(f"   Positions: {list(self._positions.keys())}")
+            print(f"   Realized P&L: ${self._realized_pnl:+.2f}")
+            logger.info(
+                "Paper state restored | cash=$%.2f | positions=%s | realized_pnl=$%.2f",
+                self._cash, list(self._positions.keys()), self._realized_pnl,
+            )
+            return True
+        except (KeyError, ValueError, json.JSONDecodeError, OSError) as exc:
+            logger.warning("Could not load paper_state.json (%s) — starting fresh", exc)
+            return False
+
+    def save_state(self) -> None:
+        """Persist current cash/positions/realized_pnl to paper_state.json."""
+        state = {
+            "cash": round(self._cash, 6),
+            "positions": {
+                sym: {"shares": round(shares, 9), "avg_cost": round(cost, 6)}
+                for sym, (shares, cost) in self._positions.items()
+            },
+            "realized_pnl": round(self._realized_pnl, 6),
+            "last_updated": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        try:
+            with open(_STATE_JSON, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+        except OSError as exc:
+            logger.warning("Could not save paper_state.json: %s", exc)
 
     # ── CSV persistence ───────────────────────────────────────────────────────
 

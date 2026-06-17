@@ -392,6 +392,7 @@ def run() -> None:
                 portfolio_summary = executor.build_summary(scan_results)
                 paper_summary     = executor.build_paper_summary(scan_results)
                 executor.log_state({r.symbol: r.price for r in scan_results})
+                executor.save_state()
             else:
                 portfolio_summary = tracker.build_summary(scan_results)
         except Exception as exc:
