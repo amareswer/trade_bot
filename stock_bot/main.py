@@ -25,7 +25,7 @@ from stock_bot.indicators.indicators import (
     rsi   as calc_rsi,
     trend as calc_trend,
 )
-from stock_bot.research.aggregator  import fetch_research, ResearchReport, COMPANY_NAMES
+from stock_bot.research.aggregator  import fetch_research, ResearchReport, get_company_name
 from stock_bot.research.fear_greed   import fetch_fear_greed
 from stock_bot.research.google_trends import fetch_market_trends
 from stock_bot.ai.ai_engine         import AIEngine
@@ -245,8 +245,8 @@ def run() -> None:
     print(f"  Screener  : {'enabled' if screener else 'disabled'}")
     print(f"  Interval  : {cfg.interval}   Lookback: {cfg.lookback_days}d   Loop: {cfg.loop_interval}s")
     ai_status = "enabled" if (ai_engine and ai_engine.enabled) else "disabled"
-    from stock_bot.ai.ai_engine import _MODEL as _AI_MODEL
-    print(f"  AI engine : {ai_status}  (model: {_AI_MODEL})")
+    _ai_model_name = ai_engine._model if (ai_engine and ai_engine.enabled) else "—"
+    print(f"  AI engine : {ai_status}  (model: {_ai_model_name})")
     if executor:
         print(f"  Paper trading: ON  cash=${cfg.paper_starting_cash:,.2f}  risk={cfg.paper_risk_pct*100:.0f}%/trade  min_conf={cfg.paper_min_confidence}%")
     print(f"  Dashboard : file://{_os.path.abspath('stock_dashboard.html')}")
@@ -380,7 +380,7 @@ def run() -> None:
 
                     scan_results.append(ScanResult(
                         symbol       = symbol,
-                        company_name = COMPANY_NAMES.get(symbol, symbol.split(".")[0]),
+                        company_name = get_company_name(symbol),
                         price        = symbol_data["last_candle"].close,
                         currency     = "CAD" if symbol.upper().endswith(".TO") else "USD",
                         rsi          = symbol_data["rsi"],

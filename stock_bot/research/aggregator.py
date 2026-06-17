@@ -13,6 +13,8 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from datetime import datetime
 
+import yfinance as yf
+
 from stock_bot.research.news_fetcher      import fetch_news,       NewsItem
 from stock_bot.research.sentiment_scraper import score_headlines,  SentimentData
 from stock_bot.research.earnings          import fetch_earnings,   EarningsInfo
@@ -21,16 +23,25 @@ from stock_bot.research.fear_greed        import fetch_fear_greed, FearGreedData
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Company name lookup — used to build richer Reddit search queries
+# Company name lookup — cached yfinance fetch, one call per symbol per session
 # ---------------------------------------------------------------------------
 
-COMPANY_NAMES: dict[str, str] = {
-    "SHOP.TO": "Shopify",
-    "RY.TO":   "Royal Bank of Canada",
-    "AC.TO":   "Air Canada",
-    "AAPL":    "Apple",
-    "NVDA":    "Nvidia",
-}
+_company_name_cache: dict[str, str] = {}
+
+
+def get_company_name(symbol: str) -> str:
+    if symbol in _company_name_cache:
+        return _company_name_cache[symbol]
+    clean = symbol.replace(".TO", "")
+    try:
+        info  = yf.Ticker(symbol).info
+        name  = info.get("longName") or info.get("shortName") or clean
+        short = info.get("shortName") or name
+        result = short if len(short) <= 25 else clean
+    except Exception:
+        result = clean
+    _company_name_cache[symbol] = result
+    return result
 
 
 @dataclass
@@ -61,7 +72,7 @@ def fetch_research(
     Never raises — every source failure is caught and returns a safe default.
     """
     if company_name is None:
-        company_name = COMPANY_NAMES.get(symbol, symbol.split(".")[0])
+        company_name = get_company_name(symbol)
 
     if fear_greed_data is None:
         fear_greed_data = fetch_fear_greed()
