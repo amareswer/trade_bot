@@ -1,7 +1,8 @@
 """
 AI analysis engine for the stock bot — multi-provider, advisory only.
 
-Supports three providers (set AI_PROVIDER in stock_bot/.env):
+Supports four providers (set AI_PROVIDER in stock_bot/.env):
+  nvidia_nim         — nvidia/nemotron-3-ultra-550b-a55b via NVIDIA NIM  (NVIDIA_API_KEY)
   openrouter         — meta-llama/llama-3.3-70b-instruct:free via openrouter.ai
   ollama_local       — any Ollama model running locally  (OLLAMA_BASE_URL)
   ollama_cloud/cloud — any Ollama model via ollama.com   (OLLAMA_CLOUD_API_KEY)
@@ -210,10 +211,28 @@ class AIEngine:
                 headers = {"Authorization": f"Bearer {cloud_key}"},
             )
 
+        elif self._provider == "nvidia_nim":
+            api_key = os.getenv("NVIDIA_API_KEY", "").strip()
+            if not api_key:
+                logger.warning("Stock AI disabled — NVIDIA_API_KEY not set in stock_bot/.env")
+                return
+            try:
+                from openai import OpenAI as _OpenAIClient
+                self._openai_cls = _OpenAIClient
+            except ImportError:
+                logger.warning(
+                    "Stock AI disabled — openai package required for nvidia_nim: "
+                    "run: pip install openai"
+                )
+                return
+            self._model    = os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b").strip()
+            self._api_key  = api_key
+            self._base_url = "https://integrate.api.nvidia.com/v1"
+
         else:
             logger.warning(
                 "Stock AI disabled — unknown AI_PROVIDER=%r "
-                "(valid: openrouter | ollama_local | ollama_cloud | cloud)",
+                "(valid: openrouter | ollama_local | ollama_cloud | cloud | nvidia_nim)",
                 self._provider,
             )
             return
@@ -224,6 +243,28 @@ class AIEngine:
     @property
     def enabled(self) -> bool:
         return self._ready
+
+    def _rate_limit_sleep(self) -> None:
+        if self._provider == "openrouter":
+            time.sleep(4)
+        elif self._provider == "nvidia_nim":
+            time.sleep(1.5)
+
+    def _fallback_to_openrouter(self) -> None:
+        api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        if not api_key:
+            logger.warning(
+                "openrouter fallback unavailable — OPENROUTER_API_KEY not set in root .env"
+            )
+            self._ready = False
+            return
+        self._provider = "openrouter"
+        self._model    = _MODEL
+        self._base_url = "https://openrouter.ai/api/v1/chat/completions"
+        self._headers  = {
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
 
     def analyze(
         self,
@@ -252,7 +293,30 @@ class AIEngine:
                     stream   = True,
                 ):
                     raw += part["message"]["content"]
-            else:
+            elif self._provider == "nvidia_nim":
+                client = self._openai_cls(
+                    base_url = self._base_url,
+                    api_key  = self._api_key,
+                )
+                completion = client.chat.completions.create(
+                    model       = self._model,
+                    messages    = [{"role": "user", "content": prompt}],
+                    temperature = 0.7,
+                    top_p       = 0.95,
+                    max_tokens  = 4096,
+                    extra_body  = {
+                        "chat_template_kwargs": {"enable_thinking": True},
+                        "reasoning_budget":     2048,
+                    },
+                    stream = True,
+                )
+                for chunk in completion:
+                    if not chunk.choices:
+                        continue
+                    content = chunk.choices[0].delta.content
+                    if content is not None:
+                        raw += content
+            else:  # openrouter | ollama_local
                 payload = {
                     "model":       self._model,
                     "messages":    [{"role": "user", "content": prompt}],
@@ -269,9 +333,14 @@ class AIEngine:
                 raw = resp.json()["choices"][0]["message"]["content"] or ""
         except Exception as exc:
             logger.warning("AI API call failed for %s [%s]: %s", symbol, self._provider, exc)
+            self._rate_limit_sleep()
+            if self._provider == "nvidia_nim":
+                logger.warning("nvidia_nim failed — falling back to openrouter")
+                self._fallback_to_openrouter()
             return _hold_verdict(symbol, "AI unavailable")
 
         latency_ms = (time.monotonic() - t0) * 1000
+        self._rate_limit_sleep()
         try:
             verdict        = _parse(raw, symbol)
             verdict.symbol = symbol

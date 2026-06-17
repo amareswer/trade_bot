@@ -11,6 +11,7 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 import time
 
@@ -37,12 +38,19 @@ _FALLBACK_SYMBOLS: list[str] = [
     "BAC",  "XOM",  "AVGO",  "SHOP.TO", "RY.TO",
 ]
 
-_BROKEN_SYMBOLS: set[str] = {
-    # TSX multi-class shares — Yahoo Finance format incompatible
-    "RCI.B.TO", "GIB.A.TO", "BIP.UN.TO",
-    "CTC.A.TO", "CCL.B.TO", "TECK.B.TO",
-    # Add any others that keep failing here
-}
+_TSX_BROKEN_PATTERNS: list[str] = [
+    r'\.[A-Z]\.TO$',    # unconverted single-letter class: RCI.B.TO, CCL.B.TO
+    r'-[A-Z]\.TO$',     # converted single-letter class:   RCI-B.TO, CCL-B.TO
+    r'-[A-Z]{2,}\.TO$', # converted multi-letter class:    BIP-UN.TO
+    r'\.UN\.TO$',       # unconverted income trusts:        BIP.UN.TO
+    r'\.PR\.',          # unconverted preferred shares
+    r'-PR\.',           # converted preferred shares
+]
+
+
+def _is_valid_tsx_symbol(symbol: str) -> bool:
+    """Return False for TSX symbols Yahoo Finance cannot handle."""
+    return not any(re.search(p, symbol) for p in _TSX_BROKEN_PATTERNS)
 
 
 class StockUniverse:
@@ -77,8 +85,6 @@ class StockUniverse:
                 seen.add(s)
                 unique.append(s)
 
-        unique = [s for s in unique if s not in _BROKEN_SYMBOLS]
-
         self._save_cache(unique)
         logger.info("Universe fetched: %d symbols", len(unique))
         return unique
@@ -88,7 +94,6 @@ class StockUniverse:
         Batch-download 5-day OHLCV, filter by avg volume and price, rank by
         volume × 5d price change, return top n.
         """
-        symbols = [s for s in symbols if s not in _BROKEN_SYMBOLS]
         logger.info("Pre-filtering %d symbols → top %d", len(symbols), n)
         metrics = self._batch_metrics(symbols)
 
@@ -146,6 +151,7 @@ class StockUniverse:
                             s = s.replace(".A.TO",  "-A.TO")
                             s = s.replace(".PR.",   "-PR.")
                             symbols.append(s)
+                        symbols = [s for s in symbols if _is_valid_tsx_symbol(s)]
                         logger.info("TSX 60: %d symbols fetched", len(symbols))
                         return symbols
         except Exception as exc:

@@ -55,13 +55,15 @@ Terminal alert box shows: `🟡 MEDIUM · STRONG_BUY · watchlist` or `· top mo
 
 ## AI providers (set AI_PROVIDER in stock_bot/.env)
 
-| Value | Auth | Model |
-|---|---|---|
-| `openrouter` | `OPENROUTER_API_KEY` in root `.env` | `meta-llama/llama-3.3-70b-instruct:free` |
-| `ollama_local` | none (local server) | `OLLAMA_MODEL` (e.g. `llama3.2`) |
-| `ollama_cloud` | `OLLAMA_CLOUD_API_KEY` in `stock_bot/.env` | `OLLAMA_MODEL` |
+| Provider | Auth | Model | Rate | Delay |
+|---|---|---|---|---|
+| `nvidia_nim` ← **ACTIVE** | `NVIDIA_API_KEY` in `stock_bot/.env` | `nvidia/nemotron-3-ultra-550b-a55b` | 40 rpm free | 1.5 s |
+| `ollama_cloud` | `OLLAMA_CLOUD_API_KEY` in `stock_bot/.env` | `gpt-oss:120b` | weekly limit | — |
+| `openrouter` | `OPENROUTER_API_KEY` in root `.env` | `meta-llama/llama-3.3-70b-instruct:free` | 10-20 rpm free | 4 s |
+| `ollama_local` | none (local server) | `OLLAMA_MODEL` (e.g. `llama3.2`) | local GPU | — |
 
-Currently active: `ollama_cloud` with `llama3.2`.
+nvidia_nim uses `openai` SDK with `stream=True` (mandatory — 550B model times out without streaming).
+On first failure, automatically falls back to openrouter and logs warning.
 
 ## AI verdict rules
 

@@ -77,6 +77,8 @@ class StockConfig:
     universe_size:         int   # top N symbols to scan per cycle
     universe_refresh_hours: int  # how often to refresh the symbol lists
     screener_enabled:      bool  # skip AI on stocks with no momentum signal
+    nvidia_api_key:        str   # NVIDIA NIM API key (nvidia_nim provider)
+    nvidia_model:          str   # NVIDIA NIM model name
     watchlist:             list[str] = field(init=False)
 
     def __post_init__(self) -> None:
@@ -130,4 +132,6 @@ def load() -> StockConfig:
         universe_size          = _int  ("UNIVERSE_SIZE",           20),
         universe_refresh_hours = _int  ("UNIVERSE_REFRESH_HOURS",  24),
         screener_enabled       = _bool ("SCREENER_ENABLED",        True),
+        nvidia_api_key         = _str  ("NVIDIA_API_KEY",          ""),
+        nvidia_model           = _str  ("NVIDIA_MODEL",            "nvidia/nemotron-3-ultra-550b-a55b"),
     )

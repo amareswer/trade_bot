@@ -96,6 +96,11 @@ def _conf_color(conf: int) -> str:
     return "#6e7681"
 
 
+def _is_ai_pending(verdict: AIVerdict) -> bool:
+    """True when AI hasn't produced a real signal — confidence 0 + internal status reason."""
+    return verdict.confidence == 0 and verdict.reasoning.startswith("AI ")
+
+
 def _fg_label(score: int) -> str:
     if score <= 25:  return "Extreme Fear"
     if score <= 45:  return "Fear"
@@ -532,6 +537,7 @@ def _stock_card_html(r: ScanResult, pos: Optional[PortfolioPosition] = None, ext
     conf_col  = _conf_color(conf)
     rsi_col   = _rsi_color(r.rsi)
     trend_arrow = _TREND_ARROW.get(r.trend or "", "—")
+    _pending  = _is_ai_pending(r.verdict)
 
     rsi_str   = f"{r.rsi:.1f}" if r.rsi is not None else "—"
     trend_str = r.trend or "—"
@@ -545,11 +551,16 @@ def _stock_card_html(r: ScanResult, pos: Optional[PortfolioPosition] = None, ext
         'vertical-align:middle">🆕 NEW IPO</span>'
         if is_new_ipo else ""
     )
+    _sig_badge = (
+        '<span class="sig-badge" style="background:#21262d;color:#6e7681;border:1px solid #30363d">⏳ AI pending…</span>'
+        if _pending else
+        f'<span class="sig-badge" style="background:{sig_color}22;color:{sig_color};border:1px solid {sig_color}55">{_e(sig_icon)}</span>'
+    )
     card_header = f"""
     <div class="card-header">
       <div>
         <div style="margin-bottom:2px">
-          <span class="sig-badge" style="background:{sig_color}22;color:{sig_color};border:1px solid {sig_color}55">{_e(sig_icon)}</span>
+          {_sig_badge}
         </div>
         <div class="card-sym">{_e(r.symbol)}{ipo_badge}</div>
         <div class="card-co">{_e(r.company_name)}</div>
@@ -652,7 +663,20 @@ def _stock_card_html(r: ScanResult, pos: Optional[PortfolioPosition] = None, ext
             parts.append(f'<div class="verdict-price-item"><span class="verdict-price-key">Stop</span><span style="color:#f85149;font-weight:600">${r.verdict.stop_loss:,.2f}</span></div>')
         price_row = f'<div class="verdict-prices">{"".join(parts)}</div>'
 
-    verdict_section = f"""
+    if _pending:
+        verdict_section = f"""
+    <div class="card-section" style="background:#0d111799">
+      <div class="section-label">🤖 AI Verdict · {_e(r.verdict.trading_style)}</div>
+      <div class="verdict-sig-row">
+        <span class="verdict-sig-text" style="color:#6e7681">⏳ AI pending…</span>
+        <div class="conf-bar-wrap">
+          <div class="conf-bar" style="width:0%;background:#30363d"></div>
+        </div>
+        <span class="conf-pct" style="color:#484f58">—</span>
+      </div>
+    </div>"""
+    else:
+        verdict_section = f"""
     <div class="card-section" style="background:#0d111799">
       <div class="section-label">🤖 AI Verdict · {_e(r.verdict.trading_style)}</div>
       <div class="verdict-sig-row">

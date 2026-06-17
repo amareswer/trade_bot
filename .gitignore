@@ -37,6 +37,7 @@ logs/
 htmlcov/
 
 dashboard.html
+stock_dashboard.html
 
 # Add these to your trade bot .gitignore
 .memory/preferences/user.md

@@ -281,6 +281,10 @@ def run() -> None:
 
         scan_results: list[ScanResult] = []
 
+        cycle_start  = time.monotonic()
+        # Reserve 30 s for post-scan work; watchlist always gets AI regardless.
+        _ai_budget_s = cfg.loop_interval - 30
+
         for symbol in all_symbols:
             verdict: AIVerdict | None = None
             try:
@@ -291,9 +295,12 @@ def run() -> None:
                     report = fetch_research(symbol, fear_greed_data=fear_greed_data, market_trends_score=market_trends_score)
                     _print_research(report)
 
+                    _is_watchlist = symbol in cfg.watchlist
+                    _ai_allowed   = _is_watchlist or (time.monotonic() - cycle_start < _ai_budget_s)
+
                     if not cfg.ai_enabled:
                         print("  🤖 AI: disabled (AI_ENABLED=false in stock_bot/.env)")
-                    elif ai_engine:
+                    elif ai_engine and _ai_allowed:
                         indicators = {
                             "rsi":         symbol_data["rsi"],
                             "trend":       symbol_data["trend"],
@@ -305,46 +312,51 @@ def run() -> None:
                             symbol, symbol_data["last_candle"], indicators, report
                         )
                         _print_verdict(verdict)
+                    elif ai_engine and not _ai_allowed:
+                        print("  🤖 AI: skipped (cycle time budget exhausted)")
                     else:
                         print("  🤖 AI: unavailable — check credentials in .env")
 
                     # ── Paper trading execution ───────────────────────────────
-                    if executor is not None and verdict is not None:
-                        px   = symbol_data["last_candle"].close
-                        sig  = verdict.signal
-                        cur  = "CAD" if symbol.upper().endswith(".TO") else "USD"
-                        if sig == "BUY" and verdict.confidence >= cfg.paper_min_confidence:
+                    if (
+                        executor is not None
+                        and verdict is not None
+                        and verdict.confidence > 0                          # skip AI unavailable
+                        and verdict.signal in ("BUY", "SELL")
+                        and verdict.confidence >= cfg.paper_min_confidence
+                    ):
+                        px  = symbol_data["last_candle"].close
+                        sig = verdict.signal
+                        if sig == "BUY":
                             if executor.position(symbol) == 0:
                                 # Size on total portfolio value (cash + positions at avg cost)
-                                snap     = executor.positions_snapshot()
-                                pos_val  = sum(sh * co for sh, co in snap.values())
-                                tot_val  = executor.cash + pos_val
-                                alloc    = tot_val * cfg.paper_risk_pct
-                                shares   = round(alloc / px, 4) if px > 0 else 0
+                                snap    = executor.positions_snapshot()
+                                pos_val = sum(sh * co for sh, co in snap.values())
+                                alloc   = (executor.cash + pos_val) * cfg.paper_risk_pct
+                                shares  = round(alloc / px, 4) if px > 0 else 0
                                 if shares > 0:
                                     reason = f"BUY {verdict.confidence}% {verdict.trading_style}"
                                     order  = executor.buy(symbol, shares, px, reason=reason)
                                     if order.status == OrderStatus.FILLED:
                                         total = round(shares * px, 2)
-                                        print(f"  📄 PAPER BUY:  {symbol}  {shares:.4f} shares @ ${px:,.2f} = ${total:,.2f}")
+                                        print(f"  📄 PAPER BUY:  {symbol}  {shares:.4f} shares")
+                                        print(f"                 @ ${px:,.2f} = ${total:,.2f}")
                                         print(f"                 Cash remaining: ${executor.cash:,.2f}")
                                     else:
-                                        need = round(shares * px, 2)
-                                        print(f"  📄 REJECTED:   {symbol}  insufficient cash")
-                                        print(f"                 (need ${need:,.2f}  have ${executor.cash:,.2f})")
-                        elif sig == "SELL":
+                                        print(f"  📄 REJECTED:   {symbol} — {order.reject_reason}")
+                        else:  # SELL
                             held = executor.position(symbol)
                             if held > 0:
-                                avg  = executor.avg_cost(symbol)
+                                avg    = executor.avg_cost(symbol)
                                 reason = f"SELL {verdict.confidence}% {verdict.trading_style}"
                                 order  = executor.sell(symbol, held, px, reason=reason)
                                 if order.status == OrderStatus.FILLED:
-                                    proceeds = round(held * px, 2)
+                                    proceeds  = round(held * px, 2)
                                     trade_pnl = round((px - avg) * held, 2)
                                     pnl_pct   = round((px - avg) / avg * 100, 1) if avg else 0.0
-                                    pnl_s     = "+" if trade_pnl >= 0 else ""
-                                    print(f"  📄 PAPER SELL: {symbol}  {held:.4f} shares @ ${px:,.2f} = ${proceeds:,.2f}")
-                                    print(f"                 Realized P&L: {pnl_s}${trade_pnl:,.2f} ({pnl_s}{pnl_pct}%)")
+                                    print(f"  📄 PAPER SELL: {symbol}  {held:.4f} shares")
+                                    print(f"                 @ ${px:,.2f} = ${proceeds:,.2f}")
+                                    print(f"                 Realized P&L: {trade_pnl:+.2f} ({pnl_pct:+.1f}%)")
                                     print(f"                 Cash remaining: ${executor.cash:,.2f}")
 
                     # Build ScanResult for dashboard
