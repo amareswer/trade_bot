@@ -5,11 +5,30 @@ metadata:
   type: project
 ---
 
-**Status as of 2026-06-15 17:25 UTC:** Bot restarted clean. Live LONG position recovered. RSI filter restored. Config now fully validated.
+**Status as of 2026-06-15 23:00 UTC:** Two bots active in same repo. Crypto bot live on Kraken. Stock bot Phases 1–3 built and running with Ollama Cloud AI.
 
 ---
 
 ## Current Live State
+
+---
+
+## Stock Bot (stock_bot/)
+
+**Running:** `python -m stock_bot.main` — advisory only, no execution
+
+**Phase:** 3 of 6 complete
+
+**Active config:**
+- `AI_PROVIDER=ollama_cloud` | `OLLAMA_MODEL=llama3.2` | `OLLAMA_CLOUD_API_KEY` set
+- `WATCHLIST=SHOP.TO,RY.TO,AAPL,NVDA,AC.TO` | `INTERVAL=1d` | `LOOKBACK_DAYS=200`
+- Reddit: no credentials set (sentiment skipped gracefully)
+
+**Next phase:** Phase 4 — HTML dashboard
+
+---
+
+## Crypto Bot (bot/)
 
 **Running:** `python -m bot.main` — Kraken BTC/CAD, 1h candles, IndicatorStrategy, LiveExecutor (LIVE_TRADING=true, DRY_RUN=false)
 

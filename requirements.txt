@@ -1,7 +1,15 @@
-ccxt>=4.0            # unified crypto exchange interface (price feed)
-python-dotenv>=1.0   # load .env into environment
-openai>=1.0          # OpenRouter-compatible client (AI advisory)
+ccxt>=4.0            # unified crypto exchange interface (crypto bot)
+python-dotenv>=1.0   # load .env into environment (both bots)
+openai>=1.0          # OpenRouter-compatible client (crypto AI advisory)
 
-# Future additions:
-# pandas>=2.0         # historical data / backtesting
+# Stock bot
+ollama>=0.4.0        # official Ollama Python client (ollama_cloud provider)
+yfinance>=0.2        # US + TSX market data (NYSE, NASDAQ, TSX via .TO suffix)
+pandas>=2.0          # DataFrame handling for yfinance output
+requests>=2.28       # HTTP client for Fear & Greed + StockTwits + future APIs
+pytrends>=4.0        # Google Trends interest score — no API key required
+feedparser>=6.0      # News RSS parsing — stock bot news (Phase 2)
+colorama>=0.4        # terminal colour output — stock bot AI verdict display (Phase 3)
+
+# Future (crypto)
 # numpy>=1.26         # numerical strategies

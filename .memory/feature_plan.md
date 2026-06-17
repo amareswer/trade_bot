@@ -15,6 +15,47 @@ Running log of feature decisions. Most recent first.
 
 ---
 
+## 2026-06-15 — Stock Bot Phases 1 · 2 · 3 (BUILT ✓)
+
+New module `stock_bot/` added to repo — fully separate from `/bot` (crypto). Advisory-only stock research + AI analysis for NYSE, NASDAQ, TSX.
+
+### Phase 1 — Price + Indicators (BUILT ✓)
+- `stock_bot/data/price_feed.py` — yfinance OHLCV, `Candle` dataclass, TSX `.TO` suffix transparent
+- `stock_bot/data/watchlist.py` — default 5-symbol list (SHOP.TO, RY.TO, AAPL, NVDA, AC.TO)
+- `stock_bot/indicators/indicators.py` — RSI, EMA, SMA, ADX, trend copied from crypto bot + MACD added
+- `stock_bot/config.py` — StockConfig from `stock_bot/.env` (isolated from root .env)
+- `stock_bot/main.py` — scan loop, one-line indicator output per symbol
+
+### Phase 2 — Web Research Engine (BUILT ✓)
+- `research/news_fetcher.py` — feedparser RSS (Yahoo Finance + Google News), 5 headlines, deduped
+- `research/reddit_scraper.py` — praw, 5 subreddits, keyword sentiment (no ML), graceful no-creds fallback
+- `research/earnings.py` — yfinance next earnings date + EPS actual vs estimate + surprise note
+- `research/fear_greed.py` — CNN API, 1-hour module-level cache, safe fallback score=50
+- `research/aggregator.py` — ThreadPoolExecutor(3) concurrent fetch, ResearchReport dataclass, company name map
+- `main.py` updated — research block printed per symbol under indicator line, Fear & Greed fetched once per cycle
+
+### Phase 3 — AI Analysis Engine (BUILT ✓)
+- `ai/verdict.py` — AIVerdict(signal, confidence, target_price, stop_loss, reasoning, trading_style, timestamp)
+- `ai/prompt_builder.py` — structured prompt < 800 tokens, rsi_note + macd_note helpers
+- `ai/ai_engine.py` — multi-provider via `requests.post`; three providers:
+  - `openrouter`: `meta-llama/llama-3.3-70b-instruct:free` via openrouter.ai
+  - `ollama_local`: any model at `OLLAMA_BASE_URL/v1/chat/completions` (no auth)
+  - `ollama_cloud`: `OLLAMA_MODEL` at ollama.com with `OLLAMA_CLOUD_API_KEY`
+- Verdict rules: confidence < 55 → HOLD, never BUY if RSI > 75, never SELL if RSI < 25
+- Any failure → HOLD(confidence=0) — never crashes loop
+- `main.py` updated — `_scan_symbol()` now returns data dict; `_print_verdict()` with colorama coloring
+- `stock_bot/.env` — `AI_PROVIDER=ollama_cloud`, `OLLAMA_CLOUD_API_KEY` set, `OLLAMA_MODEL=llama3.2`
+- `stock_bot/.env.example` — all three provider sections documented
+
+**Key decisions:**
+- Originally used DeepSeek R1 `:free` → removed from OpenRouter free tier → switched to Llama 3.3 → rate limited → user set up Ollama Cloud as active provider
+- OpenAI SDK replaced with raw `requests.post` to support all three providers uniformly
+- `OPENROUTER_API_KEY` stays in root `.env`; all other AI config in `stock_bot/.env`
+
+**Next: Phase 4** — HTML dashboard (per-symbol cards, verdict history, sentiment timeline). See [[stock-bot]].
+
+---
+
 ## 2026-06-15 — Config Validation + Volume Filter + SL-Based Sizing (BUILT ✓)
 
 Full session of backtesting, parameter sweeps, and live config corrections. No new strategy logic — only parameter validation and two new utility additions.

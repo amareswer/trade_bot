@@ -13,3 +13,4 @@
 - [State Machine](state_machine.md) — IDLE/LONG/COOLDOWN states, position-aware filtering, dedup, cooldown config
 - [Position Manager](position_manager.md) — weighted avg entry, realized/unrealized PnL, trade history, wiring pattern
 - [Security Audit](security_audit.md) — 2026-05-28 audit findings, all fixes applied, pending key rotation
+- [Stock Bot](stock_bot.md) — stock_bot/ phases 1–3 built; AI multi-provider (OpenRouter/Ollama local/cloud); Phase 4 dashboard next
