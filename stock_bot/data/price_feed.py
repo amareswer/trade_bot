@@ -18,6 +18,24 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
+_name_cache: dict[str, str] = {}
+
+
+def _cache_name_from_ticker(symbol: str, ticker: yf.Ticker) -> None:
+    if symbol in _name_cache:
+        return
+    clean = symbol.replace(".TO", "")
+    try:
+        meta  = getattr(ticker, "history_metadata", {}) or {}
+        short = meta.get("shortName", "")
+        _name_cache[symbol] = short if short and len(short) <= 25 else clean
+    except Exception:
+        _name_cache[symbol] = clean
+
+
+def get_cached_name(symbol: str) -> str:
+    return _name_cache.get(symbol, symbol.replace(".TO", ""))
+
 
 @dataclass
 class Candle:
@@ -104,6 +122,7 @@ def fetch_candles(
     if len(candles) < 26:
         logger.info("%s — only %d candles of data (new IPO)", symbol, len(candles))
 
+    _cache_name_from_ticker(symbol, ticker)
     logger.debug("Fetched %d candles for %s (interval=%s)", len(candles), symbol, interval)
     return candles
 

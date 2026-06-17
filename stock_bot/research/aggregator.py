@@ -13,8 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from datetime import datetime
 
-import yfinance as yf
-
+from stock_bot.data.price_feed            import get_cached_name
 from stock_bot.research.news_fetcher      import fetch_news,       NewsItem
 from stock_bot.research.sentiment_scraper import score_headlines,  SentimentData
 from stock_bot.research.earnings          import fetch_earnings,   EarningsInfo
@@ -23,25 +22,11 @@ from stock_bot.research.fear_greed        import fetch_fear_greed, FearGreedData
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Company name lookup — cached yfinance fetch, one call per symbol per session
+# Company name lookup — free: reads from price_feed cache populated by fetch_candles()
 # ---------------------------------------------------------------------------
 
-_company_name_cache: dict[str, str] = {}
-
-
 def get_company_name(symbol: str) -> str:
-    if symbol in _company_name_cache:
-        return _company_name_cache[symbol]
-    clean = symbol.replace(".TO", "")
-    try:
-        info  = yf.Ticker(symbol).info
-        name  = info.get("longName") or info.get("shortName") or clean
-        short = info.get("shortName") or name
-        result = short if len(short) <= 25 else clean
-    except Exception:
-        result = clean
-    _company_name_cache[symbol] = result
-    return result
+    return get_cached_name(symbol)
 
 
 @dataclass
