@@ -7,12 +7,16 @@ All fields are optional — yfinance earnings coverage varies by symbol and regi
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import date
 from typing import Optional
 
 import pandas as pd
 import yfinance as yf
+
+_earnings_cache: dict[str, tuple[any, float]] = {}
+_EARNINGS_TTL   = 86400  # 24 hours — earnings dates don't change intra-day
 
 logger = logging.getLogger(__name__)
 
@@ -38,9 +42,15 @@ def _surprise_note(actual: Optional[float], estimate: Optional[float]) -> str:
 
 def fetch_earnings(symbol: str) -> EarningsInfo:
     """
-    Fetch earnings data for `symbol` via yfinance.
+    Fetch earnings data for `symbol` via yfinance. Cached for 24 hours.
     Returns EarningsInfo with all-None fields on failure.
     """
+    cached = _earnings_cache.get(symbol)
+    if cached is not None:
+        info, ts = cached
+        if time.time() - ts < _EARNINGS_TTL:
+            return info
+
     try:
         ticker = yf.Ticker(symbol)
 
@@ -82,14 +92,18 @@ def fetch_earnings(symbol: str) -> EarningsInfo:
         if actual is not None and estimate is not None and abs(estimate) > 1e-9:
             surprise = round((actual - estimate) / abs(estimate) * 100, 1)
 
-        return EarningsInfo(
+        result = EarningsInfo(
             next_earnings_date = next_date,
             last_eps_actual    = actual,
             last_eps_estimate  = estimate,
             eps_surprise_pct   = surprise,
             earnings_note      = _surprise_note(actual, estimate),
         )
+        _earnings_cache[symbol] = (result, time.time())
+        return result
 
     except Exception as exc:
         logger.warning("Earnings fetch failed for %s: %s", symbol, exc)
-        return EarningsInfo(earnings_note="No data")
+        fallback = EarningsInfo(earnings_note="No data")
+        _earnings_cache[symbol] = (fallback, time.time())
+        return fallback

@@ -61,12 +61,27 @@ class StockPaperExecutor(StockExecutorBase):
             logger.info("StockPaperExecutor starting fresh | cash=$%.2f", starting_cash)
 
         self._ensure_csv_header()
+        print("  Paper trading: whole shares only (no fractions)")
 
     # ── Core operations ───────────────────────────────────────────────────────
 
     def buy(self, symbol: str, shares: float, price: float, reason: str = "") -> StockOrder:
-        sym   = symbol.upper()
-        order = self._new_order(sym, OrderSide.BUY, shares, price)
+        sym    = symbol.upper()
+        shares = int(shares)  # stocks trade in whole shares only
+        order  = self._new_order(sym, OrderSide.BUY, shares, price)
+
+        if shares < 1:
+            order.status        = OrderStatus.REJECTED
+            order.reject_reason = (
+                f"Insufficient cash for 1 share "
+                f"@ ${price:.2f} — need ${price:.2f} "
+                f"have ${self._cash:.2f}"
+            )
+            logger.warning("PAPER BUY REJECTED  %s × %d @ $%.2f — %s",
+                           sym, shares, price, order.reject_reason)
+            self._orders.append(order)
+            return order
+
         cost  = round(shares * price, 2)
 
         if cost > self._cash + 1e-9:
@@ -74,7 +89,7 @@ class StockPaperExecutor(StockExecutorBase):
             order.reject_reason = (
                 f"Insufficient cash: have ${self._cash:,.2f}, need ${cost:,.2f}"
             )
-            logger.warning("PAPER BUY REJECTED  %s × %.4f @ $%.2f — %s",
+            logger.warning("PAPER BUY REJECTED  %s × %d @ $%.2f — %s",
                            sym, shares, price, order.reject_reason)
         else:
             held_shares, held_cost = self._positions.get(sym, (0.0, 0.0))
@@ -103,9 +118,9 @@ class StockPaperExecutor(StockExecutorBase):
             self.save_state()
 
             logger.info(
-                "PAPER BUY FILLED   %s  %.4f shares @ $%.2f  "
-                "new_pos=%.4f  avg_cost=$%.2f  cash=$%.2f",
-                sym, shares, price, new_shares, new_cost, self._cash,
+                "PAPER BUY FILLED   %s  %d shares @ $%.2f  "
+                "new_pos=%d  avg_cost=$%.2f  cash=$%.2f",
+                sym, shares, price, int(new_shares), new_cost, self._cash,
             )
 
         self._orders.append(order)

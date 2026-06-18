@@ -8,10 +8,14 @@ All errors are caught and logged — never raises to the caller.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime
 
 import feedparser
+
+_news_cache: dict[str, tuple[list, float]] = {}
+_NEWS_TTL   = 600  # 10 minutes — news doesn't change every cycle
 
 logger = logging.getLogger(__name__)
 
@@ -68,15 +72,14 @@ def _is_relevant(title: str, ticker: str, company_name: str) -> bool:
 def fetch_news(symbol: str, company_name: str = "") -> list[NewsItem]:
     """
     Fetch up to 5 recent headlines for `symbol` from Yahoo Finance + Google News.
-
-    Headlines are filtered to those that mention the ticker symbol OR company name.
-    If fewer than 2 pass the filter the unfiltered set is returned so the card
-    is never empty (Yahoo Finance in particular serves generic headlines for some
-    tickers).
-
-    TSX symbols have the .TO suffix stripped before URL building and matching.
-    Returns an empty list on total failure.
+    Results are cached for 10 minutes — news doesn't change between bot cycles.
     """
+    cached = _news_cache.get(symbol)
+    if cached is not None:
+        headlines, ts = cached
+        if time.time() - ts < _NEWS_TTL:
+            return headlines
+
     ticker = _clean_ticker(symbol)
     yahoo  = _parse_feed(_YAHOO_RSS.format(ticker=ticker),  "Yahoo Finance")
     google = _parse_feed(_GOOGLE_RSS.format(ticker=ticker), "Google News")
@@ -100,7 +103,9 @@ def fetch_news(symbol: str, company_name: str = "") -> list[NewsItem]:
             "News for %s: %d/%d headlines relevant after filtering",
             symbol, len(relevant), len(combined),
         )
-        return relevant[:_MAX_ITEMS]
+        result = relevant[:_MAX_ITEMS]
+        _news_cache[symbol] = (result, time.time())
+        return result
 
     # Fewer than 2 relevant → fall back to unfiltered so the card isn't empty
     name_clause = f" or '{company_name}'" if company_name else ""
@@ -113,4 +118,5 @@ def fetch_news(symbol: str, company_name: str = "") -> list[NewsItem]:
     )
     for item in combined:
         item.note = fallback_note
+    _news_cache[symbol] = (combined, time.time())
     return combined

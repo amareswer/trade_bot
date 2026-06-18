@@ -214,8 +214,10 @@ class AIEngine:
         elif self._provider == "nvidia_nim":
             api_key = os.getenv("NVIDIA_API_KEY", "").strip()
             if not api_key:
-                logger.warning("Stock AI disabled — NVIDIA_API_KEY not set in stock_bot/.env")
-                return
+                raise ValueError(
+                    "NVIDIA_API_KEY is empty in .env — "
+                    "set it or change AI_PROVIDER"
+                )
             try:
                 from openai import OpenAI as _OpenAIClient
                 self._openai_cls = _OpenAIClient
@@ -228,6 +230,9 @@ class AIEngine:
             self._model    = os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b").strip()
             self._api_key  = api_key
             self._base_url = "https://integrate.api.nvidia.com/v1"
+            print(f"  AI provider: nvidia_nim")
+            print(f"  Model:       {self._model}")
+            print(f"  Key:         {api_key[:8]}... (truncated)")
 
         else:
             logger.warning(
@@ -302,20 +307,11 @@ class AIEngine:
                     model       = self._model,
                     messages    = [{"role": "user", "content": prompt}],
                     temperature = 0.7,
-                    top_p       = 0.95,
-                    max_tokens  = 4096,
-                    extra_body  = {
-                        "chat_template_kwargs": {"enable_thinking": True},
-                        "reasoning_budget":     2048,
-                    },
-                    stream = True,
+                    top_p       = 1,
+                    max_tokens  = 1024,
+                    stream      = False,
                 )
-                for chunk in completion:
-                    if not chunk.choices:
-                        continue
-                    content = chunk.choices[0].delta.content
-                    if content is not None:
-                        raw += content
+                raw = completion.choices[0].message.content or ""
             else:  # openrouter | ollama_local
                 payload = {
                     "model":       self._model,
@@ -332,10 +328,15 @@ class AIEngine:
                 resp.raise_for_status()
                 raw = resp.json()["choices"][0]["message"]["content"] or ""
         except Exception as exc:
-            logger.warning("AI API call failed for %s [%s]: %s", symbol, self._provider, exc)
+            if self._provider == "nvidia_nim":
+                logger.warning(
+                    "nvidia_nim failed for %s: %s — falling back to openrouter",
+                    symbol, exc,
+                )
+            else:
+                logger.warning("AI API call failed for %s [%s]: %s", symbol, self._provider, exc)
             self._rate_limit_sleep()
             if self._provider == "nvidia_nim":
-                logger.warning("nvidia_nim failed — falling back to openrouter")
                 self._fallback_to_openrouter()
             return _hold_verdict(symbol, "AI unavailable")
 

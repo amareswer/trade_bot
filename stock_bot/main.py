@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from stock_bot.config import load
@@ -128,79 +129,82 @@ def _print_verdict(verdict: AIVerdict) -> None:
 
 
 def _print_research(report: ResearchReport) -> None:
-    """Print the research block for one symbol (4 lines)."""
-    # News
+    """Print the research block for one symbol (3 lines)."""
     if report.news:
         headlines = " · ".join(f'"{n.title[:60]}"' for n in report.news[:3])
         print(f"  📰 News ({len(report.news)}):  {headlines}")
     else:
         print("  📰 News:      no headlines found")
 
-    # News sentiment
     s = report.sentiment
     if s.post_count > 0:
         print(f"  💬 Sentiment:  {s.label} (score: {s.score:+.2f}) | {s.post_count} headline{'s' if s.post_count != 1 else ''} scored")
     else:
         print("  💬 Sentiment:  no headlines to score")
 
-    # Earnings
     e = report.earnings
-    next_str  = str(e.next_earnings_date) if e.next_earnings_date else "unknown"
+    next_str = str(e.next_earnings_date) if e.next_earnings_date else "unknown"
     print(f"  📅 Earnings:  Next: {next_str} | Last: {e.earnings_note}")
 
 
-def _scan_symbol(
-    symbol:     str,
+# ---------------------------------------------------------------------------
+# Per-symbol worker functions (called from ThreadPoolExecutor)
+# ---------------------------------------------------------------------------
+
+def _fetch_symbol_data(
+    symbol:        str,
     cfg,
-    screener:   StockScreener | None = None,
-    force_scan: bool = False,
+    screener:      StockScreener | None,
+    watchlist_set: set[str],
 ) -> dict | None:
-    """Fetch candles, run screener, print one-line indicator summary, return data for AI."""
+    """
+    Fetch candles + compute indicators. Returns:
+      None                    — no data (market closed / unknown symbol)
+      {"screened": True, ...} — screener rejected this symbol
+      full data dict          — ready for research + AI
+    """
     candles = fetch_candles(symbol, interval=cfg.interval, lookback_days=cfg.lookback_days)
     if candles is None:
-        print(f"  {symbol} — no data available (market may be closed)")
         return None
 
     closes = [c.close for c in candles]
     highs  = [c.high  for c in candles]
     lows   = [c.low   for c in candles]
-    price  = closes[-1]
 
     rsi_val   = calc_rsi(closes)
     trend_val = "NEW IPO" if len(closes) < 21 else calc_trend(closes)
     adx_val   = calc_adx(highs, lows, closes)
     macd_val  = calc_macd(closes)
 
-    # Screener: skip AI on stocks with no momentum signal.
-    # force_scan=True bypasses the screener (used for cfg.watchlist symbols).
-    if not force_scan and screener is not None and not screener.screen(symbol, candles):
-        print(f"  {symbol:<10}  ${price:>10,.2f}  — no signal (screened out)")
-        return None
-
-    icon = _TREND_ICON.get(trend_val, "—")
-    print(
-        f"  {symbol:<10}  ${price:>10,.2f}"
-        f"  {_fmt_rsi(rsi_val)}"
-        f"  {icon} {trend_val:<8}"
-        f"  {_fmt_adx(adx_val)}"
-        f"  {_fmt_macd(macd_val)}"
-    )
-    logger.info(
-        "%s  price=%.2f  rsi=%s  trend=%s  adx=%s  macd=%s",
-        symbol, price,
-        f"{rsi_val:.1f}" if rsi_val else "n/a",
-        trend_val,
-        f"{adx_val:.1f}" if adx_val else "n/a",
-        f"{macd_val[0]:+.2f}" if macd_val else "n/a",
-    )
+    if symbol not in watchlist_set and screener is not None and not screener.screen(symbol, candles):
+        return {"screened": True, "price": closes[-1]}
 
     return {
+        "screened":    False,
         "last_candle": candles[-1],
+        "price":       closes[-1],
         "rsi":         rsi_val,
         "trend":       trend_val,
         "adx":         adx_val,
         "macd":        macd_val,
     }
+
+
+def _run_ai_call(
+    symbol:  str,
+    data:    dict,
+    report:  ResearchReport,
+    engine:  AIEngine,
+) -> AIVerdict:
+    """Run one AI analysis call. Designed for ThreadPoolExecutor submission."""
+    indicators = {
+        "rsi":         data["rsi"],
+        "trend":       data["trend"],
+        "adx":         data["adx"],
+        "macd_line":   data["macd"][0] if data["macd"] else None,
+        "macd_signal": data["macd"][1] if data["macd"] else None,
+    }
+    return engine.analyze(symbol, data["last_candle"], indicators, report)
 
 
 # ---------------------------------------------------------------------------
@@ -279,90 +283,160 @@ def run() -> None:
                 print(f"  My Watchlist : {', '.join(watchlist_symbols)}")
                 print(f"  Top Movers   : {', '.join(universe_symbols)}")
 
+        watchlist_set = set(cfg.watchlist)
         scan_results: list[ScanResult] = []
 
-        cycle_start  = time.monotonic()
-        # Reserve 30 s for post-scan work; watchlist always gets AI regardless.
-        _ai_budget_s = cfg.loop_interval - 30
+        # ── Phase 1: prices + indicators (all symbols, parallel) ───────────
+        price_data: dict[str, dict | None] = {}
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            futs = {
+                ex.submit(_fetch_symbol_data, sym, cfg, screener, watchlist_set): sym
+                for sym in all_symbols
+            }
+            for fut in as_completed(futs):
+                sym = futs[fut]
+                try:
+                    price_data[sym] = fut.result()
+                except Exception as exc:
+                    logger.warning("Price fetch failed for %s: %s", sym, exc)
+                    price_data[sym] = None
 
+        active_symbols = [
+            s for s in all_symbols
+            if isinstance(price_data.get(s), dict) and not price_data[s].get("screened")
+        ]
+
+        # ── Phase 2: research (active symbols only, parallel) ──────────────
+        research_data: dict[str, ResearchReport] = {}
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            futs = {
+                ex.submit(
+                    fetch_research, sym,
+                    fear_greed_data=fear_greed_data,
+                    market_trends_score=market_trends_score,
+                ): sym
+                for sym in active_symbols
+            }
+            for fut in as_completed(futs):
+                sym = futs[fut]
+                try:
+                    research_data[sym] = fut.result()
+                except Exception as exc:
+                    logger.warning("Research failed for %s: %s", sym, exc)
+
+        # ── Phase 3: AI calls (active symbols with research, parallel) ──────
+        ai_verdicts: dict[str, AIVerdict] = {}
+        if cfg.ai_enabled and ai_engine and ai_engine.enabled:
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                futs = {
+                    ex.submit(_run_ai_call, sym, price_data[sym], research_data[sym], ai_engine): sym
+                    for sym in active_symbols
+                    if sym in research_data
+                }
+                for fut in as_completed(futs):
+                    sym = futs[fut]
+                    try:
+                        ai_verdicts[sym] = fut.result()
+                    except Exception as exc:
+                        logger.warning("AI failed for %s: %s", sym, exc)
+
+        # ── Phase 4: print results + paper trading + build scan list ────────
         for symbol in all_symbols:
-            verdict: AIVerdict | None = None
+            data    = price_data.get(symbol)
+            report  = research_data.get(symbol)
+            verdict: AIVerdict | None = ai_verdicts.get(symbol)
             try:
-                force_scan  = symbol in cfg.watchlist
-                symbol_data = _scan_symbol(symbol, cfg, screener, force_scan=force_scan)
+                if data is None:
+                    print(f"  {symbol} — no data available (market may be closed)")
+                    print(f"  {'─' * 70}")
+                    continue
 
-                if symbol_data is not None:
-                    report = fetch_research(symbol, fear_greed_data=fear_greed_data, market_trends_score=market_trends_score)
+                if data.get("screened"):
+                    print(f"  {symbol:<10}  ${data['price']:>10,.2f}  — no signal (screened out)")
+                    print(f"  {'─' * 70}")
+                    continue
+
+                # Indicator line
+                price     = data["price"]
+                rsi_val   = data["rsi"]
+                trend_val = data["trend"]
+                adx_val   = data["adx"]
+                macd_val  = data["macd"]
+                icon = _TREND_ICON.get(trend_val, "—")
+                print(
+                    f"  {symbol:<10}  ${price:>10,.2f}"
+                    f"  {_fmt_rsi(rsi_val)}"
+                    f"  {icon} {trend_val:<8}"
+                    f"  {_fmt_adx(adx_val)}"
+                    f"  {_fmt_macd(macd_val)}"
+                )
+                logger.info(
+                    "%s  price=%.2f  rsi=%s  trend=%s  adx=%s  macd=%s",
+                    symbol, price,
+                    f"{rsi_val:.1f}" if rsi_val else "n/a",
+                    trend_val,
+                    f"{adx_val:.1f}" if adx_val else "n/a",
+                    f"{macd_val[0]:+.2f}" if macd_val else "n/a",
+                )
+
+                if report:
                     _print_research(report)
 
-                    _is_watchlist = symbol in cfg.watchlist
-                    _ai_allowed   = _is_watchlist or (time.monotonic() - cycle_start < _ai_budget_s)
+                if not cfg.ai_enabled:
+                    print("  🤖 AI: disabled (AI_ENABLED=false in stock_bot/.env)")
+                elif verdict is not None:
+                    _print_verdict(verdict)
+                elif ai_engine and ai_engine.enabled:
+                    print("  🤖 AI: unavailable — check credentials in .env")
+                else:
+                    print("  🤖 AI: disabled (AI_ENABLED=false in stock_bot/.env)")
 
-                    if not cfg.ai_enabled:
-                        print("  🤖 AI: disabled (AI_ENABLED=false in stock_bot/.env)")
-                    elif ai_engine and _ai_allowed:
-                        indicators = {
-                            "rsi":         symbol_data["rsi"],
-                            "trend":       symbol_data["trend"],
-                            "adx":         symbol_data["adx"],
-                            "macd_line":   symbol_data["macd"][0] if symbol_data["macd"] else None,
-                            "macd_signal": symbol_data["macd"][1] if symbol_data["macd"] else None,
-                        }
-                        verdict = ai_engine.analyze(
-                            symbol, symbol_data["last_candle"], indicators, report
-                        )
-                        _print_verdict(verdict)
-                    elif ai_engine and not _ai_allowed:
-                        print("  🤖 AI: skipped (cycle time budget exhausted)")
-                    else:
-                        print("  🤖 AI: unavailable — check credentials in .env")
-
-                    # ── Paper trading execution ───────────────────────────────
-                    if (
-                        executor is not None
-                        and verdict is not None
-                        and verdict.confidence > 0                          # skip AI unavailable
-                        and verdict.signal in ("BUY", "SELL")
-                        and verdict.confidence >= cfg.paper_min_confidence
-                    ):
-                        px  = symbol_data["last_candle"].close
-                        sig = verdict.signal
-                        if sig == "BUY":
-                            if executor.position(symbol) == 0:
-                                # Size on total portfolio value (cash + positions at avg cost)
-                                snap    = executor.positions_snapshot()
-                                pos_val = sum(sh * co for sh, co in snap.values())
-                                alloc   = (executor.cash + pos_val) * cfg.paper_risk_pct
-                                shares  = round(alloc / px, 4) if px > 0 else 0
-                                if shares > 0:
-                                    reason = f"BUY {verdict.confidence}% {verdict.trading_style}"
-                                    order  = executor.buy(symbol, shares, px, reason=reason)
-                                    if order.status == OrderStatus.FILLED:
-                                        total = round(shares * px, 2)
-                                        print(f"  📄 PAPER BUY:  {symbol}  {shares:.4f} shares")
-                                        print(f"                 @ ${px:,.2f} = ${total:,.2f}")
-                                        print(f"                 Cash remaining: ${executor.cash:,.2f}")
-                                    else:
-                                        print(f"  📄 REJECTED:   {symbol} — {order.reject_reason}")
-                        else:  # SELL
-                            held = executor.position(symbol)
-                            if held > 0:
-                                avg    = executor.avg_cost(symbol)
-                                reason = f"SELL {verdict.confidence}% {verdict.trading_style}"
-                                order  = executor.sell(symbol, held, px, reason=reason)
+                # ── Paper trading execution ───────────────────────────────
+                if (
+                    executor is not None
+                    and verdict is not None
+                    and verdict.confidence > 0
+                    and verdict.signal in ("BUY", "SELL")
+                    and verdict.confidence >= cfg.paper_min_confidence
+                ):
+                    px  = data["last_candle"].close
+                    sig = verdict.signal
+                    if sig == "BUY":
+                        if executor.position(symbol) == 0:
+                            snap    = executor.positions_snapshot()
+                            pos_val = sum(sh * co for sh, co in snap.values())
+                            alloc   = (executor.cash + pos_val) * cfg.paper_risk_pct
+                            shares  = int(alloc / px) if px > 0 else 0
+                            if shares > 0:
+                                reason = f"BUY {verdict.confidence}% {verdict.trading_style}"
+                                order  = executor.buy(symbol, shares, px, reason=reason)
                                 if order.status == OrderStatus.FILLED:
-                                    proceeds  = round(held * px, 2)
-                                    trade_pnl = round((px - avg) * held, 2)
-                                    pnl_pct   = round((px - avg) / avg * 100, 1) if avg else 0.0
-                                    print(f"  📄 PAPER SELL: {symbol}  {held:.4f} shares")
-                                    print(f"                 @ ${px:,.2f} = ${proceeds:,.2f}")
-                                    print(f"                 Realized P&L: {trade_pnl:+.2f} ({pnl_pct:+.1f}%)")
+                                    total = round(shares * px, 2)
+                                    print(f"  📄 PAPER BUY:  {symbol}  {shares} shares")
+                                    print(f"                 @ ${px:,.2f} = ${total:,.2f}")
                                     print(f"                 Cash remaining: ${executor.cash:,.2f}")
+                                else:
+                                    print(f"  📄 REJECTED:   {symbol} — {order.reject_reason}")
+                    else:  # SELL
+                        held = executor.position(symbol)
+                        if held > 0:
+                            avg    = executor.avg_cost(symbol)
+                            reason = f"SELL {verdict.confidence}% {verdict.trading_style}"
+                            order  = executor.sell(symbol, held, px, reason=reason)
+                            if order.status == OrderStatus.FILLED:
+                                proceeds  = round(held * px, 2)
+                                trade_pnl = round((px - avg) * held, 2)
+                                pnl_pct   = round((px - avg) / avg * 100, 1) if avg else 0.0
+                                print(f"  📄 PAPER SELL: {symbol}  {held:.4f} shares")
+                                print(f"                 @ ${px:,.2f} = ${proceeds:,.2f}")
+                                print(f"                 Realized P&L: {trade_pnl:+.2f} ({pnl_pct:+.1f}%)")
+                                print(f"                 Cash remaining: ${executor.cash:,.2f}")
 
-                    # Build ScanResult for dashboard
+                # Build ScanResult for dashboard
+                if report is not None:
                     macd_note: str | None = None
-                    if symbol_data["macd"]:
-                        ml, ms, _ = symbol_data["macd"]
+                    if macd_val:
+                        ml, ms, _ = macd_val
                         if abs(ml - ms) < 0.001 * max(abs(ml), abs(ms), 0.01):
                             macd_note = "flat"
                         elif ml > ms:
@@ -381,10 +455,10 @@ def run() -> None:
                     scan_results.append(ScanResult(
                         symbol       = symbol,
                         company_name = get_company_name(symbol),
-                        price        = symbol_data["last_candle"].close,
+                        price        = data["last_candle"].close,
                         currency     = "CAD" if symbol.upper().endswith(".TO") else "USD",
-                        rsi          = symbol_data["rsi"],
-                        trend        = symbol_data["trend"],
+                        rsi          = rsi_val,
+                        trend        = trend_val,
                         macd_note    = macd_note,
                         research     = report,
                         verdict      = verdict,
