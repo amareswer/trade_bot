@@ -46,7 +46,7 @@ _TEMPERATURE = 0.3
 _TIMEOUT_S   = 20
 
 
-def _hold_verdict(symbol: str, reason: str) -> AIVerdict:
+def _hold_verdict(symbol: str, reason: str, provider: str = "unavailable") -> AIVerdict:
     return AIVerdict(
         symbol        = symbol,
         signal        = "HOLD",
@@ -56,6 +56,7 @@ def _hold_verdict(symbol: str, reason: str) -> AIVerdict:
         reasoning     = reason,
         trading_style = "SWING",
         timestamp     = datetime.now(),
+        provider      = provider,
     )
 
 
@@ -253,7 +254,7 @@ class AIEngine:
         if self._provider == "openrouter":
             time.sleep(4)
         elif self._provider == "nvidia_nim":
-            time.sleep(1.5)
+            time.sleep(3.0)  # 40 rpm = 1 per 1.5s; 3s stays under burst window
 
     def _fallback_to_openrouter(self) -> None:
         api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -270,6 +271,48 @@ class AIEngine:
             "Content-Type":  "application/json",
             "Authorization": f"Bearer {api_key}",
         }
+
+    def _fallback_openrouter(self, symbol: str, prompt: str) -> "AIVerdict":
+        """Switch permanently to openrouter and attempt this symbol's call.
+
+        Sleeps 4s after the call regardless of outcome so the next symbol
+        doesn't flood openrouter either.
+        """
+        self._fallback_to_openrouter()
+        if not self._ready:
+            return _hold_verdict(symbol, "AI unavailable")
+        try:
+            payload = {
+                "model":       self._model,
+                "messages":    [{"role": "user", "content": prompt}],
+                "max_tokens":  _MAX_TOKENS,
+                "temperature": _TEMPERATURE,
+            }
+            resp = _requests.post(
+                self._base_url,
+                headers = self._headers,
+                json    = payload,
+                timeout = _TIMEOUT_S,
+            )
+            resp.raise_for_status()
+            raw = resp.json()["choices"][0]["message"]["content"] or ""
+        except Exception as exc:
+            logger.warning("openrouter fallback also failed for %s: %s", symbol, exc)
+            time.sleep(4.0)
+            return _hold_verdict(symbol, "AI unavailable")
+        time.sleep(4.0)
+        try:
+            verdict          = _parse(raw, symbol)
+            verdict.symbol   = symbol
+            verdict.provider = "openrouter"
+            logger.info(
+                "AI verdict for %s (openrouter fallback): %s conf=%d style=%s",
+                symbol, verdict.signal, verdict.confidence, verdict.trading_style,
+            )
+            return verdict
+        except Exception as exc:
+            logger.warning("AI parse failed for %s (%s) | raw=%r", symbol, exc, raw[:120])
+            return _hold_verdict(symbol, "AI parse error")
 
     def analyze(
         self,
@@ -306,12 +349,34 @@ class AIEngine:
                 completion = client.chat.completions.create(
                     model       = self._model,
                     messages    = [{"role": "user", "content": prompt}],
-                    temperature = 0.7,
+                    temperature = 1,
                     top_p       = 1,
                     max_tokens  = 1024,
                     stream      = False,
                 )
-                raw = completion.choices[0].message.content or ""
+                # Extract reasoning if present (ignore it)
+                reasoning = getattr(
+                    completion.choices[0].message,
+                    "reasoning_content",
+                    None,
+                )
+                # Only use the actual content for parsing
+                response_text = completion.choices[0].message.content
+                latency_ms = (time.monotonic() - t0) * 1000
+                self._rate_limit_sleep()
+                try:
+                    verdict          = _parse(response_text, symbol)
+                    verdict.symbol   = symbol
+                    verdict.provider = "nvidia_nim"
+                    logger.info(
+                        "AI verdict for %s: %s conf=%d style=%s latency=%.0fms [nvidia_nim]",
+                        symbol, verdict.signal, verdict.confidence,
+                        verdict.trading_style, latency_ms,
+                    )
+                    return verdict
+                except Exception as parse_exc:
+                    logger.warning("AI parse failed for %s (%s) | raw=%r", symbol, parse_exc, response_text[:120])
+                    return _hold_verdict(symbol, "AI parse error")
             else:  # openrouter | ollama_local
                 payload = {
                     "model":       self._model,
@@ -330,21 +395,21 @@ class AIEngine:
         except Exception as exc:
             if self._provider == "nvidia_nim":
                 logger.warning(
-                    "nvidia_nim failed for %s: %s — falling back to openrouter",
-                    symbol, exc,
+                    "nvidia_nim FULL ERROR for %s: %s: %s",
+                    symbol, type(exc).__name__, str(exc),
                 )
+                return _hold_verdict(symbol, "AI unavailable")
             else:
                 logger.warning("AI API call failed for %s [%s]: %s", symbol, self._provider, exc)
-            self._rate_limit_sleep()
-            if self._provider == "nvidia_nim":
-                self._fallback_to_openrouter()
-            return _hold_verdict(symbol, "AI unavailable")
+                self._rate_limit_sleep()
+                return _hold_verdict(symbol, "AI unavailable")
 
         latency_ms = (time.monotonic() - t0) * 1000
         self._rate_limit_sleep()
         try:
-            verdict        = _parse(raw, symbol)
-            verdict.symbol = symbol
+            verdict          = _parse(raw, symbol)
+            verdict.symbol   = symbol
+            verdict.provider = self._provider
             logger.info(
                 "AI verdict for %s: %s conf=%d style=%s latency=%.0fms [%s]",
                 symbol, verdict.signal, verdict.confidence,

@@ -20,3 +20,4 @@ class AIVerdict:
     reasoning:     str            # 2–4 sentence plain-English explanation
     trading_style: str            # "DAY" | "SWING" | "LONGTERM"
     timestamp:     datetime
+    provider:      str = "unknown"  # which AI provider answered this call

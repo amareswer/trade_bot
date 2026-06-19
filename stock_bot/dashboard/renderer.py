@@ -371,7 +371,25 @@ def _css() -> str:
 """
 
 
-def _header_html(now_str: str, loop_interval: int) -> str:
+def _header_html(now_str: str, loop_interval: int, ai_stats: dict | None = None) -> str:
+    ai_line = ""
+    if ai_stats:
+        nv    = ai_stats.get("nvidia",   0)
+        fb    = ai_stats.get("fallback", 0)
+        fl    = ai_stats.get("failed",   0)
+        total = nv + fb + fl
+        if total == 0 or (fl == 0 and fb == 0):
+            dot = "🟢"
+        elif fl > total // 2:
+            dot = "🔴"
+        else:
+            dot = "🟡"
+        parts = [f"{nv}✅"]
+        if fb:
+            parts.append(f"{fb}⚠️")
+        if fl:
+            parts.append(f"{fl}❌")
+        ai_line = f'<br>🤖 nvidia_nim · {" ".join(parts)}'
     return f"""
   <div class="header">
     <div>
@@ -379,7 +397,7 @@ def _header_html(now_str: str, loop_interval: int) -> str:
     </div>
     <div class="meta">
       Last updated: {_e(now_str)}<br>
-      Next refresh: <span id="countdown">{loop_interval}s</span>
+      Next refresh: <span id="countdown">{loop_interval}s</span>{ai_line}
     </div>
   </div>"""
 
@@ -862,6 +880,7 @@ def _build_html(
     portfolio:     Optional[PortfolioSummary] = None,
     alerts:        Optional[list[Alert]]      = None,
     paper:         Optional[PaperSummary]     = None,
+    ai_stats:      Optional[dict]             = None,
 ) -> str:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -932,7 +951,7 @@ def _build_html(
 </head>
 <body>
 
-{_header_html(now_str, loop_interval)}
+{_header_html(now_str, loop_interval, ai_stats)}
 {_fg_section_html(fear_greed)}
 {_summary_html(results)}
 {portfolio_section}
@@ -982,8 +1001,9 @@ class DashboardRenderer:
         portfolio:    Optional[PortfolioSummary] = None,
         alerts:       Optional[list[Alert]]      = None,
         paper:        Optional[PaperSummary]     = None,
+        ai_stats:     Optional[dict]             = None,
     ) -> None:
-        html_str = _build_html(scan_results, fear_greed, self.loop_interval, portfolio, alerts, paper)
+        html_str = _build_html(scan_results, fear_greed, self.loop_interval, portfolio, alerts, paper, ai_stats)
         os.makedirs(os.path.dirname(os.path.abspath(_OUTPUT_PATH)), exist_ok=True)
         with open(_OUTPUT_PATH, "w", encoding="utf-8") as f:
             f.write(html_str)

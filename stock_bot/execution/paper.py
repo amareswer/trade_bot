@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 _STOCK_BOT_DIR = os.path.dirname(os.path.dirname(__file__))  # stock_bot/
 _TRADES_CSV    = os.path.join(_STOCK_BOT_DIR, "paper_trades.csv")
 _STATE_JSON    = os.path.join(_STOCK_BOT_DIR, "paper_state.json")
+_RESET_FLAG    = os.path.join(_STOCK_BOT_DIR, ".paper_reset")
 
 _CSV_HEADER = [
     "timestamp", "symbol", "side", "shares",
@@ -57,8 +58,16 @@ class StockPaperExecutor(StockExecutorBase):
         self._positions:    dict[str, tuple[float, float]]  = {}
         self._realized_pnl: float                           = 0.0
 
-        if not self._load_state():
-            logger.info("StockPaperExecutor starting fresh | cash=$%.2f", starting_cash)
+        if os.path.exists(_RESET_FLAG):
+            os.remove(_RESET_FLAG)
+            self._cash         = self._starting_cash
+            self._positions    = {}
+            self._realized_pnl = 0.0
+            print("📄 Paper state RESET — starting fresh")
+            logger.info("Paper state reset via flag file | cash=$%.2f", starting_cash)
+        else:
+            if not self._load_state():
+                logger.info("StockPaperExecutor starting fresh | cash=$%.2f", starting_cash)
 
         self._ensure_csv_header()
         print("  Paper trading: whole shares only (no fractions)")
@@ -66,7 +75,24 @@ class StockPaperExecutor(StockExecutorBase):
     # ── Core operations ───────────────────────────────────────────────────────
 
     def buy(self, symbol: str, shares: float, price: float, reason: str = "") -> StockOrder:
-        sym    = symbol.upper()
+        sym = symbol.upper()
+
+        if price <= 0 or price > 1_000_000:
+            order = self._new_order(sym, OrderSide.BUY, int(shares), price)
+            order.status        = OrderStatus.REJECTED
+            order.reject_reason = f"Invalid price: {price}"
+            logger.error("PAPER BUY REJECTED  %s — invalid price %.8f", sym, price)
+            self._orders.append(order)
+            return order
+
+        if price < 1.0:
+            order = self._new_order(sym, OrderSide.BUY, int(shares), price)
+            order.status        = OrderStatus.REJECTED
+            order.reject_reason = f"Price too low: ${price}"
+            logger.warning("PAPER BUY REJECTED  %s — penny stock price $%.4f", sym, price)
+            self._orders.append(order)
+            return order
+
         shares = int(shares)  # stocks trade in whole shares only
         order  = self._new_order(sym, OrderSide.BUY, shares, price)
 

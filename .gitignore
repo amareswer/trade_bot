@@ -39,6 +39,9 @@ htmlcov/
 dashboard.html
 stock_dashboard.html
 
+# Paper trading reset trigger — touch to force fresh state on next restart
+stock_bot/.paper_reset
+
 # Add these to your trade bot .gitignore
 .memory/preferences/user.md
 .memory/archive/

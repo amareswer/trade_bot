@@ -106,6 +106,16 @@ def _print_verdict(verdict: AIVerdict) -> None:
     """Print the AI verdict block (3 lines)."""
     icon = _SIGNAL_ICON.get(verdict.signal, verdict.signal)
 
+    _p = verdict.provider
+    if _p == "nvidia_nim":
+        ptag = "[nvidia]"
+    elif _p == "openrouter":
+        ptag = "[openrouter]"
+    elif _p == "unavailable":
+        ptag = "[fallback]"
+    else:
+        ptag = f"[{_p}]"
+
     if verdict.confidence >= 70:
         conf_col = Fore.GREEN
     elif verdict.confidence >= 50:
@@ -114,7 +124,7 @@ def _print_verdict(verdict: AIVerdict) -> None:
         conf_col = Style.DIM
 
     conf_str = f"{conf_col}{verdict.confidence}%{Style.RESET_ALL}"
-    print(f"  🤖 AI ({verdict.trading_style:<8}):  {icon}  | Confidence: {conf_str}")
+    print(f"  🤖 AI ({verdict.trading_style:<8}) {ptag}:  {icon}  | Confidence: {conf_str}")
 
     if verdict.target_price is not None or verdict.stop_loss is not None:
         parts = []
@@ -196,7 +206,7 @@ def _run_ai_call(
     report:  ResearchReport,
     engine:  AIEngine,
 ) -> AIVerdict:
-    """Run one AI analysis call. Designed for ThreadPoolExecutor submission."""
+    """Run one AI analysis call (sequential — rate limit enforced inside engine.analyze)."""
     indicators = {
         "rsi":         data["rsi"],
         "trend":       data["trend"],
@@ -248,9 +258,12 @@ def run() -> None:
         print(f"  Top Movers   : {', '.join(universe_symbols)}")
     print(f"  Screener  : {'enabled' if screener else 'disabled'}")
     print(f"  Interval  : {cfg.interval}   Lookback: {cfg.lookback_days}d   Loop: {cfg.loop_interval}s")
-    ai_status = "enabled" if (ai_engine and ai_engine.enabled) else "disabled"
-    _ai_model_name = ai_engine._model if (ai_engine and ai_engine.enabled) else "—"
-    print(f"  AI engine : {ai_status}  (model: {_ai_model_name})")
+    if ai_engine and ai_engine.enabled:
+        print(f"  AI engine  : {ai_engine._provider} → {ai_engine._model}")
+        print(f"  Fallback   : openrouter → meta-llama/llama-3.3-70b-instruct:free")
+        print(f"  Rate limit : 3.0s between calls (40 rpm safe)")
+    else:
+        print(f"  AI engine  : disabled")
     if executor:
         print(f"  Paper trading: ON  cash=${cfg.paper_starting_cash:,.2f}  risk={cfg.paper_risk_pct*100:.0f}%/trade  min_conf={cfg.paper_min_confidence}%")
     print(f"  Dashboard : file://{_os.path.abspath('stock_dashboard.html')}")
@@ -324,21 +337,25 @@ def run() -> None:
                 except Exception as exc:
                     logger.warning("Research failed for %s: %s", sym, exc)
 
-        # ── Phase 3: AI calls (active symbols with research, parallel) ──────
+        # ── Phase 3: AI calls (active symbols with research, sequential) ────
+        # Sequential to respect NVIDIA NIM's 40 rpm limit.
+        # The 3s delay is enforced inside ai_engine.analyze() after each call.
         ai_verdicts: dict[str, AIVerdict] = {}
+        _ai_start = time.time()
         if cfg.ai_enabled and ai_engine and ai_engine.enabled:
-            with ThreadPoolExecutor(max_workers=4) as ex:
-                futs = {
-                    ex.submit(_run_ai_call, sym, price_data[sym], research_data[sym], ai_engine): sym
-                    for sym in active_symbols
-                    if sym in research_data
-                }
-                for fut in as_completed(futs):
-                    sym = futs[fut]
-                    try:
-                        ai_verdicts[sym] = fut.result()
-                    except Exception as exc:
-                        logger.warning("AI failed for %s: %s", sym, exc)
+            for sym in active_symbols:
+                if sym not in research_data:
+                    continue
+                try:
+                    ai_verdicts[sym] = _run_ai_call(
+                        sym, price_data[sym], research_data[sym], ai_engine
+                    )
+                except Exception as exc:
+                    logger.warning("AI failed for %s: %s", sym, exc)
+        _ai_elapsed    = time.time() - _ai_start
+        _ai_nvidia_n   = sum(1 for v in ai_verdicts.values() if v.provider == "nvidia_nim")
+        _ai_fallback_n = sum(1 for v in ai_verdicts.values() if v.provider == "openrouter")
+        _ai_failed_n   = sum(1 for v in ai_verdicts.values() if v.provider in ("unavailable", "unknown"))
 
         # ── Phase 4: print results + paper trading + build scan list ────────
         for symbol in all_symbols:
@@ -450,6 +467,7 @@ def run() -> None:
                             target_price=None, stop_loss=None,
                             reasoning="AI disabled", trading_style="SWING",
                             timestamp=datetime.now(),
+                            provider="unavailable",
                         )
 
                     scan_results.append(ScanResult(
@@ -469,6 +487,17 @@ def run() -> None:
                 print(f"  {symbol:<10}  ERROR: {exc}")
                 logger.warning("scan failed for %s: %s", symbol, exc)
             print(f"  {'─' * 70}")
+
+        # ── AI call summary ───────────────────────────────────────────────────
+        if cfg.ai_enabled and ai_engine:
+            print(f"  ── AI Summary {'─' * 39}")
+            print(f"  ✅ nvidia_nim:   {_ai_nvidia_n} calls succeeded")
+            if _ai_fallback_n:
+                print(f"  ⚠️  openrouter:   {_ai_fallback_n} fallbacks used")
+            if _ai_failed_n:
+                print(f"  ❌ unavailable:   {_ai_failed_n} failed")
+            print(f"  ⏱  Total AI time: {_ai_elapsed:.1f}s")
+            print(f"  {'─' * 44}")
 
         # Build portfolio summary — paper executor takes precedence over static tracker
         portfolio_summary = None
@@ -519,7 +548,16 @@ def run() -> None:
 
         # Write dashboard
         try:
-            renderer.render(scan_results, fear_greed_data, portfolio_summary, alerts, paper=paper_summary)
+            renderer.render(
+                scan_results, fear_greed_data, portfolio_summary, alerts,
+                paper    = paper_summary,
+                ai_stats = {
+                    "nvidia":   _ai_nvidia_n,
+                    "fallback": _ai_fallback_n,
+                    "failed":   _ai_failed_n,
+                    "elapsed":  _ai_elapsed,
+                },
+            )
         except Exception as exc:
             logger.warning("Dashboard render failed: %s", exc)
 

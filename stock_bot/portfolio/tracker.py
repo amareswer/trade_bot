@@ -106,11 +106,18 @@ class PortfolioTracker:
                 sym      = parts[0].strip().upper()
                 shares   = float(parts[1].strip())
                 avg_cost = float(parts[2].strip())
-                if shares <= 0 or avg_cost <= 0:
-                    raise ValueError("shares and avg_cost must be > 0")
-                self._holdings.append((sym, shares, avg_cost))
             except ValueError as exc:
                 logger.warning("Portfolio: skipping entry %r — %s", entry, exc)
+                continue
+
+            if shares <= 0 or shares > 100_000:
+                logger.warning("Portfolio: invalid shares for %s: %s — skipping", sym, shares)
+                continue
+            if avg_cost <= 0 or avg_cost > 100_000:
+                logger.warning("Portfolio: invalid avg_cost for %s: %s — skipping", sym, avg_cost)
+                continue
+
+            self._holdings.append((sym, shares, avg_cost))
 
         if self._holdings:
             logger.info("Portfolio loaded: %d position(s): %s",
