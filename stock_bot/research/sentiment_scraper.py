@@ -29,6 +29,7 @@ class SentimentData:
     post_count: int                     # number of headlines scored
     source:     str = "news_sentiment"
     top_posts:  list[str] = field(default_factory=list)
+    confidence: float = 0.0             # 0–1; 5+ headlines = 1.0
 
 
 def _label(score: float) -> str:
@@ -54,15 +55,18 @@ def score_headlines(news_items) -> SentimentData:
         total_neg += sum(1 for w in words if w in _NEGATIVE)
 
     denom = total_pos + total_neg
-    score = round((total_pos - total_neg) / denom, 3) if denom > 0 else 0.0
+    K = 4  # Laplace smoothing — prevents ±1.00 from a single keyword hit
+    score = round((total_pos - total_neg) / (denom + K), 3) if denom > 0 else 0.0
+    confidence = round(min(1.0, len(news_items) / 5), 2)
 
     logger.debug(
-        "News sentiment: %d headlines, +%d/-%d hits, score=%.3f",
-        len(news_items), total_pos, total_neg, score,
+        "News sentiment: %d headlines, +%d/-%d hits, score=%.3f, confidence=%.2f",
+        len(news_items), total_pos, total_neg, score, confidence,
     )
     return SentimentData(
         score      = score,
         label      = _label(score),
         post_count = len(news_items),
         source     = "news_sentiment",
+        confidence = confidence,
     )

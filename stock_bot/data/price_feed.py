@@ -30,12 +30,13 @@ _last_prices: dict[str, float] = {}
 
 @dataclass
 class Candle:
-    timestamp: datetime
-    open:      float
-    high:      float
-    low:       float
-    close:     float
-    volume:    float
+    timestamp:    datetime
+    open:         float
+    high:         float
+    low:          float
+    close:        float
+    volume:       float
+    volume_ratio: float | None = None  # today's volume ÷ 20-day average
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +121,12 @@ def fetch_candles(
     if not candles:
         logger.warning("All rows were NaN or malformed for %s", symbol)
         return None
+
+    # Attach volume ratio (today vs 20-day average) to the latest candle
+    volumes = [c.volume for c in candles if c.volume and c.volume > 0]
+    avg_vol_20 = sum(volumes[-20:]) / len(volumes[-20:]) if len(volumes) >= 20 else None
+    if avg_vol_20 and avg_vol_20 > 0:
+        candles[-1].volume_ratio = round(candles[-1].volume / avg_vol_20, 2)
 
     if len(candles) < 26:
         logger.info("%s — only %d candles (new IPO or thin history)", symbol, len(candles))

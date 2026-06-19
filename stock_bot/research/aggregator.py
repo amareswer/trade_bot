@@ -30,7 +30,7 @@ class ResearchReport:
     timestamp:  datetime
     news:       list[NewsItem]
     sentiment:           SentimentData
-    market_trends_score: int           # 0-100, fetched once per cycle
+    market_trends_score: int | None    # 0-100, or None when rate-limited
     earnings:            EarningsInfo
     fear_greed: FearGreedData
 
@@ -39,7 +39,7 @@ def fetch_research(
     symbol:              str,
     company_name:        str | None          = None,
     fear_greed_data:     FearGreedData | None = None,
-    market_trends_score: int                  = 0,
+    market_trends_score: int | None           = None,
 ) -> ResearchReport:
     """
     Fetch all research for one symbol.

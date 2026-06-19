@@ -57,6 +57,10 @@ class StockPaperExecutor(StockExecutorBase):
         self._cash:         float                           = starting_cash
         self._positions:    dict[str, tuple[float, float]]  = {}
         self._realized_pnl: float                           = 0.0
+        self._session_start_value: float = starting_cash
+        self._daily_loss_limit_pct: float = 0.03   # overridden by config
+        self._daily_loss_tripped: bool = False
+        self._slippage_bps: int = 15   # 0.15% — override via set_slippage_bps()
 
         if os.path.exists(_RESET_FLAG):
             os.remove(_RESET_FLAG)
@@ -68,14 +72,63 @@ class StockPaperExecutor(StockExecutorBase):
         else:
             if not self._load_state():
                 logger.info("StockPaperExecutor starting fresh | cash=$%.2f", starting_cash)
+        # Session start value reflects the actual cash after any state restore,
+        # so the daily loss circuit breaker measures drawdown from this session's
+        # opening balance, not the original starting_cash constructor arg.
+        self._session_start_value = self._cash
 
         self._ensure_csv_header()
         print("  Paper trading: whole shares only (no fractions)")
 
     # ── Core operations ───────────────────────────────────────────────────────
 
+    def set_slippage_bps(self, bps: int) -> None:
+        """Set simulated slippage in basis points (e.g. 15 = 0.15%)."""
+        self._slippage_bps = max(0, bps)
+
+    def _fill_price(self, price: float, side: str) -> float:
+        """
+        Apply one-way slippage to simulate realistic fills.
+        BUY pays slightly more, SELL receives slightly less.
+        """
+        factor = self._slippage_bps / 10_000
+        if side == "BUY":
+            return round(price * (1.0 + factor), 4)
+        return round(price * (1.0 - factor), 4)
+
+    def set_daily_loss_limit(self, pct: float) -> None:
+        """Configure the daily loss circuit breaker (fraction, e.g. 0.03 = 3%)."""
+        self._daily_loss_limit_pct = pct
+
+    def _is_daily_loss_tripped(self) -> bool:
+        """
+        Returns True if current cash drawdown from session start exceeds the limit.
+        Once tripped, stays tripped for the rest of the session.
+        """
+        if self._daily_loss_tripped:
+            return True
+        if self._session_start_value <= 0:
+            return False
+        drawdown = (self._session_start_value - self._cash) / self._session_start_value
+        if drawdown >= self._daily_loss_limit_pct:
+            self._daily_loss_tripped = True
+            logger.warning(
+                "PAPER daily loss limit hit: %.1f%% drawdown from session start $%.2f → current $%.2f",
+                drawdown * 100, self._session_start_value, self._cash,
+            )
+            return True
+        return False
+
     def buy(self, symbol: str, shares: float, price: float, reason: str = "") -> StockOrder:
         sym = symbol.upper()
+
+        if self._is_daily_loss_tripped():
+            order = self._new_order(sym, OrderSide.BUY, shares, price)
+            order.status        = OrderStatus.REJECTED
+            order.reject_reason = f"Daily loss limit ({self._daily_loss_limit_pct:.0%}) reached — no new buys today"
+            logger.warning("PAPER BUY BLOCKED  %s — daily loss circuit breaker active", sym)
+            self._orders.append(order)
+            return order
 
         if not isinstance(price, (int, float)):
             order = self._new_order(sym, OrderSide.BUY, 0, price)
@@ -123,7 +176,8 @@ class StockPaperExecutor(StockExecutorBase):
             self._orders.append(order)
             return order
 
-        cost  = round(shares * price, 2)
+        fill_px = self._fill_price(price, "BUY")
+        cost  = round(shares * fill_px, 2)
 
         if cost > self._cash + 1e-9:
             order.status        = OrderStatus.REJECTED
@@ -131,13 +185,13 @@ class StockPaperExecutor(StockExecutorBase):
                 f"Insufficient cash: have ${self._cash:,.2f}, need ${cost:,.2f}"
             )
             logger.warning("PAPER BUY REJECTED  %s × %d @ $%.2f — %s",
-                           sym, shares, price, order.reject_reason)
+                           sym, shares, fill_px, order.reject_reason)
         else:
             held_shares, held_cost = self._positions.get(sym, (0.0, 0.0))
             new_shares = held_shares + shares
             new_cost   = (
-                (held_shares * held_cost + shares * price) / new_shares
-                if new_shares > 0 else price
+                (held_shares * held_cost + shares * fill_px) / new_shares
+                if new_shares > 0 else fill_px
             )
             self._positions[sym] = (new_shares, round(new_cost, 6))
             self._cash          -= cost
@@ -149,7 +203,7 @@ class StockPaperExecutor(StockExecutorBase):
                 symbol         = sym,
                 side           = "BUY",
                 shares         = shares,
-                price          = price,
+                price          = fill_px,
                 total_value    = cost,
                 cash_remaining = self._cash,
                 reason         = reason,
@@ -161,7 +215,7 @@ class StockPaperExecutor(StockExecutorBase):
             logger.info(
                 "PAPER BUY FILLED   %s  %d shares @ $%.2f  "
                 "new_pos=%d  avg_cost=$%.2f  cash=$%.2f",
-                sym, shares, price, int(new_shares), new_cost, self._cash,
+                sym, shares, fill_px, int(new_shares), new_cost, self._cash,
             )
 
         self._orders.append(order)
@@ -171,6 +225,7 @@ class StockPaperExecutor(StockExecutorBase):
         sym   = symbol.upper()
         order = self._new_order(sym, OrderSide.SELL, shares, price)
 
+        fill_px = self._fill_price(price, "SELL")
         held_shares, held_cost = self._positions.get(sym, (0.0, 0.0))
         if shares > held_shares + 1e-9:
             order.status        = OrderStatus.REJECTED
@@ -180,8 +235,8 @@ class StockPaperExecutor(StockExecutorBase):
             logger.warning("PAPER SELL REJECTED  %s × %.4f — %s",
                            sym, shares, order.reject_reason)
         else:
-            pnl              = round((price - held_cost) * shares, 2)
-            proceeds         = round(shares * price, 2)
+            pnl              = round((fill_px - held_cost) * shares, 2)
+            proceeds         = round(shares * fill_px, 2)
             self._cash      += proceeds
             self._realized_pnl += pnl
             new_shares       = round(held_shares - shares, 9)
@@ -197,7 +252,7 @@ class StockPaperExecutor(StockExecutorBase):
                 symbol         = sym,
                 side           = "SELL",
                 shares         = shares,
-                price          = price,
+                price          = fill_px,
                 total_value    = proceeds,
                 cash_remaining = self._cash,
                 reason         = reason,
@@ -209,7 +264,7 @@ class StockPaperExecutor(StockExecutorBase):
             logger.info(
                 "PAPER SELL FILLED  %s  %.4f shares @ $%.2f  "
                 "trade_pnl=$%.2f  total_realized=$%.2f  cash=$%.2f",
-                sym, shares, price, pnl, self._realized_pnl, self._cash,
+                sym, shares, fill_px, pnl, self._realized_pnl, self._cash,
             )
 
         self._orders.append(order)

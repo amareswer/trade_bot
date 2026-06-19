@@ -64,9 +64,28 @@ def _parse_feed(url: str, source_label: str) -> list[NewsItem]:
 
 
 def _is_relevant(title: str, ticker: str, company_name: str) -> bool:
-    """Return True if the headline mentions the ticker or company name."""
+    """
+    Return True if the headline plausibly refers to this symbol.
+
+    Short tickers (3 chars or fewer after stripping exchange suffix) are
+    matched with word boundaries only — "AC" must appear as a standalone
+    word, not as part of "APUR", "ACADIA", "black", etc.
+    Long tickers (4+ chars) use substring match as before.
+    Company name match always passes regardless of ticker length.
+    """
+    import re
     t = title.lower()
-    return ticker.lower() in t or (company_name and company_name.lower() in t)
+
+    # Company name match always wins
+    if company_name and company_name.lower() in t:
+        return True
+
+    # For short tickers, require a whole-word match
+    if len(ticker) <= 3:
+        return bool(re.search(rf'\b{re.escape(ticker.lower())}\b', t))
+
+    # Long tickers: substring match is fine
+    return ticker.lower() in t
 
 
 def fetch_news(symbol: str, company_name: str = "") -> list[NewsItem]:

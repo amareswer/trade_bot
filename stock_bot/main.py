@@ -18,15 +18,17 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import sys
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime as _dt
 import pytz as _pytz
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 from stock_bot.config import load
-from stock_bot.data.price_feed import fetch_candles, reset_price_cache
+from stock_bot.data.price_feed    import fetch_candles, reset_price_cache
+from stock_bot.data.intraday_price import get_live_price
 from stock_bot.data.universe  import StockUniverse
 from stock_bot.data.screener  import StockScreener
 from stock_bot.indicators.indicators import (
@@ -244,59 +246,123 @@ def _run_ai_call(
 # Market hours guard
 # ---------------------------------------------------------------------------
 
-_US_HOLIDAYS_2026: frozenset[date] = frozenset({
-    date(2026, 1,  1),   # New Year's Day
-    date(2026, 1, 19),   # MLK Day
-    date(2026, 2, 16),   # Presidents' Day
-    date(2026, 4,  3),   # Good Friday
-    date(2026, 5, 25),   # Memorial Day
-    date(2026, 6, 19),   # Juneteenth
-    date(2026, 7,  3),   # Independence Day (observed)
-    date(2026, 9,  7),   # Labor Day
-    date(2026, 11, 26),  # Thanksgiving
-    date(2026, 12, 25),  # Christmas
-})
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    """
+    Return the nth occurrence of weekday (0=Mon...6=Sun) in the given month/year.
+    e.g. _nth_weekday(2026, 1, 0, 3) = 3rd Monday of January 2026
+    """
+    first = date(year, month, 1)
+    delta = (weekday - first.weekday()) % 7
+    return first + timedelta(days=delta + (n - 1) * 7)
 
-_CA_HOLIDAYS_2026: frozenset[date] = frozenset({
-    date(2026, 1,  1),   # New Year's Day
-    date(2026, 2, 16),   # Family Day (ON/BC/AB)
-    date(2026, 4,  3),   # Good Friday
-    date(2026, 5, 18),   # Victoria Day
-    date(2026, 7,  1),   # Canada Day
-    date(2026, 8,  3),   # Civic Holiday (ON)
-    date(2026, 9,  7),   # Labour Day
-    date(2026, 10, 12),  # Thanksgiving (CA)
-    date(2026, 11, 11),  # Remembrance Day
-    date(2026, 12, 25),  # Christmas Day
-    date(2026, 12, 26),  # Boxing Day
-})
 
-_US_HOLIDAY_NAMES: dict[date, str] = {
-    date(2026, 1,  1):  "New Year's Day",
-    date(2026, 1, 19):  "MLK Day",
-    date(2026, 2, 16):  "Presidents' Day",
-    date(2026, 4,  3):  "Good Friday",
-    date(2026, 5, 25):  "Memorial Day",
-    date(2026, 6, 19):  "Juneteenth",
-    date(2026, 7,  3):  "Independence Day",
-    date(2026, 9,  7):  "Labor Day",
-    date(2026, 11, 26): "Thanksgiving",
-    date(2026, 12, 25): "Christmas",
-}
+def _last_weekday(year: int, month: int, weekday: int) -> date:
+    """Return the last occurrence of weekday in month/year."""
+    if month == 12:
+        last = date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        last = date(year, month + 1, 1) - timedelta(days=1)
+    delta = (last.weekday() - weekday) % 7
+    return last - timedelta(days=delta)
 
-_CA_HOLIDAY_NAMES: dict[date, str] = {
-    date(2026, 1,  1):  "New Year's Day",
-    date(2026, 2, 16):  "Family Day",
-    date(2026, 4,  3):  "Good Friday",
-    date(2026, 5, 18):  "Victoria Day",
-    date(2026, 7,  1):  "Canada Day",
-    date(2026, 8,  3):  "Civic Holiday",
-    date(2026, 9,  7):  "Labour Day",
-    date(2026, 10, 12): "Thanksgiving",
-    date(2026, 11, 11): "Remembrance Day",
-    date(2026, 12, 25): "Christmas Day",
-    date(2026, 12, 26): "Boxing Day",
-}
+
+def _observed(d: date) -> date:
+    """
+    NYSE/TSX rule: if a holiday falls on Saturday, observe Friday.
+    If it falls on Sunday, observe Monday.
+    """
+    if d.weekday() == 5:   # Saturday → Friday
+        return d - timedelta(days=1)
+    if d.weekday() == 6:   # Sunday → Monday
+        return d + timedelta(days=1)
+    return d
+
+
+def _easter(year: int) -> date:
+    """
+    Anonymous Gregorian algorithm for Easter Sunday. No external library needed.
+    Accurate for 1900–2099.
+    """
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day   = ((h + l - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+
+def _victoria_day(year: int) -> date:
+    """Monday immediately preceding May 25 (Canadian statutory definition)."""
+    may24 = date(year, 5, 24)   # strictly before May 25
+    days_since_monday = may24.weekday()   # 0=Mon
+    return may24 - timedelta(days=days_since_monday)
+
+
+def _us_holidays(year: int) -> dict[date, str]:
+    """
+    Compute NYSE holidays for the given year. All rules are floating/relative —
+    no hardcoded dates. Works for any year 2025+.
+    """
+    h: dict[date, str] = {}
+
+    def add(d: date, name: str) -> None:
+        h[_observed(d)] = name
+
+    add(date(year,  1,  1),                           "New Year's Day")
+    add(_nth_weekday(year,  1, 0, 3),                 "MLK Day")           # 3rd Monday Jan
+    add(_nth_weekday(year,  2, 0, 3),                 "Presidents' Day")   # 3rd Monday Feb
+    easter = _easter(year)
+    add(easter - timedelta(days=2),                   "Good Friday")
+    add(_last_weekday(year, 5, 0),                    "Memorial Day")      # Last Monday May
+    add(date(year,  6, 19),                           "Juneteenth")
+    add(date(year,  7,  4),                           "Independence Day")
+    add(_nth_weekday(year,  9, 0, 1),                 "Labor Day")         # 1st Monday Sep
+    add(_nth_weekday(year, 11, 3, 4),                 "Thanksgiving")      # 4th Thursday Nov
+    add(date(year, 12, 25),                           "Christmas")
+
+    return h
+
+
+def _ca_holidays(year: int) -> dict[date, str]:
+    """
+    Compute TSX (Ontario) holidays for the given year.
+    Uses Ontario rules — the most conservative (most holidays) of all provinces.
+    """
+    h: dict[date, str] = {}
+
+    def add(d: date, name: str) -> None:
+        h[_observed(d)] = name
+
+    add(date(year,  1,  1),                           "New Year's Day")
+    add(_nth_weekday(year,  2, 0, 3),                 "Family Day")        # 3rd Monday Feb (ON)
+    easter = _easter(year)
+    add(easter - timedelta(days=2),                   "Good Friday")
+    add(_victoria_day(year),                          "Victoria Day")
+    add(date(year,  7,  1),                           "Canada Day")
+    add(_nth_weekday(year,  8, 0, 1),                 "Civic Holiday")     # 1st Monday Aug (ON)
+    add(_nth_weekday(year,  9, 0, 1),                 "Labour Day")        # 1st Monday Sep
+    add(_nth_weekday(year, 10, 0, 2),                 "Thanksgiving")      # 2nd Monday Oct
+    add(date(year, 11, 11),                           "Remembrance Day")
+    # Christmas + Boxing Day: if observed dates collide, advance Boxing Day
+    # until it lands on a weekday that isn't already taken (e.g. Dec 25=Fri
+    # in 2026 → Sat Dec 26 observes to Fri Dec 25, collision → push to Mon Dec 28).
+    xmas_obs   = _observed(date(year, 12, 25))
+    boxing_obs = _observed(date(year, 12, 26))
+    while boxing_obs == xmas_obs or boxing_obs.weekday() >= 5:
+        boxing_obs += timedelta(days=1)
+    h[xmas_obs]   = "Christmas Day"
+    h[boxing_obs] = "Boxing Day"
+
+    return h
 
 
 def _get_market_status() -> dict:
@@ -321,8 +387,10 @@ def _get_market_status() -> dict:
     market_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
     in_hours     = market_open <= now <= market_close
 
-    us_holiday = _US_HOLIDAY_NAMES.get(today) if today in _US_HOLIDAYS_2026 else None
-    ca_holiday = _CA_HOLIDAY_NAMES.get(today) if today in _CA_HOLIDAYS_2026 else None
+    _us = _us_holidays(today.year)
+    _ca = _ca_holidays(today.year)
+    us_holiday = _us.get(today)
+    ca_holiday = _ca.get(today)
 
     us_open = in_hours and not is_weekend and us_holiday is None
     ca_open = in_hours and not is_weekend and ca_holiday is None
@@ -353,7 +421,7 @@ def _get_loop_mode(market_status: dict) -> str:
     eastern = _pytz.timezone("US/Eastern")
     now = datetime.now(eastern)
 
-    if now.weekday() < 5 and market_status["us_holiday"] is None and market_status["ca_holiday"] is None:
+    if now.weekday() < 5 and not (market_status["us_holiday"] and market_status["ca_holiday"]):
         market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
         market_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
         if now < market_open and now.hour >= 6:
@@ -383,7 +451,32 @@ def _check_price_uniformity(scan_results: list) -> bool:
     return True
 
 
-def _run_news_scan(watchlist: list[str]) -> None:
+def _check_open_positions_sl_tp(executor, cfg) -> None:
+    """
+    Lightweight stop-loss / take-profit check for all open paper positions.
+    Fetches only the live price (fast_info) — no OHLCV, no indicators, no AI.
+    Called every 30s by a background thread independently of the main scan loop.
+    """
+    if executor is None:
+        return
+    for symbol, (shares, avg_cost) in list(executor.positions_snapshot().items()):
+        if shares <= 0:
+            continue
+        live = get_live_price(symbol)
+        if live is None:
+            continue
+        pct_change = (live - avg_cost) / avg_cost
+        if pct_change <= -abs(cfg.paper_stop_loss_pct):
+            order = executor.sell(symbol, shares, live, reason="STOP_LOSS_HIT")
+            if order.status == OrderStatus.FILLED:
+                print(f"  🛑 STOP LOSS triggered: {symbol} @ ${live:.2f} ({pct_change:+.1%})")
+        elif pct_change >= cfg.paper_take_profit_pct:
+            order = executor.sell(symbol, shares, live, reason="TAKE_PROFIT_HIT")
+            if order.status == OrderStatus.FILLED:
+                print(f"  ✅ TAKE PROFIT triggered: {symbol} @ ${live:.2f} ({pct_change:+.1%})")
+
+
+def _run_news_scan(symbols: list[str]) -> None:
     """
     Lightweight pre/after-hours news scan — no prices, no AI, no trades.
     Prints major catalyst alerts for symbols with strongly positive/negative news.
@@ -391,8 +484,8 @@ def _run_news_scan(watchlist: list[str]) -> None:
     from stock_bot.research.news_fetcher      import fetch_news
     from stock_bot.research.sentiment_scraper import score_headlines
 
-    print(f"  📰 Scanning {len(watchlist)} symbols for news catalysts...")
-    for symbol in watchlist:
+    print(f"  📰 Scanning {len(symbols)} symbols for news catalysts...")
+    for symbol in symbols:
         try:
             news = fetch_news(symbol)
             if not news:
@@ -439,6 +532,10 @@ def run() -> None:
     evaluator = AlertEvaluator(tracker)
     notifier  = AlertNotifier(cfg)
     executor  = StockPaperExecutor(cfg.paper_starting_cash) if cfg.paper_trading_enabled else None
+    if executor:
+        executor.set_daily_loss_limit(cfg.paper_daily_loss_pct)
+    if executor:
+        executor.set_slippage_bps(cfg.paper_slippage_bps)
 
     print()
     print("  Stock Bot — Running 24/7")
@@ -467,6 +564,20 @@ def run() -> None:
     print(f"  Logs      : {_os.path.join(_LOG_DIR, 'stock_bot.log')}")
     print()
 
+    # ── Background SL/TP watcher (every 30s, independent of main scan loop) ──
+    def _sl_tp_watcher() -> None:
+        while True:
+            try:
+                _check_open_positions_sl_tp(executor, cfg)
+            except Exception as _exc:
+                logger.warning("SL/TP watcher error: %s", _exc)
+            time.sleep(30)
+
+    if executor:
+        _watcher = threading.Thread(target=_sl_tp_watcher, daemon=True)
+        _watcher.start()
+        logger.info("SL/TP watcher thread started (30s interval)")
+
     tick = 0
     try:
       while True:
@@ -479,13 +590,13 @@ def run() -> None:
 
         if mode == "PRE_MARKET":
             print(f"🌅 Pre-market ({time_str}) — monitoring news...")
-            _run_news_scan(watchlist_symbols)
+            _run_news_scan(watchlist_symbols + universe_symbols)
             time.sleep(900)
             continue
 
         elif mode == "AFTER_HOURS":
             print(f"🌙 After hours ({time_str}) — monitoring news...")
-            _run_news_scan(watchlist_symbols)
+            _run_news_scan(watchlist_symbols + universe_symbols)
             time.sleep(1800)
             continue
 
@@ -541,30 +652,6 @@ def run() -> None:
                 except Exception as exc:
                     logger.warning("Price fetch failed for %s: %s", sym, exc)
                     price_data[sym] = None
-
-        # ── Stop loss / take profit for open paper positions ─────────────────
-        _STOP_LOSS_PCT   = -0.05   # -5%
-        _TAKE_PROFIT_PCT =  0.12   # +12%
-        if executor is not None and cfg.paper_trading_enabled:
-            for _sym, (_held, _entry) in list(executor.positions_snapshot().items()):
-                try:
-                    _candles = fetch_candles(_sym, interval="1d", lookback_days=5)
-                    if not _candles:
-                        continue
-                    _cur = _candles[-1].close
-                    if _entry <= 0:
-                        continue
-                    _pnl_pct = (_cur - _entry) / _entry
-                    if _pnl_pct <= _STOP_LOSS_PCT:
-                        _ord = executor.sell(_sym, _held, _cur, reason=f"Stop loss {_pnl_pct:.1%}")
-                        if _ord.status == OrderStatus.FILLED:
-                            print(f"  🛑 STOP LOSS: {_sym} @ ${_cur:.2f} ({_pnl_pct:+.1%})")
-                    elif _pnl_pct >= _TAKE_PROFIT_PCT:
-                        _ord = executor.sell(_sym, _held, _cur, reason=f"Take profit {_pnl_pct:.1%}")
-                        if _ord.status == OrderStatus.FILLED:
-                            print(f"  💰 TAKE PROFIT: {_sym} @ ${_cur:.2f} ({_pnl_pct:+.1%})")
-                except Exception as _e:
-                    logger.warning("Stop check failed for %s: %s", _sym, _e)
 
         active_symbols = [
             s for s in all_symbols
@@ -668,7 +755,9 @@ def run() -> None:
                     and verdict.signal in ("BUY", "SELL")
                     and verdict.confidence >= cfg.paper_min_confidence
                 ):
-                    px  = data["last_candle"].close
+                    px              = data["last_candle"].close
+                    live_price      = get_live_price(symbol)
+                    execution_price = live_price if live_price else px
                     sig = verdict.signal
                     _MAX_POSITIONS = 4
                     if sig == "BUY":
@@ -679,14 +768,14 @@ def run() -> None:
                                 snap    = executor.positions_snapshot()
                                 pos_val = sum(sh * co for sh, co in snap.values())
                                 alloc   = (executor.cash + pos_val) * cfg.paper_risk_pct
-                                shares  = int(alloc / px) if px > 0 else 0
+                                shares  = int(alloc / execution_price) if execution_price > 0 else 0
                                 if shares > 0:
                                     reason = f"BUY {verdict.confidence}% {verdict.trading_style}"
-                                    order  = executor.buy(symbol, shares, px, reason=reason)
+                                    order  = executor.buy(symbol, shares, execution_price, reason=reason)
                                     if order.status == OrderStatus.FILLED:
-                                        total = round(shares * px, 2)
+                                        total = round(shares * execution_price, 2)
                                         print(f"  📄 PAPER BUY:  {symbol}  {shares} shares")
-                                        print(f"                 @ ${px:,.2f} = ${total:,.2f}")
+                                        print(f"                 @ ${execution_price:,.2f} = ${total:,.2f}")
                                         print(f"                 Cash remaining: ${executor.cash:,.2f}")
                                     else:
                                         print(f"  📄 REJECTED:   {symbol} — {order.reject_reason}")
@@ -695,13 +784,13 @@ def run() -> None:
                         if held > 0:
                             avg    = executor.avg_cost(symbol)
                             reason = f"SELL {verdict.confidence}% {verdict.trading_style}"
-                            order  = executor.sell(symbol, held, px, reason=reason)
+                            order  = executor.sell(symbol, held, execution_price, reason=reason)
                             if order.status == OrderStatus.FILLED:
-                                proceeds  = round(held * px, 2)
-                                trade_pnl = round((px - avg) * held, 2)
-                                pnl_pct   = round((px - avg) / avg * 100, 1) if avg else 0.0
+                                proceeds  = round(held * execution_price, 2)
+                                trade_pnl = round((execution_price - avg) * held, 2)
+                                pnl_pct   = round((execution_price - avg) / avg * 100, 1) if avg else 0.0
                                 print(f"  📄 PAPER SELL: {symbol}  {held:.4f} shares")
-                                print(f"                 @ ${px:,.2f} = ${proceeds:,.2f}")
+                                print(f"                 @ ${execution_price:,.2f} = ${proceeds:,.2f}")
                                 print(f"                 Realized P&L: {trade_pnl:+.2f} ({pnl_pct:+.1f}%)")
                                 print(f"                 Cash remaining: ${executor.cash:,.2f}")
 

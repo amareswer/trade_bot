@@ -73,6 +73,10 @@ class StockConfig:
     paper_starting_cash:   float # virtual cash balance at startup
     paper_risk_pct:        float # fraction of cash to allocate per trade
     paper_min_confidence:  int   # min AI confidence to trigger a paper trade
+    paper_daily_loss_pct:    float   # daily loss circuit breaker (fraction)
+    paper_slippage_bps:      int     # simulated slippage in basis points
+    paper_stop_loss_pct:   float # stop-loss threshold as a fraction (e.g. 0.05 = -5%)
+    paper_take_profit_pct: float # take-profit threshold as a fraction (e.g. 0.12 = +12%)
     universe_enabled:      bool  # scan S&P500+TSX60 instead of fixed watchlist
     universe_size:         int   # top N symbols to scan per cycle
     universe_refresh_hours: int  # how often to refresh the symbol lists
@@ -128,6 +132,10 @@ def load() -> StockConfig:
         paper_starting_cash    = _float("PAPER_STARTING_CASH",     10_000.0),
         paper_risk_pct         = _float("PAPER_RISK_PCT",          0.10),
         paper_min_confidence   = _int  ("PAPER_MIN_CONFIDENCE",    65),
+        paper_daily_loss_pct    = _float("PAPER_DAILY_LOSS_PCT",    0.03),
+        paper_slippage_bps      = _int("PAPER_SLIPPAGE_BPS",      15),
+        paper_stop_loss_pct    = _float("PAPER_STOP_LOSS_PCT",     0.05),
+        paper_take_profit_pct  = _float("PAPER_TAKE_PROFIT_PCT",   0.12),
         universe_enabled       = _bool ("UNIVERSE_ENABLED",        False),
         universe_size          = _int  ("UNIVERSE_SIZE",           20),
         universe_refresh_hours = _int  ("UNIVERSE_REFRESH_HOURS",  24),

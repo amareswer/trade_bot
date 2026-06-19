@@ -19,11 +19,10 @@ logger = logging.getLogger(__name__)
 _KEYWORDS = ["stock market", "buy stocks", "stock crash"]
 
 
-def fetch_market_trends() -> int:
+def fetch_market_trends() -> int | None:
     """
     Fetch Google Trends interest for 3 market-level keywords in one call.
-    Returns the average score as an integer 0-100.
-    Returns 0 silently on 429 or any other error.
+    Returns the average score as an integer 0-100, or None on 429 / any error.
     """
     try:
         from pytrends.request import TrendReq
@@ -34,11 +33,11 @@ def fetch_market_trends() -> int:
 
         if df.empty:
             logger.debug("Google Trends: no data returned for market keywords")
-            return 0
+            return None
 
         cols = [k for k in _KEYWORDS if k in df.columns]
         if not cols:
-            return 0
+            return None
 
         score = int(df[cols].mean().mean())
         logger.debug("Google Trends market score=%d (keywords: %s)", score, cols)
@@ -49,4 +48,4 @@ def fetch_market_trends() -> int:
             logger.debug("Google Trends rate-limited — skipping this cycle")
         else:
             logger.warning("Google Trends fetch failed: %s", exc)
-        return 0
+        return None

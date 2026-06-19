@@ -69,14 +69,31 @@ def build_prompt(
     # News sentiment
     s = research.sentiment
     stocktwits_str = (
-        f"{s.score:+.3f} ({s.label}) | {s.post_count} headlines scored"
+        f"{s.score:+.3f} ({s.label}, confidence={s.confidence:.0%}) | {s.post_count} headlines scored"
         if s.post_count > 0
         else "no headlines"
     )
 
     # Market trends
-    mts        = research.market_trends_score
-    trends_str = f"{mts}/100" + (" 🔥 high interest" if mts > 70 else "")
+    if research.market_trends_score is None:
+        trends_str = "unavailable (rate limited — ignore this cycle)"
+    else:
+        mts        = research.market_trends_score
+        trends_str = f"{mts}/100" + (" 🔥 high interest" if mts > 70 else "")
+
+    # Volume vs 20-day average
+    vol_ratio = getattr(candle, "volume_ratio", None)
+    if vol_ratio is not None:
+        if vol_ratio >= 2.0:
+            vol_note = f"{vol_ratio:.1f}× avg ⚠ unusually high volume"
+        elif vol_ratio >= 1.3:
+            vol_note = f"{vol_ratio:.1f}× avg — above average"
+        elif vol_ratio <= 0.5:
+            vol_note = f"{vol_ratio:.1f}× avg ⚠ low volume — treat signals cautiously"
+        else:
+            vol_note = f"{vol_ratio:.1f}× avg — normal"
+    else:
+        vol_note = "unavailable"
 
     # Fear & Greed
     fg = research.fear_greed
@@ -92,6 +109,7 @@ Analyze the following data for {symbol} and give a clear trading recommendation.
 {ipo_note}
 === PRICE & TECHNICALS ===
 Current Price: ${price:,.2f}
+Volume vs 20-day avg: {vol_note}
 RSI (14): {rsi_str} → {_rsi_note(rsi)}
 Trend (EMA 9/21): {trend}
 MACD: {macd_l_str} / Signal: {macd_s_str} → {_macd_note(macd_line, macd_signal)}
@@ -130,4 +148,5 @@ Rules:
 - trading_style: DAY if RSI extreme + momentum, LONGTERM if earnings/fundamentals driven, SWING otherwise
 - reasoning must reference at least 2 data points from above
 - never recommend BUY if RSI > 75
-- never recommend SELL if RSI < 25"""
+- never recommend SELL if RSI < 25
+- low volume moves (volume <0.5× average) should lower your confidence by 10-15 points"""
