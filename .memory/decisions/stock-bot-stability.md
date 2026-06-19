@@ -27,6 +27,17 @@ metadata:
 | Jun 2026 | State corruption guard in _load_state() | Bot loaded $85 trillion cash from corrupted paper_state.json | Rejects and deletes any state file with cash > $1M |
 | Jun 2026 | Price guard in paper.py buy() | Prices near zero (penny stocks, bad data) caused share count of 10^15+ | Rejects: non-numeric, price ≤ 0, price > 500k, shares > 100k |
 | Jun 2026 | WATCHLIST changed to HOOD,MRNA,NCLH,AC.TO,CCL,INTC | Old watchlist had EBON ($1.95) and IGC ($0.28) — penny stocks triggered corruption | All 6 symbols are in $5-$200 range |
+| 2026-06-19 | Sentiment Laplace smoothing K=4 | Single keyword hit produced ±1.00 — AI received max-confidence signal from noise | score = (pos-neg)/(denom+4). Single hit now +0.200. Added confidence field = min(1.0, n/5) |
+| 2026-06-19 | Google Trends return None not 0 | 0/100 on first cycle looked like zero market interest — could suppress BUY | All failure paths return None. Prompt omits trends section when None |
+| 2026-06-19 | Intraday price for paper execution | Paper bought at yesterday's close — gap/overnight moves meant fills at impossible prices | get_live_price() via fast_info. Execution uses live tick; indicators use daily OHLCV |
+| 2026-06-19 | SL/TP daemon thread (30s) | Stop-loss checked every 120s — a 5% drop could become 12% before next scan | Daemon thread checks all open positions every 30s via live tick |
+| 2026-06-19 | Volume ratio in AI prompt | AI had no volume context — issued high-confidence BUY on near-zero volume moves | Candle.volume_ratio = vol/20d_avg. Buckets + low-vol confidence penalty in prompt |
+| 2026-06-19 | News ticker word-boundary fix | AC.TO matched "black", "ACADIA", "APUR" — AI reasoned on wrong news | ≤3-char tickers use \b regex. Long tickers unchanged. Company name always wins |
+| 2026-06-19 | Daily loss circuit breaker | No brake on bad paper trading days — could chew through all 4 slots | _is_daily_loss_tripped() blocks BUY when drawdown ≥ PAPER_DAILY_LOSS_PCT (3%) |
+| 2026-06-19 | Slippage model 15 bps | Paper filled at exact price — live trading has 0.1-0.5% slippage, inflating paper P&L | _fill_price() applies bps factor. BUY pays more, SELL gets less |
+| 2026-06-19 | Dynamic holiday computation | Hardcoded 2026 dates → bot would scan on Christmas 2027 → corrupted positions | _us_holidays(year) + _ca_holidays(year) compute correctly for any year forever |
+| 2026-06-19 | _get_loop_mode() partial-holiday fix | US-only holidays killed TSX pre-market news scan (fell through to WEEKEND) | Changed to not (us_holiday AND ca_holiday) — partial holidays keep news scan running |
+| 2026-06-19 | _run_news_scan covers universe | Overnight universe mover news invisible until next LIVE cycle (up to 24h) | _run_news_scan(watchlist + universe_symbols) — covers all known symbols |
 
 ### Why **Why:** lines matter
 

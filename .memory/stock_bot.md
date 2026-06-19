@@ -155,7 +155,10 @@ On first nvidia failure, automatically falls back to openrouter.
 | `AFTER_HOURS` | weekday, 4:00pm–midnight ET, no holiday | `_run_news_scan()` — news catalysts only | 1800s (30 min) |
 | `WEEKEND` | Sat/Sun or full holiday | idle print, no scan | 3600s (1 hr) |
 
-`_run_news_scan(watchlist)` — prints strongly +/- news catalysts (score ≥ 0.8 or ≤ -0.8), no prices, no AI, no trades.
+`_run_news_scan(symbols)` — accepts `watchlist_symbols + universe_symbols`.
+Pre/after-hours scans now cover ALL known symbols (watchlist + last-known
+universe movers), not just watchlist. If universe is empty (bot just started),
+gracefully falls back to watchlist only. Prints strongly +/- news catalysts (score ≥ 0.8 or ≤ -0.8), no prices, no AI, no trades.
 
 Dashboard mode badge in header shows current mode: 🟢 LIVE / 🌅 PRE-MARKET / 🌙 AFTER HOURS / 📅 WEEKEND.
 
@@ -163,6 +166,37 @@ Log file: `stock_bot/logs/bot.log` — `RotatingFileHandler`, max 10 MB, 7 files
 
 Keep-alive on Mac: `caffeinate -i python -m stock_bot.main`
 Background: `nohup caffeinate -i python -m stock_bot.main > stock_bot/logs/bot.log 2>&1 &`
+
+## Market hours — dynamic holiday computation (2026-06-19)
+
+Hardcoded `_US_HOLIDAYS_2026` / `_CA_HOLIDAYS_2026` frozensets removed.
+Replaced with computed functions — no manual update ever needed again.
+
+Helper functions in main.py (all stdlib, no new packages):
+```
+_nth_weekday(year, month, weekday, n) → date   # e.g. 3rd Monday of Jan
+_last_weekday(year, month, weekday)  → date   # e.g. last Monday of May
+_observed(d)                         → date   # Sat→Fri, Sun→Mon
+_easter(year)                        → date   # Anonymous Gregorian algorithm
+_victoria_day(year)                  → date   # Monday immediately before May 25
+_us_holidays(year)                   → dict[date, str]   # 10 NYSE holidays
+_ca_holidays(year)                   → dict[date, str]   # 12 TSX/Ontario holidays
+```
+
+`_get_market_status()` now calls `_us_holidays(today.year)` and `_ca_holidays(today.year)`
+each invocation — correct for 2026, 2027, 2028, and beyond.
+
+Boxing Day collision rule: if observed Christmas and observed Boxing Day land on the
+same weekday, Boxing Day advances until it finds a free weekday. Handles
+2027 (Dec 25=Sat → observe Fri Dec 24; Boxing Dec 26=Sun → observe Mon Dec 27).
+
+`_get_loop_mode()` partial-holiday fix:
+- Old: `if ... and us_holiday is None and ca_holiday is None`
+  → on US-only holidays (Juneteenth, Thanksgiving), mode fell through
+    to WEEKEND and killed TSX pre-market news scan entirely.
+- New: `if ... and not (us_holiday and ca_holiday)`
+  → PRE_MARKET/AFTER_HOURS runs on partial holidays (one market closed).
+    Only falls to WEEKEND when BOTH markets are closed (Christmas, New Year's).
 
 ## Market hours — US and CA independent gating (2026-06-19)
 
@@ -190,6 +224,85 @@ Holidays:
 Both use 9:30am–4:00pm ET window (TSX and NYSE share the same clock).
 
 Dashboard renders two market status badges (NYSE / TSX) with green=OPEN, yellow=holiday name, grey=CLOSED.
+
+## Signal quality fixes (2026-06-19)
+
+### Sentiment — Laplace smoothing + confidence
+File: `stock_bot/research/sentiment_scraper.py`
+- Score formula: `(pos - neg) / (denom + K)` where K=4
+- Single keyword can no longer produce ±1.00. Max from 1 hit = +0.200.
+- `SentimentData.confidence: float = min(1.0, n_headlines / 5)`
+  1 headline = 20%, 3 = 60%, 5+ = 100%
+File: `stock_bot/ai/prompt_builder.py`
+- Prompt now shows: `"+0.200 (POSITIVE, confidence=60%) | 3 headlines scored"`
+
+### Google Trends — None vs 0
+File: `stock_bot/research/google_trends.py`
+- All return 0 fallbacks replaced with `return None`
+- Return type: `int | None`
+File: `stock_bot/research/aggregator.py`
+- `ResearchReport.market_trends_score: int | None` (default None)
+File: `stock_bot/ai/prompt_builder.py`
+- None → "unavailable (rate limited — ignore this cycle)" in prompt
+- 0/100 no longer sent to AI on first cycle
+
+### Intraday execution price
+New file: `stock_bot/data/intraday_price.py`
+- `get_live_price(symbol) → float | None`
+- Uses `yf.Ticker.fast_info.last_price` — lightweight, not full OHLCV
+- Returns None on any failure — callers fall back to daily close
+File: `stock_bot/main.py`
+- Paper BUY/SELL now use `execution_price = live_price if live_price else candle.close`
+- Indicators still use daily OHLCV (correct). Only execution price uses live tick.
+
+### SL/TP watcher thread
+File: `stock_bot/main.py`
+- `_check_open_positions_sl_tp(executor, cfg)` — module-level function
+  Uses `positions_snapshot()`, `get_live_price()`, `cfg.paper_stop_loss_pct / take_profit_pct`
+- Daemon thread starts before `while True` loop, runs every 30s
+- Replaces old inline SL/TP block (which waited up to 120s for next OHLCV scan)
+- Thread catches + logs all exceptions — never silently dies
+
+### Volume ratio in AI prompt
+File: `stock_bot/data/price_feed.py`
+- `Candle.volume_ratio: float | None = None` (new optional field)
+- Set on `candles[-1]` only: current_vol / 20-day avg vol
+File: `stock_bot/ai/prompt_builder.py`
+- Volume vs 20-day avg line added under Current Price in PRICE & TECHNICALS
+- Buckets: ≥2.0× = "unusually high", ≥1.3× = "above average",
+           ≤0.5× = "low volume — treat signals cautiously", else "normal"
+- AI rule added: low volume moves (<0.5× avg) lower confidence by 10-15 points
+
+### News ticker collision fix
+File: `stock_bot/research/news_fetcher.py`
+- `_is_relevant()` upgraded: short tickers (≤3 chars after stripping .TO) use
+  word-boundary regex (`\b...\b`) — "AC" no longer matches "black", "ACADIA", "APUR"
+- Long tickers (4+ chars): substring match unchanged
+- Company name match always takes priority
+
+## Paper trading hardening (2026-06-19)
+
+### Daily loss circuit breaker
+File: `stock_bot/execution/paper.py`
+- `StockPaperExecutor._session_start_value` synced after `_load_state()` (not constructor)
+- `_is_daily_loss_tripped()` blocks new BUYs when cash drawdown ≥ `daily_loss_limit_pct`
+- `set_daily_loss_limit(pct)` wired from `cfg.paper_daily_loss_pct`
+Config: `PAPER_DAILY_LOSS_PCT=0.03` (default 3%)
+
+### Slippage model
+File: `stock_bot/execution/paper.py`
+- `_fill_price(price, side)` applies `_slippage_bps / 10_000` factor
+- BUY: fills at `price × (1 + factor)`. SELL: `price × (1 - factor)`
+- Used for cost, proceeds, P&L, `PaperTrade.price` — raw `price` param untouched
+Config: `PAPER_SLIPPAGE_BPS=15` (default 0.15%; use 30 for TSX small-caps)
+
+New config keys added to `stock_bot/.env` and `stock_bot/config.py`:
+```
+PAPER_STOP_LOSS_PCT=0.05      # SL/TP watcher threshold
+PAPER_TAKE_PROFIT_PCT=0.12    # SL/TP watcher threshold
+PAPER_DAILY_LOSS_PCT=0.03     # circuit breaker
+PAPER_SLIPPAGE_BPS=15         # fill slippage simulation
+```
 
 ## Known issues
 

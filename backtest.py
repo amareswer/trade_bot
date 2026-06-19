@@ -16,6 +16,7 @@ Date filtering (for regime testing):
     Bear stress test (Nov 2021–May 2023): BEFORE_DATE = "2023-06-01", AFTER_DATE = None
     Full dataset:                     BEFORE_DATE = None,         AFTER_DATE = None
 """
+import argparse
 import logging
 logging.basicConfig(level=logging.WARNING)
 
@@ -32,6 +33,13 @@ AFTER_DATE  = None   # keep candles FROM this date onward (recent half)
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Run crypto backtest")
+    parser.add_argument("--stop_loss",   type=float, default=cfg.backtest.stop_loss_pct)
+    parser.add_argument("--take_profit", type=float, default=cfg.backtest.take_profit_pct)
+    parser.add_argument("--fee",         type=float, default=cfg.backtest.fee_pct)
+    parser.add_argument("--limit",       type=int,   default=cfg.backtest.limit)
+    args = parser.parse_args()
+
     print(f"\n  Exchange: {cfg.exchange.exchange.capitalize()}  |  Symbol: {cfg.exchange.symbol}  |  Timeframe: {cfg.backtest.timeframe}")
 
     try:
@@ -39,7 +47,7 @@ def main():
             exchange_id = cfg.exchange.exchange,
             symbol      = cfg.exchange.symbol,
             timeframe   = cfg.backtest.timeframe,
-            total_limit = cfg.backtest.limit,
+            total_limit = args.limit,
         )
     except Exception as exc:
         print(f"\n  ERROR fetching data: {exc}\n")
@@ -76,7 +84,7 @@ def main():
         strategy_mode           = cfg.strategy.mode,
         starting_cash           = cfg.portfolio.starting_cash,
         risk_per_trade_pct      = cfg.risk.risk_per_trade_pct,
-        fee_pct                 = cfg.backtest.fee_pct,
+        fee_pct                 = args.fee,
         cooldown_ticks          = cfg.risk.cooldown_ticks,
         rsi_period              = cfg.strategy.rsi_period,
         rsi_oversold            = cfg.strategy.rsi_oversold,
@@ -94,8 +102,8 @@ def main():
         daily_loss_limit_pct    = cfg.risk.daily_loss_limit_pct,
         max_drawdown_pct        = cfg.risk.max_drawdown_pct,
         max_trades_per_day      = cfg.risk.max_trades_per_day,
-        stop_loss_pct           = cfg.backtest.stop_loss_pct,
-        take_profit_pct         = cfg.backtest.take_profit_pct,
+        stop_loss_pct           = args.stop_loss,
+        take_profit_pct         = args.take_profit,
         regime_ema_period       = cfg.strategy.regime_ema_period,
         regime_ema_slope_filter = cfg.strategy.regime_ema_slope_filter,
         volume_k                = cfg.strategy.volume_k,

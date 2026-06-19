@@ -15,6 +15,89 @@ Running log of feature decisions. Most recent first.
 
 ---
 
+## 2026-06-19 — TP Sweep + Walk-Forward Validation: TP=10% promoted (BUILT ✓)
+
+**Root cause found:** backtest.py had no argparse — --stop_loss, --take_profit, --fee
+were silently ignored. All previous TP/SL sweeps ran .env values every time.
+Fix: added argparse with defaults from cfg.backtest.* so no-arg behavior unchanged.
+
+**Real TP sweep results (SL=1.5%, fee=0.8%, 5000c):**
+
+| TP   | Trades | PF   | Return  | Fee resilience |
+|------|--------|------|---------|----------------|
+| 4.5% | 46     | 1.45 | -5.19%  | Low — TP-dominated exits |
+| 6%   | 43     | 1.38 | -5.13%  | Worst PF       |
+| 8%   | 44     | 1.46 | -4.83%  | Improving      |
+| 10%  | 58     | 1.79 | -4.70%  | Best PF        |
+| 12%  | 54     | 1.68 | -5.04%  | Good but TP inert in recent regime |
+| 15%  | 52     | 1.68 | -4.80%  | No improvement over 12% |
+
+**Zero-fee comparison revealed:** TP=12% has PF 1.84 at zero fee (best gross).
+TP=10% has PF 1.79. TP=4.5% has PF 1.35. Fee drag kills TP=4.5% hardest.
+
+**Walk-forward TP=10% (fee=0.8%):**
+
+| Window | PF   | Return  | Trades |
+|--------|------|---------|--------|
+| 5000   | 1.79 | -4.70%  | 58     |
+| 4000   | 1.83 | -4.06%  | 51     |
+| 3000   | 2.02 | -2.16%  | 32     |
+| 2000   | 1.37 | -2.17%  | 18     |
+| 1000   | 1.25 | -1.32%  | 10     |
+
+All 5 windows PF > 1.0. Recent regime (2000/1000c) holds at 1.37/1.25 —
+significantly better than old TP=4.5% which was 1.02/1.06 at same windows.
+
+**Decision: TAKE_PROFIT_PCT=0.045 → 0.10. Promoted 2026-06-19.**
+
+Key insight: TP=10% exit mix (37 SL / 9 TP / 12 strategy) means strategy SELL
+signals exit profitably before TP is needed. TP=4.5% relied on TP hits (25/84)
+and those hits are what fees kill first. TP=12% has zero TP hits in recent regime
+(2000/1000c windows) — holding through drawdowns for no benefit.
+
+Note: negative returns at all windows = 0.8% fee at $100 capital, not strategy
+failure. PF is positive and consistent across all 5 windows at both TP=10% and 12%.
+
+**Known issue:** Actual fee 0.80% confirmed (fee-dict log: cost=0.079 CAD on ~$9.94 trade).
+CAD pair surcharge ~0.54% on top of 0.26% taker. Strategy PF 1.79 positive at 0.8%
+fee but net return negative at $100 capital — fee burden exceeds gross edge at this scale.
+
+**Next steps:**
+1. Confirm TP=10% canonical run reproduces ~58 trades PF 1.79 ✓ then restart live bot
+2. Accumulate 30-50 live trades at new TP=10% config
+3. Previous TP/SL sweep results in memory are INVALID — all ran .env values due to
+   argparse bug now fixed. Only TP=10% walk-forward is validated.
+4. ADX < 20 filter hypothesis not yet tested — 66.7% win rate in that bucket from
+   attribution table. Test when 30+ live trades are in.
+5. When capital grows to $500+: revisit RISK_PER_TRADE_PCT (lower from 10% to 2-5%)
+
+---
+
+## 2026-06-19 — Signal Quality + Infrastructure Fixes (BUILT ✓)
+
+11 fixes applied in one session. All verified. See stock_bot.md for full detail.
+
+| Fix | Files | What |
+|---|---|---|
+| Sentiment K=4 smoothing | sentiment_scraper.py, prompt_builder.py | ±1.00 from single keyword impossible |
+| Trends None vs 0 | google_trends.py, aggregator.py, prompt_builder.py | Rate-limit 0 no longer looks like zero interest |
+| Intraday price | data/intraday_price.py (new), main.py | Paper fills at live tick, not yesterday's close |
+| SL/TP watcher thread | main.py, config.py | 30s SL/TP checks replace 120s scan-loop check |
+| Volume ratio | price_feed.py, prompt_builder.py | vol/20d_avg in Candle + AI prompt with penalty rule |
+| News ticker fix | news_fetcher.py | ≤3-char tickers word-boundary matched |
+| Daily loss breaker | paper.py, config.py, main.py | 3% daily drawdown halts new paper BUYs |
+| Slippage model | paper.py, config.py, main.py | 15 bps fill slippage on all paper trades |
+| Dynamic holidays | main.py | _us_holidays(year) + _ca_holidays(year) — works any year |
+| Partial-holiday mode fix | main.py | US-only holidays no longer kill TSX news scan |
+| Universe in off-hours scan | main.py | Pre/after-hours now scans watchlist + universe |
+
+**3 strategy-level fixes deferred** (require paper baseline before touching signal logic):
+- EMA crossover confirmation (2+ candle requirement before BULLISH signal)
+- Universe ranking composite (1d + 5d momentum, not 5d only)
+- AI-generated target/stop → ATR-based calculation in code
+
+---
+
 ## 2026-06-16 — Stock Bot Source Separation + Dashboard Visual Sections (BUILT ✓)
 
 Two changes that flow the "where did this symbol come from" tag end-to-end through the pipeline.

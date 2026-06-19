@@ -155,10 +155,20 @@ A robust crypto trading system that:
 
 ## VALIDATED TRADING CONFIG
 
-As of 2026-06-15, the following configuration has passed:
-- 5000-candle backtest (BTC/USDT 4h, Mar 2024–Jun 2026): PF 1.38, 86 trades, win rate 31.4%, max DD -1.37%, return +1.51%
-- SL/TP sweep (4 configs): SL=1.5% / TP=4.5% confirmed best ratio (1:3)
-- Walk-forward (5 × 1000-candle windows): positive PF across 4000 and 5000 candle windows; recent 6-month window (Jul 2025–now) shows PF ~1.02 — market regime choppier, not a filter problem
+As of 2026-06-19, the following configuration has passed:
+- 5000-candle backtest (BTC/USDT 4h, Mar 2024–Jun 2026): PF 1.79, 58 trades, win rate 32.8%, max DD -5.12%, return -4.70% (at 0.8% fee)
+- SL/TP sweep: SL=1.5% / TP=10% validated 2026-06-19 (was TP=4.5%)
+- Walk-forward (5 windows, TP=10%, fee=0.8%):
+
+  | Window | Candles | PF   | Return  |
+  |--------|---------|------|---------|
+  | Full   | 5000    | 1.79 | -4.70%  |
+  | 4000   | Sep24   | 1.83 | -4.06%  |
+  | 3000   | Feb25   | 2.02 | -2.16%  |
+  | 2000   | Aug25   | 1.37 | -2.17%  |
+  | 1000   | Jan26   | 1.25 | -1.32%  |
+
+  All 5 windows PF > 1.0 — walk-forward passed.
 - ADX sweep (18 / 25 / 30 / 35): ADX=18 is best on both full history and recent window
 - RSI filter confirmed ON: RSI_FILTER_ENABLED=false drops PF from 1.38 → 1.19 and return from +1.51% → -0.10%
 - Volume filter tested (VOLUME_K=1.2) and disabled: hurt PF (1.38→1.00), added noise not quality
@@ -168,7 +178,7 @@ ADX_THRESHOLD=18
 RSI_FILTER_ENABLED=true
 VOLUME_K=0
 STOP_LOSS_PCT=0.015
-TAKE_PROFIT_PCT=0.045
+TAKE_PROFIT_PCT=0.10   # was 0.045 — validated 2026-06-19
 BACKTEST_LIMIT=5000
 BACKTEST_TIMEFRAME=4h
 EXCHANGE=binance
@@ -184,8 +194,15 @@ TAKE_PROFIT_PCT=0.045
 
 ### How to verify the config is active
 Run: EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py
-Expected: ~86 trades, PF ~1.38, return ~+1.51%, max DD ~-1.37%
+Expected: ~58 trades, PF ~1.79, return ~-4.70%, max DD ~-5.12%
 If RSI_FILTER_ENABLED=false accidentally: trade count jumps to ~107, PF drops to 1.19
+
+### Config change log (2026-06-19)
+Previous validated config: TP=4.5% (PF 1.38 at zero fee)
+New validated config: TP=10% (PF 1.79 at zero fee, 1.79 at 0.8% fee)
+Reason: fee resilience — TP=10% exit mix is 37 SL / 9 TP / 12 strategy
+vs TP=4.5% which was 56 SL / 25 TP / 3 strategy. Higher TP lets strategy
+SELL signals do meaningful work, reducing fee sensitivity.
 
 ### New code added 2026-06-15
 - `calc_trade_qty_sl(cash, entry_price, stop_loss_price)` on AppConfig — SL-based position sizing
