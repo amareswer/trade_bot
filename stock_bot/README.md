@@ -253,6 +253,36 @@ stock_bot/
 
 ---
 
+## Running 24/7 on Mac
+
+```bash
+# Keep the Mac awake and the bot running indefinitely
+caffeinate -i python -m stock_bot.main
+
+# Run as a background service with logs
+nohup caffeinate -i python -m stock_bot.main \
+  > stock_bot/logs/bot.log 2>&1 &
+
+# Check if it's running
+ps aux | grep stock_bot
+
+# Stop it
+pkill -f stock_bot.main
+```
+
+Logs are written to `stock_bot/logs/bot.log` (rotating, max 10 MB, 7 files kept).
+
+The bot operates in four modes automatically:
+
+| Mode | Hours (ET) | What it does | Sleep interval |
+|---|---|---|---|
+| 🟢 LIVE | Mon–Fri 9:30am–4:00pm | Full scan: prices + AI + trades | `LOOP_INTERVAL` (120s) |
+| 🌅 PRE_MARKET | Mon–Fri 6:00am–9:30am | News-only scan, no prices | 15 min |
+| 🌙 AFTER_HOURS | Mon–Fri 4:00pm–midnight | News-only scan, no prices | 30 min |
+| 📅 WEEKEND | Sat–Sun all day | Idle — stays alive | 1 hour |
+
+---
+
 ## Phase roadmap
 
 | Phase | Status | Description |

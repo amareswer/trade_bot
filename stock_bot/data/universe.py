@@ -89,11 +89,29 @@ class StockUniverse:
         logger.info("Universe fetched: %d symbols", len(unique))
         return unique
 
-    def pre_filter(self, symbols: list[str], n: int = 20) -> list[str]:
+    def pre_filter(self, symbols: list[str], n: int = 20, market_status: dict = None) -> list[str]:
         """
         Batch-download 5-day OHLCV, filter by avg volume and price, rank by
         volume × 5d price change, return top n.
+
+        If market_status is provided, only symbols from currently open markets
+        are considered — US closed drops S&P500 symbols, CA closed drops .TO symbols.
         """
+        if market_status is not None:
+            us_open = market_status.get("us_open", True)
+            ca_open = market_status.get("ca_open", True)
+            eligible = []
+            for s in symbols:
+                is_canadian = s.endswith(".TO")
+                if is_canadian and ca_open:
+                    eligible.append(s)
+                elif not is_canadian and us_open:
+                    eligible.append(s)
+            if not eligible:
+                logger.warning("No eligible symbols — all markets closed")
+                return []
+            symbols = eligible
+
         logger.info("Pre-filtering %d symbols → top %d", len(symbols), n)
         metrics = self._batch_metrics(symbols)
 

@@ -18,6 +18,11 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
+MINIMUM_VALID_PRICE = 1.00  # reject any candle set whose latest close is below this
+
+# Module-level cache reset each scan cycle via reset_price_cache()
+_last_prices: dict[str, float] = {}
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -31,6 +36,33 @@ class Candle:
     low:       float
     close:     float
     volume:    float
+
+
+# ---------------------------------------------------------------------------
+# Price sanity validation
+# ---------------------------------------------------------------------------
+
+def reset_price_cache() -> None:
+    """Clear the per-cycle duplicate price cache. Call once at the start of each scan."""
+    global _last_prices
+    _last_prices = {}
+
+
+def _is_duplicate_price(symbol: str, price: float) -> bool:
+    """
+    Detect when yfinance returns the same price for multiple different symbols.
+    This is the signature of holiday data corruption (one ticker's price bleeds
+    into others). Returns True and logs a warning when corruption is detected.
+    """
+    for other_symbol, other_price in _last_prices.items():
+        if other_symbol != symbol and abs(other_price - price) < 0.01:
+            logger.warning(
+                "%s price $%.2f matches %s — holiday data corruption, rejecting",
+                symbol, price, other_symbol,
+            )
+            return True
+    _last_prices[symbol] = price
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +123,25 @@ def fetch_candles(
 
     if len(candles) < 26:
         logger.info("%s — only %d candles (new IPO or thin history)", symbol, len(candles))
+
+    latest = candles[-1].close
+    if latest < MINIMUM_VALID_PRICE:
+        logger.warning(
+            "%s price $%.4f is below $%.2f minimum — rejecting as corrupted data",
+            symbol, latest, MINIMUM_VALID_PRICE,
+        )
+        return None
+
+    if latest <= 0:
+        logger.warning("%s price $%.2f ≤ 0 — rejecting", symbol, latest)
+        return None
+
+    if latest > 500_000:
+        logger.warning("%s price $%.2f > $500k — rejecting", symbol, latest)
+        return None
+
+    if _is_duplicate_price(symbol, latest):
+        return None
 
     logger.debug("Fetched %d candles for %s (interval=%s)", len(candles), symbol, interval)
     return candles

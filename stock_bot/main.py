@@ -2,22 +2,31 @@
 Stock bot — Phase 4 entry point.
 
 Advisory only. No orders, no execution, no real money.
-Loops through the watchlist every LOOP_INTERVAL seconds, prints
-a terminal summary per symbol, and writes stock_dashboard.html.
+Runs 24/7 with three modes:
+  LIVE        — full scan every LOOP_INTERVAL seconds (market open)
+  PRE_MARKET  — news scan every 15 min (6:00–9:30am ET weekdays)
+  AFTER_HOURS — news scan every 30 min (4:00pm–midnight ET weekdays)
+  WEEKEND     — idle check every hour (Sat–Sun)
 
 Run from the repo root:
     python -m stock_bot.main
+Keep alive on Mac:
+    caffeinate -i python -m stock_bot.main
 """
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+import datetime as _dt
+import pytz as _pytz
+from datetime import datetime, date
 
 from stock_bot.config import load
-from stock_bot.data.price_feed import fetch_candles
+from stock_bot.data.price_feed import fetch_candles, reset_price_cache
 from stock_bot.data.universe  import StockUniverse
 from stock_bot.data.screener  import StockScreener
 from stock_bot.indicators.indicators import (
@@ -48,7 +57,11 @@ import os as _os
 _LOG_DIR = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "logs")
 _os.makedirs(_LOG_DIR, exist_ok=True)
 
-_fh = logging.FileHandler(_os.path.join(_LOG_DIR, "stock_bot.log"))
+_fh = logging.handlers.RotatingFileHandler(
+    _os.path.join(_LOG_DIR, "stock_bot.log"),
+    maxBytes=10_000_000,
+    backupCount=7,
+)
 _fh.setLevel(logging.INFO)
 _fh.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
 
@@ -166,6 +179,7 @@ def _fetch_symbol_data(
     cfg,
     screener:      StockScreener | None,
     watchlist_set: set[str],
+    market_status: dict | None = None,
 ) -> dict | None:
     """
     Fetch candles + compute indicators. Returns:
@@ -173,6 +187,15 @@ def _fetch_symbol_data(
       {"screened": True, ...} — screener rejected this symbol
       full data dict          — ready for research + AI
     """
+    if market_status is not None:
+        is_ca = symbol.upper().endswith(".TO")
+        if is_ca and not market_status["ca_open"]:
+            logger.info("%s skipped — TSX closed", symbol)
+            return None
+        if not is_ca and not market_status["us_open"]:
+            logger.info("%s skipped — NYSE closed", symbol)
+            return None
+
     candles = fetch_candles(symbol, interval=cfg.interval, lookback_days=cfg.lookback_days)
     if candles is None:
         return None
@@ -218,6 +241,172 @@ def _run_ai_call(
 
 
 # ---------------------------------------------------------------------------
+# Market hours guard
+# ---------------------------------------------------------------------------
+
+_US_HOLIDAYS_2026: frozenset[date] = frozenset({
+    date(2026, 1,  1),   # New Year's Day
+    date(2026, 1, 19),   # MLK Day
+    date(2026, 2, 16),   # Presidents' Day
+    date(2026, 4,  3),   # Good Friday
+    date(2026, 5, 25),   # Memorial Day
+    date(2026, 6, 19),   # Juneteenth
+    date(2026, 7,  3),   # Independence Day (observed)
+    date(2026, 9,  7),   # Labor Day
+    date(2026, 11, 26),  # Thanksgiving
+    date(2026, 12, 25),  # Christmas
+})
+
+_CA_HOLIDAYS_2026: frozenset[date] = frozenset({
+    date(2026, 1,  1),   # New Year's Day
+    date(2026, 2, 16),   # Family Day (ON/BC/AB)
+    date(2026, 4,  3),   # Good Friday
+    date(2026, 5, 18),   # Victoria Day
+    date(2026, 7,  1),   # Canada Day
+    date(2026, 8,  3),   # Civic Holiday (ON)
+    date(2026, 9,  7),   # Labour Day
+    date(2026, 10, 12),  # Thanksgiving (CA)
+    date(2026, 11, 11),  # Remembrance Day
+    date(2026, 12, 25),  # Christmas Day
+    date(2026, 12, 26),  # Boxing Day
+})
+
+_US_HOLIDAY_NAMES: dict[date, str] = {
+    date(2026, 1,  1):  "New Year's Day",
+    date(2026, 1, 19):  "MLK Day",
+    date(2026, 2, 16):  "Presidents' Day",
+    date(2026, 4,  3):  "Good Friday",
+    date(2026, 5, 25):  "Memorial Day",
+    date(2026, 6, 19):  "Juneteenth",
+    date(2026, 7,  3):  "Independence Day",
+    date(2026, 9,  7):  "Labor Day",
+    date(2026, 11, 26): "Thanksgiving",
+    date(2026, 12, 25): "Christmas",
+}
+
+_CA_HOLIDAY_NAMES: dict[date, str] = {
+    date(2026, 1,  1):  "New Year's Day",
+    date(2026, 2, 16):  "Family Day",
+    date(2026, 4,  3):  "Good Friday",
+    date(2026, 5, 18):  "Victoria Day",
+    date(2026, 7,  1):  "Canada Day",
+    date(2026, 8,  3):  "Civic Holiday",
+    date(2026, 9,  7):  "Labour Day",
+    date(2026, 10, 12): "Thanksgiving",
+    date(2026, 11, 11): "Remembrance Day",
+    date(2026, 12, 25): "Christmas Day",
+    date(2026, 12, 26): "Boxing Day",
+}
+
+
+def _get_market_status() -> dict:
+    """
+    Return independent open/closed status for US (NYSE) and Canadian (TSX) markets.
+
+    Keys:
+      us_open    — bool: NYSE/NASDAQ open right now
+      ca_open    — bool: TSX open right now
+      any_open   — bool: at least one market is open (drives scan loop gate)
+      is_weekend — bool
+      us_holiday — str | None: holiday name if NYSE closed for a holiday today
+      ca_holiday — str | None: holiday name if TSX closed for a holiday today
+      in_hours   — bool: current time is within 9:30–16:00 ET window
+    """
+    eastern = _pytz.timezone("US/Eastern")
+    now     = datetime.now(eastern)
+    today   = now.date()
+
+    is_weekend   = now.weekday() >= 5
+    market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+    in_hours     = market_open <= now <= market_close
+
+    us_holiday = _US_HOLIDAY_NAMES.get(today) if today in _US_HOLIDAYS_2026 else None
+    ca_holiday = _CA_HOLIDAY_NAMES.get(today) if today in _CA_HOLIDAYS_2026 else None
+
+    us_open = in_hours and not is_weekend and us_holiday is None
+    ca_open = in_hours and not is_weekend and ca_holiday is None
+
+    return {
+        "us_open":    us_open,
+        "ca_open":    ca_open,
+        "any_open":   us_open or ca_open,
+        "is_weekend": is_weekend,
+        "us_holiday": us_holiday,
+        "ca_holiday": ca_holiday,
+        "in_hours":   in_hours,
+    }
+
+
+def _get_loop_mode(market_status: dict) -> str:
+    """
+    Return one of: "LIVE" | "PRE_MARKET" | "AFTER_HOURS" | "WEEKEND"
+
+    LIVE        — at least one market is open right now
+    PRE_MARKET  — weekday, before 9:30am ET
+    AFTER_HOURS — weekday, after 4:00pm ET
+    WEEKEND     — Saturday, Sunday, or a full holiday blackout
+    """
+    if market_status["any_open"]:
+        return "LIVE"
+
+    eastern = _pytz.timezone("US/Eastern")
+    now = datetime.now(eastern)
+
+    if now.weekday() < 5 and market_status["us_holiday"] is None and market_status["ca_holiday"] is None:
+        market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+        market_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+        if now < market_open and now.hour >= 6:
+            return "PRE_MARKET"
+        if now >= market_close:
+            return "AFTER_HOURS"
+
+    return "WEEKEND"
+
+
+def _check_price_uniformity(scan_results: list) -> bool:
+    """
+    If 3+ symbols show the exact same price, the data feed is corrupted
+    (holiday bleed-through). Returns False to signal the cycle should be aborted.
+    """
+    prices = [r.price for r in scan_results if r and r.price]
+    if len(prices) < 3:
+        return True
+    price_counts = Counter(round(p, 2) for p in prices)
+    most_common_price, count = price_counts.most_common(1)[0]
+    if count >= 3:
+        logger.error(
+            "ABORT: %d symbols showing same price $%.2f — corrupted data feed, skipping cycle",
+            count, most_common_price,
+        )
+        return False
+    return True
+
+
+def _run_news_scan(watchlist: list[str]) -> None:
+    """
+    Lightweight pre/after-hours news scan — no prices, no AI, no trades.
+    Prints major catalyst alerts for symbols with strongly positive/negative news.
+    """
+    from stock_bot.research.news_fetcher      import fetch_news
+    from stock_bot.research.sentiment_scraper import score_headlines
+
+    print(f"  📰 Scanning {len(watchlist)} symbols for news catalysts...")
+    for symbol in watchlist:
+        try:
+            news = fetch_news(symbol)
+            if not news:
+                continue
+            sentiment = score_headlines(news)
+            if sentiment.score >= 0.8:
+                print(f"  📈 {symbol}: Strongly positive — {news[0].title[:60]}")
+            elif sentiment.score <= -0.8:
+                print(f"  📉 {symbol}: Strongly negative — {news[0].title[:60]}")
+        except Exception as exc:
+            logger.debug("News scan failed for %s: %s", symbol, exc)
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
@@ -231,7 +420,8 @@ def run() -> None:
     if cfg.universe_enabled:
         _universe = StockUniverse(refresh_hours=cfg.universe_refresh_hours)
         raw_symbols      = _universe.get_universe()
-        universe_symbols = _universe.pre_filter(raw_symbols, cfg.universe_size)
+        _startup_market  = _get_market_status()
+        universe_symbols = _universe.pre_filter(raw_symbols, cfg.universe_size, market_status=_startup_market)
         _universe_refreshed_at = time.time()
     else:
         _universe        = None
@@ -251,7 +441,14 @@ def run() -> None:
     executor  = StockPaperExecutor(cfg.paper_starting_cash) if cfg.paper_trading_enabled else None
 
     print()
-    print("  Stock Bot — Phase 6  (indicators + research + AI + dashboard + alerts + paper trading)")
+    print("  Stock Bot — Running 24/7")
+    print(f"  {'─' * 45}")
+    print(f"  🟢 LIVE trading:    Mon-Fri 9:30am–4:00pm EST")
+    print(f"  🌅 Pre-market scan: Mon-Fri 6:00am–9:30am EST")
+    print(f"  🌙 After-hours:     Mon-Fri 4:00pm–midnight EST")
+    print(f"  📅 Weekend idle:    Sat–Sun (no scanning)")
+    print(f"  🏖  Holidays:        Per-market routing active")
+    print(f"  {'─' * 45}")
     print(f"  My Watchlist : {', '.join(watchlist_symbols)}")
     if cfg.universe_enabled:
         print(f"  Universe     : S&P500 + TSX60 → top {cfg.universe_size} movers")
@@ -267,11 +464,39 @@ def run() -> None:
     if executor:
         print(f"  Paper trading: ON  cash=${cfg.paper_starting_cash:,.2f}  risk={cfg.paper_risk_pct*100:.0f}%/trade  min_conf={cfg.paper_min_confidence}%")
     print(f"  Dashboard : file://{_os.path.abspath('stock_dashboard.html')}")
+    print(f"  Logs      : {_os.path.join(_LOG_DIR, 'stock_bot.log')}")
     print()
 
     tick = 0
     try:
       while True:
+        market_status = _get_market_status()
+        mode = _get_loop_mode(market_status)
+
+        eastern  = _pytz.timezone("US/Eastern")
+        now_et   = datetime.now(eastern)
+        time_str = now_et.strftime("%I:%M%p EST").lstrip("0")
+
+        if mode == "PRE_MARKET":
+            print(f"🌅 Pre-market ({time_str}) — monitoring news...")
+            _run_news_scan(watchlist_symbols)
+            time.sleep(900)
+            continue
+
+        elif mode == "AFTER_HOURS":
+            print(f"🌙 After hours ({time_str}) — monitoring news...")
+            _run_news_scan(watchlist_symbols)
+            time.sleep(1800)
+            continue
+
+        elif mode == "WEEKEND":
+            eastern_now = datetime.now(eastern)
+            day_name    = eastern_now.strftime("%A")
+            print(f"📅 Weekend ({day_name} {time_str}) — markets closed. Next open: Monday 9:30am EST")
+            time.sleep(3600)
+            continue
+
+        # ── LIVE mode ────────────────────────────────────────────────────────
         tick += 1
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -289,7 +514,7 @@ def run() -> None:
             elapsed_h = (time.time() - _universe_refreshed_at) / 3600
             if elapsed_h >= cfg.universe_refresh_hours:
                 raw_symbols      = _universe.get_universe()
-                universe_symbols = _universe.pre_filter(raw_symbols, cfg.universe_size)
+                universe_symbols = _universe.pre_filter(raw_symbols, cfg.universe_size, market_status=market_status)
                 all_symbols      = list(dict.fromkeys(watchlist_symbols + universe_symbols))
                 _universe_refreshed_at = time.time()
                 print(f"  Universe refreshed: {len(universe_symbols)} new movers")
@@ -299,11 +524,14 @@ def run() -> None:
         watchlist_set = set(cfg.watchlist)
         scan_results: list[ScanResult] = []
 
+        # Reset duplicate price detector for this cycle
+        reset_price_cache()
+
         # ── Phase 1: prices + indicators (all symbols, parallel) ───────────
         price_data: dict[str, dict | None] = {}
         with ThreadPoolExecutor(max_workers=10) as ex:
             futs = {
-                ex.submit(_fetch_symbol_data, sym, cfg, screener, watchlist_set): sym
+                ex.submit(_fetch_symbol_data, sym, cfg, screener, watchlist_set, market_status): sym
                 for sym in all_symbols
             }
             for fut in as_completed(futs):
@@ -516,6 +744,11 @@ def run() -> None:
                 logger.warning("scan failed for %s: %s", symbol, exc)
             print(f"  {'─' * 70}")
 
+        # Batch sanity check — abort cycle if data feed is corrupted
+        if not _check_price_uniformity(scan_results):
+            print("  ⚠️  Corrupted data detected — skipping this cycle")
+            continue
+
         # ── AI call summary ───────────────────────────────────────────────────
         if cfg.ai_enabled and ai_engine:
             print(f"  ── AI Summary {'─' * 39}")
@@ -578,13 +811,15 @@ def run() -> None:
         try:
             renderer.render(
                 scan_results, fear_greed_data, portfolio_summary, alerts,
-                paper    = paper_summary,
-                ai_stats = {
+                paper         = paper_summary,
+                ai_stats      = {
                     "nvidia":   _ai_nvidia_n,
                     "fallback": _ai_fallback_n,
                     "failed":   _ai_failed_n,
                     "elapsed":  _ai_elapsed,
                 },
+                market_status = market_status,
+                loop_mode     = mode,
             )
         except Exception as exc:
             logger.warning("Dashboard render failed: %s", exc)

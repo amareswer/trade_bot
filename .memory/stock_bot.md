@@ -126,6 +126,10 @@ On first nvidia failure, automatically falls back to openrouter.
 - Ranks by `volume × |price_change|` (momentum × volume)
 - Returns top 10 (UNIVERSE_SIZE=10) as `universe_symbols`
 - TTL cache: refreshes every 24 hours
+- **Market-aware (2026-06-19):** `pre_filter(symbols, n, market_status=...)` accepts
+  the market_status dict — US closed → drops all non-.TO symbols before ranking;
+  CA closed → drops all .TO symbols; both closed → returns []; both open → all 560 ranked.
+  main.py passes market_status at startup and on every TTL refresh.
 
 `data/screener.py` — StockScreener
 - Applied to universe symbols ONLY (watchlist bypasses)
@@ -140,11 +144,57 @@ On first nvidia failure, automatically falls back to openrouter.
 | `ticker.info` / `fast_info` company name lookup in price_feed.py | Added 2-3s penalty per symbol per cycle | Use `symbol.replace(".TO", "")` only — simple and fast |
 | `_name_cache` + `get_cached_name()` in price_feed.py | Unnecessary — name is only used for display | Removed entirely; aggregator.py now returns `symbol.replace(".TO", "")` |
 
+## 24/7 operation (added 2026-06-19)
+
+`_get_loop_mode(market_status)` in main.py returns one of four modes:
+
+| Mode | Condition | What runs | Sleep |
+|---|---|---|---|
+| `LIVE` | any market open | Full scan: prices + AI + trades | `LOOP_INTERVAL` (120s) |
+| `PRE_MARKET` | weekday, 6:00am–9:30am ET, no holiday | `_run_news_scan()` — news catalysts only | 900s (15 min) |
+| `AFTER_HOURS` | weekday, 4:00pm–midnight ET, no holiday | `_run_news_scan()` — news catalysts only | 1800s (30 min) |
+| `WEEKEND` | Sat/Sun or full holiday | idle print, no scan | 3600s (1 hr) |
+
+`_run_news_scan(watchlist)` — prints strongly +/- news catalysts (score ≥ 0.8 or ≤ -0.8), no prices, no AI, no trades.
+
+Dashboard mode badge in header shows current mode: 🟢 LIVE / 🌅 PRE-MARKET / 🌙 AFTER HOURS / 📅 WEEKEND.
+
+Log file: `stock_bot/logs/bot.log` — `RotatingFileHandler`, max 10 MB, 7 files kept.
+
+Keep-alive on Mac: `caffeinate -i python -m stock_bot.main`
+Background: `nohup caffeinate -i python -m stock_bot.main > stock_bot/logs/bot.log 2>&1 &`
+
+## Market hours — US and CA independent gating (2026-06-19)
+
+`_get_market_status()` in main.py returns:
+```python
+{
+  "us_open":    bool,   # NYSE/NASDAQ open right now
+  "ca_open":    bool,   # TSX open right now
+  "any_open":   bool,   # scan loop gate — if False, entire cycle is skipped
+  "is_weekend": bool,
+  "us_holiday": str | None,  # e.g. "Juneteenth", "MLK Day"
+  "ca_holiday": str | None,  # e.g. "Canada Day", "Family Day"
+  "in_hours":   bool,   # 9:30–16:00 ET window
+}
+```
+
+Per-symbol routing in `_fetch_symbol_data()`:
+- `.TO` symbols → skip if `ca_open` is False
+- US symbols → skip if `us_open` is False
+
+Holidays:
+- US (NYSE): New Year's, MLK Day, Presidents' Day, Good Friday, Memorial Day, Juneteenth, Independence Day, Labor Day, Thanksgiving, Christmas
+- CA (TSX): New Year's, Family Day, Good Friday, Victoria Day, Canada Day, Civic Holiday, Labour Day, Thanksgiving, Remembrance Day, Christmas Day, Boxing Day
+
+Both use 9:30am–4:00pm ET window (TSX and NYSE share the same clock).
+
+Dashboard renders two market status badges (NYSE / TSX) with green=OPEN, yellow=holiday name, grey=CLOSED.
+
 ## Known issues
 
 - Yahoo Finance crumb (401) errors on cycle 2+ when yfinance session expires between cycles — bot handles gracefully (returns None, skips symbol, continues)
 - On US market holidays, yfinance returns NaN or stale cross-contaminated prices — resolved on next trading day
-- TSX symbols (AC.TO, BMO.TO) sometimes return no data on US holiday despite TSX being open
 - EBON ($1.95) and IGC ($0.2799) in PORTFOLIO are penny stocks — screener would reject them as universe symbols (price < $5), but they're watchlist and pass through to display-only portfolio section
 - SPCX: no earnings data (may be delisted from yfinance index)
 - OpenRouter free tier hits 429 under rapid calls — bot handles with HOLD fallback

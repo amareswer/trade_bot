@@ -20,7 +20,7 @@ metadata:
 
 **Critical rules — stock bot (PERMANENT — do not change):**
 6. Never add session management to yfinance — `yf.download()` manages its own session internally. Custom sessions break it.
-7. Never use `ticker.info`, `fast_info`, or any yfinance metadata call for company names — use `symbol.replace(".TO", "")` only. Each metadata call adds 2-3s per symbol.
+7. Never use `ticker.info` or `fast_info` **for company names** — use `symbol.replace(".TO", "")` only. `fast_info` for price sanity validation is acceptable (see `_validate_price()` in price_feed.py), but adds ~2s per symbol — do not add more metadata calls.
 8. Always validate price > 0 and < 500,000 before any trade calculation in paper.py
 9. Always use `int(risk_amount / price)` for share counts — never float shares for stocks
 10. Paper state files (`paper_state.json`, `paper_trades.csv`) must be manually deleted when switching strategies or after suspected corruption

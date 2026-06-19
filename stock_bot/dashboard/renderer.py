@@ -371,7 +371,35 @@ def _css() -> str:
 """
 
 
-def _header_html(now_str: str, loop_interval: int, ai_stats: dict | None = None) -> str:
+_MODE_META: dict[str, tuple[str, str, str]] = {
+    "LIVE":        ("🟢", "LIVE TRADING",  "#3fb950"),
+    "PRE_MARKET":  ("🌅", "PRE-MARKET",    "#d29922"),
+    "AFTER_HOURS": ("🌙", "AFTER HOURS",   "#58a6ff"),
+    "WEEKEND":     ("📅", "WEEKEND",       "#8b949e"),
+}
+
+
+def _header_html(
+    now_str:       str,
+    loop_interval: int,
+    ai_stats:      dict | None = None,
+    market_status: dict | None = None,
+    loop_mode:     str         = "LIVE",
+) -> str:
+    import pytz as _tz
+    eastern  = _tz.timezone("US/Eastern")
+    now_et   = datetime.now(eastern)
+    time_str = now_et.strftime("%I:%M%p EST").lstrip("0")
+
+    mode_emoji, mode_label, mode_color = _MODE_META.get(loop_mode, ("🟢", "LIVE TRADING", "#3fb950"))
+    mode_badge = (
+        f'<span style="display:inline-flex;align-items:center;gap:6px;'
+        f'background:{mode_color}18;border:1px solid {mode_color}55;'
+        f'border-radius:6px;padding:3px 12px;font-size:13px;font-weight:700;color:{mode_color}">'
+        f'{mode_emoji} {mode_label}&nbsp; <span style="font-weight:400;color:#8b949e;font-size:11px">{_e(time_str)}</span>'
+        f'</span>'
+    )
+
     ai_line = ""
     if ai_stats:
         nv    = ai_stats.get("nvidia",   0)
@@ -390,16 +418,49 @@ def _header_html(now_str: str, loop_interval: int, ai_stats: dict | None = None)
         if fl:
             parts.append(f"{fl}❌")
         ai_line = f'<br>🤖 nvidia_nim · {" ".join(parts)}'
+
+    market_bar = ""
+    if market_status is not None:
+        def _mkt_badge(label: str, is_open: bool, holiday: str | None) -> str:
+            if is_open:
+                color = "#3fb950"
+                status = "OPEN"
+            elif holiday:
+                color = "#d29922"
+                status = _e(holiday)
+            else:
+                color = "#6e7681"
+                status = "CLOSED"
+            return (
+                f'<span style="display:inline-flex;align-items:center;gap:5px;'
+                f'background:#161b22;border:1px solid #30363d;border-radius:6px;'
+                f'padding:3px 10px;font-size:11px;">'
+                f'<span style="width:8px;height:8px;border-radius:50%;background:{color};display:inline-block"></span>'
+                f'<span style="color:#8b949e">{label}</span>'
+                f'<span style="color:{color};font-weight:600">{status}</span>'
+                f'</span>'
+            )
+        us_badge = _mkt_badge("NYSE", market_status["us_open"], market_status["us_holiday"])
+        ca_badge = _mkt_badge("TSX",  market_status["ca_open"], market_status["ca_holiday"])
+        market_bar = f"""
+  <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;align-items:center;">
+    <span style="font-size:11px;color:#8b949e;margin-right:4px;">Markets:</span>
+    {us_badge}
+    {ca_badge}
+  </div>"""
+
     return f"""
   <div class="header">
     <div>
       <div class="title">📈 Stock Research Bot</div>
+      <div style="margin-top:8px">{mode_badge}</div>
     </div>
     <div class="meta">
       Last updated: {_e(now_str)}<br>
       Next refresh: <span id="countdown">{loop_interval}s</span>{ai_line}
     </div>
-  </div>"""
+  </div>
+{market_bar}"""
 
 
 def _fg_section_html(fg: FearGreedData) -> str:
@@ -881,6 +942,8 @@ def _build_html(
     alerts:        Optional[list[Alert]]      = None,
     paper:         Optional[PaperSummary]     = None,
     ai_stats:      Optional[dict]             = None,
+    market_status: Optional[dict]             = None,
+    loop_mode:     str                        = "LIVE",
 ) -> str:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -951,7 +1014,7 @@ def _build_html(
 </head>
 <body>
 
-{_header_html(now_str, loop_interval, ai_stats)}
+{_header_html(now_str, loop_interval, ai_stats, market_status, loop_mode)}
 {_fg_section_html(fear_greed)}
 {_summary_html(results)}
 {portfolio_section}
@@ -996,14 +1059,16 @@ class DashboardRenderer:
 
     def render(
         self,
-        scan_results: list[ScanResult],
-        fear_greed:   FearGreedData,
-        portfolio:    Optional[PortfolioSummary] = None,
-        alerts:       Optional[list[Alert]]      = None,
-        paper:        Optional[PaperSummary]     = None,
-        ai_stats:     Optional[dict]             = None,
+        scan_results:  list[ScanResult],
+        fear_greed:    FearGreedData,
+        portfolio:     Optional[PortfolioSummary] = None,
+        alerts:        Optional[list[Alert]]      = None,
+        paper:         Optional[PaperSummary]     = None,
+        ai_stats:      Optional[dict]             = None,
+        market_status: Optional[dict]             = None,
+        loop_mode:     str                        = "LIVE",
     ) -> None:
-        html_str = _build_html(scan_results, fear_greed, self.loop_interval, portfolio, alerts, paper, ai_stats)
+        html_str = _build_html(scan_results, fear_greed, self.loop_interval, portfolio, alerts, paper, ai_stats, market_status, loop_mode)
         os.makedirs(os.path.dirname(os.path.abspath(_OUTPUT_PATH)), exist_ok=True)
         with open(_OUTPUT_PATH, "w", encoding="utf-8") as f:
             f.write(html_str)

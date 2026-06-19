@@ -93,6 +93,14 @@ class StockPaperExecutor(StockExecutorBase):
             self._orders.append(order)
             return order
 
+        if price < 1.00:
+            order = self._new_order(sym, OrderSide.BUY, int(shares), price)
+            order.status        = OrderStatus.REJECTED
+            order.reject_reason = f"Price ${price:.4f} below $1.00 minimum — possible corrupted data"
+            logger.warning("PAPER BUY REJECTED  %s — price $%.4f below $1.00 minimum", sym, price)
+            self._orders.append(order)
+            return order
+
         shares = int(shares)  # stocks trade in whole shares only
         order  = self._new_order(sym, OrderSide.BUY, shares, price)
 
