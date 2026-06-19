@@ -18,29 +18,6 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
-_name_cache: dict[str, str] = {}
-
-
-# ---------------------------------------------------------------------------
-# Name cache (lightweight — Ticker used only for metadata, not price data)
-# ---------------------------------------------------------------------------
-
-def _cache_name_from_ticker(symbol: str) -> None:
-    if symbol in _name_cache:
-        return
-    clean = symbol.replace(".TO", "")
-    try:
-        ticker = yf.Ticker(symbol)
-        meta   = getattr(ticker, "history_metadata", {}) or {}
-        short  = meta.get("shortName", "")
-        _name_cache[symbol] = short if short and len(short) <= 25 else clean
-    except Exception:
-        _name_cache[symbol] = clean
-
-
-def get_cached_name(symbol: str) -> str:
-    return _name_cache.get(symbol, symbol.replace(".TO", ""))
-
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -88,18 +65,14 @@ def fetch_candles(
             df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
 
     except Exception as e:
-        logger.warning(f"fetch failed {symbol}: {e}")
+        logger.warning("fetch failed %s: %s", symbol, e)
         return None
 
     candles: list[Candle] = []
     for ts, row in df.iterrows():
         try:
             close = float(row["Close"])
-            if math.isnan(close):
-                continue
-            if close <= 0 or close > 100_000:
-                logger.warning("Invalid close price for %s at %s: %s — skipping candle",
-                               symbol, ts, close)
+            if math.isnan(close) or close <= 0 or close > 100_000:
                 continue
             candles.append(Candle(
                 timestamp = ts.to_pydatetime(),
@@ -116,15 +89,9 @@ def fetch_candles(
         logger.warning("All rows were NaN or malformed for %s", symbol)
         return None
 
-    latest = candles[-1].close
-    if latest <= 0 or latest > 500_000:
-        logger.error("Latest price invalid for %s: %s — returning None", symbol, latest)
-        return None
-
     if len(candles) < 26:
         logger.info("%s — only %d candles (new IPO or thin history)", symbol, len(candles))
 
-    _cache_name_from_ticker(symbol)
     logger.debug("Fetched %d candles for %s (interval=%s)", len(candles), symbol, interval)
     return candles
 

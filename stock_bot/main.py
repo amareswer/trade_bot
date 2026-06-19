@@ -314,6 +314,30 @@ def run() -> None:
                     logger.warning("Price fetch failed for %s: %s", sym, exc)
                     price_data[sym] = None
 
+        # ── Stop loss / take profit for open paper positions ─────────────────
+        _STOP_LOSS_PCT   = -0.05   # -5%
+        _TAKE_PROFIT_PCT =  0.12   # +12%
+        if executor is not None and cfg.paper_trading_enabled:
+            for _sym, (_held, _entry) in list(executor.positions_snapshot().items()):
+                try:
+                    _candles = fetch_candles(_sym, interval="1d", lookback_days=5)
+                    if not _candles:
+                        continue
+                    _cur = _candles[-1].close
+                    if _entry <= 0:
+                        continue
+                    _pnl_pct = (_cur - _entry) / _entry
+                    if _pnl_pct <= _STOP_LOSS_PCT:
+                        _ord = executor.sell(_sym, _held, _cur, reason=f"Stop loss {_pnl_pct:.1%}")
+                        if _ord.status == OrderStatus.FILLED:
+                            print(f"  🛑 STOP LOSS: {_sym} @ ${_cur:.2f} ({_pnl_pct:+.1%})")
+                    elif _pnl_pct >= _TAKE_PROFIT_PCT:
+                        _ord = executor.sell(_sym, _held, _cur, reason=f"Take profit {_pnl_pct:.1%}")
+                        if _ord.status == OrderStatus.FILLED:
+                            print(f"  💰 TAKE PROFIT: {_sym} @ ${_cur:.2f} ({_pnl_pct:+.1%})")
+                except Exception as _e:
+                    logger.warning("Stop check failed for %s: %s", _sym, _e)
+
         active_symbols = [
             s for s in all_symbols
             if isinstance(price_data.get(s), dict) and not price_data[s].get("screened")
@@ -418,22 +442,26 @@ def run() -> None:
                 ):
                     px  = data["last_candle"].close
                     sig = verdict.signal
+                    _MAX_POSITIONS = 4
                     if sig == "BUY":
                         if executor.position(symbol) == 0:
-                            snap    = executor.positions_snapshot()
-                            pos_val = sum(sh * co for sh, co in snap.values())
-                            alloc   = (executor.cash + pos_val) * cfg.paper_risk_pct
-                            shares  = int(alloc / px) if px > 0 else 0
-                            if shares > 0:
-                                reason = f"BUY {verdict.confidence}% {verdict.trading_style}"
-                                order  = executor.buy(symbol, shares, px, reason=reason)
-                                if order.status == OrderStatus.FILLED:
-                                    total = round(shares * px, 2)
-                                    print(f"  📄 PAPER BUY:  {symbol}  {shares} shares")
-                                    print(f"                 @ ${px:,.2f} = ${total:,.2f}")
-                                    print(f"                 Cash remaining: ${executor.cash:,.2f}")
-                                else:
-                                    print(f"  📄 REJECTED:   {symbol} — {order.reject_reason}")
+                            if len(executor.positions_snapshot()) >= _MAX_POSITIONS:
+                                print(f"  📄 SKIP: {symbol} — max {_MAX_POSITIONS} positions reached")
+                            else:
+                                snap    = executor.positions_snapshot()
+                                pos_val = sum(sh * co for sh, co in snap.values())
+                                alloc   = (executor.cash + pos_val) * cfg.paper_risk_pct
+                                shares  = int(alloc / px) if px > 0 else 0
+                                if shares > 0:
+                                    reason = f"BUY {verdict.confidence}% {verdict.trading_style}"
+                                    order  = executor.buy(symbol, shares, px, reason=reason)
+                                    if order.status == OrderStatus.FILLED:
+                                        total = round(shares * px, 2)
+                                        print(f"  📄 PAPER BUY:  {symbol}  {shares} shares")
+                                        print(f"                 @ ${px:,.2f} = ${total:,.2f}")
+                                        print(f"                 Cash remaining: ${executor.cash:,.2f}")
+                                    else:
+                                        print(f"  📄 REJECTED:   {symbol} — {order.reject_reason}")
                     else:  # SELL
                         held = executor.position(symbol)
                         if held > 0:

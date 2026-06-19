@@ -18,6 +18,8 @@ RSI_OVERSOLD    = 35.0    # RSI below this → potential buy signal
 RSI_OVERBOUGHT  = 70.0    # RSI above this → potential sell signal
 PRICE_MOVE_PCT  = 3.0     # % move in latest candle vs previous to flag
 MACD_LOOKBACK   = 3       # candles back to check for a cross
+_MIN_PRICE      = 5.0     # no penny stocks — below this price, skip
+_MAX_PRICE      = 200.0   # affordable at $1k account — above this, skip
 
 
 class StockScreener:
@@ -33,6 +35,15 @@ class StockScreener:
     def screen(self, symbol: str, candles: list[Candle]) -> bool:
         if not candles or len(candles) < 2:
             return True  # too little data — pass through rather than suppress
+
+        latest_price = candles[-1].close
+        if latest_price < _MIN_PRICE:
+            logger.info("%s $%.2f — below min price $%.0f, skipping", symbol, latest_price, _MIN_PRICE)
+            return False
+        if latest_price > _MAX_PRICE:
+            logger.info("%s $%.2f — above max price $%.0f, skipping", symbol, latest_price, _MAX_PRICE)
+            return False
+
         if len(candles) < 26:
             return True  # new IPO — price momentum alone justifies full analysis
 

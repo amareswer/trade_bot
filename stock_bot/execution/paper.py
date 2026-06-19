@@ -77,7 +77,15 @@ class StockPaperExecutor(StockExecutorBase):
     def buy(self, symbol: str, shares: float, price: float, reason: str = "") -> StockOrder:
         sym = symbol.upper()
 
-        if price <= 0 or price > 1_000_000:
+        if not isinstance(price, (int, float)):
+            order = self._new_order(sym, OrderSide.BUY, 0, price)
+            order.status        = OrderStatus.REJECTED
+            order.reject_reason = f"Invalid price type: {type(price)}"
+            logger.error("PAPER BUY REJECTED  %s — invalid price type %s", sym, type(price))
+            self._orders.append(order)
+            return order
+
+        if price <= 0 or price > 500_000:
             order = self._new_order(sym, OrderSide.BUY, int(shares), price)
             order.status        = OrderStatus.REJECTED
             order.reject_reason = f"Invalid price: {price}"
@@ -85,16 +93,15 @@ class StockPaperExecutor(StockExecutorBase):
             self._orders.append(order)
             return order
 
-        if price < 1.0:
-            order = self._new_order(sym, OrderSide.BUY, int(shares), price)
-            order.status        = OrderStatus.REJECTED
-            order.reject_reason = f"Price too low: ${price}"
-            logger.warning("PAPER BUY REJECTED  %s — penny stock price $%.4f", sym, price)
-            self._orders.append(order)
-            return order
-
         shares = int(shares)  # stocks trade in whole shares only
         order  = self._new_order(sym, OrderSide.BUY, shares, price)
+
+        if shares > 100_000:
+            order.status        = OrderStatus.REJECTED
+            order.reject_reason = f"Share count unrealistic: {shares} — price data may be corrupted"
+            logger.error("PAPER BUY REJECTED  %s — share count %d unrealistic", sym, shares)
+            self._orders.append(order)
+            return order
 
         if shares < 1:
             order.status        = OrderStatus.REJECTED
@@ -311,12 +318,36 @@ class StockPaperExecutor(StockExecutorBase):
         try:
             with open(_STATE_JSON, "r", encoding="utf-8") as f:
                 state = json.load(f)
-            self._cash         = float(state["cash"])
-            self._realized_pnl = float(state.get("realized_pnl", 0.0))
-            self._positions    = {
-                sym.upper(): (float(v["shares"]), float(v["avg_cost"]))
-                for sym, v in state.get("positions", {}).items()
-            }
+            cash = float(state["cash"])
+            realized_pnl = float(state.get("realized_pnl", 0.0))
+
+            # Sanity check — reject obviously corrupted state
+            if cash > 1_000_000 or cash < 0:
+                logger.warning(
+                    "paper_state.json has corrupted cash=%.2f — deleting and starting fresh", cash
+                )
+                os.remove(_STATE_JSON)
+                return False
+            if abs(realized_pnl) > 1_000_000:
+                logger.warning(
+                    "paper_state.json has corrupted realized_pnl=%.2f — deleting and starting fresh",
+                    realized_pnl,
+                )
+                os.remove(_STATE_JSON)
+                return False
+
+            positions: dict[str, tuple[float, float]] = {}
+            for sym, v in state.get("positions", {}).items():
+                shares   = float(v["shares"])
+                avg_cost = float(v["avg_cost"])
+                if shares <= 0 or shares > 100_000 or avg_cost <= 0 or avg_cost > 500_000:
+                    logger.warning("Skipping corrupted position %s: shares=%s avg_cost=%s", sym, shares, avg_cost)
+                    continue
+                positions[sym.upper()] = (shares, avg_cost)
+
+            self._cash         = cash
+            self._realized_pnl = realized_pnl
+            self._positions    = positions
             print("📄 Paper state restored:")
             print(f"   Cash: ${self._cash:,.2f}")
             print(f"   Positions: {list(self._positions.keys())}")

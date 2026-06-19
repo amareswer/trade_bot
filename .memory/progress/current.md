@@ -5,138 +5,76 @@ metadata:
   type: project
 ---
 
-**Status as of 2026-06-15 23:00 UTC:** Two bots active in same repo. Crypto bot live on Kraken. Stock bot Phases 1–3 built and running with Ollama Cloud AI.
-
----
-
-## Current Live State
+**Status as of 2026-06-19:** Two bots active. Crypto bot live on Kraken. Stock bot stable on paper trading at $1,000.
 
 ---
 
 ## Stock Bot (stock_bot/)
 
-**Running:** `python -m stock_bot.main` — advisory only, no execution
+**Status:** STABLE ✅ — Phase 6 complete
 
-**Phase:** 6 of 6 complete (all phases built)
+**Running:** `python -m stock_bot.main` — paper trading active
+
+**Last session (2026-06-19):** Stability fixes
+- Reverted session management from price_feed.py (broke yfinance)
+- Reverted ticker.info company name lookup (2-3s penalty per symbol)
+- Added price validation in paper.py buy(): type check, 0 < price < 500k, shares < 100k
+- Added state corruption guard in _load_state(): rejects cash > $1M or |realized_pnl| > $1M
+- Added int(shares) storage in portfolio tracker
+- Screener price filter: $5–$200 (universe symbols)
+- Max 4 positions enforced in main.py
+- Stop loss -5% / take profit +12% using fresh fetch_candles per position
+- WATCHLIST changed to HOOD,MRNA,NCLH,AC.TO,CCL,INTC (affordable at $1k)
 
 **Active config:**
-- `AI_PROVIDER=ollama_cloud` | `OLLAMA_MODEL=llama3.2` | `OLLAMA_CLOUD_API_KEY` set
-- `WATCHLIST=SHOP.TO,RY.TO,AAPL,NVDA,AC.TO` | `INTERVAL=1d` | `LOOKBACK_DAYS=200`
-- Reddit: no credentials set (sentiment skipped gracefully)
-- `UNIVERSE_ENABLED=false` by default; set to `true` to enable S&P500+TSX60 top-mover scanning
-- Dashboard written to `stock_dashboard.html` in repo root every cycle
+- `PAPER_STARTING_CASH=1000.00` | `PAPER_RISK_PCT=0.25` | `PAPER_MIN_CONFIDENCE=70`
+- `UNIVERSE_SIZE=10` | `WATCHLIST=HOOD,MRNA,NCLH,AC.TO,CCL,INTC`
+- `AI_PROVIDER=nvidia_nim` | `NVIDIA_MODEL=openai/gpt-oss-120b`
 
-**What's running (as of 2026-06-16):**
-- Indicators + research + AI verdict per symbol
-- HTML dashboard: two-section layout — 📋 My Watchlist (blue) + 🔥 Top Movers (green)
-- Alerts: terminal box with source tag (watchlist vs top mover)
-- Paper trading: off by default (`PAPER_TRADING_ENABLED=false`)
-- Source separation: `ScanResult.source` + `Alert.source` flow through entire pipeline
+**Real portfolio (display only, no paper trading):**
+- BMO.TO: 5 shares @ $66.10 | CM.TO: 4 @ $41.15 | SPCX: 2 @ $160.00
+- EBON: 3 @ $1.95 | IGC: 50 @ $0.2799
 
-**Next steps for stock bot:**
-1. Enable universe scanner (`UNIVERSE_ENABLED=true`) and monitor top-mover quality
-2. Wire Reddit credentials if sentiment data is wanted
-3. Consider Questrade paper API when ready for real broker integration
+**Next for stock bot:**
+1. Accumulate 30-50 paper trades and compare paper PF/win rate to real behavior
+2. Stock bot backtester (Part 2 of this session)
+3. Validate paper P&L after 1 week of clean runs
 
 ---
 
 ## Crypto Bot (bot/)
 
-**Running:** `python -m bot.main` — Kraken BTC/CAD, 1h candles, IndicatorStrategy, LiveExecutor (LIVE_TRADING=true, DRY_RUN=false)
+**Status:** LIVE on Kraken BTC/CAD
 
-**Open position:**
-- BUY 0.000108 BTC/CAD @ $92,050.90 (filled 2026-06-15 07:00 UTC)
-- Stop-loss: ~$90,671 (1.5% below entry) — checked every 30s tick
-- Take-profit: ~$96,143 (4.5% above entry) — checked every 30s tick
-- Fee paid: $0.0795 CAD (0.80% — consistent with first fill)
-- Cash remaining: $89.79 CAD
-- Last candle close (20:00 UTC): $93,078.80 → unrealized PnL ≈ +$0.11 CAD
+**Known issue:** Actual fee 0.80% vs 0.26% modeled — maker orders (limit) may reduce to 0.16%
 
-**Restart at 17:25 UTC — all 4 checks passed:**
-1. `State restored: cash=89.79 pos=0.000108 cost_basis=92050.90` ✓
-2. `PositionManager seeded: qty=0.000108 avg_entry=92050.90` ✓
-3. `State machine recovered to LONG | entry=92050.90` ✓
-4. Warmup replayed correctly; first new candle awaited
+**Next steps:**
+1. Accumulate 30-50 live trades and compare live PF/win rate to backtest
+2. Verify Kraken fee: test limit order to confirm 0.16% maker rate
+3. Once fee confirmed <0.20%: consider ETH/CAD expansion
+4. When capital grows to $500+: revisit RISK_PER_TRADE_PCT (lower to 2%)
 
 ---
 
-## Active .env (as of 2026-06-15 17:25 UTC)
+## Open Items (Crypto)
 
-| Setting | Value | Notes |
-|---|---|---|
-| EXCHANGE | kraken | Live only; binance for backtests |
-| SYMBOL | BTC/CAD | |
-| CANDLE_MINUTES | 60 | 1h candles |
-| ADX_THRESHOLD | 18.0 | Validated best across all sweep configs |
-| RSI_FILTER_ENABLED | **true** | Restored 2026-06-15 ~17:25 UTC (was false — mistake) |
-| VOLUME_K | 0 | Disabled — tested 1.2, hurt PF |
-| STOP_LOSS_PCT | 0.015 | Updated 2026-06-15 (was 0.02) |
-| TAKE_PROFIT_PCT | 0.045 | Updated 2026-06-15 (was 0.04) |
-| RISK_PER_TRADE_PCT | 0.10 | High intentionally at $100 capital |
-| RISK_MAX_POSITION_PCT | 0.15 | |
-| LIVE_TRADING | true | |
-| DRY_RUN | false | |
+1. **Verify fee path** — Kraken 0.80% actual vs 0.26% modeled. Test limit order (maker) for 0.16% rate.
+2. **ETH expansion** — deferred until fee path confirmed <0.20%
 
 ---
 
-## What Was Validated This Session (2026-06-15)
+## Active .env — Crypto Bot (bot/.env)
 
-**SL/TP sweep — winner: SL=1.5% / TP=4.5% (1:3 ratio)**
-
-| Config | Trades | PF | Max DD | Return |
-|---|---|---|---|---|
-| SL=2% TP=4% (1:2) | 85 | 1.06 | -2.13% | -1.12% |
-| **SL=1.5% TP=4.5% (1:3) ← ACTIVE** | **86** | **1.38** | **-1.37%** | **+1.51%** |
-| SL=2% TP=6% (1:3) | 72 | 1.20 | -1.94% | +0.36% |
-| SL=1% TP=3% (1:3) | 110 | 0.88 | -3.46% | -3.13% |
-
-**ADX sweep — ADX=18 confirmed best (no change needed)**
-
-| ADX | 5000c PF | 5000c Return | 2000c PF |
-|---|---|---|---|
-| 18 (active) | **1.38** | **+1.51%** | 1.02 |
-| 25 | 1.03 | -0.86% | 1.04 |
-| 30 | 0.89 | -1.39% | 0.52 |
-| 35 | 1.09 | -0.29% | 1.00 |
-
-**RSI filter — must be true**
-
-| RSI_FILTER_ENABLED | Trades | PF | Return |
-|---|---|---|---|
-| false (was live) | 107 | 1.19 | -0.10% |
-| **true (now live)** | **86** | **1.38** | **+1.51%** |
-
-**Volume filter — disabled (VOLUME_K=0)**
-
-| VOLUME_K | Trades | PF | Return |
-|---|---|---|---|
-| 0 (disabled, active) | 86 | 1.38 | +1.51% |
-| 1.2 (tested) | 68 | 1.00 | -1.28% |
-
-**Walk-forward (5 × 1000-candle windows, SL=1.5% TP=4.5%):**
-- W1 full 5000 (Mar 2024–Jun 2026): PF 1.38, +1.51% ✓
-- W2 4000 (Aug 2024–Jun 2026): PF 1.41, +1.39% ✓
-- W3 3000 (Feb 2025–Jun 2026): PF 1.30, +0.41% ✓
-- W4 2000 (Jul 2025–Jun 2026): PF 1.02, -0.50% — recent regime choppier
-- W5 1000 (Dec 2025–Jun 2026): PF 1.06, -0.24% — thin sample (16 trades)
-- **Conclusion:** strategy earns across older periods; recent 6 months is a market condition issue, not a code/filter problem. Watch live trades for confirmation.
-
----
-
-## Open Items (Manual Follow-Up Required)
-
-1. **Verify Jun 11 fill close on Kraken** — History → Trades, look for SELL ~Jun 14 10:44 UTC. Balance evidence: exchange showed $99.81 at Jun 13 23:59 restart (was $89.88 saved) → position closed between Jun 12 08:20 and Jun 13 23:59 while bot was stopped.
-
-2. **Isolate dev/test from production API** — Jun 14 test burst sent real orders (BUY/SELL 0.001 BTC) to live Kraken key. Test harness must never use production credentials.
-
-3. **Kraken fee investigation** — 0.80% actual vs 0.26% modeled on both fills. Likely BTC/CAD FX surcharge. Maker orders (limit) = 0.16% tier. Fee situation means strategy is net-negative at current $100 capital even with good PF signal.
-
----
-
-## Next Steps
-
-1. **Hold current position** — do not change SL/TP mid-trade. Wait for $90,671 SL or $96,143 TP
-2. **After position closes:** compare live PF/win rate to backtest baseline
-3. **Kraken fee lever:** test a limit order (maker) to confirm 0.16% rate
-4. **When capital grows to $500+:** revisit RISK_PER_TRADE_PCT (lower to 2% validated level)
-5. **ETH expansion:** deferred until fee path confirmed <0.20%
+| Setting | Value |
+|---|---|
+| EXCHANGE | kraken |
+| SYMBOL | BTC/CAD |
+| CANDLE_MINUTES | 60 |
+| ADX_THRESHOLD | 18 |
+| RSI_FILTER_ENABLED | true |
+| VOLUME_K | 0 |
+| STOP_LOSS_PCT | 0.015 |
+| TAKE_PROFIT_PCT | 0.045 |
+| RISK_PER_TRADE_PCT | 0.10 |
+| LIVE_TRADING | true |
+| DRY_RUN | false |

@@ -117,7 +117,7 @@ class PortfolioTracker:
                 logger.warning("Portfolio: invalid avg_cost for %s: %s — skipping", sym, avg_cost)
                 continue
 
-            self._holdings.append((sym, shares, avg_cost))
+            self._holdings.append((sym, int(shares), avg_cost))
 
         if self._holdings:
             logger.info("Portfolio loaded: %d position(s): %s",

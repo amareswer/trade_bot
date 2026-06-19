@@ -7,18 +7,19 @@ metadata:
 
 ## What it is
 
-Advisory-only stock research + AI analysis bot living in `stock_bot/` inside the same repo as the crypto bot. No execution, no real money. Runs independently with `python -m stock_bot.main`. Writes `stock_dashboard.html` every cycle.
+Advisory + paper trading stock research bot living in `stock_bot/` inside the same repo as the crypto bot.
+Runs independently: `python -m stock_bot.main`. Writes `stock_dashboard.html` every cycle.
 
-## Phase status (as of 2026-06-16)
+## Phase status (as of 2026-06-19)
 
 | Phase | Status | What it does |
 |---|---|---|
 | 1 | ✅ Built | yfinance price feed → RSI, MACD, EMA trend, ADX per symbol |
-| 2 | ✅ Built | Web research: RSS news, Reddit sentiment, earnings, CNN Fear & Greed |
-| 3 | ✅ Built | AI analysis engine: multi-provider (OpenRouter / Ollama local / Ollama cloud) |
-| 4 | ✅ Built | HTML dashboard: per-symbol cards, portfolio table, Fear & Greed meter, alerts panel |
+| 2 | ✅ Built | Web research: RSS news, sentiment from headlines, earnings, CNN Fear & Greed |
+| 3 | ✅ Built | AI analysis engine: nvidia_nim primary, openrouter fallback |
+| 4 | ✅ Built | HTML dashboard: watchlist (blue) + top movers (green) sections |
 | 5 | ✅ Built | Alerts: STRONG_BUY/SELL, EARNINGS_SOON, RSI extremes — terminal + email + desktop |
-| 6 | ✅ Built | Paper trading executor, portfolio tracker, universe scanner (S&P500+TSX60), screener |
+| 6 | ✅ Built | Paper trading ($1,000, max 4 positions), universe scanner, screener, stop loss/take profit |
 
 ## Run command
 
@@ -32,15 +33,51 @@ Dashboard written to `stock_dashboard.html` in repo root after every cycle.
 
 `stock_bot/.env` is **separate** from root `.env` (crypto bot). Never merge them.
 - `OPENROUTER_API_KEY` lives in root `.env` — `ai_engine.py` loads it separately via `load_dotenv(_ROOT_ENV, override=False)`
-- Everything else (watchlist, AI provider, alerts, paper trading, universe) lives in `stock_bot/.env`
+- Everything else lives in `stock_bot/.env`
 
-## Key design: source separation (added 2026-06-16)
-
-Symbols are tracked by origin throughout the entire pipeline:
+## Active .env (2026-06-19 — STABLE)
 
 ```
-watchlist_symbols = cfg.watchlist          # always force_scan=True
-universe_symbols  = universe.pre_filter()  # go through screener
+WATCHLIST=HOOD,MRNA,NCLH,AC.TO,CCL,INTC   # affordable at $1k, passes screener
+INTERVAL=1d
+LOOKBACK_DAYS=200
+LOOP_INTERVAL=120
+
+AI_PROVIDER=nvidia_nim
+NVIDIA_MODEL=openai/gpt-oss-120b           # fast, good quality
+AI_ENABLED=true
+
+PAPER_TRADING_ENABLED=true
+PAPER_STARTING_CASH=1000.00
+PAPER_RISK_PCT=0.25                        # $250 max per trade
+PAPER_MIN_CONFIDENCE=70                    # only high-confidence signals
+PAPER_MAX_POSITIONS=4                      # enforced in main.py
+
+UNIVERSE_ENABLED=true
+UNIVERSE_SIZE=10
+SCREENER_ENABLED=true
+
+PORTFOLIO=BMO.TO:5:66.10,CM.TO:4:41.15,SPCX:2:160.00,EBON:3:1.95,IGC:50:0.2799
+BASE_CURRENCY=CAD
+PROTECTED=BMO.TO,CM.TO,SPCX              # display only, never paper-sell
+```
+
+## Paper trading rules (enforced in code)
+
+- Max 4 open positions at once (`_MAX_POSITIONS = 4` in main.py)
+- Stop loss: -5% of entry price (`_STOP_LOSS_PCT = -0.05`)
+- Take profit: +12% of entry price (`_TAKE_PROFIT_PCT = 0.12`)
+- Min confidence: 70% for any paper trade
+- Whole shares only (`int(shares)` before every order)
+- Price guard in paper.py buy(): rejects price ≤ 0, > $500,000, or share count > 100,000
+- State validation in _load_state(): rejects cash > $1M or |realized_pnl| > $1M (corrupted state guard)
+- Screener price filter: $5–$200 only (universe symbols only; watchlist bypasses)
+
+## Key design: source separation
+
+```
+watchlist_symbols = cfg.watchlist          # always force_scan=True, bypass screener
+universe_symbols  = universe.pre_filter()  # must pass screener
 all_symbols       = deduped union of both
 
 ScanResult.source = "watchlist" | "universe"
@@ -51,19 +88,17 @@ Dashboard renders two distinct sections:
 - **📋 My Watchlist** — dark-blue header (`#1c2333`), blue card left-border (`#388bfd`)
 - **🔥 Top Movers** — dark-green header (`#1c2820`), green card left-border (`#2ea043`)
 
-Terminal alert box shows: `🟡 MEDIUM · STRONG_BUY · watchlist` or `· top mover`
-
 ## AI providers (set AI_PROVIDER in stock_bot/.env)
 
-| Provider | Auth | Model | Rate | Delay |
+| Provider | Auth | Model | Rate | Notes |
 |---|---|---|---|---|
-| `nvidia_nim` ← **ACTIVE** | `NVIDIA_API_KEY` in `stock_bot/.env` | `nvidia/nemotron-3-ultra-550b-a55b` | 40 rpm free | 1.5 s |
-| `ollama_cloud` | `OLLAMA_CLOUD_API_KEY` in `stock_bot/.env` | `gpt-oss:120b` | weekly limit | — |
-| `openrouter` | `OPENROUTER_API_KEY` in root `.env` | `meta-llama/llama-3.3-70b-instruct:free` | 10-20 rpm free | 4 s |
-| `ollama_local` | none (local server) | `OLLAMA_MODEL` (e.g. `llama3.2`) | local GPU | — |
+| `nvidia_nim` ← **ACTIVE** | `NVIDIA_API_KEY` in `.env` | `openai/gpt-oss-120b` | 40 rpm free | Primary |
+| `openrouter` | `OPENROUTER_API_KEY` in root `.env` | `meta-llama/llama-3.3-70b-instruct:free` | 10-20 rpm | Auto-fallback |
+| `ollama_cloud` | `OLLAMA_CLOUD_API_KEY` in `.env` | `gpt-oss:120b` | weekly limit | Backup |
+| `ollama_local` | none | `OLLAMA_MODEL` | local GPU | Dev only |
 
-nvidia_nim uses `openai` SDK with `stream=True` (mandatory — 550B model times out without streaming).
-On first failure, automatically falls back to openrouter and logs warning.
+nvidia_nim uses `openai` SDK with `stream=True` (mandatory — model times out without streaming).
+On first nvidia failure, automatically falls back to openrouter.
 
 ## AI verdict rules
 
@@ -84,46 +119,55 @@ On first failure, automatically falls back to openrouter and logs warning.
 | RSI_OVERBOUGHT | RSI > 75 on owned symbol | HIGH |
 | RSI_OVERSOLD | RSI < 25 on owned symbol | HIGH |
 
-Delivery: terminal box (always), Gmail SMTP (opt-in HIGH only), plyer desktop (opt-in HIGH only).
-
 ## Universe scanner
 
 `data/universe.py` — StockUniverse
 - Fetches S&P500 + TSX60 symbols from Wikipedia
 - Ranks by `volume × |price_change|` (momentum × volume)
-- Returns top N (default 20) as `universe_symbols`
-- TTL cache: refreshes every `UNIVERSE_REFRESH_HOURS` (default 24)
+- Returns top 10 (UNIVERSE_SIZE=10) as `universe_symbols`
+- TTL cache: refreshes every 24 hours
 
-`data/screener.py` — StockScreener  
-- Gate applied to universe symbols only (not watchlist)
-- Filters out low-momentum stocks before running AI
-- `force_scan=True` bypasses screener for watchlist symbols
+`data/screener.py` — StockScreener
+- Applied to universe symbols ONLY (watchlist bypasses)
+- Price range filter: `_MIN_PRICE = 5.0`, `_MAX_PRICE = 200.0`
+- Technical filter: RSI extremes, MACD cross, ≥3% price move (any one passes)
 
-## Known issues / watch items
+## What was reverted and why (2026-06-19 stability session)
 
-- Yahoo Finance RSS returns generic finance headlines for some tickers; Google News RSS is more targeted
-- OpenRouter free tier (`llama-3.3-70b-instruct:free`) hits 429 rate limits under rapid successive calls; bot handles gracefully with HOLD fallback
-- Reddit sentiment returns "no posts" when credentials are blank — expected, not a bug
-- Earnings data coverage varies: TSX symbols sometimes have no next-earnings-date from yfinance
+| What | Why reverted | Lesson |
+|---|---|---|
+| Custom `_get_fresh_session()` + `requests.Session()` in price_feed.py | Broke all price fetches — yfinance manages its own session internally | Never add custom session management to yfinance |
+| `ticker.info` / `fast_info` company name lookup in price_feed.py | Added 2-3s penalty per symbol per cycle | Use `symbol.replace(".TO", "")` only — simple and fast |
+| `_name_cache` + `get_cached_name()` in price_feed.py | Unnecessary — name is only used for display | Removed entirely; aggregator.py now returns `symbol.replace(".TO", "")` |
+
+## Known issues
+
+- Yahoo Finance crumb (401) errors on cycle 2+ when yfinance session expires between cycles — bot handles gracefully (returns None, skips symbol, continues)
+- On US market holidays, yfinance returns NaN or stale cross-contaminated prices — resolved on next trading day
+- TSX symbols (AC.TO, BMO.TO) sometimes return no data on US holiday despite TSX being open
+- EBON ($1.95) and IGC ($0.2799) in PORTFOLIO are penny stocks — screener would reject them as universe symbols (price < $5), but they're watchlist and pass through to display-only portfolio section
+- SPCX: no earnings data (may be delisted from yfinance index)
+- OpenRouter free tier hits 429 under rapid calls — bot handles with HOLD fallback
 
 ## File map
 
 ```
 stock_bot/
   data/
-    price_feed.py     ← yfinance OHLCV, Candle dataclass, TSX .TO transparent
+    price_feed.py     ← yfinance OHLCV (plain yf.download only — NO session management)
     watchlist.py      ← default symbol list + parser
     universe.py       ← StockUniverse: S&P500+TSX60 ranked by volume×momentum
-    screener.py       ← StockScreener: momentum gate for universe symbols
+    screener.py       ← StockScreener: price filter ($5-$200) + momentum gate
   indicators/
     indicators.py     ← RSI, EMA, SMA, ADX, MACD — pure functions
   research/
     news_fetcher.py   ← RSS headlines (Yahoo Finance + Google News), 5 per symbol
-    reddit_scraper.py ← praw, 5 subreddits, keyword sentiment score
+    sentiment_scraper.py ← headline sentiment scoring
     earnings.py       ← yfinance next earnings date + EPS actual vs estimate
     fear_greed.py     ← CNN Fear & Greed index, 1-hour module-level cache
     google_trends.py  ← PyTrends 7-day interest score per symbol
-    aggregator.py     ← ThreadPoolExecutor(3), ResearchReport dataclass
+    aggregator.py     ← ThreadPoolExecutor(2), ResearchReport dataclass
+                         get_company_name() = symbol.replace(".TO", "") — no API call
   ai/
     verdict.py        ← AIVerdict dataclass
     prompt_builder.py ← assembles indicators + research into <800-token prompt
@@ -135,12 +179,21 @@ stock_bot/
     evaluator.py      ← AlertEvaluator: runs all checks each cycle
     notifier.py       ← AlertNotifier: terminal + email + desktop delivery
   portfolio/
-    tracker.py        ← PortfolioTracker (static holdings), PortfolioSummary
+    tracker.py        ← PortfolioTracker (static PORTFOLIO env var holdings)
+                         Validates: shares 0-100k, avg_cost 0-100k, stores int(shares)
   execution/
-    paper.py          ← StockPaperExecutor: virtual cash, paper buy/sell, realized PnL
+    paper.py          ← StockPaperExecutor: virtual $1k, paper buy/sell, realized PnL
+                         Guards: price type check, price 0-500k, shares 0-100k
+                         State guard: rejects cash>$1M or |realized_pnl|>$1M on load
     base.py           ← Order, OrderStatus base types
   config.py           ← StockConfig from stock_bot/.env, all settings + validation
-  main.py             ← entry point — scan loop, terminal output, dashboard render
+  main.py             ← entry point — scan loop, stop loss/take profit, max positions, dashboard
   .env                ← local config (not committed)
   .env.example        ← template with all options documented
 ```
+
+## Next steps
+
+1. Accumulate 30-50 paper trades and compare paper PF/win rate to real market behavior
+2. Consider backtester for stock bot (Part 2 of this stability session)
+3. ETH/BTC universe expansion once stock paper trading is validated
