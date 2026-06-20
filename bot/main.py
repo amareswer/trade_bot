@@ -600,8 +600,7 @@ def run():
         if filtered_signal == Signal.SELL:
             trade_qty = executor.position
         else:
-            _sl_price = price * (1 - cfg.backtest.stop_loss_pct) if cfg.backtest.stop_loss_pct > 0 else 0.0
-            trade_qty = cfg.calc_trade_qty_sl(executor.cash, price, _sl_price)
+            trade_qty = cfg.calc_trade_qty(executor.cash, price)
 
         # ── 7. AI advisory (optional) ──────────────────────────────────
         advice       = None

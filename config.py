@@ -136,10 +136,15 @@ class RiskConfig:
 
     def __post_init__(self):
         errors = []
-        if not 0 < self.risk_per_trade_pct <= 0.10:
-            errors.append("RISK_PER_TRADE_PCT must be between 0% and 10%")
-        if not 0 < self.max_position_pct <= 0.50:
-            errors.append("RISK_MAX_POSITION_PCT must be between 0% and 50%")
+        # Raised from 10%/50% — small account ($100 CAD) needs 50% position
+        # sizing to overcome Kraken's fixed 0.80% fee per round trip.
+        # At $100 capital, 10% trade size ($10) is consumed by fees before
+        # any profit is possible. 50% trade size ($50) makes fee = 1.6% of
+        # trade, which TP=10% can overcome.
+        if not 0 < self.risk_per_trade_pct <= 0.75:
+            errors.append("RISK_PER_TRADE_PCT must be between 0% and 75%")
+        if not 0 < self.max_position_pct <= 0.80:
+            errors.append("RISK_MAX_POSITION_PCT must be between 0% and 80%")
         if not 0 < self.daily_loss_limit_pct <= 0.20:
             errors.append("RISK_DAILY_LOSS_LIMIT must be between 0% and 20%")
         if not 0 < self.max_drawdown_pct <= 0.50:
