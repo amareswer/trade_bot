@@ -316,10 +316,12 @@ class AIEngine:
 
     def analyze(
         self,
-        symbol:     str,
+        symbol:          str,
         candle,
-        indicators: dict,
-        research:   ResearchReport,
+        indicators:      dict,
+        research:        ResearchReport,
+        stop_loss_pct:   float = 0.05,
+        take_profit_pct: float = 0.12,
     ) -> AIVerdict:
         """
         Analyze one symbol and return a verdict.
@@ -328,7 +330,8 @@ class AIEngine:
         if not self.enabled:
             return _hold_verdict(symbol, "AI unavailable — provider not configured")
 
-        prompt = build_prompt(symbol, candle, indicators, research)
+        prompt = build_prompt(symbol, candle, indicators, research,
+                              stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct)
         t0     = time.monotonic()
         raw    = ""
 

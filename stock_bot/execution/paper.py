@@ -20,6 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+from stock_bot.data.price_feed import get_sector
 from stock_bot.execution.base import (
     OrderSide, OrderStatus, StockExecutorBase, StockOrder,
 )
@@ -29,7 +30,8 @@ from stock_bot.portfolio.tracker import (
 
 logger = logging.getLogger(__name__)
 
-_STOCK_BOT_DIR = os.path.dirname(os.path.dirname(__file__))  # stock_bot/
+_STOCK_BOT_DIR   = os.path.dirname(os.path.dirname(__file__))  # stock_bot/
+_MAX_PER_SECTOR  = 2   # max open positions in any single sector
 _TRADES_CSV    = os.path.join(_STOCK_BOT_DIR, "paper_trades.csv")
 _STATE_JSON    = os.path.join(_STOCK_BOT_DIR, "paper_state.json")
 _RESET_FLAG    = os.path.join(_STOCK_BOT_DIR, ".paper_reset")
@@ -156,6 +158,22 @@ class StockPaperExecutor(StockExecutorBase):
 
         shares = int(shares)  # stocks trade in whole shares only
         order  = self._new_order(sym, OrderSide.BUY, shares, price)
+
+        # Sector concentration check — don't pile into the same industry
+        if sym not in self._positions:   # only gate new positions, not add-ons
+            sector = self._sector_of(sym)
+            if self._sector_count().get(sector, 0) >= _MAX_PER_SECTOR:
+                order.status        = OrderStatus.REJECTED
+                order.reject_reason = (
+                    f"Sector limit: already {_MAX_PER_SECTOR} open positions "
+                    f"in '{sector}'"
+                )
+                logger.warning(
+                    "PAPER BUY BLOCKED  %s — sector '%s' at limit %d",
+                    sym, sector, _MAX_PER_SECTOR,
+                )
+                self._orders.append(order)
+                return order
 
         if shares > 100_000:
             order.status        = OrderStatus.REJECTED
@@ -467,6 +485,23 @@ class StockPaperExecutor(StockExecutorBase):
                 ])
         except OSError as exc:
             logger.warning("Could not write to paper_trades.csv: %s", exc)
+
+    # ── Sector helpers ────────────────────────────────────────────────────────
+
+    def _sector_of(self, symbol: str) -> str:
+        return get_sector(symbol)
+
+    def _sector_count(self) -> dict[str, int]:
+        """Return {sector: open_position_count} for current portfolio."""
+        counts: dict[str, int] = {}
+        for sym in self._positions:
+            sector = self._sector_of(sym)
+            counts[sector] = counts.get(sector, 0) + 1
+        return counts
+
+    def get_sector_exposure(self) -> dict[str, int]:
+        """Public view of sector concentration in open positions."""
+        return self._sector_count()
 
     # ── Internal ─────────────────────────────────────────────────────────────
 

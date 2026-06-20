@@ -23,6 +23,31 @@ MINIMUM_VALID_PRICE = 1.00  # reject any candle set whose latest close is below 
 # Module-level cache reset each scan cycle via reset_price_cache()
 _last_prices: dict[str, float] = {}
 
+# Sector cache — persists for the process lifetime (one yfinance call per symbol)
+_sector_cache: dict[str, str] = {}
+
+
+def get_sector(symbol: str) -> str:
+    """
+    Fetch the sector for a symbol from yfinance.
+    Returns a normalized lowercase sector string.
+    Falls back to "other" on any failure.
+    Cached in _sector_cache to avoid repeat API calls.
+    """
+    sym = symbol.upper()
+    if sym in _sector_cache:
+        return _sector_cache[sym]
+    try:
+        info = yf.Ticker(sym).info
+        sector = info.get("sector", "") or ""
+        normalized = sector.lower().strip()
+        if not normalized:
+            normalized = "other"
+        _sector_cache[sym] = normalized
+    except Exception:
+        _sector_cache[sym] = "other"
+    return _sector_cache[sym]
+
 
 # ---------------------------------------------------------------------------
 # Data model

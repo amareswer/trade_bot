@@ -198,9 +198,9 @@ class DashboardConfig:
 class BacktestConfig:
     timeframe:       str   = "4h"
     limit:           int   = 5000    # paginated — up to 5000 candles
-    fee_pct:         float = 0.001   # 0.1% per trade
-    stop_loss_pct:   float = 0.02    # exit if price drops 2% from entry (0 = disabled)
-    take_profit_pct: float = 0.04    # exit if price rises 4% from entry (0 = disabled)
+    fee_pct:         float = 0.008   # 0.8% Kraken taker fee (validated 2026-06-19)
+    stop_loss_pct:   float = 0.015   # exit if price drops 1.5% from entry (0 = disabled)
+    take_profit_pct: float = 0.10    # exit if price rises 10% from entry (0 = disabled)
 
     _VALID_TIMEFRAMES = {"1m","5m","15m","30m","1h","2h","4h","6h","12h","1d","1w"}
 
@@ -362,9 +362,9 @@ def _load() -> AppConfig:
         backtest=BacktestConfig(
             timeframe       = _str  ("BACKTEST_TIMEFRAME", "4h"),
             limit           = _int  ("BACKTEST_LIMIT",     5000),
-            fee_pct         = _float("BACKTEST_FEE_PCT",   0.001),
-            stop_loss_pct   = _float("STOP_LOSS_PCT",      0.02),
-            take_profit_pct = _float("TAKE_PROFIT_PCT",    0.04),
+            fee_pct         = _float("BACKTEST_FEE_PCT",   0.008),
+            stop_loss_pct   = _float("STOP_LOSS_PCT",      0.015),
+            take_profit_pct = _float("TAKE_PROFIT_PCT",    0.10),
         ),
     )
 

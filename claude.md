@@ -210,11 +210,28 @@ SELL signals do meaningful work, reducing fee sensitivity.
 - `volume_k` field wired through IndicatorConfig → StrategyConfig → AppConfig → engine.py → backtest.py → main.py
   (set VOLUME_K=0 to disable; VOLUME_K=1.2 requires current candle volume ≥ 1.2× avg of prior 3)
 
+### Bug fixes applied 2026-06-20
+All critical bugs resolved:
+
+**Crypto bot (bot/):**
+- `bot/risk/risk_manager.py`: HALT gate now only blocks BUY — SELL always allowed (positions can close during halt)
+- `bot/backtest/engine.py`: Added `forced_exit` flag — SL/TP triggers bypass cooldown state machine (stop-losses were being suppressed)
+- `walkforward.py` + `montecarlo.py`: ADX threshold corrected 15.0 → 18.0 (was testing wrong strategy vs live)
+- `config.py`: Defaults corrected — fee 0.001→0.008, SL 0.02→0.015, TP 0.04→0.10 (both dataclass and _load())
+- `bot/backtest/report.py`: Added Buy-and-Hold benchmark section with alpha comparison
+
+**Stock bot (stock_bot/):**
+- `stock_bot/data/screener.py`: Removed $200 price cap (was blocking NVDA, AAPL, MSFT); RSI_OVERBOUGHT 70→75; price filter long-only (abs→positive)
+- `stock_bot/main.py`: Added 5% sanity check on live_price vs candle_close — TSX fast_info currency mismatch caused impossible P&L like +921%
+- `stock_bot/research/sentiment_scraper.py`: Replaced 12-word flat keyword list with phrase-pattern rules + negation detection window (3 tokens)
+
 ### Next steps remaining
 1. Accumulate 30–50 live trades on Kraken BTC/CAD — compare live PF/win rate to backtest
 2. Verify Jun 11 position close price on Kraken (History → Trades, SELL ~Jun 14 10:44 UTC)
 3. Investigate Kraken fee: actual 0.80% vs 0.26% modeled — maker orders (limit) may reduce to 0.16%
 4. Once fee confirmed <0.20%: consider ETH/CAD expansion
+5. Add oversold recovery candidates to universe pre_filter (currently selects only momentum leaders which AI then rejects as overbought)
+6. Add 5-day earnings blackout gate to stock_bot BUY block (avoid buying 5 days before earnings date)
 - Can evolve into a professional-grade trading platform
 ## Exchange Setup
 - Backtesting: EXCHANGE=binance, SYMBOL=BTC/USDT

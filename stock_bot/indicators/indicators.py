@@ -173,7 +173,11 @@ def adx(
     return adx_val
 
 
-def trend(prices: list[float], fast_period: int = 9, slow_period: int = 21) -> str:
+# Two-candle EMA confirmation: a crossover must hold for 2 consecutive
+# candles before signaling BULLISH/BEARISH. Reduces whipsaws on daily bars
+# where a single noisy candle can produce a false crossover.
+def trend(prices: list[float], fast_period: int = 9, slow_period: int = 21,
+          prev_trend: str | None = None) -> str:
     """
     Trend direction via EMA crossover.
     Returns "BULLISH", "BEARISH", or "NEUTRAL".
@@ -184,7 +188,15 @@ def trend(prices: list[float], fast_period: int = 9, slow_period: int = 21) -> s
         return "NEUTRAL"
     band = slow * 0.0001
     if fast > slow + band:
-        return "BULLISH"
-    if fast < slow - band:
-        return "BEARISH"
-    return "NEUTRAL"
+        current = "BULLISH"
+    elif fast < slow - band:
+        current = "BEARISH"
+    else:
+        return "NEUTRAL"
+
+    # Require one prior candle of the same direction before confirming.
+    # Suppresses the first candle of a new crossover and direction reversals.
+    opposite = "BEARISH" if current == "BULLISH" else "BULLISH"
+    if prev_trend is None or prev_trend == opposite:
+        return "NEUTRAL"
+    return current

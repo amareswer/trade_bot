@@ -157,6 +157,7 @@ def run(
         # ── Stop-loss / take-profit override ─────────────────────────
         exit_reason = "strategy"
         exit_price  = price
+        forced_exit = False
         if executor.position > 0 and entry_price > 0:
             sl_level = entry_price * (1 - stop_loss_pct) if stop_loss_pct > 0 else None
             tp_level = entry_price * (1 + take_profit_pct) if take_profit_pct > 0 else None
@@ -164,12 +165,17 @@ def run(
                 raw_signal  = Signal.SELL
                 exit_reason = "stop_loss"
                 exit_price  = sl_level
+                forced_exit = True
             elif tp_level is not None and candle.high >= tp_level:
                 raw_signal  = Signal.SELL
                 exit_reason = "take_profit"
                 exit_price  = tp_level
+                forced_exit = True
 
         filtered_signal, _ = state_machine.filter_signal(raw_signal)
+        # SL/TP must never be suppressed by cooldown — always force the exit
+        if forced_exit and filtered_signal != Signal.SELL:
+            filtered_signal = Signal.SELL
 
         if filtered_signal == Signal.SELL:
             trade_qty = executor.position

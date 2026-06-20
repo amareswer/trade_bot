@@ -2,6 +2,10 @@
 AIVerdict dataclass — the structured output of one AI analysis call.
 
 Advisory only. Never triggers execution.
+
+stop_loss and target_price are code-calculated from cfg.paper_stop_loss_pct /
+cfg.paper_take_profit_pct and injected into the prompt — the AI copies them
+verbatim rather than inventing its own levels.
 """
 from __future__ import annotations
 

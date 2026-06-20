@@ -38,12 +38,19 @@ def _macd_note(macd_line: float | None, macd_signal: float | None) -> str:
 
 
 def build_prompt(
-    symbol:     str,
-    candle,                  # stock_bot.data.price_feed.Candle
-    indicators: dict,        # keys: rsi, trend, adx, macd_line, macd_signal
-    research:   ResearchReport,
+    symbol:          str,
+    candle,                           # stock_bot.data.price_feed.Candle
+    indicators:      dict,            # keys: rsi, trend, adx, macd_line, macd_signal
+    research:        ResearchReport,
+    stop_loss_pct:   float = 0.05,
+    take_profit_pct: float = 0.12,
 ) -> str:
     price       = candle.close
+    sl_price    = round(price * (1 - stop_loss_pct),   2)
+    tp_price    = round(price * (1 + take_profit_pct), 2)
+    sl_pct_str  = f"{stop_loss_pct  * 100:.1f}%"
+    tp_pct_str  = f"{take_profit_pct * 100:.1f}%"
+
     rsi         = indicators.get("rsi")
     trend       = indicators.get("trend") or "NEUTRAL"
     macd_line   = indicators.get("macd_line")
@@ -114,6 +121,10 @@ RSI (14): {rsi_str} → {_rsi_note(rsi)}
 Trend (EMA 9/21): {trend}
 MACD: {macd_l_str} / Signal: {macd_s_str} → {_macd_note(macd_line, macd_signal)}
 
+Pre-calculated risk levels (use these exactly — do not invent alternatives):
+  Stop loss:   ${sl_price} ({sl_pct_str} below current price)
+  Take profit: ${tp_price} ({tp_pct_str} above current price)
+
 === NEWS (last 3 headlines) ===
 {news_block}
 
@@ -132,12 +143,12 @@ CNN Fear & Greed Index: {fg.score} — {fg.label}
 
 === YOUR TASK ===
 Respond ONLY with a JSON object. No markdown, no explanation outside the JSON.
-Use this exact structure:
+Use this exact structure (stop_loss and target_price are pre-calculated — copy them verbatim):
 {{
   "signal": "BUY" | "SELL" | "HOLD",
   "confidence": <integer 0-100>,
-  "target_price": <float or null>,
-  "stop_loss": <float or null>,
+  "target_price": {tp_price},
+  "stop_loss": {sl_price},
   "trading_style": "DAY" | "SWING" | "LONGTERM",
   "reasoning": "<2-4 sentences explaining the recommendation>"
 }}

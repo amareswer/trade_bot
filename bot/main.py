@@ -601,6 +601,11 @@ def run():
             trade_qty = executor.position
         else:
             trade_qty = cfg.calc_trade_qty(executor.cash, price)
+            # Safety: never use more than 98% of available cash.
+            # Prevents "Insufficient funds" from rounding at exchange.
+            max_affordable = (executor.cash * 0.98) / price
+            trade_qty = min(trade_qty, max_affordable)
+            trade_qty = round(trade_qty, 6)
 
         # ── 7. AI advisory (optional) ──────────────────────────────────
         advice       = None

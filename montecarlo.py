@@ -23,7 +23,7 @@ from bot.data.historical_feed import fetch_candles_paginated
 from bot.backtest import engine, metrics as metrics_mod
 
 VALIDATED_CONFIG = dict(
-    adx_threshold      = 15.0,
+    adx_threshold      = 18.0,
     max_ema_spread_pct = 0.005,
     rsi_filter_enabled = True,
 )
@@ -135,7 +135,7 @@ def main():
 
     if len(trade_pnls) < 10:
         print(f"  Too few trades ({len(trade_pnls)}) for Monte Carlo.")
-        print(f"  Make sure .env has ADX_THRESHOLD=15 and MAX_EMA_SPREAD_PCT=0.005\n")
+        print(f"  Make sure .env has ADX_THRESHOLD=18 and MAX_EMA_SPREAD_PCT=0.005\n")
         return
 
     starting_cash = cfg.portfolio.starting_cash

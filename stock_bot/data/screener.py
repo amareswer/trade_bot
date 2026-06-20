@@ -15,11 +15,10 @@ logger = logging.getLogger(__name__)
 
 # ── Thresholds (all configurable here, used nowhere else) ────────────────────
 RSI_OVERSOLD    = 35.0    # RSI below this → potential buy signal
-RSI_OVERBOUGHT  = 70.0    # RSI above this → potential sell signal
-PRICE_MOVE_PCT  = 3.0     # % move in latest candle vs previous to flag
+RSI_OVERBOUGHT  = 75.0    # RSI above this → potential sell signal (synced with AI hard rule)
+PRICE_MOVE_PCT  = 3.0     # % upward move in latest candle vs previous to flag
 MACD_LOOKBACK   = 3       # candles back to check for a cross
 _MIN_PRICE      = 5.0     # no penny stocks — below this price, skip
-_MAX_PRICE      = 200.0   # affordable at $1k account — above this, skip
 
 
 class StockScreener:
@@ -39,9 +38,6 @@ class StockScreener:
         latest_price = candles[-1].close
         if latest_price < _MIN_PRICE:
             logger.info("%s $%.2f — below min price $%.0f, skipping", symbol, latest_price, _MIN_PRICE)
-            return False
-        if latest_price > _MAX_PRICE:
-            logger.info("%s $%.2f — above max price $%.0f, skipping", symbol, latest_price, _MAX_PRICE)
             return False
 
         if len(candles) < 26:
@@ -64,7 +60,7 @@ class StockScreener:
         # Significant single-candle price move
         if closes[-2] != 0:
             pct = (closes[-1] - closes[-2]) / closes[-2] * 100
-            if abs(pct) >= PRICE_MOVE_PCT:
+            if pct >= PRICE_MOVE_PCT:  # long-only: only upward momentum qualifies
                 logger.debug("%s screener PASS — price move %.2f%%", symbol, pct)
                 return True
 

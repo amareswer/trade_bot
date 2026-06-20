@@ -93,6 +93,7 @@ class LiveExecutor:
                         exchange_cash, quote, self._portfolio.cash,
                     )
             self._portfolio.cash = exchange_cash
+            self._sync_position(symbol)
 
             # Unmissable startup line — print() bypasses logging so it always
             # appears in the terminal regardless of log level configuration.
@@ -165,6 +166,39 @@ class LiveExecutor:
             msg = str(exc)
             logger.warning("_sync_cash failed: %s — using starting_cash=%.2f", msg, self._starting_cash)
             return self._starting_cash, msg
+
+    def _sync_position(self, symbol: str) -> None:
+        """
+        On startup, detect exchange-held base currency that the saved state
+        doesn't reflect (e.g. bot restarted mid-fill or after a manual trade).
+        If exchange holds BTC but saved position=0, reseed at current ticker price.
+        """
+        base = symbol.split("/")[0]
+        try:
+            balance      = self._exchange.fetch_balance()
+            exchange_qty = float(balance.get("free", {}).get(base, 0.0))
+        except Exception as exc:
+            logger.warning("_sync_position: fetch_balance failed — %s", exc)
+            return
+
+        if exchange_qty > 1e-6 and self._portfolio.position < 1e-9:
+            try:
+                current_price = float(self._exchange.fetch_ticker(symbol)["last"])
+            except Exception:
+                current_price = 0.0
+            self._portfolio.position    = exchange_qty
+            self._portfolio._cost_basis = current_price
+            logger.warning(
+                "STATE MISMATCH: exchange holds %.6f %s but saved state=0. "
+                "Reseeded at current price %.2f",
+                exchange_qty, base, current_price,
+            )
+            print(
+                f"  POSITION RESEEDED: {exchange_qty:.6f} {base}"
+                f" @ ${current_price:,.2f}"
+                f" (exchange vs saved-state mismatch)",
+                flush=True,
+            )
 
     # ── State persistence ─────────────────────────────────────────────
 

@@ -27,7 +27,7 @@ import pytz as _pytz
 from datetime import datetime, date, timedelta
 
 from stock_bot.config import load
-from stock_bot.data.price_feed    import fetch_candles, reset_price_cache
+from stock_bot.data.price_feed    import fetch_candles, reset_price_cache, get_sector
 from stock_bot.data.intraday_price import get_live_price
 from stock_bot.data.universe  import StockUniverse
 from stock_bot.data.screener  import StockScreener
@@ -182,6 +182,7 @@ def _fetch_symbol_data(
     screener:      StockScreener | None,
     watchlist_set: set[str],
     market_status: dict | None = None,
+    prev_trend:    str | None  = None,
 ) -> dict | None:
     """
     Fetch candles + compute indicators. Returns:
@@ -207,7 +208,7 @@ def _fetch_symbol_data(
     lows   = [c.low   for c in candles]
 
     rsi_val   = calc_rsi(closes)
-    trend_val = "NEW IPO" if len(closes) < 21 else calc_trend(closes)
+    trend_val = "NEW IPO" if len(closes) < 21 else calc_trend(closes, prev_trend=prev_trend)
     adx_val   = calc_adx(highs, lows, closes)
     macd_val  = calc_macd(closes)
 
@@ -226,10 +227,12 @@ def _fetch_symbol_data(
 
 
 def _run_ai_call(
-    symbol:  str,
-    data:    dict,
-    report:  ResearchReport,
-    engine:  AIEngine,
+    symbol:          str,
+    data:            dict,
+    report:          ResearchReport,
+    engine:          AIEngine,
+    stop_loss_pct:   float = 0.05,
+    take_profit_pct: float = 0.12,
 ) -> AIVerdict:
     """Run one AI analysis call (sequential — rate limit enforced inside engine.analyze)."""
     indicators = {
@@ -239,7 +242,8 @@ def _run_ai_call(
         "macd_line":   data["macd"][0] if data["macd"] else None,
         "macd_signal": data["macd"][1] if data["macd"] else None,
     }
-    return engine.analyze(symbol, data["last_candle"], indicators, report)
+    return engine.analyze(symbol, data["last_candle"], indicators, report,
+                          stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct)
 
 
 # ---------------------------------------------------------------------------
@@ -510,6 +514,12 @@ def run() -> None:
     # ── Universe / watchlist setup ────────────────────────────────────────────
     watchlist_symbols = list(cfg.watchlist)
 
+    # Pre-warm sector cache so first scan cycle has no per-symbol delay
+    logger.info("Pre-warming sector cache for %d watchlist symbols...", len(watchlist_symbols))
+    for sym in watchlist_symbols:
+        get_sector(sym)
+    logger.info("Sector cache ready.")
+
     if cfg.universe_enabled:
         _universe = StockUniverse(refresh_hours=cfg.universe_refresh_hours)
         raw_symbols      = _universe.get_universe()
@@ -579,6 +589,7 @@ def run() -> None:
         logger.info("SL/TP watcher thread started (30s interval)")
 
     tick = 0
+    _prev_trend: dict[str, str | None] = {}
     try:
       while True:
         market_status = _get_market_status()
@@ -642,7 +653,10 @@ def run() -> None:
         price_data: dict[str, dict | None] = {}
         with ThreadPoolExecutor(max_workers=10) as ex:
             futs = {
-                ex.submit(_fetch_symbol_data, sym, cfg, screener, watchlist_set, market_status): sym
+                ex.submit(
+                    _fetch_symbol_data, sym, cfg, screener, watchlist_set,
+                    market_status, _prev_trend.get(sym),
+                ): sym
                 for sym in all_symbols
             }
             for fut in as_completed(futs):
@@ -652,6 +666,11 @@ def run() -> None:
                 except Exception as exc:
                     logger.warning("Price fetch failed for %s: %s", sym, exc)
                     price_data[sym] = None
+
+        # Update prev_trend tracking after all fetches complete
+        for sym, data in price_data.items():
+            if isinstance(data, dict) and "trend" in data:
+                _prev_trend[sym] = data["trend"]
 
         active_symbols = [
             s for s in all_symbols
@@ -687,7 +706,9 @@ def run() -> None:
                     continue
                 try:
                     ai_verdicts[sym] = _run_ai_call(
-                        sym, price_data[sym], research_data[sym], ai_engine
+                        sym, price_data[sym], research_data[sym], ai_engine,
+                        stop_loss_pct=cfg.paper_stop_loss_pct,
+                        take_profit_pct=cfg.paper_take_profit_pct,
                     )
                 except Exception as exc:
                     logger.warning("AI failed for %s: %s", sym, exc)
@@ -757,6 +778,15 @@ def run() -> None:
                 ):
                     px              = data["last_candle"].close
                     live_price      = get_live_price(symbol)
+                    # Sanity-check live price against the daily candle close.
+                    # fast_info.last_price can return a wrong currency (USD vs CAD)
+                    # or stale/corrupt data for TSX tickers — cap at ±5% deviation.
+                    if live_price and px and abs(live_price - px) / px > 0.05:
+                        logger.warning(
+                            "%s live_price $%.2f deviates >5%% from candle close $%.2f — using candle close",
+                            symbol, live_price, px,
+                        )
+                        live_price = None
                     execution_price = live_price if live_price else px
                     sig = verdict.signal
                     _MAX_POSITIONS = 4

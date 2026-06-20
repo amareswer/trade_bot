@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Optional
 
 from stock_bot.ai.verdict          import AIVerdict
+from stock_bot.data.price_feed     import get_sector
 from stock_bot.research.aggregator import ResearchReport
 from stock_bot.research.fear_greed import FearGreedData
 from stock_bot.portfolio.tracker   import PortfolioPosition, PortfolioSummary, PaperSummary, PaperTrade
@@ -774,6 +775,164 @@ def _stock_card_html(r: ScanResult, pos: Optional[PortfolioPosition] = None, ext
 
 
 # ---------------------------------------------------------------------------
+# Portfolio overview — unified real + paper positions with sector data
+# ---------------------------------------------------------------------------
+
+def _portfolio_overview_html(
+    portfolio_summary: Optional[PortfolioSummary],
+    paper_summary:     Optional[PaperSummary],
+) -> str:
+    """
+    Unified table showing both real and paper positions side-by-side.
+    Sector data is fetched live from yfinance (cached per session).
+    Only rendered when at least one position exists across either account.
+    """
+    all_positions: list[dict] = []
+
+    # Real positions — PortfolioSummary.positions is list[PortfolioPosition]
+    if portfolio_summary and portfolio_summary.positions:
+        for p in portfolio_summary.positions:
+            all_positions.append({
+                "symbol":   p.symbol,
+                "type":     "REAL",
+                "shares":   p.shares,
+                "avg_cost": p.avg_cost,
+                "current":  p.current_price,
+                "pnl":      p.gain_loss,
+                "pnl_pct":  p.gain_loss_pct,
+                "sector":   get_sector(p.symbol),
+            })
+
+    # Paper positions — PaperSummary.positions is also list[PortfolioPosition]
+    if paper_summary and paper_summary.positions:
+        for p in paper_summary.positions:
+            all_positions.append({
+                "symbol":   p.symbol,
+                "type":     "PAPER",
+                "shares":   p.shares,
+                "avg_cost": p.avg_cost,
+                "current":  p.current_price,
+                "pnl":      p.gain_loss,
+                "pnl_pct":  p.gain_loss_pct,
+                "sector":   get_sector(p.symbol),
+            })
+
+    if not all_positions:
+        return ""
+
+    # REAL first, then PAPER; alpha within each group
+    all_positions.sort(key=lambda x: (0 if x["type"] == "REAL" else 1, x["symbol"]))
+
+    # Sector concentration map across all positions
+    sector_counts: dict[str, int] = {}
+    for p in all_positions:
+        s = p["sector"]
+        sector_counts[s] = sector_counts.get(s, 0) + 1
+
+    # ── Table rows ────────────────────────────────────────────────────────────
+    _th = (
+        'style="text-align:left;padding:7px 10px;color:#8b949e;font-size:10px;'
+        'font-weight:600;text-transform:uppercase;letter-spacing:.04em;'
+        'border-bottom:1px solid #30363d;white-space:nowrap"'
+    )
+    _td = (
+        'style="padding:9px 10px;border-bottom:1px solid #21262d;'
+        'font-size:12px;color:#c9d1d9;white-space:nowrap"'
+    )
+
+    rows = ""
+    for p in all_positions:
+        if p["type"] == "REAL":
+            badge = (
+                '<span style="background:#1c3a5e;color:#58a6ff;'
+                'padding:1px 7px;border-radius:10px;font-size:11px">REAL</span>'
+            )
+        else:
+            badge = (
+                '<span style="background:#3a2a00;color:#e3b341;'
+                'padding:1px 7px;border-radius:10px;font-size:11px">PAPER</span>'
+            )
+
+        current_str = f"${p['current']:,.2f}" if p["current"] is not None else f'<span style="color:{_MUTED}">—</span>'
+
+        if p["pnl"] is not None:
+            pnl_col     = _GREEN if p["pnl"] >= 0 else _RED
+            pnl_str     = f'<span style="color:{pnl_col}">${p["pnl"]:+.2f}</span>'
+            pnl_pct_str = f'<span style="color:{pnl_col}">{p["pnl_pct"]:+.1f}%</span>'
+        else:
+            pnl_str     = f'<span style="color:{_MUTED}">—</span>'
+            pnl_pct_str = f'<span style="color:{_MUTED}">—</span>'
+
+        rows += f"""
+        <tr>
+          <td {_td}><strong>{_e(p['symbol'])}</strong></td>
+          <td {_td} style="padding:9px 10px;border-bottom:1px solid #21262d;font-size:12px;color:{_MUTED};white-space:nowrap">{_e(p['sector'])}</td>
+          <td {_td}>{badge}</td>
+          <td {_td}>{p['shares']:g}</td>
+          <td {_td}>${p['avg_cost']:,.2f}</td>
+          <td {_td}>{current_str}</td>
+          <td {_td}>{pnl_str}</td>
+          <td {_td}>{pnl_pct_str}</td>
+        </tr>"""
+
+    # ── Totals footer ─────────────────────────────────────────────────────────
+    real_value  = sum(p["current"] * p["shares"] for p in all_positions if p["type"] == "REAL"  and p["current"])
+    paper_value = sum(p["current"] * p["shares"] for p in all_positions if p["type"] == "PAPER" and p["current"])
+    combined    = real_value + paper_value
+
+    tfoot = f"""
+        <tr style="border-top:2px solid #30363d">
+          <td colspan="8" style="padding:9px 10px;font-size:12px;color:{_MUTED}">
+            Real:&nbsp;<span style="color:#58a6ff;font-weight:600">${real_value:,.2f} CAD</span>
+            &nbsp;&nbsp;|&nbsp;&nbsp;
+            Paper:&nbsp;<span style="color:#e3b341;font-weight:600">${paper_value:,.2f}</span>
+            &nbsp;&nbsp;|&nbsp;&nbsp;
+            Combined:&nbsp;<span style="color:{_TEXT};font-weight:600">${combined:,.2f}</span>
+          </td>
+        </tr>"""
+
+    # ── Sector concentration warnings ─────────────────────────────────────────
+    sector_html = ""
+    for sector, count in sorted(sector_counts.items(), key=lambda x: -x[1]):
+        if count >= 3:
+            sector_html += f"""
+      <div style="background:#3a2a00;border:1px solid #e3b34144;border-radius:6px;
+                  padding:8px 12px;margin:8px 10px 10px;font-size:12px;color:#e3b341">
+        ⚠️ High concentration: <strong>{_e(sector)}</strong> — {count} positions across real + paper holdings
+      </div>"""
+        elif count == 2:
+            sector_html += f"""
+      <div style="font-size:11px;color:{_MUTED};padding:4px 14px 8px">
+        · {_e(sector)}: 2 positions
+      </div>"""
+
+    return f"""
+  <div style="margin-bottom:20px">
+    <h2>🗂 Portfolio Overview</h2>
+    <div style="background:{_CARD_BG};border:1px solid {_BORDER};border-radius:8px;overflow:hidden">
+      <div style="overflow-x:auto">
+        <table style="width:100%;border-collapse:collapse">
+          <thead>
+            <tr>
+              <th {_th}>Symbol</th>
+              <th {_th}>Sector</th>
+              <th {_th}>Type</th>
+              <th {_th}>Shares</th>
+              <th {_th}>Avg Cost</th>
+              <th {_th}>Current</th>
+              <th {_th}>P&amp;L</th>
+              <th {_th}>P&amp;L %</th>
+            </tr>
+          </thead>
+          <tbody>{rows}</tbody>
+          <tfoot>{tfoot}</tfoot>
+        </table>
+      </div>{sector_html}
+    </div>
+  </div>"""
+
+
+# ---------------------------------------------------------------------------
 # Alerts panel
 # ---------------------------------------------------------------------------
 
@@ -999,9 +1158,10 @@ def _build_html(
 {mv_cards}
   </div>"""
 
-    portfolio_section = _portfolio_section_html(portfolio) if portfolio else ""
-    paper_section     = _paper_section_html(paper) if paper else ""
-    alerts_section    = _alerts_panel_html(alerts or [])
+    portfolio_section  = _portfolio_section_html(portfolio) if portfolio else ""
+    paper_section      = _paper_section_html(paper) if paper else ""
+    overview_section   = _portfolio_overview_html(portfolio, paper)
+    alerts_section     = _alerts_panel_html(alerts or [])
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1019,6 +1179,7 @@ def _build_html(
 {_summary_html(results)}
 {portfolio_section}
 {paper_section}
+{overview_section}
 {_top_picks_html(results)}
 {watchlist_section_html}
 {universe_section_html}

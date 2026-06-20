@@ -86,6 +86,22 @@ def print_report(metrics: BacktestMetrics, result: BacktestResult) -> None:
     sr_col = _GR if sr >= 1.0 else (_YL if sr >= 0 else _RD)
     _row("Sharpe ratio",    f"{sr_col}{sr:.2f}{_R}")
 
+    # ── Buy-and-hold benchmark ────────────────────────────────────────
+    warmup = getattr(result, "warmup_ticks", 0)
+    if result.candles and len(result.candles) > warmup:
+        bh_start = result.candles[warmup].close
+        bh_end   = result.candles[-1].close
+        if bh_start > 0:
+            bh_return    = (bh_end - bh_start) / bh_start
+            strat_return = metrics.total_return_pct
+            edge         = strat_return - bh_return
+            edge_col     = _GR if edge >= 0 else _RD
+            print(f"\n  {_B}BENCHMARK vs BUY-AND-HOLD{_R}")
+            print(f"  {'─'*46}")
+            _row("B&H return",      _pct(bh_return))
+            _row("Strategy return", _pct(strat_return))
+            _row("Alpha (edge)",    f"{edge_col}{'+' if edge >= 0 else ''}{edge*100:.2f}%{_R}")
+
     print(f"\n{_DIM}{bar}{_R}\n")
 
 

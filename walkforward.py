@@ -33,7 +33,7 @@ VAL_END     = None           # through present
 # ── Best config found in Exp 2 — do not change these ─────────────────────────
 # These are the parameters being validated, not optimised here.
 VALIDATED_CONFIG = dict(
-    adx_threshold      = 15.0,
+    adx_threshold      = 18.0,
     max_ema_spread_pct = 0.005,   # 0.5% ceiling
     rsi_filter_enabled = True,
     # Everything else from cfg
