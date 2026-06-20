@@ -77,11 +77,11 @@ def _bool(key: str, default: bool) -> bool:
 
 @dataclass
 class ExchangeConfig:
-    exchange:       str = "kraken"
-    symbol:         str = "BTC/USDT"
-    feed_mode:      str = "live"    # "live" | "simulated"
-    loop_interval:  int = 30        # seconds between ticks
-    candle_minutes: int = 240       # aggregation window for live indicator mode
+    exchange:       str           # required — set EXCHANGE in .env
+    symbol:         str           # required — set SYMBOL in .env
+    feed_mode:      str  = "live" # "live" | "simulated"
+    loop_interval:  int  = 30     # seconds between ticks
+    candle_minutes: int  = 240    # aggregation window for live indicator mode
     live_trading:   bool = False
     dry_run:        bool = False
     api_key:        str  = ""
@@ -96,6 +96,16 @@ class ExchangeConfig:
             raise ValueError("LOOP_INTERVAL must be >= 1")
         if self.candle_minutes < 1:
             raise ValueError("CANDLE_MINUTES must be >= 1")
+        if self.live_trading and not self.api_key:
+            raise ValueError(
+                "LIVE_TRADING=true requires KRAKEN_API_KEY to be set in .env. "
+                "The bot refuses to start live without credentials."
+            )
+        if self.live_trading and not self.api_secret:
+            raise ValueError(
+                "LIVE_TRADING=true requires KRAKEN_API_SECRET to be set in .env. "
+                "The bot refuses to start live without credentials."
+            )
 
 
 @dataclass
@@ -381,15 +391,20 @@ def _load() -> AppConfig:
         ),
     )
 
-    # Warn loudly when ADX_THRESHOLD is absent from the environment.
-    # The code default (25.0) produces completely different strategy behaviour
-    # from the validated live value (18.0) — a silent divergence that is very
-    # hard to notice. This fires at import time so it appears in every run.
+    # Warn loudly when critical strategy values are absent from the environment.
+    # These fire at import time so they appear in every run, not buried mid-log.
     if "ADX_THRESHOLD" not in os.environ:
         logger.warning(
             "ADX_THRESHOLD not set in .env — falling back to code default %.1f. "
             "Live-validated strategy uses 18.0. Backtest and live bot WILL diverge.",
             cfg.strategy.adx_threshold,
+        )
+    if "VOLUME_K" not in os.environ:
+        logger.warning(
+            "VOLUME_K not set in .env — falling back to code default %.1f. "
+            "Live-validated strategy uses VOLUME_K=0 (disabled). "
+            "Volume filter will be active, which may suppress valid signals.",
+            cfg.strategy.volume_k,
         )
 
     return cfg
