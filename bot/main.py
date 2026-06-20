@@ -303,13 +303,28 @@ def run():
         timeout_s      = cfg.ai.timeout_s,
     ) if cfg.ai.enabled else None
 
+    # In live mode: show real Kraken balance, not starting_cash from .env.
+    # executor.cash and executor.position are already synced from the exchange
+    # by the time LiveExecutor.__init__() returns (lines above).
+    if cfg.exchange.live_trading:
+        _header_cash = executor.cash
+        try:
+            _header_price = feed.get_price()
+            _header_total = executor.cash + executor.position * _header_price
+        except Exception:
+            _header_total = None
+    else:
+        _header_cash  = cfg.portfolio.starting_cash
+        _header_total = None
+
     display.header(
         cfg.exchange.exchange,
         cfg.exchange.symbol,
-        cfg.portfolio.starting_cash,
+        _header_cash,
         cfg.strategy.mode,
         live_trading = cfg.exchange.live_trading,
         dry_run      = cfg.exchange.dry_run,
+        total_value  = _header_total,
     )
     if cfg.dashboard.enabled:
         print(f"  Dashboard → file://{_DASHBOARD_PATH}\n")

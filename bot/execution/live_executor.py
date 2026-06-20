@@ -79,19 +79,11 @@ class LiveExecutor:
         # In live mode: load saved state (position/cost_basis) then override cash
         # with the actual exchange balance to detect restart drift.
         # In dry-run: load saved state only (no API call for balance).
-        state_found = self._load_state()
+        self._load_state()
         if not dry_run:
             base  = symbol.split("/")[0]
             quote = symbol.split("/")[1]
             exchange_cash, sync_error = self._sync_cash()
-            if state_found:
-                diff = abs(exchange_cash - self._portfolio.cash)
-                if diff > 0.50:
-                    logger.warning(
-                        "Balance mismatch on restart: exchange=%.2f %s, "
-                        "saved=%.2f — using exchange balance",
-                        exchange_cash, quote, self._portfolio.cash,
-                    )
             self._portfolio.cash = exchange_cash
             self._sync_position(symbol)
 
@@ -169,36 +161,79 @@ class LiveExecutor:
 
     def _sync_position(self, symbol: str) -> None:
         """
-        On startup, detect exchange-held base currency that the saved state
-        doesn't reflect (e.g. bot restarted mid-fill or after a manual trade).
-        If exchange holds BTC but saved position=0, reseed at current ticker price.
+        Exchange is the single source of truth for position.
+
+        Uses total balance (not free) so Kraken's settlement window — where a
+        recent fill shows BTC in total but not yet in free — never causes a
+        spurious zero-out of a real open position.
+
+        Outcomes:
+          total > 0              → position = total (authoritative)
+          total > 0, free == 0  → settlement window; log WARNING, still use total
+          total == 0, free == 0 → genuinely no position; clear it
         """
         base = symbol.split("/")[0]
         try:
-            balance      = self._exchange.fetch_balance()
-            exchange_qty = float(balance.get("free", {}).get(base, 0.0))
+            balance        = self._exchange.fetch_balance()
+            exchange_free  = float(balance.get("free",  {}).get(base, 0.0))
+            exchange_total = float(balance.get("total", {}).get(base, 0.0))
         except Exception as exc:
             logger.warning("_sync_position: fetch_balance failed — %s", exc)
             return
 
-        if exchange_qty > 1e-6 and self._portfolio.position < 1e-9:
-            try:
-                current_price = float(self._exchange.fetch_ticker(symbol)["last"])
-            except Exception:
-                current_price = 0.0
-            self._portfolio.position    = exchange_qty
-            self._portfolio._cost_basis = current_price
-            logger.warning(
-                "STATE MISMATCH: exchange holds %.6f %s but saved state=0. "
-                "Reseeded at current price %.2f",
-                exchange_qty, base, current_price,
-            )
-            print(
-                f"  POSITION RESEEDED: {exchange_qty:.6f} {base}"
-                f" @ ${current_price:,.2f}"
-                f" (exchange vs saved-state mismatch)",
-                flush=True,
-            )
+        prev_position = self._portfolio.position
+
+        if exchange_total > 1e-9:
+            self._portfolio.position = exchange_total
+
+            if exchange_free < 1e-9:
+                # Kraken settlement window: fill landed in total, not yet free
+                logger.warning(
+                    "BTC settling on exchange: total=%.6f free=0"
+                    " — using total as position, will become free shortly",
+                    exchange_total,
+                )
+                print(
+                    f"  SETTLEMENT: {base} total={exchange_total:.6f} free=0"
+                    f" — position set to total, awaiting settlement.",
+                    flush=True,
+                )
+
+            if prev_position < 1e-9:
+                # Saved position was 0 — reseed cost_basis at current price
+                try:
+                    current_price = float(self._exchange.fetch_ticker(symbol)["last"])
+                except Exception:
+                    current_price = 0.0
+                self._portfolio._cost_basis = current_price
+                logger.warning(
+                    "STATE MISMATCH: exchange holds %.6f %s but saved position=0."
+                    " Reseeded cost_basis at current price %.2f",
+                    exchange_total, base, current_price,
+                )
+                print(
+                    f"  POSITION RESEEDED: {exchange_total:.6f} {base}"
+                    f" @ ${current_price:,.2f}"
+                    f" (exchange vs saved-state mismatch)",
+                    flush=True,
+                )
+            else:
+                logger.warning(
+                    "Position confirmed from exchange: %.6f %s (free=%.6f)",
+                    exchange_total, base, exchange_free,
+                )
+        else:
+            # total == 0 and free == 0: genuinely no position on exchange
+            if prev_position > 1e-9:
+                logger.warning(
+                    "Exchange shows 0 %s (total=0 free=0) but saved position=%.6f"
+                    " — clearing position (exchange is source of truth)",
+                    base, prev_position,
+                )
+            self._portfolio.position    = 0.0
+            self._portfolio._cost_basis = 0.0
+
+        self._save_state()
 
     # ── State persistence ─────────────────────────────────────────────
 
@@ -227,9 +262,13 @@ class LiveExecutor:
 
     def _load_state(self) -> bool:
         """
-        Load persisted portfolio state.
-        Returns True if state was successfully restored, False if starting fresh.
-        Silently ignores a missing file.
+        Restore accounting fields from disk.
+        Returns True if state was successfully loaded, False if starting fresh.
+
+        # position and cash are always overridden by _sync_position and _sync_cash
+        # — only accounting fields (cost_basis, realized_pnl, fees_paid) are
+        # restored from disk. The state file is an accounting ledger, not a
+        # position tracker.
         """
         try:
             with open(self._state_path) as f:
@@ -248,16 +287,14 @@ class LiveExecutor:
             )
             return False
 
-        self._portfolio.cash          = float(state["cash"])
-        self._portfolio.position      = float(state["position"])
-        self._portfolio._cost_basis   = float(state["cost_basis"])
-        self._portfolio.realized_pnl  = float(state["realized_pnl"])
-        self._fees_paid               = float(state.get("fees_paid", 0.0))
+        # Only restore accounting fields — position and cash come from the exchange
+        self._portfolio._cost_basis   = float(state.get("cost_basis",   0.0))
+        self._portfolio.realized_pnl  = float(state.get("realized_pnl", 0.0))
+        self._fees_paid               = float(state.get("fees_paid",     0.0))
         logger.warning(
-            "State restored: cash=%.2f pos=%.6f cost_basis=%.2f pnl=%.2f (saved %s)",
-            self._portfolio.cash, self._portfolio.position,
+            "Accounting restored: cost_basis=%.2f pnl=%.2f fees=%.4f (saved %s)",
             self._portfolio._cost_basis, self._portfolio.realized_pnl,
-            state.get("saved_at", "?"),
+            self._fees_paid, state.get("saved_at", "?"),
         )
         return True
 

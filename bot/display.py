@@ -24,15 +24,22 @@ def header(
     symbol:       str,
     cash:         float,
     strategy:     str,
-    live_trading: bool = False,
-    dry_run:      bool = False,
+    live_trading: bool  = False,
+    dry_run:      bool  = False,
+    total_value:  float | None = None,
 ) -> None:
     if live_trading and not dry_run:
-        mode = f"{_RD}{_B}LIVE{_R} ${cash:,.0f}"
+        cash_str = f"${cash:,.2f} cash"
+        if total_value is not None and abs(total_value - cash) > 0.01:
+            cash_str += f"  |  ${total_value:,.2f} total"
+        mode = f"{_RD}{_B}LIVE{_R}  {cash_str}"
     elif dry_run:
-        mode = f"{_YL}DRY RUN{_R} ${cash:,.0f}"
+        cash_str = f"${cash:,.2f} cash"
+        if total_value is not None and abs(total_value - cash) > 0.01:
+            cash_str += f"  |  ${total_value:,.2f} total"
+        mode = f"{_YL}DRY RUN{_R}  {cash_str}"
     else:
-        mode = f"paper ${cash:,.0f}"
+        mode = f"paper ${cash:,.2f}"
     line = (
         f"  {_B}Trade Bot{_R}  ▸  {_CY}{exchange.capitalize()}{_R}"
         f"  ▸  {_B}{_BL}{symbol}{_R}  ▸  strategy={strategy}  ▸  {mode}"
