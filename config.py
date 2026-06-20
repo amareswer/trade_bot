@@ -33,6 +33,17 @@ def _str(key: str, default: str) -> str:
     return os.getenv(key, default).strip()
 
 
+def _required_str(key: str) -> str:
+    """Fail fast if a critical env var is absent — no silent wrong defaults."""
+    val = os.getenv(key)
+    if not val or not val.strip():
+        raise ValueError(
+            f"Config error: {key} is required but not set in .env. "
+            f"Add it to your .env file before running the bot."
+        )
+    return val.strip()
+
+
 def _float(key: str, default: float) -> float:
     raw = os.getenv(key)
     if raw is None:
@@ -269,10 +280,12 @@ class AppConfig:
         logger.info("CONFIG  exchange=%s  symbol=%s  feed=%s  candle=%dmin",
             self.exchange.exchange, self.exchange.symbol, self.exchange.feed_mode,
             self.exchange.candle_minutes)
-        logger.info("CONFIG  strategy=%s  RSI(%d) %g/%g  EMA(%d/%d)  regime_ema=%d  slope=%s",
+        adx_src = "from .env" if "ADX_THRESHOLD" in os.environ else "CODE DEFAULT — set ADX_THRESHOLD in .env"
+        logger.info("CONFIG  strategy=%s  RSI(%d) %g/%g  EMA(%d/%d)  ADX=%.1f (%s)  regime_ema=%d  slope=%s",
             self.strategy.mode, self.strategy.rsi_period,
             self.strategy.rsi_oversold, self.strategy.rsi_overbought,
             self.strategy.fast_ema_period, self.strategy.slow_ema_period,
+            self.strategy.adx_threshold, adx_src,
             self.strategy.regime_ema_period,
             self.strategy.regime_ema_slope_filter)
         logger.info("CONFIG  risk  per_trade=%.0f%%  max_pos=%.0f%%  daily_loss=%.0f%%  max_dd=%.0f%%  max_trades=%d/day  cooldown=%d",
@@ -306,10 +319,10 @@ class AppConfig:
 # ---------------------------------------------------------------------------
 
 def _load() -> AppConfig:
-    return AppConfig(
+    cfg = AppConfig(
         exchange=ExchangeConfig(
-            exchange       = _str ("EXCHANGE",       "kraken"),
-            symbol         = _str ("SYMBOL",         "BTC/USDT"),
+            exchange       = _required_str("EXCHANGE"),
+            symbol         = _required_str("SYMBOL"),
             feed_mode      = _str ("FEED_MODE",       "live"),
             loop_interval  = _int ("LOOP_INTERVAL",   30),
             candle_minutes = _int ("CANDLE_MINUTES",  240),
@@ -328,7 +341,7 @@ def _load() -> AppConfig:
             buy_threshold           = _float("BUY_THRESHOLD",           0.0),
             sell_threshold          = _float("SELL_THRESHOLD",          0.0),
             adx_period              = _int  ("ADX_PERIOD",              14),
-            adx_threshold           = _float("ADX_THRESHOLD",           25.0),
+            adx_threshold           = _float("ADX_THRESHOLD",           25.0),  # live .env must set 18
             adx_max                 = _float("ADX_MAX",                 0.0),
             max_ema_spread_pct      = _float("MAX_EMA_SPREAD_PCT",      0.0),
             rsi_filter_enabled      = _bool ("RSI_FILTER_ENABLED",      True),
@@ -367,6 +380,19 @@ def _load() -> AppConfig:
             take_profit_pct = _float("TAKE_PROFIT_PCT",    0.10),
         ),
     )
+
+    # Warn loudly when ADX_THRESHOLD is absent from the environment.
+    # The code default (25.0) produces completely different strategy behaviour
+    # from the validated live value (18.0) — a silent divergence that is very
+    # hard to notice. This fires at import time so it appears in every run.
+    if "ADX_THRESHOLD" not in os.environ:
+        logger.warning(
+            "ADX_THRESHOLD not set in .env — falling back to code default %.1f. "
+            "Live-validated strategy uses 18.0. Backtest and live bot WILL diverge.",
+            cfg.strategy.adx_threshold,
+        )
+
+    return cfg
 
 
 # Single instance — import this everywhere
