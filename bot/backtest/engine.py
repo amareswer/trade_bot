@@ -23,6 +23,7 @@ from bot.data.historical_feed import Candle
 from bot.strategy.threshold_strategy import ThresholdStrategy, Signal
 from bot.strategy.indicator_strategy import IndicatorStrategy, IndicatorConfig
 from bot.execution.executor import PaperExecutor, OrderStatus, OrderSide
+from bot.indicators.indicators import ema as _ema
 from bot.risk.risk_manager import RiskManager, RiskConfig
 from bot.state.trade_state import TradingStateMachine
 from bot.portfolio.position_manager import PositionManager
@@ -79,6 +80,7 @@ def run(
     adx_max:                  float = 0.0,
     max_ema_spread_pct:       float = 0.0,
     rsi_filter_enabled:       bool  = True,
+    macd_enabled:             bool  = False,
     # Threshold config
     buy_threshold:            float = 0.0,
     sell_threshold:           float = 0.0,
@@ -90,6 +92,9 @@ def run(
     # Exit rules
     stop_loss_pct:            float = 0.02,
     take_profit_pct:          float = 0.04,
+    trail_stop_pct:           float = 0.0,
+    partial_tp_pct:           float = 0.0,
+    partial_tp_size:          float = 0.5,
     slippage_pct:             float = 0.0,
     # Regime filter
     regime_ema_period:        int   = 200,
@@ -112,6 +117,7 @@ def run(
             adx_max                  = adx_max,
             max_ema_spread_pct       = max_ema_spread_pct,
             rsi_filter_enabled       = rsi_filter_enabled,
+            macd_enabled             = macd_enabled,
             regime_ema_period        = regime_ema_period,
             regime_ema_slope_filter  = regime_ema_slope_filter,
             volume_k                 = volume_k,
@@ -139,6 +145,8 @@ def run(
     total_fees       = 0.0
     warmup_ticks     = 0
     entry_price:     float = 0.0
+    _trail_peak:     float = 0.0
+    _partial_tp_done: bool = False
     entry_snapshots: list[dict] = []
 
     # ── Main loop ─────────────────────────────────────────────────────
@@ -154,23 +162,73 @@ def run(
             equity_curve.append(executor.portfolio.total_value(price))
             continue
 
+        # ── Trailing peak update ──────────────────────────────────────
+        if executor.position > 0 and _trail_peak > 0:
+            _trail_peak = max(_trail_peak, candle.high)
+
+        # ── Partial TP: sell 50% at partial_tp_pct (only when explicitly set) ─
+        if (
+            executor.position > 0
+            and entry_price > 0
+            and partial_tp_pct > 0
+            and not _partial_tp_done
+            and candle.high >= entry_price * (1 + partial_tp_pct)
+        ):
+            _p_qty = round(executor.position * partial_tp_size, 6)
+            _p_price = entry_price * (1 + partial_tp_pct)
+            if _p_qty > 0:
+                _p_approval = risk.evaluate(Signal.SELL, _p_price, executor.portfolio, _p_qty, candle.timestamp.date())
+                if _p_approval:
+                    _p_fill_price = _p_price * (1 - slippage_pct) if slippage_pct > 0 else _p_price
+                    _p_order = executor.execute(Signal.SELL, _p_fill_price, quantity=_p_qty)
+                    if _p_order and _p_order.status == OrderStatus.FILLED:
+                        risk.record_fill()
+                        state_machine.on_fill(Signal.SELL, _p_order.price)
+                        _p_pnl = position_manager.on_sell(_p_order.price, _p_order.quantity)
+                        _p_fee = round(_p_order.total_value * fee_pct, 4)
+                        total_fees += _p_fee
+                        executor._portfolio.cash -= _p_fee
+                        _partial_tp_done = True
+                        state_machine.recover_long(entry_price)
+                        fills.append(FillRecord(
+                            candle_index = i,
+                            timestamp    = candle.timestamp.strftime("%Y-%m-%d %H:%M"),
+                            side         = _p_order.side.value,
+                            price        = _p_order.price,
+                            quantity     = _p_order.quantity,
+                            total_value  = _p_order.total_value,
+                            pnl          = _p_pnl,
+                            fee          = _p_fee,
+                            reason       = "partial_tp",
+                        ))
+
         # ── Stop-loss / take-profit override ─────────────────────────
         exit_reason = "strategy"
         exit_price  = price
         forced_exit = False
         if executor.position > 0 and entry_price > 0:
-            sl_level = entry_price * (1 - stop_loss_pct) if stop_loss_pct > 0 else None
-            tp_level = entry_price * (1 + take_profit_pct) if take_profit_pct > 0 else None
-            if sl_level is not None and candle.low <= sl_level:
-                raw_signal  = Signal.SELL
-                exit_reason = "stop_loss"
-                exit_price  = sl_level
-                forced_exit = True
-            elif tp_level is not None and candle.high >= tp_level:
-                raw_signal  = Signal.SELL
-                exit_reason = "take_profit"
-                exit_price  = tp_level
-                forced_exit = True
+            # Trailing stop takes priority over fixed SL if configured
+            if trail_stop_pct > 0 and _trail_peak > 0:
+                _trail_sl = _trail_peak * (1 - trail_stop_pct)
+                if candle.low <= _trail_sl:
+                    raw_signal  = Signal.SELL
+                    exit_reason = "trail_stop"
+                    exit_price  = _trail_sl
+                    forced_exit = True
+            elif stop_loss_pct > 0:
+                sl_level = entry_price * (1 - stop_loss_pct)
+                if candle.low <= sl_level:
+                    raw_signal  = Signal.SELL
+                    exit_reason = "stop_loss"
+                    exit_price  = sl_level
+                    forced_exit = True
+            if not forced_exit and take_profit_pct > 0:
+                tp_level = entry_price * (1 + take_profit_pct)
+                if candle.high >= tp_level:
+                    raw_signal  = Signal.SELL
+                    exit_reason = "take_profit"
+                    exit_price  = tp_level
+                    forced_exit = True
 
         filtered_signal, _ = state_machine.filter_signal(raw_signal)
         # SL/TP must never be suppressed by cooldown — always force the exit
@@ -205,10 +263,11 @@ def run(
                 if order.side == OrderSide.BUY:
                     position_manager.on_buy(order.price, order.quantity)
                     entry_price = order.price
+                    _trail_peak = order.price
+                    _partial_tp_done = False
                     _adx  = strategy.last_adx   if is_indicator else None
                     _rsi  = strategy.last_rsi   if is_indicator else None
                     _trnd = strategy.last_trend if is_indicator else None
-                    from bot.indicators.indicators import ema as _ema
                     _closes_snap = list(strategy._closes)
                     _ema_fast = _ema(_closes_snap, strategy.config.fast_ema_period)
                     _ema_slow = _ema(_closes_snap, strategy.config.slow_ema_period)
@@ -223,6 +282,8 @@ def run(
                 else:
                     pnl = position_manager.on_sell(order.price, order.quantity)
                     entry_price = 0.0
+                    _trail_peak = 0.0
+                    _partial_tp_done = False
 
                 fills.append(FillRecord(
                     candle_index = i,

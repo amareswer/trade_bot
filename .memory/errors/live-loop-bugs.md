@@ -82,3 +82,27 @@ Sticky vars initialized to `"HOLD"` / `None` / `None` before the loop. `_render_
 **How to apply:** Any time LiveExecutor state is persisted and loaded on restart, audit every downstream consumer of that state. Current consumers that must be seeded: PositionManager (for P&L / SL/TP gate), TradingStateMachine (for signal filtering). Future consumers (e.g. RiskManager's peak tracking for max drawdown) may also need seeding.
 
 **Pattern note:** This is the fifth instance of "component A updated, downstream component B never informed" in this project. The pattern appears when components are added incrementally — each component works in isolation but state flow between them is only audited at integration time. Any new component that reads position/cash state must be explicitly seeded on restart.
+
+---
+
+## Bug 6: Backtest trade count regression (62→10) — 2026-06-20
+
+**Symptom:** After risk config hardening commit (`e82ef1c`), backtest dropped from 62 to 10 trades with near-zero PF.
+
+**Root cause:** `RISK_MAX_DRAWDOWN=0.05` in live `.env` (tuned for live $100 account) blocked all new BUYs after ~6 SL losses (~0.85% each ≈ 5.1% cumulative > 5% limit). Live and backtest shared the same `cfg.risk.max_drawdown_pct`. No way to run backtest without applying live risk circuit breakers.
+
+**Fix:** `backtest.py` now has `--max_drawdown` CLI arg (default=0.25). `walkforward.py` + `montecarlo.py` hardcoded to 0.25. Live `.env` RISK_MAX_DRAWDOWN unchanged. Backtest never sees live drawdown limits.
+
+**How to apply:** Backtest circuit breakers must always use generous limits (0.25+). Live risk limits are for capital protection — they are intentionally conservative and will cap trade count in backtests. Keep them separate. Any new risk limit added to `.env` must also have a backtest override.
+
+---
+
+## Bug 7: Partial TP default auto-activated — 2026-06-20
+
+**Symptom:** When wiring partial TP into backtest engine, deriving `partial_tp_pct = take_profit_pct / 2` when the arg was 0 changed the baseline from 62 to 10 trades.
+
+**Root cause:** Dividing TP in half at 50% of position while keeping the state machine in LONG caused trades to exit earlier and at different prices than the validated baseline.
+
+**Fix:** Partial TP only activates when `partial_tp_pct > 0` explicitly. Default=0 means completely disabled. No auto-derivation from take_profit_pct.
+
+**How to apply:** Any new exit mechanism (trailing stop, partial TP, time-based exit) must default to disabled (0 or False) in engine.py so the validated baseline is preserved unless the feature is explicitly enabled.

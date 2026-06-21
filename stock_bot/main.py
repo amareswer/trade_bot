@@ -541,7 +541,7 @@ def run() -> None:
     tracker   = PortfolioTracker(cfg.portfolio)
     evaluator = AlertEvaluator(tracker)
     notifier  = AlertNotifier(cfg)
-    executor  = StockPaperExecutor(cfg.paper_starting_cash) if cfg.paper_trading_enabled else None
+    executor  = StockPaperExecutor(cfg.paper_starting_cash, max_exposure_pct=cfg.paper_max_exposure_pct) if cfg.paper_trading_enabled else None
     if executor:
         executor.set_daily_loss_limit(cfg.paper_daily_loss_pct)
     if executor:
@@ -705,6 +705,27 @@ def run() -> None:
                 if sym not in research_data:
                     continue
                 try:
+                    _d        = price_data[sym]
+                    _rsi_g    = _d.get("rsi")
+                    _adx_g    = _d.get("adx")
+                    _trend_g  = _d.get("trend")
+                    _skip_why = None
+                    if _rsi_g is not None and _rsi_g > cfg.ai_gate_rsi_max:
+                        _skip_why = f"RSI={_rsi_g:.1f} overbought"
+                    elif _adx_g is not None and _adx_g < cfg.ai_gate_adx_min:
+                        _skip_why = f"ADX={_adx_g:.1f} ranging"
+                    elif _trend_g == "NEUTRAL":
+                        _skip_why = "trend NEUTRAL"
+                    if _skip_why:
+                        logger.info("AI skipped for %s — %s", sym, _skip_why)
+                        ai_verdicts[sym] = AIVerdict(
+                            symbol=sym, signal="HOLD", confidence=0,
+                            target_price=None, stop_loss=None,
+                            reasoning=f"AI skipped — {_skip_why}",
+                            trading_style="SWING", timestamp=datetime.now(),
+                            provider="skipped",
+                        )
+                        continue
                     ai_verdicts[sym] = _run_ai_call(
                         sym, price_data[sym], research_data[sym], ai_engine,
                         stop_loss_pct=cfg.paper_stop_loss_pct,
@@ -781,19 +802,29 @@ def run() -> None:
                     # Sanity-check live price against the daily candle close.
                     # fast_info.last_price can return a wrong currency (USD vs CAD)
                     # or stale/corrupt data for TSX tickers — cap at ±5% deviation.
-                    if live_price and px and abs(live_price - px) / px > 0.05:
+                    if live_price and px and abs(live_price - px) / px > cfg.price_sanity_pct:
                         logger.warning(
-                            "%s live_price $%.2f deviates >5%% from candle close $%.2f — using candle close",
-                            symbol, live_price, px,
+                            "%s live_price $%.2f deviates >%.0f%% from candle close $%.2f — using candle close",
+                            symbol, live_price, cfg.price_sanity_pct * 100, px,
                         )
                         live_price = None
                     execution_price = live_price if live_price else px
                     sig = verdict.signal
-                    _MAX_POSITIONS = 4
                     if sig == "BUY":
+                        # Earnings blackout: no BUY within 5 days of earnings
+                        _rpt = research_data.get(symbol)
+                        if _rpt and _rpt.earnings.next_earnings_date is not None:
+                            _days_to_earn = (_rpt.earnings.next_earnings_date - date.today()).days
+                            if 0 <= _days_to_earn <= cfg.earnings_blackout_days:
+                                print(f"  📄 SKIP: {symbol} — earnings in {_days_to_earn}d (blackout)")
+                                print(f"  {'─' * 70}")
+                                continue
                         if executor.position(symbol) == 0:
-                            if len(executor.positions_snapshot()) >= _MAX_POSITIONS:
-                                print(f"  📄 SKIP: {symbol} — max {_MAX_POSITIONS} positions reached")
+                            _price_map_now = {r.symbol: r.price for r in scan_results}
+                            if not executor.check_exposure(_price_map_now):
+                                print(f"  📄 SKIP: {symbol} — max exposure ({cfg.paper_max_exposure_pct*100:.0f}%) reached")
+                            elif len(executor.positions_snapshot()) >= cfg.paper_max_positions:
+                                print(f"  📄 SKIP: {symbol} — max {cfg.paper_max_positions} positions reached")
                             else:
                                 snap    = executor.positions_snapshot()
                                 pos_val = sum(sh * co for sh, co in snap.values())

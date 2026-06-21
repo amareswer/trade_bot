@@ -77,10 +77,16 @@ class StockConfig:
     paper_slippage_bps:      int     # simulated slippage in basis points
     paper_stop_loss_pct:   float # stop-loss threshold as a fraction (e.g. 0.05 = -5%)
     paper_take_profit_pct: float # take-profit threshold as a fraction (e.g. 0.12 = +12%)
+    paper_max_exposure_pct: float # max fraction of portfolio value in open positions
+    paper_max_positions:   int   # max number of open positions at once
     universe_enabled:      bool  # scan S&P500+TSX60 instead of fixed watchlist
     universe_size:         int   # top N symbols to scan per cycle
     universe_refresh_hours: int  # how often to refresh the symbol lists
     screener_enabled:      bool  # skip AI on stocks with no momentum signal
+    ai_gate_rsi_max:       float # skip AI call when RSI > this (overbought, e.g. 75)
+    ai_gate_adx_min:       float # skip AI call when ADX < this (ranging, e.g. 15)
+    earnings_blackout_days: int  # block BUY within N days of next earnings date
+    price_sanity_pct:      float # reject live price if it deviates >this from candle close (e.g. 0.05)
     nvidia_api_key:        str   # NVIDIA NIM API key (nvidia_nim provider)
     nvidia_model:          str   # NVIDIA NIM model name
     watchlist:             list[str] = field(init=False)
@@ -136,10 +142,16 @@ def load() -> StockConfig:
         paper_slippage_bps      = _int("PAPER_SLIPPAGE_BPS",      15),
         paper_stop_loss_pct    = _float("PAPER_STOP_LOSS_PCT",     0.05),
         paper_take_profit_pct  = _float("PAPER_TAKE_PROFIT_PCT",   0.12),
+        paper_max_exposure_pct = _float("PAPER_MAX_EXPOSURE_PCT",  0.25),
+        paper_max_positions    = _int  ("PAPER_MAX_POSITIONS",     4),
         universe_enabled       = _bool ("UNIVERSE_ENABLED",        False),
         universe_size          = _int  ("UNIVERSE_SIZE",           20),
         universe_refresh_hours = _int  ("UNIVERSE_REFRESH_HOURS",  24),
         screener_enabled       = _bool ("SCREENER_ENABLED",        True),
+        ai_gate_rsi_max        = _float("AI_GATE_RSI_MAX",         75.0),
+        ai_gate_adx_min        = _float("AI_GATE_ADX_MIN",         15.0),
+        earnings_blackout_days = _int  ("EARNINGS_BLACKOUT_DAYS",  5),
+        price_sanity_pct       = _float("PRICE_SANITY_PCT",        0.05),
         nvidia_api_key         = _str  ("NVIDIA_API_KEY",          ""),
         nvidia_model           = _str  ("NVIDIA_MODEL",            "nvidia/nemotron-3-ultra-550b-a55b"),
     )

@@ -34,10 +34,11 @@ AFTER_DATE  = None   # keep candles FROM this date onward (recent half)
 
 def main():
     parser = argparse.ArgumentParser(description="Run crypto backtest")
-    parser.add_argument("--stop_loss",   type=float, default=cfg.backtest.stop_loss_pct)
-    parser.add_argument("--take_profit", type=float, default=cfg.backtest.take_profit_pct)
-    parser.add_argument("--fee",         type=float, default=cfg.backtest.fee_pct)
-    parser.add_argument("--limit",       type=int,   default=cfg.backtest.limit)
+    parser.add_argument("--stop_loss",    type=float, default=cfg.backtest.stop_loss_pct)
+    parser.add_argument("--take_profit",  type=float, default=cfg.backtest.take_profit_pct)
+    parser.add_argument("--fee",          type=float, default=cfg.backtest.fee_pct)
+    parser.add_argument("--limit",        type=int,   default=cfg.backtest.limit)
+    parser.add_argument("--max_drawdown", type=float, default=0.25)
     args = parser.parse_args()
 
     print(f"\n  Exchange: {cfg.exchange.exchange.capitalize()}  |  Symbol: {cfg.exchange.symbol}  |  Timeframe: {cfg.backtest.timeframe}")
@@ -100,10 +101,13 @@ def main():
         sell_threshold          = cfg.strategy.sell_threshold,
         max_position_pct        = cfg.risk.max_position_pct,
         daily_loss_limit_pct    = cfg.risk.daily_loss_limit_pct,
-        max_drawdown_pct        = cfg.risk.max_drawdown_pct,
+        max_drawdown_pct        = args.max_drawdown,
         max_trades_per_day      = cfg.risk.max_trades_per_day,
         stop_loss_pct           = args.stop_loss,
         take_profit_pct         = args.take_profit,
+        trail_stop_pct          = cfg.backtest.trail_stop_pct,
+        partial_tp_pct          = cfg.backtest.partial_tp_pct,
+        partial_tp_size         = cfg.backtest.partial_tp_size,
         regime_ema_period       = cfg.strategy.regime_ema_period,
         regime_ema_slope_filter = cfg.strategy.regime_ema_slope_filter,
         volume_k                = cfg.strategy.volume_k,

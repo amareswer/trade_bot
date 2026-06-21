@@ -83,6 +83,32 @@ metadata:
 
 ---
 
+## Session 2026-06-21 — Tier 1–3 Professional Upgrade (COMPLETE ✅)
+
+**Metrics (Tier 1):**
+- `bot/indicators/indicators.py`: ATR (Wilder's), MACD (12/26/9) added
+- `bot/backtest/metrics.py`: Sortino, Calmar, annualized return
+- `bot/backtest/report.py`: new metric rows in terminal output
+
+**Live hardening (Tier 2):**
+- `bot/main.py`: trailing stop (intra-candle tick), partial TP (partial_tp_pct > 0), MTF 1D gate (blocks BUY when daily BEARISH)
+- `bot/backtest/engine.py`: trail_stop_pct, partial_tp_pct, partial_tp_size wired (all default 0 — baseline preserved)
+
+**Infrastructure (Tier 3):**
+- `bot/signals/external_signals.py`: ExternalSignalGate (Fear & Greed + BTC funding rate, fail-open, 1h TTL)
+- `bot/alerts/telegram.py`: TelegramAlerter (daemon threads, fill/daily_pnl/error/startup)
+- `bot/data/trade_log.py`: TradeLog (SQLite at logs/trades.db)
+- `live_comparison.py`: CLI — loads live fills, computes PF/win rate/Sharpe vs baseline
+- `deploy/trade_bot.service` + `deploy/deploy.sh`: systemd + one-shot VPS deploy
+
+**New env vars:**
+EXT_FNG_ENABLED, EXT_FUNDING_ENABLED, TELEGRAM_ENABLED, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+TRAIL_STOP_PCT, PARTIAL_TP_PCT, PARTIAL_TP_SIZE
+
+**Hardcoded value audit (COMPLETE):** All previously hardcoded exchange/symbol/thresholds replaced with config reads in both bots. See decisions/stock-bot-stability.md for stock bot specifics.
+
+---
+
 ## Active .env — Crypto Bot (bot/.env)
 
 | Setting | Value |

@@ -44,9 +44,11 @@ class LiveExecutor:
         starting_cash: float = 10_000.0,
         dry_run:       bool  = False,
         state_path:    str   = _DEFAULT_STATE_PATH,
+        order_type:    str   = "market",
     ):
         self.symbol         = symbol
         self.dry_run        = dry_run
+        self._order_type    = order_type
         self._starting_cash = starting_cash
         self._state_path    = state_path
         self._portfolio     = Portfolio(cash=starting_cash)
@@ -404,17 +406,31 @@ class LiveExecutor:
 
         else:
             try:
-                logger.warning(
-                    "LIVE ORDER: %s %.6f %s",
-                    side.value, quantity, self.symbol,
-                )
                 ccxt_side = "buy" if side == OrderSide.BUY else "sell"
-                raw = self._exchange.create_order(
-                    symbol = self.symbol,
-                    type   = "market",
-                    side   = ccxt_side,
-                    amount = quantity,
-                )
+                if self._order_type == "limit":
+                    limit_price = round(price * 1.001, 2) if side == OrderSide.BUY else round(price * 0.999, 2)
+                    logger.warning(
+                        "LIMIT ORDER: %s %.6f %s @ %.2f (0.1%% offset from %.2f)",
+                        side.value, quantity, self.symbol, limit_price, price,
+                    )
+                    raw = self._exchange.create_order(
+                        symbol = self.symbol,
+                        type   = "limit",
+                        side   = ccxt_side,
+                        amount = quantity,
+                        price  = limit_price,
+                    )
+                else:
+                    logger.warning(
+                        "LIVE ORDER: %s %.6f %s",
+                        side.value, quantity, self.symbol,
+                    )
+                    raw = self._exchange.create_order(
+                        symbol = self.symbol,
+                        type   = "market",
+                        side   = ccxt_side,
+                        amount = quantity,
+                    )
                 order_id_str = str(raw.get("id", ""))
                 filled_qty   = float(raw.get("filled") or 0.0)
                 fill_price   = float(raw.get("average") or raw.get("price") or price)
@@ -445,11 +461,22 @@ class LiveExecutor:
                         last_raw.get("price")   or
                         price
                     )
-                    logger.warning(
-                        "ORDER %s NOT CLOSED after 3 polls — saving state with "
-                        "partial fill=%.6f %s @ %.2f. Manual verification recommended.",
-                        order_id_str, filled_qty, self.symbol, fill_price,
-                    )
+                    if self._order_type == "limit" and last_raw.get("status") not in ("closed", "filled"):
+                        try:
+                            self._exchange.cancel_order(order_id_str, self.symbol)
+                            logger.warning(
+                                "LIMIT ORDER %s not filled after polls — cancelled. "
+                                "Consider ORDER_TYPE=market for guaranteed fills.",
+                                order_id_str,
+                            )
+                        except Exception as _cancel_exc:
+                            logger.warning("Failed to cancel limit order %s: %s", order_id_str, _cancel_exc)
+                    else:
+                        logger.warning(
+                            "ORDER %s NOT CLOSED after 3 polls — saving state with "
+                            "partial fill=%.6f %s @ %.2f. Manual verification recommended.",
+                            order_id_str, filled_qty, self.symbol, fill_price,
+                        )
 
                 quantity = filled_qty
 

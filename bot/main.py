@@ -12,6 +12,7 @@ Architecture (top → bottom):
   →  Portfolio Manager
   →  Terminal Dashboard
 """
+import csv
 import logging
 import os
 import signal as _signal_module
@@ -51,9 +52,13 @@ from bot.execution.live_executor import LiveExecutor
 from bot.risk.risk_manager import RiskManager, RiskConfig
 from bot.state.trade_state import TradingStateMachine
 from bot.portfolio.position_manager import PositionManager
+from bot.indicators.indicators import ema as _ema_fn, trend as _trend_fn
 from bot.ai.ai_engine import AIEngine, merge_signals
 from bot import display
 from bot.dashboard import renderer as _dashboard
+from bot.signals.external_signals import ExternalSignalGate, ExternalSignalsConfig as _ExtSigsCfg
+from bot.alerts.telegram import TelegramAlerter
+from bot.data.trade_log import TradeLog
 
 # ── Dashboard path ────────────────────────────────────────────────────────────
 _DASHBOARD_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dashboard.html")
@@ -228,6 +233,7 @@ def build_strategy():
             adx_max                  = cfg.strategy.adx_max,
             max_ema_spread_pct       = cfg.strategy.max_ema_spread_pct,
             rsi_filter_enabled       = cfg.strategy.rsi_filter_enabled,
+            macd_enabled             = cfg.strategy.macd_enabled,
             regime_ema_period        = cfg.strategy.regime_ema_period,
             regime_ema_slope_filter  = cfg.strategy.regime_ema_slope_filter,
             volume_k                 = cfg.strategy.volume_k,
@@ -255,6 +261,7 @@ def run():
             api_secret    = cfg.exchange.api_secret,
             starting_cash = cfg.portfolio.starting_cash,
             dry_run       = cfg.exchange.dry_run,
+            order_type    = cfg.exchange.order_type,
         )
         mode_str = "[DRY RUN] " if cfg.exchange.dry_run else ""
         print(
@@ -303,6 +310,28 @@ def run():
         timeout_s      = cfg.ai.timeout_s,
     ) if cfg.ai.enabled else None
 
+    # ── External signal gate (live mode only) ─────────────────────────────────
+    ext_gate: "ExternalSignalGate | None" = None
+    if cfg.exchange.feed_mode == "live" and (cfg.signals.fng_enabled or cfg.signals.funding_enabled):
+        ext_gate = ExternalSignalGate(_ExtSigsCfg(
+            fng_enabled           = cfg.signals.fng_enabled,
+            fng_bear_max          = cfg.signals.fng_bear_max,
+            fng_bull_min          = cfg.signals.fng_bull_min,
+            fng_cache_seconds     = cfg.signals.fng_cache_seconds,
+            funding_enabled       = cfg.signals.funding_enabled,
+            funding_symbol        = cfg.signals.funding_symbol,
+            funding_max           = cfg.signals.funding_max,
+            funding_cache_seconds = cfg.signals.funding_cache_seconds,
+        ))
+
+    # ── Persistent trade log + Telegram alerts ────────────────────────────────
+    trade_log = TradeLog()
+    alerter   = TelegramAlerter(
+        bot_token = cfg.alerts.telegram_bot_token,
+        chat_id   = cfg.alerts.telegram_chat_id,
+        enabled   = cfg.alerts.telegram_enabled,
+    )
+
     # In live mode: show real Kraken balance, not starting_cash from .env.
     # executor.cash and executor.position are already synced from the exchange
     # by the time LiveExecutor.__init__() returns (lines above).
@@ -329,6 +358,9 @@ def run():
     if cfg.dashboard.enabled:
         print(f"  Dashboard → file://{_DASHBOARD_PATH}\n")
 
+    _mode_label = "LIVE" if cfg.exchange.live_trading else ("DRY RUN" if cfg.exchange.dry_run else "PAPER")
+    alerter.startup(cfg.exchange.exchange, cfg.exchange.symbol, _mode_label)
+
     is_indicator = isinstance(strategy, IndicatorStrategy)
 
     # ── Derive live candle timeframe from CANDLE_MINUTES ─────────────────────
@@ -344,10 +376,22 @@ def run():
     if is_indicator and cfg.exchange.feed_mode == "live":
         live_exchange     = _build_exchange()
         last_candle_ts_ms = _warmup_strategy(strategy, live_exchange, _LIVE_TF)
+        try:
+            _raw_1d = live_exchange.fetch_ohlcv(cfg.exchange.symbol, timeframe="1d", limit=30)
+            _mtf_1d_closes = [float(r[4]) for r in _raw_1d[:-1]]
+            print(f"  MTF: loaded {len(_mtf_1d_closes)} daily candles for regime check.", flush=True)
+        except Exception as _mtf_exc:
+            print(f"  MTF: daily candle fetch failed ({_mtf_exc}) — MTF disabled this session.", flush=True)
 
     tick        = 0
     tick_log:   deque[dict] = deque(maxlen=200)
     candle_log: deque[dict] = deque(maxlen=50)
+
+    # Trailing stop and partial TP state — reset on each new trade
+    _trail_peak:      float = 0.0
+    _partial_tp_done: bool  = False
+    # MTF 1D closes for regime check — loaded once at startup
+    _mtf_1d_closes: list[float] = []
 
     # Sticky indicator values — updated each candle close, displayed between closes
     _dash_signal = "HOLD"
@@ -426,20 +470,51 @@ def run():
         # ── 3. Strategy signal ────────────────────────────────────────
         if is_indicator:
             if live_exchange is not None:
-                # ── Intra-candle SL/TP: runs on every 30s tick ────────────
+                # ── Intra-candle SL/TP + Trailing Stop + Partial TP ──────
                 if position_manager.has_position and position_manager.avg_entry > 0:
                     _ic_entry = position_manager.avg_entry
-                    _ic_sl = (cfg.backtest.stop_loss_pct > 0
-                              and price <= _ic_entry * (1 - cfg.backtest.stop_loss_pct))
+                    # Update trailing peak on every tick
+                    _trail_peak = max(_trail_peak, price)
+                    _trail_sl_level = (
+                        _trail_peak * (1 - cfg.backtest.stop_loss_pct)
+                        if _trail_peak > 0 and cfg.backtest.stop_loss_pct > 0 else 0.0
+                    )
+
+                    # Partial TP — sell cfg.backtest.partial_tp_size at partial_tp_pct gain
+                    _partial_tp_level = (
+                        _ic_entry * (1 + cfg.backtest.partial_tp_pct)
+                        if cfg.backtest.partial_tp_pct > 0 else None
+                    )
+                    if (
+                        _partial_tp_level is not None
+                        and price >= _partial_tp_level
+                        and not _partial_tp_done
+                        and executor.position > 0
+                    ):
+                        _p_qty = round(executor.position * cfg.backtest.partial_tp_size, 6)
+                        if _p_qty > 0:
+                            _p_approval = risk.evaluate(Signal.SELL, price, executor.portfolio, _p_qty)
+                            if _p_approval.approved:
+                                _p_order = executor.execute(Signal.SELL, price, quantity=_p_qty)
+                                if _p_order and _p_order.status == OrderStatus.FILLED:
+                                    risk.record_fill()
+                                    state_machine.on_fill(Signal.SELL, _p_order.price)
+                                    _p_pnl = position_manager.on_sell(_p_order.price, _p_order.quantity)
+                                    _partial_tp_done = True
+                                    state_machine.recover_long(_p_order.price)
+                                    print(f"           📊 PARTIAL TP:  {_p_qty:.6f} @ {price:,.2f}  PnL={_p_pnl:+.2f}", flush=True)
+                                    logger.warning("PARTIAL TP: sold %.6f @ %.2f  pnl=%.2f", _p_qty, price, _p_pnl)
+
+                    _ic_sl = _trail_sl_level > 0 and price <= _trail_sl_level
                     _ic_tp = (cfg.backtest.take_profit_pct > 0
                               and price >= _ic_entry * (1 + cfg.backtest.take_profit_pct))
                     if _ic_sl or _ic_tp:
                         if _ic_sl:
                             logger.warning(
-                                "STOP LOSS triggered: price=%.2f entry=%.2f sl=%.1f%%",
-                                price, _ic_entry, cfg.backtest.stop_loss_pct * 100,
+                                "TRAIL STOP triggered: price=%.2f peak=%.2f trail_sl=%.2f",
+                                price, _trail_peak, _trail_sl_level,
                             )
-                            print(f"           \U0001f6d1 STOP LOSS   price={price:,.2f}  entry={_ic_entry:,.2f}", flush=True)
+                            print(f"           🛑 TRAIL STOP  price={price:,.2f}  peak={_trail_peak:,.2f}  sl={_trail_sl_level:,.2f}", flush=True)
                         else:
                             logger.warning(
                                 "TAKE PROFIT triggered: price=%.2f entry=%.2f tp=%.1f%%",
@@ -454,10 +529,31 @@ def run():
                                 risk.record_fill()
                                 state_machine.on_fill(Signal.SELL, _ic_order.price)
                                 _ic_pnl = position_manager.on_sell(_ic_order.price, _ic_order.quantity)
+                                _trail_peak = 0.0
+                                _partial_tp_done = False
+                                _ic_reason = "trail_stop" if _ic_sl else "take_profit"
                                 display.fill(
                                     _ic_order.side.value, _ic_order.quantity,
                                     cfg.exchange.symbol, _ic_order.price,
                                     _ic_order.total_value, _ic_pnl,
+                                )
+                                trade_log.log_fill(
+                                    side          = "SELL",
+                                    symbol        = cfg.exchange.symbol,
+                                    quantity      = _ic_order.quantity,
+                                    price         = _ic_order.price,
+                                    pnl           = _ic_pnl,
+                                    exchange      = cfg.exchange.exchange,
+                                    signal_reason = _ic_reason,
+                                )
+                                alerter.fill(
+                                    side        = "SELL",
+                                    symbol      = cfg.exchange.symbol,
+                                    quantity    = _ic_order.quantity,
+                                    price       = _ic_order.price,
+                                    total_value = _ic_order.total_value,
+                                    pnl         = _ic_pnl,
+                                    exchange    = cfg.exchange.exchange,
                                 )
                         else:
                             logger.warning(
@@ -479,7 +575,7 @@ def run():
                             "rsi":    _dash_rsi,
                             "trend":  _dash_trend,
                             "state":  state_machine.state.value,
-                            "reason": "SL/TP exit",
+                            "reason": "trail_stop" if _ic_sl else "take_profit",
                         })
                         _render_dashboard("SELL", _dash_rsi, _dash_trend)
                         time.sleep(cfg.exchange.loop_interval)
@@ -541,7 +637,6 @@ def run():
             _adx_live  = strategy.last_adx
             _rsi_live  = strategy.last_rsi
             _trnd_live = strategy.last_trend or "UNKNOWN"
-            from bot.indicators.indicators import ema as _ema_fn
             _cl = list(strategy._closes)
             _ef = _ema_fn(_cl, strategy.config.fast_ema_period)
             _es = _ema_fn(_cl, strategy.config.slow_ema_period)
@@ -578,9 +673,8 @@ def run():
                 flush=True
             )
 
-            import csv, os as _os
-            _live_log = "logs/live_signals.csv"
-            _write_header = not _os.path.exists(_live_log)
+            _live_log = os.path.join(_log_dir, "live_signals.csv")
+            _write_header = not os.path.exists(_live_log)
             with open(_live_log, "a", newline="") as _f:
                 _w = csv.writer(_f)
                 if _write_header:
@@ -598,6 +692,29 @@ def run():
                     _sig_str,
                     _reason,
                 ])
+
+        # ── 3d. MTF gate: block BUY when daily trend is BEARISH ─────────
+        if is_indicator and raw_signal == Signal.BUY and _mtf_1d_closes:
+            _mtf_trend = _trend_fn(_mtf_1d_closes)
+            if _mtf_trend == "BEARISH":
+                raw_signal = Signal.HOLD
+                print(f"  MTF gate: 1D trend BEARISH — BUY suppressed", flush=True)
+                logger.info("MTF gate: BUY suppressed — daily trend BEARISH")
+            # Refresh 1D closes each candle close
+            try:
+                _raw_1d_refresh = live_exchange.fetch_ohlcv(cfg.exchange.symbol, timeframe="1d", limit=30) if live_exchange else None
+                if _raw_1d_refresh:
+                    _mtf_1d_closes = [float(r[4]) for r in _raw_1d_refresh[:-1]]
+            except Exception:
+                pass  # keep stale 1D data if refresh fails
+
+        # ── 3e. External signal gate (live only) ──────────────────────
+        if raw_signal == Signal.BUY and ext_gate is not None:
+            _ext_approved, _ext_reason = ext_gate.approve_buy()
+            if not _ext_approved:
+                raw_signal = Signal.HOLD
+                print(f"  EXT gate: {_ext_reason}", flush=True)
+                logger.info("External signal gate blocked BUY: %s", _ext_reason)
 
         # ── 4. Warmup guard ───────────────────────────────────────────
         if is_indicator and not strategy.is_warmed_up:
@@ -708,12 +825,34 @@ def run():
                     pnl = None
                     if order.side == OrderSide.BUY:
                         position_manager.on_buy(order.price, order.quantity)
+                        _trail_peak = order.price  # seed trailing peak at entry
+                        _partial_tp_done = False
                     else:
                         pnl = position_manager.on_sell(order.price, order.quantity)
+                        _trail_peak = 0.0
+                        _partial_tp_done = False
 
                     display.fill(
                         order.side.value, order.quantity,
                         cfg.exchange.symbol, order.price, order.total_value, pnl,
+                    )
+                    trade_log.log_fill(
+                        side          = order.side.value,
+                        symbol        = cfg.exchange.symbol,
+                        quantity      = order.quantity,
+                        price         = order.price,
+                        pnl           = pnl,
+                        exchange      = cfg.exchange.exchange,
+                        signal_reason = filter_reason or raw_signal.value,
+                    )
+                    alerter.fill(
+                        side        = order.side.value,
+                        symbol      = cfg.exchange.symbol,
+                        quantity    = order.quantity,
+                        price       = order.price,
+                        total_value = order.total_value,
+                        pnl         = pnl,
+                        exchange    = cfg.exchange.exchange,
                     )
                 else:
                     display.reject(order.reject_reason or "")

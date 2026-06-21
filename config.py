@@ -86,6 +86,7 @@ class ExchangeConfig:
     dry_run:        bool = False
     api_key:        str  = ""
     api_secret:     str  = ""
+    order_type:     str  = "market"  # "market" | "limit"
 
     def __post_init__(self):
         if self.feed_mode not in ("live", "simulated"):
@@ -106,6 +107,8 @@ class ExchangeConfig:
                 "LIVE_TRADING=true requires KRAKEN_API_SECRET to be set in .env. "
                 "The bot refuses to start live without credentials."
             )
+        if self.order_type not in ("market", "limit"):
+            raise ValueError(f"ORDER_TYPE must be 'market' or 'limit', got '{self.order_type}'")
 
 
 @dataclass
@@ -125,7 +128,8 @@ class StrategyConfig:
     rsi_filter_enabled:      bool  = True  # False = bypass RSI level/direction checks
     regime_ema_period:       int   = 200   # BUY only when price > this EMA (0 = disabled)
     regime_ema_slope_filter: bool  = False # BUY only when EMA200 slope > 0 (rising)
-    volume_k:                float = 1.2   # volume filter multiplier (0 = disabled)
+    volume_k:                float = 0.0   # volume filter multiplier (0 = disabled)
+    macd_enabled:            bool  = True  # BUY only when MACD histogram is rising
 
     def __post_init__(self):
         if self.mode not in ("indicator", "threshold"):
@@ -217,11 +221,14 @@ class DashboardConfig:
 
 @dataclass
 class BacktestConfig:
-    timeframe:       str   = "4h"
-    limit:           int   = 5000    # paginated — up to 5000 candles
-    fee_pct:         float = 0.008   # 0.8% Kraken taker fee (validated 2026-06-19)
-    stop_loss_pct:   float = 0.015   # exit if price drops 1.5% from entry (0 = disabled)
-    take_profit_pct: float = 0.10    # exit if price rises 10% from entry (0 = disabled)
+    timeframe:           str   = "4h"
+    limit:               int   = 5000    # paginated — up to 5000 candles
+    fee_pct:             float = 0.008   # 0.8% Kraken taker fee (validated 2026-06-19)
+    stop_loss_pct:       float = 0.015   # exit if price drops 1.5% from entry (0 = disabled)
+    take_profit_pct:     float = 0.10    # exit if price rises 10% from entry (0 = disabled)
+    trail_stop_pct:      float = 0.0     # trailing stop distance from peak (0 = disabled)
+    partial_tp_pct:      float = 0.0     # sell partial_tp_size at this gain (0 = disabled)
+    partial_tp_size:     float = 0.5     # fraction of position to sell at partial TP
 
     _VALID_TIMEFRAMES = {"1m","5m","15m","30m","1h","2h","4h","6h","12h","1d","1w"}
 
@@ -241,6 +248,25 @@ class BacktestConfig:
             raise ValueError("TAKE_PROFIT_PCT must be between 0% and 100%")
 
 
+@dataclass
+class ExternalSignalsConfig:
+    fng_enabled:           bool  = True
+    fng_bear_max:          float = 75.0    # block BUY when FNG > this (extreme greed)
+    fng_bull_min:          float = 0.0     # require FNG >= this (0 = disabled)
+    fng_cache_seconds:     int   = 3600    # TTL for Fear & Greed cache
+    funding_enabled:       bool  = True
+    funding_symbol:        str   = "BTCUSDT"
+    funding_max:           float = 0.0005  # block BUY when funding > 0.05%
+    funding_cache_seconds: int   = 3600    # TTL for funding rate cache
+
+
+@dataclass
+class AlertConfig:
+    telegram_enabled:  bool = False
+    telegram_bot_token: str = ""
+    telegram_chat_id:  str  = ""
+
+
 # ---------------------------------------------------------------------------
 # Root config
 # ---------------------------------------------------------------------------
@@ -254,6 +280,8 @@ class AppConfig:
     ai:        AIConfig
     dashboard: DashboardConfig
     backtest:  BacktestConfig
+    signals:   ExternalSignalsConfig
+    alerts:    AlertConfig
 
     def calc_trade_qty(self, cash: float, price: float) -> float:
         """
@@ -287,9 +315,9 @@ class AppConfig:
     def log_startup(self) -> None:
         """Log all config on startup (no secrets logged)."""
         logger.info("─" * 60)
-        logger.info("CONFIG  exchange=%s  symbol=%s  feed=%s  candle=%dmin",
+        logger.info("CONFIG  exchange=%s  symbol=%s  feed=%s  candle=%dmin  order_type=%s",
             self.exchange.exchange, self.exchange.symbol, self.exchange.feed_mode,
-            self.exchange.candle_minutes)
+            self.exchange.candle_minutes, self.exchange.order_type)
         adx_src = "from .env" if "ADX_THRESHOLD" in os.environ else "CODE DEFAULT — set ADX_THRESHOLD in .env"
         logger.info("CONFIG  strategy=%s  RSI(%d) %g/%g  EMA(%d/%d)  ADX=%.1f (%s)  regime_ema=%d  slope=%s",
             self.strategy.mode, self.strategy.rsi_period,
@@ -340,6 +368,7 @@ def _load() -> AppConfig:
             dry_run        = _bool("DRY_RUN",         False),
             api_key        = _str ("KRAKEN_API_KEY",  ""),
             api_secret     = _str ("KRAKEN_API_SECRET", ""),
+            order_type     = _str ("ORDER_TYPE",      "market"),
         ),
         strategy=StrategyConfig(
             mode                    = _str  ("STRATEGY_MODE",           "indicator"),
@@ -357,7 +386,8 @@ def _load() -> AppConfig:
             rsi_filter_enabled      = _bool ("RSI_FILTER_ENABLED",      True),
             regime_ema_period       = _int  ("REGIME_EMA_PERIOD",       200),
             regime_ema_slope_filter = _bool ("REGIME_EMA_SLOPE_FILTER", False),
-            volume_k                = _float("VOLUME_K",                1.2),
+            volume_k                = _float("VOLUME_K",                0.0),
+            macd_enabled            = _bool ("MACD_ENABLED",            True),
         ),
         risk=RiskConfig(
             risk_per_trade_pct   = _float("RISK_PER_TRADE_PCT",    0.01),
@@ -383,11 +413,29 @@ def _load() -> AppConfig:
             refresh_s = _int ("DASHBOARD_REFRESH", 30),
         ),
         backtest=BacktestConfig(
-            timeframe       = _str  ("BACKTEST_TIMEFRAME", "4h"),
-            limit           = _int  ("BACKTEST_LIMIT",     5000),
-            fee_pct         = _float("BACKTEST_FEE_PCT",   0.008),
-            stop_loss_pct   = _float("STOP_LOSS_PCT",      0.015),
-            take_profit_pct = _float("TAKE_PROFIT_PCT",    0.10),
+            timeframe        = _str  ("BACKTEST_TIMEFRAME",   "4h"),
+            limit            = _int  ("BACKTEST_LIMIT",       5000),
+            fee_pct          = _float("BACKTEST_FEE_PCT",     0.008),
+            stop_loss_pct    = _float("STOP_LOSS_PCT",        0.015),
+            take_profit_pct  = _float("TAKE_PROFIT_PCT",      0.10),
+            trail_stop_pct   = _float("TRAIL_STOP_PCT",       0.0),
+            partial_tp_pct   = _float("PARTIAL_TP_PCT",       0.0),
+            partial_tp_size  = _float("PARTIAL_TP_SIZE",      0.5),
+        ),
+        signals=ExternalSignalsConfig(
+            fng_enabled            = _bool ("EXT_FNG_ENABLED",       True),
+            fng_bear_max           = _float("EXT_FNG_BEAR_MAX",      75.0),
+            fng_bull_min           = _float("EXT_FNG_BULL_MIN",      0.0),
+            fng_cache_seconds      = _int  ("EXT_FNG_CACHE_S",       3600),
+            funding_enabled        = _bool ("EXT_FUNDING_ENABLED",   True),
+            funding_symbol         = _str  ("EXT_FUNDING_SYMBOL",    "BTCUSDT"),
+            funding_max            = _float("EXT_FUNDING_MAX",       0.0005),
+            funding_cache_seconds  = _int  ("EXT_FUNDING_CACHE_S",   3600),
+        ),
+        alerts=AlertConfig(
+            telegram_enabled    = _bool("TELEGRAM_ENABLED",    False),
+            telegram_bot_token  = _str ("TELEGRAM_BOT_TOKEN",  ""),
+            telegram_chat_id    = _str ("TELEGRAM_CHAT_ID",    ""),
         ),
     )
 
@@ -399,11 +447,11 @@ def _load() -> AppConfig:
             "Live-validated strategy uses 18.0. Backtest and live bot WILL diverge.",
             cfg.strategy.adx_threshold,
         )
-    if "VOLUME_K" not in os.environ:
+    if cfg.strategy.volume_k > 0:
         logger.warning(
-            "VOLUME_K not set in .env — falling back to code default %.1f. "
+            "VOLUME_K=%.1f — volume filter is ACTIVE. "
             "Live-validated strategy uses VOLUME_K=0 (disabled). "
-            "Volume filter will be active, which may suppress valid signals.",
+            "Set VOLUME_K=0 in .env unless you have re-validated with volume filter on.",
             cfg.strategy.volume_k,
         )
 

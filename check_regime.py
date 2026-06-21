@@ -31,11 +31,13 @@ def ema(closes: list, period: int) -> Optional[float]:
 
 
 def main():
-    exchange = ccxt.kraken()
+    from config import cfg
+    exchange_cls = getattr(ccxt, cfg.exchange.exchange.lower())
+    exchange = exchange_cls()
 
     # ── Fetch data ────────────────────────────────────────────────────
     try:
-        ohlcv = exchange.fetch_ohlcv('BTC/CAD', '4h', limit=300)
+        ohlcv = exchange.fetch_ohlcv(cfg.exchange.symbol, cfg.backtest.timeframe, limit=300)
     except Exception as e:
         print(f"Error fetching data: {e}")
         raise SystemExit(1)

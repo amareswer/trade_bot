@@ -10,6 +10,7 @@ requests>=2.28       # HTTP client for Fear & Greed + StockTwits + future APIs
 pytrends>=4.0        # Google Trends interest score — no API key required
 feedparser>=6.0      # News RSS parsing — stock bot news (Phase 2)
 colorama>=0.4        # terminal colour output — stock bot AI verdict display (Phase 3)
+pytz>=2023.3         # timezone-aware market hours handling (stock bot)
 
 # Future (crypto)
 # numpy>=1.26         # numerical strategies

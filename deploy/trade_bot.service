@@ -1,0 +1,31 @@
+[Unit]
+Description=Crypto Trading Bot
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/trade_bot
+EnvironmentFile=/opt/trade_bot/.env
+
+ExecStart=/opt/trade_bot/venv/bin/python main.py
+Restart=on-failure
+RestartSec=30
+
+# Send stdout+stderr to the system journal (view with: journalctl -u trade_bot -f)
+StandardOutput=journal
+StandardError=journal
+
+# Hard limits — bot should never need more than this
+MemoryMax=512M
+CPUQuota=50%
+
+# Keep the process in a clean environment
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

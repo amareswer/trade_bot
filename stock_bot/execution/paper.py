@@ -50,8 +50,9 @@ class StockPaperExecutor(StockExecutorBase):
     All prices come from yfinance data in the scan cycle (no extra API calls).
     """
 
-    def __init__(self, starting_cash: float = 10_000.0) -> None:
+    def __init__(self, starting_cash: float = 10_000.0, max_exposure_pct: float = 0.25) -> None:
         self._starting_cash: float                          = starting_cash
+        self._max_exposure_pct: float                       = max_exposure_pct
         self._orders:        list[StockOrder]               = []
         self._trade_log:     list[PaperTrade]               = []
 
@@ -502,6 +503,15 @@ class StockPaperExecutor(StockExecutorBase):
     def get_sector_exposure(self) -> dict[str, int]:
         """Public view of sector concentration in open positions."""
         return self._sector_count()
+
+    def check_exposure(self, price_map: dict[str, float]) -> bool:
+        """Return True if current position value is under the max exposure threshold."""
+        total = self.total_value(price_map)
+        if total <= 0:
+            return True
+        snap = self.positions_snapshot()
+        pos_val = sum(shares * price_map.get(sym, cost) for sym, (shares, cost) in snap.items())
+        return (pos_val / total) < self._max_exposure_pct
 
     # ── Internal ─────────────────────────────────────────────────────────────
 

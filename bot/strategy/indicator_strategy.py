@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from bot.strategy.threshold_strategy import Signal
-from bot.indicators.indicators import rsi as calc_rsi, trend as calc_trend, ema as calc_ema, adx as calc_adx
+from bot.indicators.indicators import rsi as calc_rsi, trend as calc_trend, ema as calc_ema, adx as calc_adx, macd as calc_macd
 from bot.data.historical_feed import Candle
 
 logger = logging.getLogger(__name__)
@@ -57,6 +57,10 @@ class IndicatorConfig:
     adx_threshold:            float = 25.0   # < threshold = ranging market → HOLD (0 = disabled)
     adx_max:                  float = 0.0    # > max = overextended trend → HOLD (0 = disabled)
     volume_k:                 float = 1.2    # current volume must be >= k * avg(last 3 candles); 0 = disabled
+    macd_enabled:             bool  = True   # BUY only when MACD histogram is rising (momentum)
+    macd_fast_period:         int   = 12
+    macd_slow_period:         int   = 26
+    macd_signal_period:       int   = 9
     rsi_filter_enabled:       bool  = True   # set False to bypass RSI level/direction checks
     regime_ema_period:        int   = 200    # BUY only when price > this EMA (0 = disabled)
     regime_ema_slope_filter:  bool  = False  # BUY only when EMA200 slope > 0 (rising)
@@ -86,10 +90,11 @@ class IndicatorStrategy:
         self._highs:      deque = deque(maxlen=buf)
         self._lows:       deque = deque(maxlen=buf)
         self._volumes:    deque = deque(maxlen=buf)
-        self._last_rsi:   Optional[float] = None
-        self._last_trend: Optional[str]   = None
-        self._last_adx:   Optional[float] = None
-        self._prev_rsi:   Optional[float] = None   # RSI one tick ago — for direction
+        self._last_rsi:       Optional[float] = None
+        self._last_trend:     Optional[str]   = None
+        self._last_adx:       Optional[float] = None
+        self._prev_rsi:       Optional[float] = None   # RSI one tick ago — for direction
+        self._last_macd_hist: Optional[float] = None
 
         self.stats: dict = {
             "candles_seen":    0,
@@ -98,6 +103,7 @@ class IndicatorStrategy:
             "trend_rejected":  0,
             "ema_rejected":    0,
             "rsi_rejected":    0,
+            "macd_rejected":   0,
             "regime_rejected": 0,
             "volume_rejected": 0,
             "buy_signals":     0,
@@ -227,6 +233,16 @@ class IndicatorStrategy:
                 curr_vol, avg_vol_3, self.config.volume_k * avg_vol_3, volume_ok,
             )
 
+        # ── MACD momentum confirmation ────────────────────────────────
+        macd_val = calc_macd(closes, self.config.macd_fast_period, self.config.macd_slow_period, self.config.macd_signal_period)
+        macd_hist = macd_val[2] if macd_val is not None else None
+        macd_hist_rising = (
+            macd_hist is not None
+            and self._last_macd_hist is not None
+            and macd_hist > self._last_macd_hist
+        )
+        self._last_macd_hist = macd_hist
+
         # ── BUY / SELL conditions ─────────────────────────────────────
         if trend_val == "BULLISH":
             if not ema_strong:
@@ -238,6 +254,8 @@ class IndicatorStrategy:
                 self.stats["rsi_rejected"] += 1
             elif not volume_ok:
                 self.stats["volume_rejected"] += 1
+            elif self.config.macd_enabled and not macd_hist_rising:
+                self.stats["macd_rejected"] += 1
             else:
                 self.stats["buy_signals"] += 1
                 return Signal.BUY
@@ -283,3 +301,7 @@ class IndicatorStrategy:
     @property
     def tick_count(self) -> int:
         return len(self._closes)
+
+    @property
+    def last_macd_hist(self) -> Optional[float]:
+        return self._last_macd_hist

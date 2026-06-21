@@ -120,6 +120,42 @@ def adx(
     return adx_val
 
 
+def atr(
+    highs:  list[float],
+    lows:   list[float],
+    closes: list[float],
+    period: int = 14,
+) -> float | None:
+    """
+    Average True Range via Wilder's smoothing (same method as ADX).
+    True Range = max(high-low, |high-prev_close|, |low-prev_close|)
+    Requires at least 2*period data points.
+    """
+    n = len(closes)
+    if n < 2 * period or len(highs) != n or len(lows) != n:
+        return None
+
+    tr_list: list[float] = []
+    for i in range(1, n):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i]  - closes[i - 1]),
+        )
+        tr_list.append(tr)
+
+    if len(tr_list) < period:
+        return None
+
+    # Seed: simple average of first `period` TR values
+    atr_val = sum(tr_list[:period]) / period
+    # Wilder's smooth for the rest
+    for tr in tr_list[period:]:
+        atr_val = (atr_val * (period - 1) + tr) / period
+
+    return atr_val
+
+
 def trend(prices: list[float], fast_period: int = 9, slow_period: int = 21) -> str:
     """
     Trend direction via EMA crossover.
@@ -139,3 +175,34 @@ def trend(prices: list[float], fast_period: int = 9, slow_period: int = 21) -> s
     if fast < slow - band:
         return "BEARISH"
     return "NEUTRAL"
+
+
+def macd(
+    prices: list[float],
+    fast_period: int = 12,
+    slow_period: int = 26,
+    signal_period: int = 9,
+) -> tuple[float, float, float] | None:
+    """
+    MACD — Moving Average Convergence Divergence.
+    Returns (macd_line, signal_line, histogram) or None on insufficient data.
+    Histogram rising across consecutive candles = momentum accelerating.
+    """
+    if len(prices) < slow_period + signal_period:
+        return None
+    macd_values: list[float] = []
+    for i in range(slow_period - 1, len(prices)):
+        window = prices[: i + 1]
+        fast = ema(window, fast_period)
+        slow = ema(window, slow_period)
+        if fast is None or slow is None:
+            continue
+        macd_values.append(fast - slow)
+    if len(macd_values) < signal_period:
+        return None
+    signal_line = ema(macd_values, signal_period)
+    if signal_line is None:
+        return None
+    macd_line = macd_values[-1]
+    histogram  = macd_line - signal_line
+    return macd_line, signal_line, histogram

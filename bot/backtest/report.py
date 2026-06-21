@@ -86,6 +86,17 @@ def print_report(metrics: BacktestMetrics, result: BacktestResult) -> None:
     sr_col = _GR if sr >= 1.0 else (_YL if sr >= 0 else _RD)
     _row("Sharpe ratio",    f"{sr_col}{sr:.2f}{_R}")
 
+    so = metrics.sortino_ratio
+    so_col = _GR if so >= 2.0 else (_YL if so >= 0 else _RD)
+    _row("Sortino ratio",   f"{so_col}{so:.2f}{_R}")
+
+    cal = metrics.calmar_ratio
+    cal_col = _GR if cal >= 1.0 else (_YL if cal >= 0 else _RD)
+    _row("Calmar ratio",    f"{cal_col}{cal:.2f}{_R}")
+
+    ann = metrics.annualized_return
+    _row("Annlzd return",   _pct(ann))
+
     # ── Buy-and-hold benchmark ────────────────────────────────────────
     warmup = getattr(result, "warmup_ticks", 0)
     if result.candles and len(result.candles) > warmup:

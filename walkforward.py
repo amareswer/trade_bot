@@ -73,7 +73,7 @@ def run_period(candles, label, start, end):
         sell_threshold       = cfg.strategy.sell_threshold,
         max_position_pct     = cfg.risk.max_position_pct,
         daily_loss_limit_pct = cfg.risk.daily_loss_limit_pct,
-        max_drawdown_pct     = cfg.risk.max_drawdown_pct,
+        max_drawdown_pct     = 0.25,
         max_trades_per_day   = cfg.risk.max_trades_per_day,
         stop_loss_pct        = cfg.backtest.stop_loss_pct,
         take_profit_pct      = cfg.backtest.take_profit_pct,
