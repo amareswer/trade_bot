@@ -130,6 +130,13 @@ class StrategyConfig:
     regime_ema_slope_filter: bool  = False # BUY only when EMA200 slope > 0 (rising)
     volume_k:                float = 0.0   # volume filter multiplier (0 = disabled)
     macd_enabled:            bool  = True  # BUY only when MACD histogram is rising
+    # ── Dual-regime additions ─────────────────────────────────────────────────
+    regime_enabled:          bool  = True  # True = dual-regime; False = trend-only (original)
+    bb_period:               int   = 20    # Bollinger Band period for ranging detection
+    bb_std_dev:              float = 2.0   # Bollinger Band std-dev multiplier
+    mr_rsi_oversold:         float = 35.0  # mean-reversion BUY threshold (ranging mode)
+    mr_rsi_overbought:       float = 65.0  # mean-reversion SELL threshold (ranging mode)
+    atr_volatile_multiplier: float = 1.5   # ATR > mult × avg ATR → sit flat (VOLATILE)
 
     def __post_init__(self):
         if self.mode not in ("indicator", "threshold"):
@@ -229,6 +236,8 @@ class BacktestConfig:
     trail_stop_pct:      float = 0.0     # trailing stop distance from peak (0 = disabled)
     partial_tp_pct:      float = 0.0     # sell partial_tp_size at this gain (0 = disabled)
     partial_tp_size:     float = 0.5     # fraction of position to sell at partial TP
+    atr_sl_enabled:      bool  = False   # True = ATR-based SL; False = fixed % SL
+    atr_sl_multiplier:   float = 2.0     # SL = entry_price - ATR × multiplier
 
     _VALID_TIMEFRAMES = {"1m","5m","15m","30m","1h","2h","4h","6h","12h","1d","1w"}
 
@@ -293,6 +302,25 @@ class AppConfig:
             return 0.0
         trade_value = cash * self.risk.risk_per_trade_pct
         return round(trade_value / price, 6)
+
+    def calc_trade_qty_atr(
+        self,
+        cash:          float,
+        price:         float,
+        atr_value:     float,
+        atr_multiplier: float | None = None,
+    ) -> float:
+        """
+        ATR-based sizing: SL distance = ATR × multiplier.
+        Risks exactly risk_per_trade_pct of cash if the ATR stop is hit.
+        Falls back to calc_trade_qty() when ATR is 0 or unavailable.
+        """
+        mult = atr_multiplier if atr_multiplier is not None else self.backtest.atr_sl_multiplier
+        if price <= 0 or cash <= 0 or atr_value <= 0 or mult <= 0:
+            return self.calc_trade_qty(cash, price)
+        sl_distance = atr_value * mult
+        dollar_risk = cash * self.risk.risk_per_trade_pct
+        return round(dollar_risk / sl_distance, 6)
 
     def calc_trade_qty_sl(
         self,
@@ -388,6 +416,12 @@ def _load() -> AppConfig:
             regime_ema_slope_filter = _bool ("REGIME_EMA_SLOPE_FILTER", False),
             volume_k                = _float("VOLUME_K",                0.0),
             macd_enabled            = _bool ("MACD_ENABLED",            True),
+            regime_enabled          = _bool ("REGIME_ENABLED",          True),
+            bb_period               = _int  ("BB_PERIOD",               20),
+            bb_std_dev              = _float("BB_STD_DEV",              2.0),
+            mr_rsi_oversold         = _float("MR_RSI_OVERSOLD",         35.0),
+            mr_rsi_overbought       = _float("MR_RSI_OVERBOUGHT",       65.0),
+            atr_volatile_multiplier = _float("ATR_VOLATILE_MULTIPLIER", 1.5),
         ),
         risk=RiskConfig(
             risk_per_trade_pct   = _float("RISK_PER_TRADE_PCT",    0.01),
@@ -421,6 +455,8 @@ def _load() -> AppConfig:
             trail_stop_pct   = _float("TRAIL_STOP_PCT",       0.0),
             partial_tp_pct   = _float("PARTIAL_TP_PCT",       0.0),
             partial_tp_size  = _float("PARTIAL_TP_SIZE",      0.5),
+            atr_sl_enabled   = _bool ("ATR_SL_ENABLED",       False),
+            atr_sl_multiplier= _float("ATR_SL_MULTIPLIER",    2.0),
         ),
         signals=ExternalSignalsConfig(
             fng_enabled            = _bool ("EXT_FNG_ENABLED",       True),

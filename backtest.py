@@ -111,6 +111,14 @@ def main():
         regime_ema_period       = cfg.strategy.regime_ema_period,
         regime_ema_slope_filter = cfg.strategy.regime_ema_slope_filter,
         volume_k                = cfg.strategy.volume_k,
+        regime_enabled          = cfg.strategy.regime_enabled,
+        bb_period               = cfg.strategy.bb_period,
+        bb_std_dev              = cfg.strategy.bb_std_dev,
+        mr_rsi_oversold         = cfg.strategy.mr_rsi_oversold,
+        mr_rsi_overbought       = cfg.strategy.mr_rsi_overbought,
+        atr_volatile_multiplier = cfg.strategy.atr_volatile_multiplier,
+        atr_sl_enabled          = cfg.backtest.atr_sl_enabled,
+        atr_sl_multiplier       = cfg.backtest.atr_sl_multiplier,
     )
 
     m = metrics_mod.compute(result)
@@ -130,23 +138,29 @@ def main():
         print(f"  Warmup (skipped)          {rs.get('warmup_rejected', 0):>6}")
         print(f"  Tradeable candles         {tradeable:>6}")
         print(f"  ─────────────────────────────────────────")
-        adx_n    = rs.get("adx_rejected", 0)
-        trend_n  = rs.get("trend_rejected", 0)
-        ema_n    = rs.get("ema_rejected", 0)
-        rsi_n    = rs.get("rsi_rejected", 0)
-        regime_n = rs.get("regime_rejected", 0)
-        vol_n    = rs.get("volume_rejected", 0)
+        adx_n      = rs.get("adx_rejected", 0)
+        trend_n    = rs.get("trend_rejected", 0)
+        ema_n      = rs.get("ema_rejected", 0)
+        rsi_n      = rs.get("rsi_rejected", 0)
+        regime_n   = rs.get("regime_rejected", 0)
+        vol_n      = rs.get("volume_rejected", 0)
+        volatile_n = rs.get("volatile_skipped", 0)
+        r_buy_n    = rs.get("ranging_buy", 0)
+        r_sell_n   = rs.get("ranging_sell", 0)
         print(f"  ADX rejected              {adx_n:>6}{pct(adx_n)}")
         print(f"  Trend rejected (NEUTRAL)  {trend_n:>6}{pct(trend_n)}")
         print(f"  EMA spread rejected       {ema_n:>6}{pct(ema_n)}")
         print(f"  RSI rejected              {rsi_n:>6}{pct(rsi_n)}")
         print(f"  Regime EMA rejected       {regime_n:>6}{pct(regime_n)}")
         print(f"  Volume rejected           {vol_n:>6}{pct(vol_n)}")
+        print(f"  Volatile (flat)           {volatile_n:>6}{pct(volatile_n)}")
         print(f"  ─────────────────────────────────────────")
         buy_n  = rs.get("buy_signals", 0)
         sell_n = rs.get("sell_signals", 0)
-        print(f"  BUY  signals emitted      {buy_n:>6}{pct(buy_n)}")
-        print(f"  SELL signals emitted      {sell_n:>6}{pct(sell_n)}")
+        print(f"  BUY  signals (trend)      {buy_n - r_buy_n:>6}{pct(buy_n - r_buy_n)}")
+        print(f"  SELL signals (trend)      {sell_n - r_sell_n:>6}{pct(sell_n - r_sell_n)}")
+        print(f"  BUY  signals (ranging)    {r_buy_n:>6}{pct(r_buy_n)}")
+        print(f"  SELL signals (ranging)    {r_sell_n:>6}{pct(r_sell_n)}")
         print()
 
     csv_path = report.save_csv(result)

@@ -101,6 +101,16 @@ def run(
     regime_ema_slope_filter:  bool  = False,
     # Volume filter
     volume_k:                 float = 1.2,
+    # Dual-regime
+    regime_enabled:           bool  = True,
+    bb_period:                int   = 20,
+    bb_std_dev:               float = 2.0,
+    mr_rsi_oversold:          float = 35.0,
+    mr_rsi_overbought:        float = 65.0,
+    atr_volatile_multiplier:  float = 1.5,
+    # ATR-based SL
+    atr_sl_enabled:           bool  = False,
+    atr_sl_multiplier:        float = 2.0,
 ) -> BacktestResult:
     """Run a full backtest and return the result."""
 
@@ -121,6 +131,12 @@ def run(
             regime_ema_period        = regime_ema_period,
             regime_ema_slope_filter  = regime_ema_slope_filter,
             volume_k                 = volume_k,
+            regime_enabled           = regime_enabled,
+            bb_period                = bb_period,
+            bb_std_dev               = bb_std_dev,
+            mr_rsi_oversold          = mr_rsi_oversold,
+            mr_rsi_overbought        = mr_rsi_overbought,
+            atr_volatile_multiplier  = atr_volatile_multiplier,
         ))
         is_indicator = True
     else:
@@ -147,6 +163,7 @@ def run(
     entry_price:     float = 0.0
     _trail_peak:     float = 0.0
     _partial_tp_done: bool = False
+    _entry_atr:      float = 0.0   # ATR at the time of BUY — used for ATR-based SL
     entry_snapshots: list[dict] = []
 
     # ── Main loop ─────────────────────────────────────────────────────
@@ -207,13 +224,20 @@ def run(
         exit_price  = price
         forced_exit = False
         if executor.position > 0 and entry_price > 0:
-            # Trailing stop takes priority over fixed SL if configured
+            # Trailing stop takes priority over fixed/ATR SL if configured
             if trail_stop_pct > 0 and _trail_peak > 0:
                 _trail_sl = _trail_peak * (1 - trail_stop_pct)
                 if candle.low <= _trail_sl:
                     raw_signal  = Signal.SELL
                     exit_reason = "trail_stop"
                     exit_price  = _trail_sl
+                    forced_exit = True
+            elif atr_sl_enabled and _entry_atr > 0:
+                sl_level = entry_price - _entry_atr * atr_sl_multiplier
+                if candle.low <= sl_level:
+                    raw_signal  = Signal.SELL
+                    exit_reason = "stop_loss"
+                    exit_price  = max(sl_level, candle.low)
                     forced_exit = True
             elif stop_loss_pct > 0:
                 sl_level = entry_price * (1 - stop_loss_pct)
@@ -265,6 +289,7 @@ def run(
                     entry_price = order.price
                     _trail_peak = order.price
                     _partial_tp_done = False
+                    _entry_atr = strategy.last_atr or 0.0
                     _adx  = strategy.last_adx   if is_indicator else None
                     _rsi  = strategy.last_rsi   if is_indicator else None
                     _trnd = strategy.last_trend if is_indicator else None
@@ -284,6 +309,7 @@ def run(
                     entry_price = 0.0
                     _trail_peak = 0.0
                     _partial_tp_done = False
+                    _entry_atr = 0.0
 
                 fills.append(FillRecord(
                     candle_index = i,

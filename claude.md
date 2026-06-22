@@ -225,13 +225,64 @@ All critical bugs resolved:
 - `stock_bot/main.py`: Added 5% sanity check on live_price vs candle_close — TSX fast_info currency mismatch caused impossible P&L like +921%
 - `stock_bot/research/sentiment_scraper.py`: Replaced 12-word flat keyword list with phrase-pattern rules + negation detection window (3 tokens)
 
-### Next steps remaining
-1. Accumulate 30–50 live trades on Kraken BTC/CAD — compare live PF/win rate to backtest
-2. Verify Jun 11 position close price on Kraken (History → Trades, SELL ~Jun 14 10:44 UTC)
-3. Investigate Kraken fee: actual 0.80% vs 0.26% modeled — maker orders (limit) may reduce to 0.16%
-4. Once fee confirmed <0.20%: consider ETH/CAD expansion
-5. Add oversold recovery candidates to universe pre_filter (currently selects only momentum leaders which AI then rejects as overbought)
-6. Add 5-day earnings blackout gate to stock_bot BUY block (avoid buying 5 days before earnings date)
+### Next steps — prioritized roadmap (audited 2026-06-21)
+
+#### TODAY — Active money at risk
+1. **Fix backtest fee** — `.env`: change `BACKTEST_FEE_PCT=0.001` → `BACKTEST_FEE_PCT=0.008`
+   - Every backtest run since deploy has reported false PF numbers at 0.1% fee
+   - After fix, re-run: `EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py` → expect ~58 trades, PF ~1.79
+2. **Run 1h backtest** — live bot uses `CANDLE_MINUTES=60` but ALL validation was done on 4h candles
+   - `EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_TIMEFRAME=1h BACKTEST_LIMIT=5000 python backtest.py`
+   - If PF < 1.0: stop live trading until re-validated; if PF > 1.0: confirm and document
+3. **Fix SL/TP risk gate bypass** — `bot/main.py` lines 525–561
+   - Intra-candle SL/TP path routes through `risk.evaluate()` — a daily-loss halt silently blocks the stop-loss
+   - SL/TP triggers must bypass the risk gate entirely (same fix as `risk_manager.py` SELL bypass)
+4. **Fix `deploy.sh` before any VPS push** — `deploy/deploy.sh` line 39
+   - `--exclude='logs'` wipes `live_state.json` on redeploy → bot restarts thinking it holds nothing
+   - Change to: preserve `logs/live_state.json` and `logs/trades.db`, exclude only `logs/trade_bot.log`
+
+#### DAY 2 — Fee savings + silent failures
+5. **Enable limit orders for BUY** — saves 0.64% per round trip (0.80% → 0.16% maker rate)
+   - `.env`: `ORDER_TYPE=limit`
+   - `live_executor.py:411`: change BUY offset `price * 1.001` → `price * 0.998` (bid-side passive)
+   - Leave SELL as market order (guaranteed exit)
+   - Increase cancel timeout `range(1, 4)` → `range(1, 10)` (9s resting time on 60min candle bot)
+6. **Fix dual SL evaluation paths** — `bot/main.py:618-633`
+   - Intra-tick SL/TP (lines 474–582) always fires first; candle-close SL block (lines 618–633) is dead code
+   - Remove the candle-close SL block to eliminate double-exit confusion
+
+#### DAY 3 — Stock bot circuit breaker + alerting
+7. **Fix stock bot daily loss breaker** — `stock_bot/execution/paper.py:81,114-115`
+   - `session_start_value = self._cash` ignores open positions — breaker can fire when portfolio is flat
+   - Fix: use `cash + sum(position mark values)` as baseline in both session init and drawdown calc
+8. **Wire daily P&L Telegram alert** — `bot/main.py`
+   - `TelegramAlerter.daily_pnl()` exists but is never called
+   - Add midnight UTC trigger inside main loop: `if now.hour == 0 and now.minute < 1: alerter.daily_pnl(...)`
+9. **Wire partial TP Telegram alert** — `bot/main.py` ~line 506
+   - Partial TP calls `trade_log.log_fill()` but skips `alerter.fill()` — real-money exit goes unreported
+10. **Add consecutive error counter** — `bot/main.py` price fetch block
+    - After 5 consecutive fetch failures: call `alerter.error("Price feed down 5+ ticks")` and back off
+
+#### WEEK 2 — Hardening
+11. Correct ADX default: `config.py:383` change `25.0` → `18.0` (safe only while `.env` exists)
+12. Correct RSI levels: `.env` set `RSI_OVERSOLD=30` `RSI_OVERBOUGHT=70` (validated values, not current 32/68)
+13. Add logrotate on VPS: `/etc/logrotate.d/trade_bot` — weekly, 4 rotations, compress (log grows unbounded)
+14. Add position drift reconciliation: periodic `fetch_balance()` vs `live_state.json` to detect divergence
+15. Add candle watchdog: if `2 × candle_minutes` pass with no new candle, call `alerter.error()`
+16. Set up external uptime monitor (UptimeRobot free tier) — systemd stops after 5 crashes with no external alert
+17. Schedule weekly `live_comparison.py`: `0 9 * * 1 python live_comparison.py >> logs/weekly.log`
+
+#### MONTH+ — Revenue unlock gates
+| Milestone | Gate | Impact |
+|---|---|---|
+| 1h backtest PF > 1.0 confirmed | Run this week | Validates live config isn't a gamble |
+| 30–50 live trades accumulated | ~2–3 months | Compare live PF vs backtest |
+| Kraken maker fee confirmed <0.20% | Test one limit order | Unlocks ETH/CAD expansion |
+| Stock bot: 30 paper trades, PF ≥ 1.2, win rate ≥ 30% | ~4–6 weeks | Gate for Phase 7 IBKR live |
+| Capital grows to $500+ | Organic | Lower RISK_PER_TRADE_PCT from 10% → 2% |
+| Add 5-day earnings blackout to stock_bot BUY | After paper validated | Avoid pre-earnings gap risk |
+| Add oversold recovery to universe pre_filter | After paper validated | AI rejects overbought momentum leaders |
+
 - Can evolve into a professional-grade trading platform
 ## Exchange Setup
 - Backtesting: EXCHANGE=binance, SYMBOL=BTC/USDT

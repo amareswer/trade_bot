@@ -177,6 +177,43 @@ def trend(prices: list[float], fast_period: int = 9, slow_period: int = 21) -> s
     return "NEUTRAL"
 
 
+def bollinger_bands(
+    prices: list[float],
+    period: int = 20,
+    std_dev: float = 2.0,
+) -> tuple[float, float, float] | None:
+    """
+    Bollinger Bands — returns (upper, middle, lower).
+    Middle = SMA(period). Upper/lower = middle ± std_dev × population stdev.
+    Returns None when fewer than `period` prices are available.
+    """
+    if len(prices) < period:
+        return None
+    window = prices[-period:]
+    middle = sum(window) / period
+    variance = sum((p - middle) ** 2 for p in window) / period
+    sigma = variance ** 0.5
+    band = std_dev * sigma
+    return middle + band, middle, middle - band
+
+
+def bb_width(
+    prices: list[float],
+    period: int = 20,
+    std_dev: float = 2.0,
+) -> float | None:
+    """
+    Bollinger Band Width = (upper - lower) / middle.
+    Expanding = trending/volatile; contracting = ranging (squeeze).
+    Returns None on insufficient data.
+    """
+    result = bollinger_bands(prices, period, std_dev)
+    if result is None:
+        return None
+    upper, middle, lower = result
+    return (upper - lower) / middle if middle != 0 else None
+
+
 def macd(
     prices: list[float],
     fast_period: int = 12,

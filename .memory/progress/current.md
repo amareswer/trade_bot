@@ -83,6 +83,42 @@ metadata:
 
 ---
 
+## PM Audit — 2026-06-21 (Multi-agent review)
+
+Three agents audited crypto bot, stock bot, and deployment. Findings below by priority.
+
+### TODAY — Active money at risk
+- [ ] Fix `BACKTEST_FEE_PCT=0.001` → `0.008` in `.env` — all recent backtest PF numbers are wrong
+- [ ] Run 1h backtest (`BACKTEST_TIMEFRAME=1h`) — live bot on 1h but ALL validation done on 4h; untested
+- [ ] Fix SL/TP risk gate bypass (`bot/main.py:525-561`) — halt state blocks stop-loss from firing
+- [ ] Fix `deploy.sh` — `--exclude='logs'` wipes `live_state.json` on redeploy (position lost)
+
+### DAY 2
+- [ ] Enable limit orders for BUY only — `ORDER_TYPE=limit`, offset `price*0.998`, 9s cancel timeout
+- [ ] Remove dual SL evaluation path — candle-close SL block (`bot/main.py:618-633`) is dead code
+
+### DAY 3
+- [ ] Fix stock bot daily loss breaker (`paper.py:81,114`) — uses cash only, ignores position value
+- [ ] Wire `alerter.daily_pnl()` in `bot/main.py` midnight loop
+- [ ] Wire `alerter.fill()` on partial TP path (`bot/main.py:~506`)
+- [ ] Add consecutive error counter → Telegram after 5 failures
+
+### WEEK 2
+- [ ] ADX default `config.py:383`: `25.0` → `18.0`
+- [ ] RSI levels in `.env`: `RSI_OVERSOLD=30 RSI_OVERBOUGHT=70`
+- [ ] Add logrotate on VPS (`/etc/logrotate.d/trade_bot`)
+- [ ] Add position drift reconciliation (`fetch_balance()` vs `live_state.json`)
+- [ ] Add candle watchdog alert (2× candle_minutes silence → Telegram error)
+- [ ] External uptime monitor (UptimeRobot free)
+- [ ] Cron for `live_comparison.py` weekly
+
+### MONTH+ Gates
+- Kraken fee <0.20% confirmed → ETH/CAD expansion
+- 30-50 paper trades on stock bot → PF ≥ 1.2, win rate ≥ 30% → Phase 7 IBKR live
+- Capital $500+ → lower RISK_PER_TRADE_PCT 10% → 2%
+
+---
+
 ## Session 2026-06-21 — Tier 1–3 Professional Upgrade (COMPLETE ✅)
 
 **Metrics (Tier 1):**
