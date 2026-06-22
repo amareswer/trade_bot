@@ -10,6 +10,8 @@
 - [Execution Layer](execution_layer.md) — PaperExecutor + LiveExecutor, Order lifecycle, Portfolio, P&L model, fees_paid, state persistence, all hardening complete
 - [Multi-Symbol Validation](decisions/multi-symbol-validation.md) — ETH=first expansion, LINK=excluded, BTC=weak current regime, fee gating constraint, expansion decisions
 - [Stock Bot Stability Decisions](decisions/stock-bot-stability.md) — what was reverted and why (Jun 2026): session management, ticker.info names, int shares; permanent DO NOT rules
+- [Timeframe: 4h Validated](decisions/timeframe-4h-validated.md) — 1h rejected (PF 0.49, zero TPs); 4h locked (PF 1.78, 5 WF windows); CANDLE_MINUTES=240 permanent
+- [Fee Structure](decisions/fee-structure.md) — Kraken taker 0.8%, limit BUY saves 0.64%/trip; ORDER_TYPE=limit; SELL always market; backtest fee corrected to 0.008
 - [Live Loop Bugs](errors/live-loop-bugs.md) — 4 bugs fixed Jun10–12: SL/TP gap, dashboard staleness, position-size rounding drift, root logger level
 - [State Machine](state_machine.md) — IDLE/LONG/COOLDOWN states, position-aware filtering, dedup, cooldown config
 - [Position Manager](position_manager.md) — weighted avg entry, realized/unrealized PnL, trade history, wiring pattern

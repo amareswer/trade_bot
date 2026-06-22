@@ -407,11 +407,13 @@ class LiveExecutor:
         else:
             try:
                 ccxt_side = "buy" if side == OrderSide.BUY else "sell"
-                if self._order_type == "limit":
-                    limit_price = round(price * 1.001, 2) if side == OrderSide.BUY else round(price * 0.999, 2)
+                if self._order_type == "limit" and side == OrderSide.BUY:
+                    # Passive bid 0.2% below market — qualifies for Kraken maker rate (0.16%)
+                    # SELL is always market for guaranteed exit regardless of ORDER_TYPE
+                    limit_price = round(price * 0.998, 2)
                     logger.warning(
-                        "LIMIT ORDER: %s %.6f %s @ %.2f (0.1%% offset from %.2f)",
-                        side.value, quantity, self.symbol, limit_price, price,
+                        "LIMIT BUY: %.6f %s @ %.2f (0.2%% below %.2f)",
+                        quantity, self.symbol, limit_price, price,
                     )
                     raw = self._exchange.create_order(
                         symbol = self.symbol,
@@ -440,7 +442,7 @@ class LiveExecutor:
                 # last poll reported — never leave cash/position unupdated after
                 # a real order was sent.
                 last_raw = raw
-                for poll_num in range(1, 4):
+                for poll_num in range(1, 10):
                     time.sleep(1)
                     try:
                         last_raw   = self._exchange.fetch_order(order_id_str, self.symbol)

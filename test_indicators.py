@@ -9,7 +9,7 @@ import math
 
 sys.path.insert(0, ".")
 
-from bot.indicators.indicators import sma, ema, rsi, trend
+from bot.indicators.indicators import sma, ema, rsi, trend, atr
 from bot.strategy.indicator_strategy import IndicatorStrategy, IndicatorConfig
 from bot.strategy.threshold_strategy import Signal
 
@@ -87,6 +87,47 @@ flat = [50.0] * 50
 check("flat series → NEUTRAL", trend(flat, 9, 21) == "NEUTRAL")
 # Insufficient data → NEUTRAL
 check("insufficient data → NEUTRAL", trend([1.0, 2.0], 9, 21) == "NEUTRAL")
+
+# ---------------------------------------------------------------------------
+# ATR
+# ---------------------------------------------------------------------------
+print("\nATR")
+
+_period = 3
+
+# 1. None when insufficient data (< period+1 closes)
+_short_h = [10.0] * _period
+_short_l = [9.0]  * _period
+_short_c = [9.5]  * _period          # exactly period closes — need period+1
+check("returns None when insufficient data (< period+1 closes)",
+      atr(_short_h, _short_l, _short_c, _period) is None)
+
+# 2. None when list lengths mismatch
+_n = _period + 5
+_h = [10.0] * _n
+_l = [9.0]  * _n
+_c = [9.5]  * (_n - 1)              # one element short
+check("returns None when list lengths mismatch",
+      atr(_h, _l, _c, _period) is None)
+
+# 3. Flat series → ATR == 0.0  (no movement = zero true range every bar)
+_flat_n = _period + 10
+_flat   = [100.0] * _flat_n
+check("flat series (constant price) returns 0.0",
+      atr(_flat, _flat, _flat, _period) == 0.0)
+
+# 4. Rising series → ATR > 0
+_rising_c = [float(100 + i) for i in range(_period + 10)]
+_rising_h = [c + 1.0 for c in _rising_c]
+_rising_l = [c - 1.0 for c in _rising_c]
+_atr_rising = atr(_rising_h, _rising_l, _rising_c, _period)
+check("rising series returns a positive float",
+      _atr_rising is not None and _atr_rising > 0.0)
+
+# 5. ATR is between 0 and (max_high - min_low) inclusive
+_bound = max(_rising_h) - min(_rising_l)
+check("ATR value is between 0 and (max_high - min_low) inclusive",
+      _atr_rising is not None and 0.0 <= _atr_rising <= _bound)
 
 # ---------------------------------------------------------------------------
 # IndicatorStrategy integration

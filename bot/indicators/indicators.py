@@ -127,12 +127,14 @@ def atr(
     period: int = 14,
 ) -> float | None:
     """
-    Average True Range via Wilder's smoothing (same method as ADX).
-    True Range = max(high-low, |high-prev_close|, |low-prev_close|)
-    Requires at least 2*period data points.
+    Average True Range using Wilder's smoothing.
+
+    Measures volatility: larger values = wider swings; used for SL placement and position sizing.
+    Requires at least period + 1 data points.
+    Returns None when data is insufficient.
     """
     n = len(closes)
-    if n < 2 * period or len(highs) != n or len(lows) != n:
+    if n < period + 1 or len(highs) != n or len(lows) != n:
         return None
 
     tr_list: list[float] = []
@@ -143,9 +145,6 @@ def atr(
             abs(lows[i]  - closes[i - 1]),
         )
         tr_list.append(tr)
-
-    if len(tr_list) < period:
-        return None
 
     # Seed: simple average of first `period` TR values
     atr_val = sum(tr_list[:period]) / period

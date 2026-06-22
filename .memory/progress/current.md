@@ -145,18 +145,45 @@ TRAIL_STOP_PCT, PARTIAL_TP_PCT, PARTIAL_TP_SIZE
 
 ---
 
+---
+
+## Session 2026-06-22 — Critical Fixes + Live Config Hardening (COMPLETE ✅)
+
+**Backtest validation:**
+- Corrected BACKTEST_FEE_PCT=0.001 → 0.008 (real Kraken taker rate)
+- 4h backtest at 0.8% fee: PF 1.78, 61 trades, return -22.68% (fee drag)
+- 1h backtest at 0.8% fee: PF 0.49 — strategy FAILS on 1h (zero TPs fired)
+
+**Decision: locked to 4h candles** — see decisions/timeframe-4h-validated.md
+
+**Code fixes:**
+- `bot/main.py`: removed dead candle-close SL/TP block (trail stop always fires first)
+- `bot/execution/live_executor.py`: limit BUY at price*0.998 (maker 0.16%), SELL always market, poll 9s
+- `deploy/deploy.sh`: preserves live_state.json and trades.db on redeploy (was wiping entire logs/)
+- Risk gate bypass: confirmed already fixed — risk_manager.py only gates BUY
+
+**Bot status:** Running locally (caffeinate) on Kraken BTC/CAD
+- Position: 0.000556 BTC recovered, entry reseeded at $91,466 (actual was $90,611 — minor)
+- Cash: $49.47 CAD | Total: $100.29
+
+---
+
 ## Active .env — Crypto Bot (bot/.env)
 
 | Setting | Value |
 |---|---|
 | EXCHANGE | kraken |
 | SYMBOL | BTC/CAD |
-| CANDLE_MINUTES | 60 |
+| CANDLE_MINUTES | 240 |
+| ORDER_TYPE | limit |
 | ADX_THRESHOLD | 18 |
 | RSI_FILTER_ENABLED | true |
+| RSI_OVERSOLD | 30.0 |
+| RSI_OVERBOUGHT | 70.0 |
 | VOLUME_K | 0 |
 | STOP_LOSS_PCT | 0.015 |
-| TAKE_PROFIT_PCT | 0.045 |
-| RISK_PER_TRADE_PCT | 0.10 |
+| TAKE_PROFIT_PCT | 0.10 |
+| RISK_PER_TRADE_PCT | 0.50 |
+| BACKTEST_FEE_PCT | 0.008 |
 | LIVE_TRADING | true |
 | DRY_RUN | false |
