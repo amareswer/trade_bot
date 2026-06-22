@@ -36,10 +36,10 @@ apt-get install -y -qq python3 python3-pip python3-venv git curl
 echo "[2/6] Copying repo to $INSTALL_DIR ..."
 mkdir -p "$INSTALL_DIR"
 rsync -a --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' \
-      --exclude='venv' --exclude='logs' \
+      --exclude='venv' --exclude='logs/trade_bot.log' \
       "$REPO_ROOT/" "$INSTALL_DIR/"
 
-# Keep logs directory writable
+# Keep logs directory and persistent state files
 mkdir -p "$INSTALL_DIR/logs"
 chown -R ubuntu:ubuntu "$INSTALL_DIR" 2>/dev/null || true
 

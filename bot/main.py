@@ -614,25 +614,7 @@ def run():
         else:
             raw_signal = strategy.evaluate(price)
 
-        # ── 3b. Live stop-loss / take-profit ─────────────────────────
-        if is_indicator and position_manager.has_position and position_manager.avg_entry > 0:
-            _entry = position_manager.avg_entry
-            if cfg.backtest.stop_loss_pct > 0 and price <= _entry * (1 - cfg.backtest.stop_loss_pct):
-                raw_signal = Signal.SELL
-                logger.warning(
-                    "STOP LOSS triggered: price=%.2f entry=%.2f sl=%.1f%%",
-                    price, _entry, cfg.backtest.stop_loss_pct * 100,
-                )
-                print(f"           🛑 STOP LOSS   price={price:,.2f}  entry={_entry:,.2f}", flush=True)
-            elif cfg.backtest.take_profit_pct > 0 and price >= _entry * (1 + cfg.backtest.take_profit_pct):
-                raw_signal = Signal.SELL
-                logger.warning(
-                    "TAKE PROFIT triggered: price=%.2f entry=%.2f tp=%.1f%%",
-                    price, _entry, cfg.backtest.take_profit_pct * 100,
-                )
-                print(f"           ✅ TAKE PROFIT  price={price:,.2f}  entry={_entry:,.2f}", flush=True)
-
-        # ── 3c. Candle-close diagnostic log ──────────────────────────
+        # ── 3b. Candle-close diagnostic log ──────────────────────────
         if is_indicator and live_exchange is not None:
             _adx_live  = strategy.last_adx
             _rsi_live  = strategy.last_rsi
