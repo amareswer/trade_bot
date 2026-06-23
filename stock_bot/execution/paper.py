@@ -122,8 +122,33 @@ class StockPaperExecutor(StockExecutorBase):
             return True
         return False
 
-    def buy(self, symbol: str, shares: float, price: float, reason: str = "") -> StockOrder:
+    def buy(
+        self,
+        symbol: str,
+        shares: float,
+        price: float,
+        reason: str = "",
+        candle_close: float | None = None,
+        live_price: float | None = None,
+    ) -> StockOrder:
         sym = symbol.upper()
+
+        if candle_close is not None and live_price is not None:
+            deviation = abs(candle_close - live_price) / max(live_price, 0.01)
+            if deviation > 0.10:
+                order = self._new_order(sym, OrderSide.BUY, int(shares), price)
+                order.status        = OrderStatus.REJECTED
+                order.reject_reason = (
+                    f"Candle close ${candle_close:.2f} deviates {deviation * 100:.1f}% "
+                    f"from live price ${live_price:.2f} — corrupted data"
+                )
+                logger.warning(
+                    "PAPER BUY REJECTED %s — candle close $%.2f deviates "
+                    "%.1f%% from live price $%.2f (corrupted data)",
+                    sym, candle_close, deviation * 100, live_price,
+                )
+                self._orders.append(order)
+                return order
 
         if self._is_daily_loss_tripped():
             order = self._new_order(sym, OrderSide.BUY, shares, price)

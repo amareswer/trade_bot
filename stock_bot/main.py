@@ -799,6 +799,7 @@ def run() -> None:
                 ):
                     px              = data["last_candle"].close
                     live_price      = get_live_price(symbol)
+                    raw_live_price  = live_price  # preserve original before sanity null
                     # Sanity-check live price against the daily candle close.
                     # fast_info.last_price can return a wrong currency (USD vs CAD)
                     # or stale/corrupt data for TSX tickers — cap at ±5% deviation.
@@ -832,7 +833,10 @@ def run() -> None:
                                 shares  = int(alloc / execution_price) if execution_price > 0 else 0
                                 if shares > 0:
                                     reason = f"BUY {verdict.confidence}% {verdict.trading_style}"
-                                    order  = executor.buy(symbol, shares, execution_price, reason=reason)
+                                    order  = executor.buy(
+                                        symbol, shares, execution_price, reason=reason,
+                                        candle_close=px, live_price=raw_live_price,
+                                    )
                                     if order.status == OrderStatus.FILLED:
                                         total = round(shares * execution_price, 2)
                                         print(f"  📄 PAPER BUY:  {symbol}  {shares} shares")

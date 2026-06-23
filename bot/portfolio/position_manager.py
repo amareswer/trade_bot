@@ -69,6 +69,9 @@ class PositionManager:
 
     def on_buy(self, price: float, quantity: float) -> None:
         """Record a BUY fill. Updates weighted average entry price."""
+        if quantity <= 0:
+            logger.warning("on_buy called with quantity=%.8f — skipping", quantity)
+            return
         prev_cost       = self._quantity * self._avg_entry
         self._quantity += quantity
         self._avg_entry = (prev_cost + quantity * price) / self._quantity
@@ -85,6 +88,9 @@ class PositionManager:
 
     def on_sell(self, price: float, quantity: float) -> float:
         """Record a SELL fill. Returns realized PnL for this trade."""
+        if quantity <= 0:
+            logger.warning("on_sell called with quantity=%.8f — skipping", quantity)
+            return 0.0
         pnl              = round((price - self._avg_entry) * quantity, 2)
         self._realized_pnl += pnl
         self._quantity   = max(0.0, self._quantity - quantity)

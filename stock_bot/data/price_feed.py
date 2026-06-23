@@ -81,8 +81,8 @@ def _is_duplicate_price(symbol: str, price: float) -> bool:
     into others). Returns True and logs a warning when corruption is detected.
     """
     for other_symbol, other_price in _last_prices.items():
-        if other_symbol != symbol and abs(other_price - price) < 0.01:
-            logger.warning(
+        if other_symbol != symbol and abs(other_price - price) / max(other_price, 0.01) < 0.001:
+            logger.debug(
                 "%s price $%.2f matches %s — holiday data corruption, rejecting",
                 symbol, price, other_symbol,
             )
