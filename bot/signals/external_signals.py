@@ -102,6 +102,9 @@ class ExternalSignalGate:
         self._funding:          Optional[float] = None
         self._funding_fetched_at: float         = 0.0
 
+        if not self._cfg.funding_enabled:
+            logger.info("Funding rate gate disabled (EXT_FUNDING_ENABLED=false)")
+
     # ------------------------------------------------------------------
     # Public
     # ------------------------------------------------------------------

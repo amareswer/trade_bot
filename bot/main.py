@@ -52,7 +52,7 @@ from bot.execution.live_executor import LiveExecutor
 from bot.risk.risk_manager import RiskManager, RiskConfig
 from bot.state.trade_state import TradingStateMachine
 from bot.portfolio.position_manager import PositionManager
-from bot.indicators.indicators import ema as _ema_fn, trend as _trend_fn
+from bot.indicators.indicators import ema as _ema_fn, trend as _trend_fn, atr as _atr_fn
 from bot.ai.ai_engine import AIEngine, merge_signals
 from bot import display
 from bot.dashboard import renderer as _dashboard
@@ -390,6 +390,8 @@ def run():
     # Trailing stop and partial TP state — reset on each new trade
     _trail_peak:      float = 0.0
     _partial_tp_done: bool  = False
+    _atr_sl_price:    float = 0.0
+    _atr_tp_price:    float = 0.0
     # MTF 1D closes for regime check — loaded once at startup
     _mtf_1d_closes: list[float] = []
 
@@ -476,8 +478,11 @@ def run():
                     # Update trailing peak on every tick
                     _trail_peak = max(_trail_peak, price)
                     _trail_sl_level = (
-                        _trail_peak * (1 - cfg.backtest.stop_loss_pct)
-                        if _trail_peak > 0 and cfg.backtest.stop_loss_pct > 0 else 0.0
+                        _atr_sl_price if _atr_sl_price > 0
+                        else (
+                            _trail_peak * (1 - cfg.backtest.stop_loss_pct)
+                            if _trail_peak > 0 and cfg.backtest.stop_loss_pct > 0 else 0.0
+                        )
                     )
 
                     # Partial TP — sell cfg.backtest.partial_tp_size at partial_tp_pct gain
@@ -506,8 +511,11 @@ def run():
                                     logger.warning("PARTIAL TP: sold %.6f @ %.2f  pnl=%.2f", _p_qty, price, _p_pnl)
 
                     _ic_sl = _trail_sl_level > 0 and price <= _trail_sl_level
-                    _ic_tp = (cfg.backtest.take_profit_pct > 0
+                    _ic_tp = (
+                        price >= _atr_tp_price if _atr_tp_price > 0
+                        else (cfg.backtest.take_profit_pct > 0
                               and price >= _ic_entry * (1 + cfg.backtest.take_profit_pct))
+                    )
                     if _ic_sl or _ic_tp:
                         if _ic_sl:
                             logger.warning(
@@ -809,10 +817,30 @@ def run():
                         position_manager.on_buy(order.price, order.quantity)
                         _trail_peak = order.price  # seed trailing peak at entry
                         _partial_tp_done = False
+                        _atr_sl_price = 0.0
+                        _atr_tp_price = 0.0
+                        if is_indicator:
+                            _atr_val = _atr_fn(
+                                list(strategy._highs),
+                                list(strategy._lows),
+                                list(strategy._closes),
+                                cfg.strategy.atr_period,
+                            )
+                            if _atr_val is None or _atr_val <= 0 or cfg.strategy.atr_sl_mult <= 0:
+                                _atr_sl_price = 0.0
+                                logger.info("ATR SL disabled or unavailable — using fixed SL/TP")
+                            else:
+                                _atr_sl_price = order.price - _atr_val * cfg.strategy.atr_sl_mult
+                                logger.info(
+                                    "ATR SL/TP: entry=%.2f atr=%.2f sl=%.2f mult=%.1f",
+                                    order.price, _atr_val, _atr_sl_price, cfg.strategy.atr_sl_mult,
+                                )
                     else:
                         pnl = position_manager.on_sell(order.price, order.quantity)
                         _trail_peak = 0.0
                         _partial_tp_done = False
+                        _atr_sl_price = 0.0
+                        _atr_tp_price = 0.0
 
                     display.fill(
                         order.side.value, order.quantity,

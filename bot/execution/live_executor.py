@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 import ccxt
 
 from bot.execution.executor import Order, OrderSide, OrderStatus, Portfolio
+from config import cfg
 
 logger = logging.getLogger(__name__)
 
@@ -191,9 +192,9 @@ class LiveExecutor:
             if exchange_free < 1e-9:
                 # Kraken settlement window: fill landed in total, not yet free
                 logger.warning(
-                    "BTC settling on exchange: total=%.6f free=0"
+                    "%s settling on exchange: total=%.6f free=0"
                     " — using total as position, will become free shortly",
-                    exchange_total,
+                    self.symbol.split("/")[0], exchange_total,
                 )
                 print(
                     f"  SETTLEMENT: {base} total={exchange_total:.6f} free=0"
@@ -342,6 +343,110 @@ class LiveExecutor:
         if errors:
             raise ValueError("; ".join(errors))
 
+    # ── Limit order chasing ───────────────────────────────────────────
+
+    def _place_limit_order(self, side: str, quantity: float, price: float) -> dict:
+        """
+        Post-only limit order with automatic repricing.
+
+        Places a post-only limit order just inside the spread, polls until filled,
+        and reprices up to cfg.exchange.limit_chase_max_retries times on timeout.
+
+        ccxt.InvalidOrder (Kraken PO rejection — order would cross spread):
+            Halves the tick offset and retries without consuming a timeout retry slot.
+            Falls back to market if tick_pct drops below 0.000001.
+
+        Any other ccxt exception: falls back to market immediately.
+        Returns the raw ccxt order dict of the final filled order.
+        """
+        _MIN_TICK_PCT    = 0.000001
+        tick_pct         = cfg.exchange.limit_chase_tick_pct
+        timeout_attempts = 0
+        max_attempts     = cfg.exchange.limit_chase_max_retries + 1
+
+        while timeout_attempts < max_attempts:
+            # Fetch orderbook and compute limit price — network errors fall back immediately.
+            try:
+                book = self._exchange.fetch_order_book(self.symbol, limit=5)
+                if side == "buy":
+                    bid           = float(book["bids"][0][0])
+                    limit_price_f = bid * (1.0 + tick_pct)
+                else:
+                    ask           = float(book["asks"][0][0])
+                    limit_price_f = ask * (1.0 - tick_pct)
+                limit_price = self._exchange.price_to_precision(self.symbol, limit_price_f)
+            except Exception as exc:
+                logger.warning(
+                    "_place_limit_order: %s (%s) — falling back to market order",
+                    type(exc).__name__, exc,
+                )
+                return self._exchange.create_order(self.symbol, "market", side, quantity)
+
+            logger.warning(
+                "LIMIT %s attempt %d/%d: %.6f %s @ %.2f (post-only, tick_pct=%.6f)",
+                side.upper(), timeout_attempts + 1, max_attempts,
+                quantity, self.symbol, limit_price_f, tick_pct,
+            )
+
+            try:
+                raw = self._exchange.create_order(
+                    self.symbol, "limit", side, quantity, limit_price,
+                    {"timeInForce": "PO"},
+                )
+                order_id = str(raw.get("id", ""))
+            except ccxt.InvalidOrder:
+                # Kraken rejected PO because the price would cross the spread.
+                # Halve the tick offset and retry — does not consume a timeout slot.
+                tick_pct /= 2.0
+                logger.warning(
+                    "PO order would cross spread — retrying with tighter offset %.6f",
+                    tick_pct,
+                )
+                if tick_pct < _MIN_TICK_PCT:
+                    logger.warning("spread too tight for post-only, using market")
+                    return self._exchange.create_order(self.symbol, "market", side, quantity)
+                continue
+            except Exception as exc:
+                logger.warning(
+                    "_place_limit_order: %s (%s) — falling back to market order",
+                    type(exc).__name__, exc,
+                )
+                return self._exchange.create_order(self.symbol, "market", side, quantity)
+
+            # Quick return if exchange already shows the order as closed
+            if raw.get("status") == "closed":
+                return raw
+
+            # Poll for fill every 5 s up to the configured timeout
+            deadline = time.time() + cfg.exchange.limit_chase_timeout_s
+            while time.time() < deadline:
+                time.sleep(5)
+                try:
+                    polled = self._exchange.fetch_order(order_id, self.symbol)
+                    if polled.get("status") == "closed":
+                        logger.warning("LIMIT %s filled: %s", side.upper(), order_id)
+                        return polled
+                except Exception as poll_exc:
+                    logger.warning("fetch_order %s failed: %s", order_id, poll_exc)
+
+            # Timeout — cancel and consume one timeout retry slot
+            try:
+                self._exchange.cancel_order(order_id, self.symbol)
+                logger.warning(
+                    "LIMIT %s timed out (attempt %d) — cancelled %s",
+                    side.upper(), timeout_attempts + 1, order_id,
+                )
+            except Exception as cancel_exc:
+                logger.warning("cancel_order %s failed: %s", order_id, cancel_exc)
+
+            timeout_attempts += 1
+
+        logger.warning(
+            "limit chase failed after %d retries, falling back to market order",
+            cfg.exchange.limit_chase_max_retries,
+        )
+        return self._exchange.create_order(self.symbol, "market", side, quantity)
+
     # ── Core execution ────────────────────────────────────────────────
 
     def execute(
@@ -407,82 +512,93 @@ class LiveExecutor:
         else:
             try:
                 ccxt_side = "buy" if side == OrderSide.BUY else "sell"
-                if self._order_type == "limit" and side == OrderSide.BUY:
-                    # Passive bid 0.2% below market — qualifies for Kraken maker rate (0.16%)
-                    # SELL is always market for guaranteed exit regardless of ORDER_TYPE
-                    limit_price = round(price * 0.998, 2)
-                    logger.warning(
-                        "LIMIT BUY: %.6f %s @ %.2f (0.2%% below %.2f)",
-                        quantity, self.symbol, limit_price, price,
-                    )
-                    raw = self._exchange.create_order(
-                        symbol = self.symbol,
-                        type   = "limit",
-                        side   = ccxt_side,
-                        amount = quantity,
-                        price  = limit_price,
-                    )
-                else:
-                    logger.warning(
-                        "LIVE ORDER: %s %.6f %s",
-                        side.value, quantity, self.symbol,
-                    )
-                    raw = self._exchange.create_order(
-                        symbol = self.symbol,
-                        type   = "market",
-                        side   = ccxt_side,
-                        amount = quantity,
-                    )
-                order_id_str = str(raw.get("id", ""))
-                filled_qty   = float(raw.get("filled") or 0.0)
-                fill_price   = float(raw.get("average") or raw.get("price") or price)
 
-                # Poll up to 3 times for 'closed' status.
-                # If still open after 3 polls, use whatever 'filled' amount the
-                # last poll reported — never leave cash/position unupdated after
-                # a real order was sent.
-                last_raw = raw
-                for poll_num in range(1, 10):
-                    time.sleep(1)
-                    try:
-                        last_raw   = self._exchange.fetch_order(order_id_str, self.symbol)
-                        filled_qty = float(last_raw.get("filled") or filled_qty)
-                        if last_raw.get("status") == "closed":
-                            fill_price = float(
-                                last_raw.get("average") or
-                                last_raw.get("price")   or
-                                price
-                            )
-                            break
-                    except Exception as poll_exc:
-                        logger.warning("fetch_order poll %d failed: %s", poll_num, poll_exc)
+                if cfg.exchange.limit_order_enabled:
+                    # Limit-chase path: _place_limit_order handles all polling and
+                    # retries internally and always returns a resolved order dict.
+                    raw          = self._place_limit_order(ccxt_side, quantity, price)
+                    order_id_str = str(raw.get("id", ""))
+                    filled_qty   = float(raw.get("filled") or 0.0)
+                    fill_price   = float(raw.get("average") or raw.get("price") or price)
+                    quantity     = filled_qty
+                    last_raw     = raw
                 else:
-                    filled_qty = float(last_raw.get("filled") or filled_qty)
-                    fill_price = float(
-                        last_raw.get("average") or
-                        last_raw.get("price")   or
-                        price
-                    )
-                    if self._order_type == "limit" and last_raw.get("status") not in ("closed", "filled"):
-                        try:
-                            self._exchange.cancel_order(order_id_str, self.symbol)
-                            logger.warning(
-                                "LIMIT ORDER %s not filled after polls — cancelled. "
-                                "Consider ORDER_TYPE=market for guaranteed fills.",
-                                order_id_str,
-                            )
-                        except Exception as _cancel_exc:
-                            logger.warning("Failed to cancel limit order %s: %s", order_id_str, _cancel_exc)
+                    if self._order_type == "limit" and side == OrderSide.BUY:
+                        # Passive bid 0.2% below market — qualifies for Kraken maker rate (0.16%)
+                        # SELL is always market for guaranteed exit regardless of ORDER_TYPE
+                        limit_price = round(price * 0.998, 2)
+                        logger.warning(
+                            "LIMIT BUY: %.6f %s @ %.2f (0.2%% below %.2f)",
+                            quantity, self.symbol, limit_price, price,
+                        )
+                        raw = self._exchange.create_order(
+                            symbol = self.symbol,
+                            type   = "limit",
+                            side   = ccxt_side,
+                            amount = quantity,
+                            price  = limit_price,
+                        )
                     else:
                         logger.warning(
-                            "ORDER %s NOT CLOSED after 3 polls — saving state with "
-                            "partial fill=%.6f %s @ %.2f. Manual verification recommended.",
-                            order_id_str, filled_qty, self.symbol, fill_price,
+                            "LIVE ORDER: %s %.6f %s",
+                            side.value, quantity, self.symbol,
                         )
+                        raw = self._exchange.create_order(
+                            symbol = self.symbol,
+                            type   = "market",
+                            side   = ccxt_side,
+                            amount = quantity,
+                        )
+                    order_id_str = str(raw.get("id", ""))
+                    filled_qty   = float(raw.get("filled") or 0.0)
+                    fill_price   = float(raw.get("average") or raw.get("price") or price)
 
-                quantity = filled_qty
+                    # Poll up to 9 times for 'closed' status.
+                    # If still open after polls, use whatever 'filled' amount the
+                    # last poll reported — never leave cash/position unupdated after
+                    # a real order was sent.
+                    last_raw = raw
+                    for poll_num in range(1, 10):
+                        time.sleep(1)
+                        try:
+                            last_raw   = self._exchange.fetch_order(order_id_str, self.symbol)
+                            filled_qty = float(last_raw.get("filled") or filled_qty)
+                            if last_raw.get("status") == "closed":
+                                fill_price = float(
+                                    last_raw.get("average") or
+                                    last_raw.get("price")   or
+                                    price
+                                )
+                                break
+                        except Exception as poll_exc:
+                            logger.warning("fetch_order poll %d failed: %s", poll_num, poll_exc)
+                    else:
+                        filled_qty = float(last_raw.get("filled") or filled_qty)
+                        fill_price = float(
+                            last_raw.get("average") or
+                            last_raw.get("price")   or
+                            price
+                        )
+                        if self._order_type == "limit" and last_raw.get("status") not in ("closed", "filled"):
+                            try:
+                                self._exchange.cancel_order(order_id_str, self.symbol)
+                                logger.warning(
+                                    "LIMIT ORDER %s not filled after polls — cancelled. "
+                                    "Consider ORDER_TYPE=market for guaranteed fills.",
+                                    order_id_str,
+                                )
+                            except Exception as _cancel_exc:
+                                logger.warning("Failed to cancel limit order %s: %s", order_id_str, _cancel_exc)
+                        else:
+                            logger.warning(
+                                "ORDER %s NOT CLOSED after 3 polls — saving state with "
+                                "partial fill=%.6f %s @ %.2f. Manual verification recommended.",
+                                order_id_str, filled_qty, self.symbol, fill_price,
+                            )
 
-                # Extract fee from the final polled response.
+                    quantity = filled_qty
+
+                # Shared fee extraction — works for both limit-chase and market paths.
                 # Log the raw dict so the true fee structure is auditable.
                 fee_data     = last_raw.get("fee") or {}
                 logger.warning("Fee dict from exchange: %s", fee_data)

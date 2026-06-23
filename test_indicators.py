@@ -129,6 +129,22 @@ _bound = max(_rising_h) - min(_rising_l)
 check("ATR value is between 0 and (max_high - min_low) inclusive",
       _atr_rising is not None and 0.0 <= _atr_rising <= _bound)
 
+# 6. All equal high/low/close (flat market) → TR = 0 → ATR = 0.0
+_all_equal = [50.0] * (_period + 5)
+check("all equal high/low/close (flat market) → ATR = 0.0",
+      atr(_all_equal, _all_equal, _all_equal, _period) == 0.0)
+
+# 7. ATR SL/TP math: entry=100, atr=5, sl_mult=2→sl=90, tp_mult=4→tp=120, R/R=2.0
+_entry_price = 100.0
+_atr_test    = 5.0
+_sl_mult     = 2.0
+_tp_mult     = 4.0
+_sl_price    = _entry_price - _atr_test * _sl_mult   # 90.0
+_tp_price    = _entry_price + _atr_test * _tp_mult   # 120.0
+_rr          = (_tp_price - _entry_price) / (_entry_price - _sl_price)  # 2.0
+check("ATR SL/TP math: entry=100 atr=5 sl_mult=2 → sl=90, tp_mult=4 → tp=120, R/R=2.0",
+      _sl_price == 90.0 and _tp_price == 120.0 and _rr == 2.0)
+
 # ---------------------------------------------------------------------------
 # IndicatorStrategy integration
 # ---------------------------------------------------------------------------

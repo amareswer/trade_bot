@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import ccxt
 import bot.execution.live_executor as le_mod
 from bot.execution.executor import OrderSide, OrderStatus
 from bot.execution.live_executor import LiveExecutor
@@ -485,6 +486,175 @@ def test_restart_recovery_seeds_position_manager_and_state_machine():
     # history is empty — seed/recover_long create no fake trade records
     assert len(state_machine.history)  == 0
     assert len(position_manager.history) == 0
+
+
+# ---------------------------------------------------------------------------
+# Limit order tests — cfg and time.sleep mocked, no network
+# ---------------------------------------------------------------------------
+
+def _limit_cfg(mock_cfg, *, enabled=True, timeout_s=30, max_retries=3, tick_pct=0.0001):
+    """Configure mock cfg for limit order tests."""
+    mock_cfg.exchange.limit_order_enabled     = enabled
+    mock_cfg.exchange.limit_chase_timeout_s   = timeout_s
+    mock_cfg.exchange.limit_chase_max_retries = max_retries
+    mock_cfg.exchange.limit_chase_tick_pct    = tick_pct
+
+
+def _ob():
+    """Standard orderbook mock: bid=90000, ask=90100."""
+    return {"bids": [[90000.0, 1.0]], "asks": [[90100.0, 1.0]]}
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_limit_order_fills_on_first_attempt(mock_cfg, mock_sleep):
+    """Limit order closed immediately by exchange — FILLED, maker fee deducted."""
+    _limit_cfg(mock_cfg, enabled=True, timeout_s=30)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0)
+
+    mock_ex.fetch_order_book.return_value  = _ob()
+    mock_ex.price_to_precision.return_value = "90009.0"
+
+    limit_raw = {
+        "id":      "limit-001",
+        "status":  "closed",
+        "filled":  0.001,
+        "average": 90009.0,
+        "fee":     {"cost": 0.0144, "currency": "CAD"},  # maker ~0.16%
+    }
+    mock_ex.create_order.return_value = limit_raw
+
+    order = ex.execute(Signal.BUY, 90000.0, 0.001)
+
+    assert order is not None
+    assert order.status == OrderStatus.FILLED
+    # create_order called exactly once with type='limit'
+    mock_ex.create_order.assert_called_once()
+    assert mock_ex.create_order.call_args[0][1] == "limit"
+    # Post-only flag sent
+    assert mock_ex.create_order.call_args[0][5] == {"timeInForce": "PO"}
+    # Maker fee deducted
+    assert abs(ex.fees_paid - 0.0144) < 1e-6
+    # No market-order fallback — fetch_order never needed
+    mock_ex.fetch_order.assert_not_called()
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_limit_order_reprices_after_timeout(mock_cfg, mock_sleep):
+    """First attempt times out (timeout=0 skips poll loop), cancel called, second attempt fills."""
+    _limit_cfg(mock_cfg, enabled=True, timeout_s=0, max_retries=3)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0)
+
+    mock_ex.fetch_order_book.return_value   = _ob()
+    mock_ex.price_to_precision.return_value = "90009.0"
+
+    open_raw = {"id": "limit-01", "status": "open",   "filled": 0.0,   "average": None,    "fee": {}}
+    fill_raw = {"id": "limit-02", "status": "closed", "filled": 0.001, "average": 90009.0,
+                "fee": {"cost": 0.0144, "currency": "CAD"}}
+    mock_ex.create_order.side_effect = [open_raw, fill_raw]
+
+    order = ex.execute(Signal.BUY, 90000.0, 0.001)
+
+    assert order is not None
+    assert order.status == OrderStatus.FILLED
+    # First limit order was cancelled
+    mock_ex.cancel_order.assert_called_once_with("limit-01", "BTC/CAD")
+    # Two limit order placements total
+    assert mock_ex.create_order.call_count == 2
+    assert all(c[0][1] == "limit" for c in mock_ex.create_order.call_args_list)
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_limit_order_falls_back_to_market_after_max_retries(mock_cfg, mock_sleep, caplog):
+    """All limit attempts time out → market order placed → WARNING containing 'falling back'."""
+    import logging
+    _limit_cfg(mock_cfg, enabled=True, timeout_s=0, max_retries=2)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0)
+
+    mock_ex.fetch_order_book.return_value   = _ob()
+    mock_ex.price_to_precision.return_value = "90009.0"
+
+    open_raw   = {"id": "limit-0X", "status": "open",   "filled": 0.0,   "average": None,    "fee": {}}
+    market_raw = {"id": "mkt-001",  "status": "closed", "filled": 0.001, "average": 90000.0,
+                  "fee": {"cost": 0.72, "currency": "CAD"}}
+    # 3 limit attempts (max_retries=2 → range(3)), then market fallback
+    mock_ex.create_order.side_effect = [
+        {**open_raw, "id": "limit-01"},
+        {**open_raw, "id": "limit-02"},
+        {**open_raw, "id": "limit-03"},
+        market_raw,
+    ]
+
+    with caplog.at_level(logging.WARNING, logger="bot.execution.live_executor"):
+        order = ex.execute(Signal.BUY, 90000.0, 0.001)
+
+    assert order is not None
+    assert order.status == OrderStatus.FILLED
+    # Final create_order call must be a market order
+    last_call = mock_ex.create_order.call_args_list[-1]
+    assert last_call[0][1] == "market"
+    assert mock_ex.create_order.call_count == 4  # 3 limit + 1 market
+    assert any("falling back" in r.message for r in caplog.records)
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_limit_order_disabled_uses_market(mock_cfg, mock_sleep):
+    """LIMIT_ORDER_ENABLED=false → existing market path used, create_order called with type='market'."""
+    _limit_cfg(mock_cfg, enabled=False)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0)
+
+    raw = {
+        "id":      "mkt-002",
+        "status":  "closed",
+        "filled":  0.001,
+        "average": 90000.0,
+        "fee":     {"cost": 0.0, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = raw
+    mock_ex.fetch_order.return_value  = raw  # first poll sees closed → breaks
+
+    order = ex.execute(Signal.BUY, 90000.0, 0.001)
+
+    assert order is not None
+    assert order.status == OrderStatus.FILLED
+    mock_ex.create_order.assert_called_once()
+    assert mock_ex.create_order.call_args[1]["type"] == "market"
+    # _place_limit_order never called — no orderbook fetch
+    mock_ex.fetch_order_book.assert_not_called()
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_limit_order_po_rejection_retries_with_tighter_offset(mock_cfg, mock_sleep):
+    """ccxt.InvalidOrder on first create_order → halves tick_pct, second attempt fills. No market fallback."""
+    _limit_cfg(mock_cfg, enabled=True, timeout_s=30, max_retries=3, tick_pct=0.0001)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0)
+
+    mock_ex.fetch_order_book.return_value   = _ob()
+    mock_ex.price_to_precision.return_value = "90009.0"
+
+    fill_raw = {
+        "id":      "limit-002",
+        "status":  "closed",
+        "filled":  0.001,
+        "average": 90009.0,
+        "fee":     {"cost": 0.0144, "currency": "CAD"},
+    }
+    mock_ex.create_order.side_effect = [
+        ccxt.InvalidOrder("would be filled immediately"),  # PO rejected on 1st attempt
+        fill_raw,                                           # 2nd attempt fills
+    ]
+
+    order = ex.execute(Signal.BUY, 90000.0, 0.001)
+
+    assert order is not None
+    assert order.status == OrderStatus.FILLED
+    # Exactly two limit order placements — no market fallback
+    assert mock_ex.create_order.call_count == 2
+    assert all(c[0][1] == "limit" for c in mock_ex.create_order.call_args_list)
 
 
 if __name__ == "__main__":

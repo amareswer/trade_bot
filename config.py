@@ -86,7 +86,11 @@ class ExchangeConfig:
     dry_run:        bool = False
     api_key:        str  = ""
     api_secret:     str  = ""
-    order_type:     str  = "market"  # "market" | "limit"
+    order_type:              str   = "market"  # "market" | "limit"
+    limit_order_enabled:     bool  = False    # reads LIMIT_ORDER_ENABLED
+    limit_chase_timeout_s:   int   = 120      # reads LIMIT_CHASE_TIMEOUT_S
+    limit_chase_max_retries: int   = 3        # reads LIMIT_CHASE_MAX_RETRIES
+    limit_chase_tick_pct:    float = 0.0001   # reads LIMIT_CHASE_TICK_PCT — offset as % of price (0.0001 = 0.01%)
 
     def __post_init__(self):
         if self.feed_mode not in ("live", "simulated"):
@@ -137,6 +141,9 @@ class StrategyConfig:
     mr_rsi_oversold:         float = 35.0  # mean-reversion BUY threshold (ranging mode)
     mr_rsi_overbought:       float = 65.0  # mean-reversion SELL threshold (ranging mode)
     atr_volatile_multiplier: float = 1.5   # ATR > mult × avg ATR → sit flat (VOLATILE)
+    atr_sl_mult:             float = 2.0   # reads ATR_SL_MULT — SL = entry - atr × mult
+    atr_tp_mult:             float = 4.0   # reads ATR_TP_MULT — TP = entry + atr × mult
+    atr_period:              int   = 14    # reads ATR_PERIOD
 
     def __post_init__(self):
         if self.mode not in ("indicator", "threshold"):
@@ -346,6 +353,9 @@ class AppConfig:
         logger.info("CONFIG  exchange=%s  symbol=%s  feed=%s  candle=%dmin  order_type=%s",
             self.exchange.exchange, self.exchange.symbol, self.exchange.feed_mode,
             self.exchange.candle_minutes, self.exchange.order_type)
+        logger.info("CONFIG  limit_order=%s  timeout=%ds  retries=%d  tick_pct=%.4f%%",
+            self.exchange.limit_order_enabled, self.exchange.limit_chase_timeout_s,
+            self.exchange.limit_chase_max_retries, self.exchange.limit_chase_tick_pct * 100)
         adx_src = "from .env" if "ADX_THRESHOLD" in os.environ else "CODE DEFAULT — set ADX_THRESHOLD in .env"
         logger.info("CONFIG  strategy=%s  RSI(%d) %g/%g  EMA(%d/%d)  ADX=%.1f (%s)  regime_ema=%d  slope=%s",
             self.strategy.mode, self.strategy.rsi_period,
@@ -354,6 +364,8 @@ class AppConfig:
             self.strategy.adx_threshold, adx_src,
             self.strategy.regime_ema_period,
             self.strategy.regime_ema_slope_filter)
+        logger.info("CONFIG  atr  sl_mult=%.1f  tp_mult=%.1f  period=%d",
+            self.strategy.atr_sl_mult, self.strategy.atr_tp_mult, self.strategy.atr_period)
         logger.info("CONFIG  risk  per_trade=%.0f%%  max_pos=%.0f%%  daily_loss=%.0f%%  max_dd=%.0f%%  max_trades=%d/day  cooldown=%d",
             self.risk.risk_per_trade_pct * 100,
             self.risk.max_position_pct * 100,
@@ -396,7 +408,11 @@ def _load() -> AppConfig:
             dry_run        = _bool("DRY_RUN",         False),
             api_key        = _str ("KRAKEN_API_KEY",  ""),
             api_secret     = _str ("KRAKEN_API_SECRET", ""),
-            order_type     = _str ("ORDER_TYPE",      "market"),
+            order_type              = _str  ("ORDER_TYPE",             "market"),
+            limit_order_enabled     = _bool ("LIMIT_ORDER_ENABLED",      False),
+            limit_chase_timeout_s   = _int  ("LIMIT_CHASE_TIMEOUT_S",    120),
+            limit_chase_max_retries = _int  ("LIMIT_CHASE_MAX_RETRIES",  3),
+            limit_chase_tick_pct    = _float("LIMIT_CHASE_TICK_PCT",     0.0001),
         ),
         strategy=StrategyConfig(
             mode                    = _str  ("STRATEGY_MODE",           "indicator"),
@@ -422,6 +438,9 @@ def _load() -> AppConfig:
             mr_rsi_oversold         = _float("MR_RSI_OVERSOLD",         35.0),
             mr_rsi_overbought       = _float("MR_RSI_OVERBOUGHT",       65.0),
             atr_volatile_multiplier = _float("ATR_VOLATILE_MULTIPLIER", 1.5),
+            atr_sl_mult             = _float("ATR_SL_MULT",              2.0),
+            atr_tp_mult             = _float("ATR_TP_MULT",              4.0),
+            atr_period              = _int  ("ATR_PERIOD",               14),
         ),
         risk=RiskConfig(
             risk_per_trade_pct   = _float("RISK_PER_TRADE_PCT",    0.01),
