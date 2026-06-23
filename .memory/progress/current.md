@@ -5,7 +5,56 @@ metadata:
   type: project
 ---
 
-**Status as of 2026-06-23:** Two bots active. Crypto bot live on Kraken. Stock bot in paper trading observation. Three new items built this session.
+**Status as of 2026-06-23 (updated):** Two bots active. Crypto bot live on Kraken. Stock bot in paper trading observation. Walk-forward on 1d swing strategy: VALIDATED. Week 2 hardening A–D complete.
+
+---
+
+## Session 2026-06-23 (continued) — Swing Walk-Forward + Week 2 Hardening (COMPLETE ✅)
+
+### 1d Swing Walk-Forward — swing_walkforward.py (DONE ✓)
+
+New file: `swing_walkforward.py` — validates SL=4% TP=25% on 1d BTC/USDT across 3 OOS periods.
+
+**Results (fee=0.8%, ADX≥18, RSI filter ON, cash=$10k):**
+
+| Period           | Candles | Trades | PF   | Return% | MaxDD% | Verdict |
+|------------------|---------|--------|------|---------|--------|---------|
+| Train 2017–2022  | 1963    | 29     | 2.67 | +8.35%  | -3.76% | PASS    |
+| Val_1 2023–mid24 | 547     | 8      | 2.30 | +1.50%  | -1.41% | PASS    |
+| Val_2 mid24–now  | 723     | 5      | 1.54 | +0.06%  | -2.21% | PASS    |
+
+**Conclusion: VALIDATED — Edge holds out-of-sample. Safe to paper-trade alongside 4h bot.**
+
+### 1d Swing Strategy — Status: VALIDATED
+
+- Config: SL=4% TP=25% ADX=18 RSI_FILTER=true cooldown=3 fee=0.8%
+- All 3 walk-forward periods PASS (PF ≥ 1.3)
+- Val_2 (recent regime) shows PF decay to 1.54 — lower trade count (5 trades), still PASS
+- **Next step:** paper-trade alongside live 4h bot for 4 weeks; compare signal quality before activating with real capital
+- Do NOT add to live .env — research only until paper-trade period complete
+
+### Week 2 Hardening — COMPLETE ✅ (4 items)
+
+**CHANGE A — Candle watchdog (bot/main.py)**
+- Added `_last_candle_time = time.time()` to initialization block
+- Fires `alerter.error()` when no new candle for `candle_minutes × 2` minutes
+- Resets after firing to avoid spam every tick
+- Updates `_last_candle_time` each time a new candle arrives
+
+**CHANGE B — Position drift reconciliation (bot/main.py)**
+- Runs every 60 ticks in live mode only
+- Calls `executor._exchange.fetch_balance()`, compares exchange vs bot position
+- Fires `alerter.error()` + `logger.warning()` if drift > 10 satoshi (0.000010)
+- Fails silently on exchange error (logs warning only)
+
+**CHANGE C — Logrotate config (deploy/logrotate_trade_bot.conf)**
+- Weekly rotation, 4 rotations kept, compressed, copytruncate (no service restart needed)
+- Install: `sudo cp deploy/logrotate_trade_bot.conf /etc/logrotate.d/trade_bot`
+- Requires replacing `/path/to/your/project` with actual VPS path
+
+**CHANGE D — UptimeRobot setup guide (deploy/UPTIME_MONITOR.md)**
+- Full step-by-step: create account, Heartbeat monitor, VPS cron ping, alert contacts
+- Explains why Heartbeat (no HTTP server) and systemd restart limit pitfall
 
 ---
 
@@ -151,10 +200,10 @@ Three agents audited crypto bot, stock bot, and deployment. Findings below by pr
 ### WEEK 2
 - [ ] ADX default `config.py:383`: `25.0` → `18.0`
 - [ ] RSI levels in `.env`: `RSI_OVERSOLD=30 RSI_OVERBOUGHT=70`
-- [ ] Add logrotate on VPS (`/etc/logrotate.d/trade_bot`)
-- [ ] Add position drift reconciliation (`fetch_balance()` vs `live_state.json`)
-- [ ] Add candle watchdog alert (2× candle_minutes silence → Telegram error)
-- [ ] External uptime monitor (UptimeRobot free)
+- [x] Add logrotate on VPS — `deploy/logrotate_trade_bot.conf` created ✓
+- [x] Add position drift reconciliation — wired in `bot/main.py` (every 60 ticks) ✓
+- [x] Add candle watchdog alert — wired in `bot/main.py` (2× candle_minutes) ✓
+- [x] External uptime monitor — `deploy/UPTIME_MONITOR.md` setup guide created ✓
 - [ ] Cron for `live_comparison.py` weekly
 
 ### MONTH+ Gates

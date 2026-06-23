@@ -17,3 +17,4 @@
 - [Position Manager](position_manager.md) — weighted avg entry, realized/unrealized PnL, trade history, wiring pattern
 - [Security Audit](security_audit.md) — 2026-05-28 audit findings, all fixes applied, pending key rotation
 - [Stock Bot](stock_bot.md) — all 6 phases built; $1k paper trading; STABLE as of 2026-06-19; reverts documented
+- [1d Swing Validated](decisions/swing-1d-validated.md) — SL=4% TP=25% walk-forward PASS all 3 periods; paper-trade candidate; not in live .env

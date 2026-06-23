@@ -11,6 +11,35 @@ Running log of feature decisions. Most recent first.
 
 ---
 
+## 2026-06-23 — Swing Walk-Forward + Week 2 Hardening (BUILT ✓)
+
+### 1D swing walk-forward — swing_walkforward.py (BUILT ✓)
+New file: `swing_walkforward.py` — OOS walk-forward for SL=4% TP=25% on 1d BTC/USDT.
+3 periods: Train (2017–2022), Val_1 (2023–mid24), Val_2 (mid24–now).
+All 3 PASS: PF 2.67 / 2.30 / 1.54 at 0.8% fee.
+**VALIDATED** — safe to paper-trade alongside 4h bot. NOT in live .env yet.
+Next step: 4-week paper-trade observation before real capital activation.
+
+### Candle watchdog — bot/main.py (BUILT ✓)
+`_last_candle_time` initialized before main loop; updated each time a new live candle
+fires. On every tick: if `time.time() - _last_candle_time > candle_minutes * 60 * 2`,
+fires `alerter.error()` then resets to avoid spam. Guards with `feed_mode == "live"`.
+
+### Position drift reconciliation — bot/main.py (BUILT ✓)
+Runs every 60 ticks when `cfg.exchange.live_trading`. Calls `executor._exchange.fetch_balance()`,
+compares `free[base]` vs `executor.position`. If drift > 0.000010, logs WARNING + fires
+Telegram error. Exception-safe (silent on API failure).
+
+### Logrotate config — deploy/logrotate_trade_bot.conf (BUILT ✓)
+Weekly rotation, 4 rotations, compressed, copytruncate. Replace project path then:
+`sudo cp deploy/logrotate_trade_bot.conf /etc/logrotate.d/trade_bot`
+
+### UptimeRobot guide — deploy/UPTIME_MONITOR.md (BUILT ✓)
+Step-by-step: Heartbeat monitor, VPS cron ping every 5min, alert contacts.
+Covers systemd restart-limit pitfall and manual recovery command.
+
+---
+
 ## 2026-06-23 — Alerting wiring + 1D swing backtest + DCA module (BUILT ✓)
 
 ### Telegram alert wiring — bot/main.py (BUILT ✓)

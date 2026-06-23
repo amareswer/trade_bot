@@ -387,6 +387,7 @@ def run():
     tick_log:   deque[dict] = deque(maxlen=200)
     _consecutive_errors = 0
     candle_log: deque[dict] = deque(maxlen=50)
+    _last_candle_time = time.time()
 
     # Trailing stop and partial TP state — reset on each new trade
     _trail_peak:      float = 0.0
@@ -473,6 +474,36 @@ def run():
             print(f"  TICK {tick:04d} | price fetch failed: {exc}")
             time.sleep(cfg.exchange.loop_interval)
             continue
+
+        # ── 2b. Candle watchdog (live mode) ──────────────────────────
+        if cfg.exchange.feed_mode == "live":
+            _candle_stale_s = cfg.exchange.candle_minutes * 60 * 2
+            if time.time() - _last_candle_time > _candle_stale_s:
+                alerter.error(
+                    f"Candle watchdog: no new {cfg.exchange.candle_minutes}min candle "
+                    f"for {int((time.time()-_last_candle_time)/60)} minutes — feed may be stale"
+                )
+                _last_candle_time = time.time()  # reset so we don't spam every tick
+
+        # ── 2c. Position drift reconciliation (every 60 ticks, live only) ──
+        if cfg.exchange.live_trading and tick % 60 == 0:
+            try:
+                balance = executor._exchange.fetch_balance()
+                base = cfg.exchange.symbol.split("/")[0]
+                exchange_pos = float(balance.get("free", {}).get(base, 0))
+                bot_pos = executor.position
+                drift = abs(exchange_pos - bot_pos)
+                if drift > 0.000010:  # 10 satoshi threshold
+                    logger.warning(
+                        "POSITION DRIFT: exchange=%.6f bot=%.6f drift=%.6f %s",
+                        exchange_pos, bot_pos, drift, base,
+                    )
+                    alerter.error(
+                        f"Position drift detected: exchange={exchange_pos:.6f} "
+                        f"bot={bot_pos:.6f} {base} — check logs/live_state.json"
+                    )
+            except Exception as _drift_exc:
+                logger.warning("Position drift check failed: %s", _drift_exc)
 
         # ── 3. Strategy signal ────────────────────────────────────────
         if is_indicator:
@@ -634,6 +665,7 @@ def run():
                     time.sleep(cfg.exchange.loop_interval)
                     continue
                 last_candle_ts_ms = new_ts
+                _last_candle_time = time.time()  # watchdog: new candle received
                 raw_signal = strategy.evaluate(candle)
             else:
                 # Simulated mode: flat fake candle per tick
