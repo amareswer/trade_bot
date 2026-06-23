@@ -9,6 +9,35 @@ metadata:
 
 Running log of feature decisions. Most recent first.
 
+---
+
+## 2026-06-23 — Alerting wiring + 1D swing backtest + DCA module (BUILT ✓)
+
+### Telegram alert wiring — bot/main.py (BUILT ✓)
+Three missing alert paths wired in `bot/main.py`:
+1. Partial TP: `trade_log.log_fill()` + `alerter.fill()` added after partial TP fills (was missing both)
+2. Midnight daily P&L: UTC midnight check at bottom of main loop → `alerter.daily_pnl()`
+3. Price feed error counter: `_consecutive_errors` → `alerter.error()` after 5 consecutive failures
+
+### 1D Swing Backtest — swing_backtest.py (BUILT ✓)
+New script: `swing_backtest.py` — sweeps 6 SL/TP combos on 1d BTC/USDT.
+Fixed params: fee=0.8%, ADX=18, RSI filter ON, cooldown=3, starting_cash=$10k.
+4 PASS configs found. **Best: SL=4%, TP=25%, PF=1.85, 59 trades, +5.19% return, -5.17% maxDD.**
+CANDIDATE only — do not promote to live .env without walk-forward on 1d timeframe.
+Saved: `logs/swing_backtest_1d_20260623.csv`
+
+### DCA Bot — dca_bot.py (BUILT ✓)
+New standalone script: `dca_bot.py`.
+- State: `logs/dca_state.json` (total_invested, total_units, last_buy_date, buys[])
+- Config: DCA_AMOUNT_CAD, DCA_INTERVAL_DAYS, DCA_SYMBOL, DCA_EXCHANGE from .env
+- Filters: RSI overbought skip + daily EMA9/EMA21 trend skip
+- DCA_DRY_RUN=true (default): records as-if fill, never real orders
+- DCA_DRY_RUN=false: places ccxt market BUY with KRAKEN_API_KEY/SECRET
+- `python dca_bot.py --report`: buy history table, no network calls
+- Dry-run confirmed: today BEARISH (EMA9 < EMA21) → correctly skipped
+
+---
+
 **Why:** User requested that every change or feature plan be noted here so nothing is forgotten across sessions.
 
 **How to apply:** Check this before suggesting new features — don't re-propose deferred items without context. Use this to pick up exactly where we left off.

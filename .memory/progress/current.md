@@ -5,6 +5,51 @@ metadata:
   type: project
 ---
 
+**Status as of 2026-06-23:** Two bots active. Crypto bot live on Kraken. Stock bot in paper trading observation. Three new items built this session.
+
+---
+
+## Session 2026-06-23 — Alerting + Swing Backtest + DCA Module (COMPLETE ✅)
+
+### Task 1 — Telegram alert wiring in bot/main.py (DONE ✓)
+Three changes made to `bot/main.py`:
+- **Partial TP alert**: added `trade_log.log_fill()` + `alerter.fill()` immediately after partial TP fills (previously unreported real-money exits)
+- **Midnight daily P&L**: added UTC midnight check after `time.sleep()` at bottom of main loop → calls `alerter.daily_pnl()` with realized_pnl, total_value, fills_today
+- **Consecutive error counter**: `_consecutive_errors` counter increments on each price fetch failure; calls `alerter.error()` when >= 5 consecutive failures; resets to 0 on success
+- Verified: `python -c "from bot.main import run; print('import OK')"` → clean
+
+### Task 2 — 1D swing backtest sweep (DONE ✓)
+New file: `swing_backtest.py`
+- Fetches 5000 × 1d BTC/USDT from Binance (got 3,233 — full history since Aug 2017)
+- Sweeps 6 SL/TP combinations at fee=0.8%, ADX≥18, RSI filter ON, cooldown=3 ticks
+- **Results:**
+
+| SL%  | TP%  | Trades | Win%  | PF   | MaxDD%  | Return%  | Verdict  |
+|------|------|--------|-------|------|---------|----------|----------|
+| 2%   | 10%  | 83     | 20.5% | 1.30 | -10.21% | -9.16%   | MARGINAL |
+| 3%   | 15%  | 75     | 21.3% | 1.30 | -10.10% | -6.74%   | MARGINAL |
+| 3%   | 20%  | 66     | 21.2% | 1.68 | -4.09%  | -0.05%   | PASS     |
+| 4%   | 20%  | 61     | 26.2% | 1.58 | -6.56%  | +0.53%   | PASS     |
+| 4%   | 25%  | 59     | 27.1% | 1.85 | -5.17%  | +5.19%   | PASS ⭐  |
+| 5%   | 25%  | 54     | 29.6% | 1.67 | -4.83%  | +4.00%   | PASS     |
+
+- **Best config**: SL=4%, TP=25%, PF=1.85, 59 trades, return +5.19%, maxDD -5.17%
+- Saved to `logs/swing_backtest_1d_20260623.csv`
+- **Decision**: noted as candidate only — 1d candles, different from live 4h config. Do NOT change live .env. Requires forward walk-forward before any promotion.
+
+### Task 3 — DCA module (DONE ✓)
+New file: `dca_bot.py`
+- Standalone — separate from live bot, separate state: `logs/dca_state.json`
+- Config via .env: DCA_AMOUNT_CAD=50, DCA_INTERVAL_DAYS=7, DCA_SYMBOL=BTC/CAD, DCA_EXCHANGE=kraken
+- Filters: RSI overbought skip (DCA_SKIP_IF_RSI_ABOVE), daily trend skip (DCA_SKIP_IF_DAILY_BEARISH)
+- DCA_DRY_RUN=true (default): updates state as if filled, never places real orders
+- DCA_DRY_RUN=false: places real market BUY via ccxt using KRAKEN_API_KEY/SECRET
+- `--report` flag: prints buy history table + portfolio summary (no network calls)
+- Dry-run test confirmed: filters working (today BEARISH — correctly skipped)
+- Full buy summary output confirmed with filters disabled
+
+---
+
 **Status as of 2026-06-19:** Two bots active. Crypto bot live on Kraken. Stock bot stable on paper trading at $1,000.
 
 ---

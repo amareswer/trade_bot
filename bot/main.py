@@ -385,6 +385,7 @@ def run():
 
     tick        = 0
     tick_log:   deque[dict] = deque(maxlen=200)
+    _consecutive_errors = 0
     candle_log: deque[dict] = deque(maxlen=50)
 
     # Trailing stop and partial TP state — reset on each new trade
@@ -464,7 +465,11 @@ def run():
         # ── 2. Fetch live price ───────────────────────────────────────
         try:
             price = feed.get_price()
+            _consecutive_errors = 0
         except Exception as exc:
+            _consecutive_errors += 1
+            if _consecutive_errors >= 5:
+                alerter.error(f"Price feed down {_consecutive_errors} consecutive ticks — {exc}")
             print(f"  TICK {tick:04d} | price fetch failed: {exc}")
             time.sleep(cfg.exchange.loop_interval)
             continue
@@ -509,6 +514,24 @@ def run():
                                     state_machine.recover_long(_p_order.price)
                                     print(f"           📊 PARTIAL TP:  {_p_qty:.6f} @ {price:,.2f}  PnL={_p_pnl:+.2f}", flush=True)
                                     logger.warning("PARTIAL TP: sold %.6f @ %.2f  pnl=%.2f", _p_qty, price, _p_pnl)
+                                    trade_log.log_fill(
+                                        side          = "SELL",
+                                        symbol        = cfg.exchange.symbol,
+                                        quantity      = _p_qty,
+                                        price         = _p_order.price,
+                                        pnl           = _p_pnl,
+                                        exchange      = cfg.exchange.exchange,
+                                        signal_reason = "partial_tp",
+                                    )
+                                    alerter.fill(
+                                        side        = "SELL",
+                                        symbol      = cfg.exchange.symbol,
+                                        quantity    = _p_qty,
+                                        price       = _p_order.price,
+                                        total_value = _p_order.total_value,
+                                        pnl         = _p_pnl,
+                                        exchange    = cfg.exchange.exchange,
+                                    )
 
                     _ic_sl = _trail_sl_level > 0 and price <= _trail_sl_level
                     _ic_tp = (
@@ -896,6 +919,14 @@ def run():
         _render_dashboard(final_signal.value, rsi_val, trend_val)
 
         time.sleep(cfg.exchange.loop_interval)
+        _now_utc = datetime.now(_tz.utc)
+        if _now_utc.hour == 0 and _now_utc.minute == 0:
+            alerter.daily_pnl(
+                symbol       = cfg.exchange.symbol,
+                realized_pnl = position_manager.realized_pnl,
+                total_value  = executor.portfolio.total_value(price),
+                trade_count  = risk._fills_today,
+            )
 
     display.stopped(
         ticks        = tick,
