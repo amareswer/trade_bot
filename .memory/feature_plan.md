@@ -11,6 +11,36 @@ Running log of feature decisions. Most recent first.
 
 ---
 
+## 2026-06-24 — AI Confidence Tracker + Three Strategy Fixes (BUILT ✓)
+
+### Confidence band accuracy tracker (BUILT ✓)
+Validation system that reads paper_trades.csv and measures whether AI confidence scores predict profits.
+Bands: LOW 70–79, MED 80–89, HIGH 90–100, PRE <70.
+**Why:** AI confidence IS the primary signal — need to verify it has edge before going live.
+Gate: 80+ confidence win% ≥ 55%, trades ≥ 10 → eligible for IBKR live.
+New files: `stock_bot/analysis/accuracy_tracker.py`, `stock_bot/analysis/paper_report.py`, `stock_analysis.py`.
+paper.py: buy() now takes `confidence=0`, writes to CSV; save_state() includes `starting_cash`.
+main.py: executor.buy() passes `confidence=verdict.confidence`.
+
+### FIX A — EMA 2-candle confirmation (BUILT ✓)
+`trend(confirmation_candles=2)` checks prior candle EMA direction internally instead of
+requiring external `_prev_trend` state. Removes noisy single-candle crossover signals.
+`_prev_trend` dict removed from main.py. Default `confirmation_candles=1` preserves existing behavior.
+
+### FIX B — Universe composite momentum (BUILT ✓)
+Score: `volume_ratio × (0.40×|change_1d| + 0.60×|change_5d|)`.
+Old: `volume_ratio × (0.60×change_1d + 0.40×change_5d)` (no abs, wrong weights).
+**Why:** abs() means both rising and falling stocks rank; 60% weight to 5d prevents
+overnight noise from dominating; 40% to 1d captures stocks just starting to move.
+
+### FIX C — ATR volatility context for AI (BUILT ✓)
+`atr(highs, lows, closes, period=14)` added to indicators.py (Wilder's smoothing).
+Passed through main.py → indicators dict → prompt_builder.py.
+Prompt shows: `ATR(14): $X.XX (X.X% of price) — high/moderate/low volatility`.
+AI rule: high ATR means natural swings may noise-trigger a 5% SL — lower confidence.
+
+---
+
 ## 2026-06-23 — Daily Loss Fix + Stock Backtester (BUILT ✓)
 
 ### Daily loss circuit breaker — paper.py (BUILT ✓)

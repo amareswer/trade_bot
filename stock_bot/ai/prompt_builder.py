@@ -40,7 +40,7 @@ def _macd_note(macd_line: float | None, macd_signal: float | None) -> str:
 def build_prompt(
     symbol:          str,
     candle,                           # stock_bot.data.price_feed.Candle
-    indicators:      dict,            # keys: rsi, trend, adx, macd_line, macd_signal
+    indicators:      dict,            # keys: rsi, trend, adx, macd_line, macd_signal, atr
     research:        ResearchReport,
     stop_loss_pct:   float = 0.05,
     take_profit_pct: float = 0.12,
@@ -55,6 +55,7 @@ def build_prompt(
     trend       = indicators.get("trend") or "NEUTRAL"
     macd_line   = indicators.get("macd_line")
     macd_signal = indicators.get("macd_signal")
+    atr_val     = indicators.get("atr")
 
     rsi_str   = f"{rsi:.1f}" if rsi is not None else "n/a"
     macd_l_str = f"{macd_line:+.3f}" if macd_line is not None else "n/a"
@@ -102,6 +103,19 @@ def build_prompt(
     else:
         vol_note = "unavailable"
 
+    # ATR(14) — actual price volatility context
+    if atr_val is not None:
+        atr_pct = (atr_val / price) * 100
+        if atr_pct > 3.0:
+            atr_bucket = "high volatility"
+        elif atr_pct >= 1.0:
+            atr_bucket = "moderate volatility"
+        else:
+            atr_bucket = "low volatility"
+        atr_note = f"${atr_val:.2f} ({atr_pct:.1f}% of price) — {atr_bucket}"
+    else:
+        atr_note = "unavailable"
+
     # Fear & Greed
     fg = research.fear_greed
 
@@ -117,6 +131,7 @@ Analyze the following data for {symbol} and give a clear trading recommendation.
 === PRICE & TECHNICALS ===
 Current Price: ${price:,.2f}
 Volume vs 20-day avg: {vol_note}
+ATR(14): {atr_note}
 RSI (14): {rsi_str} → {_rsi_note(rsi)}
 Trend (EMA 9/21): {trend}
 MACD: {macd_l_str} / Signal: {macd_s_str} → {_macd_note(macd_line, macd_signal)}
@@ -160,4 +175,5 @@ Rules:
 - reasoning must reference at least 2 data points from above
 - never recommend BUY if RSI > 75
 - never recommend SELL if RSI < 25
-- low volume moves (volume <0.5× average) should lower your confidence by 10-15 points"""
+- low volume moves (volume <0.5× average) should lower your confidence by 10-15 points
+- Consider ATR when setting confidence — high ATR means wider natural swings; a 5% SL may be hit by noise on high-ATR stocks"""

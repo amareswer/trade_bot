@@ -5,7 +5,52 @@ metadata:
   type: project
 ---
 
-**Status as of 2026-06-23 (updated):** Two bots active. Crypto bot live on Kraken. Stock bot in paper trading observation. Walk-forward on 1d swing strategy: VALIDATED. Week 2 hardening A–D complete. Daily loss circuit breaker fixed. Stock backtester built (baseline: FAIL — strategy too selective without AI).
+**Status as of 2026-06-24 (updated):** Two bots active. Crypto bot live on Kraken. Stock bot in paper trading observation. Walk-forward on 1d swing strategy: VALIDATED. Week 2 hardening complete. AI confidence band tracker built. Three strategy fixes applied.
+
+---
+
+## Session 2026-06-24 — AI Confidence Tracker + Strategy Fixes (COMPLETE ✅)
+
+### Task 1 — AI confidence band accuracy tracker (DONE ✓)
+New files: `stock_bot/analysis/__init__.py`, `stock_bot/analysis/accuracy_tracker.py`, `stock_analysis.py`
+- `ConfidenceBandTracker`: load_trades(), pair_trades(), band_report(), recommendation()
+- Confidence bands: LOW 70–79, MED 80–89, HIGH 90–100, PRE <70 (pre-tracker)
+- paper.py: `buy()` now accepts `confidence=0`, written to CSV as 9th column
+- paper.py: `save_state()` now includes `starting_cash` for paper_report to read
+- main.py: `executor.buy()` now passes `confidence=verdict.confidence`
+
+**Stock bot validation framework:**
+- Gate: 15+ completed trades → check band_report()
+- Live trading gate: 80+ confidence band win% >= 55%, trades >= 10
+- Run: `python stock_analysis.py --report`
+
+### Task 2 — Three strategy fixes (DONE ✓)
+
+**FIX A — EMA 2-candle confirmation:**
+- `indicators.py: trend()` — added `confirmation_candles=1` (default, preserves prev_trend behavior)
+  When `confirmation_candles=2`: computes EMA on prices[:-1] to verify prior candle shows same direction
+- `main.py: _fetch_symbol_data()` — now calls `calc_trend(closes, fast_period=9, slow_period=21, confirmation_candles=2)`
+- Removed external `_prev_trend` state tracking dict (no longer needed)
+
+**FIX B — Universe composite 1d+5d momentum:**
+- `universe.py: _batch_metrics()` — score now uses abs() values and weights 0.4×1d + 0.6×5d
+  `composite = (0.40 × abs(change_1d)) + (0.60 × abs(change_5d))`; `score = volume_ratio × composite`
+- Stocks just starting to move today rank higher; stocks that moved 5 days ago but stalling rank lower
+
+**FIX C — ATR-based volatility context for AI:**
+- `indicators.py: atr(highs, lows, closes, period=14)` — Wilder's smoothing, returns float | None
+- `main.py: _fetch_symbol_data()` — computes `atr_val = calc_atr(highs, lows, closes, period=14)`, added to data dict
+- `main.py: _run_ai_call()` — passes `"atr": data.get("atr")` in indicators dict
+- `prompt_builder.py` — adds `ATR(14): $X.XX (X.X% of price) — {bucket}` to PRICE & TECHNICALS
+  bucket: >3% = high volatility, 1-3% = moderate, <1% = low
+  AI rule added: high ATR = wider natural swings, may hit 5% SL on noise
+
+### Task 3 — Paper trade report (DONE ✓)
+New file: `stock_bot/analysis/paper_report.py`
+- `generate_report()`: reads paper_trades.csv + paper_state.json, no network calls
+- Shows: ACCOUNT, COMPLETED ROUND-TRIPS, OPEN POSITIONS, SUMMARY STATS
+- Status: NEED MORE DATA / TRACKING / VALIDATED based on completed trade count
+- Integrated into `stock_analysis.py --report` flag
 
 ---
 

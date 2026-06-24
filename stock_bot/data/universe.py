@@ -95,9 +95,16 @@ class StockUniverse:
         Batch-download 30-day OHLCV, filter by avg volume, price, and composite
         momentum score, return top n ranked by score.
 
-        Score = momentum_score × volume_ratio, where:
-          momentum_score = 0.60 × change_1d + 0.40 × change_5d
+        Score = volume_ratio × composite_momentum, where:
+          momentum_1d    = abs(change_1d)            # today's absolute move
+          momentum_5d    = abs(change_5d)            # week's absolute move
+          composite      = 0.40 × momentum_1d + 0.60 × momentum_5d
           volume_ratio   = today_volume / avg_volume_20d
+          score          = volume_ratio × composite
+
+        Weights: 1d at 40%, 5d at 60% — stocks just starting to move today
+        rank higher; stocks that already moved 5 days ago but stalling rank lower.
+        Both directions of momentum count (abs values).
 
         If market_status is provided, only symbols from currently open markets
         are considered — US closed drops S&P500 symbols, CA closed drops .TO symbols.
@@ -252,11 +259,17 @@ class StockUniverse:
                     volume     = float(volumes.iloc[-1])
                     avg_vol_20 = float(volumes.iloc[-20:].mean()) if len(volumes) >= 20 else float(volumes.mean())
 
-                    change_1d = (close - close_1d) / close_1d if close_1d > 0 else 0.0
-                    change_5d = (close - close_5d) / close_5d if close_5d > 0 else 0.0
-                    volume_ratio   = volume / avg_vol_20 if avg_vol_20 > 0 else 1.0
-                    momentum_score = (0.60 * change_1d) + (0.40 * change_5d)
-                    score          = momentum_score * volume_ratio
+                    change_1d    = (close - close_1d) / close_1d if close_1d > 0 else 0.0
+                    change_5d    = (close - close_5d) / close_5d if close_5d > 0 else 0.0
+                    volume_ratio = volume / avg_vol_20 if avg_vol_20 > 0 else 1.0
+
+                    # Composite momentum: abs values so both directions rank equally;
+                    # 1d weighted 40%, 5d 60% — recent movers that just started today
+                    # rank higher than stocks whose move peaked 5 days ago.
+                    momentum_1d    = abs(change_1d)
+                    momentum_5d    = abs(change_5d)
+                    composite      = (0.40 * momentum_1d) + (0.60 * momentum_5d)
+                    score          = volume_ratio * composite
 
                     result[sym] = {
                         "price":          close,
@@ -264,7 +277,7 @@ class StockUniverse:
                         "change_1d":      change_1d,
                         "change_5d":      change_5d,
                         "volume_ratio":   volume_ratio,
-                        "momentum_score": momentum_score,
+                        "momentum_score": composite,
                         "score":          score,
                     }
 

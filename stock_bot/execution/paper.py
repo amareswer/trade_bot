@@ -44,7 +44,7 @@ _RESET_FLAG    = os.path.join(_STOCK_BOT_DIR, ".paper_reset")
 
 _CSV_HEADER = [
     "timestamp", "symbol", "side", "shares",
-    "price", "total_value", "cash_remaining", "reason",
+    "price", "total_value", "cash_remaining", "reason", "confidence",
 ]
 
 
@@ -149,6 +149,7 @@ class StockPaperExecutor(StockExecutorBase):
         shares: float,
         price: float,
         reason: str = "",
+        confidence: int = 0,
         candle_close: float | None = None,
         live_price: float | None = None,
     ) -> StockOrder:
@@ -274,7 +275,7 @@ class StockPaperExecutor(StockExecutorBase):
                 reason         = reason,
             )
             self._trade_log.append(trade)
-            self._log_trade_csv(trade)
+            self._log_trade_csv(trade, confidence=confidence)
             self.save_state()
             self._update_position_value({sym: fill_px})
 
@@ -495,6 +496,7 @@ class StockPaperExecutor(StockExecutorBase):
         """Persist current cash/positions/realized_pnl to paper_state.json."""
         state = {
             "cash": round(self._cash, 6),
+            "starting_cash": round(self._starting_cash, 6),
             "positions": {
                 sym: {"shares": round(shares, 9), "avg_cost": round(cost, 6)}
                 for sym, (shares, cost) in self._positions.items()
@@ -519,7 +521,7 @@ class StockPaperExecutor(StockExecutorBase):
             except OSError as exc:
                 logger.warning("Could not create paper_trades.csv: %s", exc)
 
-    def _log_trade_csv(self, trade: PaperTrade) -> None:
+    def _log_trade_csv(self, trade: PaperTrade, confidence: int = 0) -> None:
         try:
             with open(_TRADES_CSV, "a", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow([
@@ -531,6 +533,7 @@ class StockPaperExecutor(StockExecutorBase):
                     f"{trade.total_value:.2f}",
                     f"{trade.cash_remaining:.2f}",
                     trade.reason,
+                    confidence,
                 ])
         except OSError as exc:
             logger.warning("Could not write to paper_trades.csv: %s", exc)

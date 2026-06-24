@@ -173,14 +173,47 @@ def adx(
     return adx_val
 
 
-# Two-candle EMA confirmation: a crossover must hold for 2 consecutive
-# candles before signaling BULLISH/BEARISH. Reduces whipsaws on daily bars
-# where a single noisy candle can produce a false crossover.
-def trend(prices: list[float], fast_period: int = 9, slow_period: int = 21,
-          prev_trend: str | None = None) -> str:
+def atr(
+    highs:  list[float],
+    lows:   list[float],
+    closes: list[float],
+    period: int = 14,
+) -> float | None:
+    """
+    Average True Range using Wilder's smoothing.
+    Returns ATR of the most recent candle, or None if fewer than period+1 candles.
+    """
+    n = len(closes)
+    if n < period + 1 or len(highs) != n or len(lows) != n:
+        return None
+
+    tr_list: list[float] = []
+    for i in range(1, n):
+        h, l, pc = highs[i], lows[i], closes[i - 1]
+        tr_list.append(max(h - l, abs(h - pc), abs(l - pc)))
+
+    atr_val = sum(tr_list[:period]) / period
+    for tr in tr_list[period:]:
+        atr_val = (atr_val * (period - 1) + tr) / period
+    return atr_val
+
+
+def trend(
+    prices:               list[float],
+    fast_period:          int = 9,
+    slow_period:          int = 21,
+    prev_trend:           str | None = None,
+    confirmation_candles: int = 1,
+) -> str:
     """
     Trend direction via EMA crossover.
     Returns "BULLISH", "BEARISH", or "NEUTRAL".
+
+    confirmation_candles=1 (default): uses prev_trend for one-candle confirmation.
+      Returns NEUTRAL on the first candle of a new crossover (suppresses whipsaws).
+    confirmation_candles=2: computes confirmation internally — requires both the
+      current and prior candle to show fast EMA > slow EMA (BULLISH) or < (BEARISH).
+      Does not require external state tracking via prev_trend.
     """
     fast = ema(prices, fast_period)
     slow = ema(prices, slow_period)
@@ -194,8 +227,20 @@ def trend(prices: list[float], fast_period: int = 9, slow_period: int = 21,
     else:
         return "NEUTRAL"
 
-    # Require one prior candle of the same direction before confirming.
-    # Suppresses the first candle of a new crossover and direction reversals.
+    if confirmation_candles >= 2:
+        # Check prior candle direction by recomputing EMA on prices[:-1]
+        fast_prev = ema(prices[:-1], fast_period)
+        slow_prev = ema(prices[:-1], slow_period)
+        if fast_prev is None or slow_prev is None:
+            return "NEUTRAL"
+        band_prev = slow_prev * 0.0001
+        if current == "BULLISH" and not (fast_prev > slow_prev + band_prev):
+            return "NEUTRAL"
+        if current == "BEARISH" and not (fast_prev < slow_prev - band_prev):
+            return "NEUTRAL"
+        return current
+
+    # Original prev_trend confirmation path (confirmation_candles=1)
     opposite = "BEARISH" if current == "BULLISH" else "BULLISH"
     if prev_trend is None or prev_trend == opposite:
         return "NEUTRAL"

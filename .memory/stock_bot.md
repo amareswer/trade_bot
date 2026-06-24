@@ -329,6 +329,36 @@ File: `stock_backtest.py` (project root)
 - SPCX: no earnings data (may be delisted from yfinance index)
 - OpenRouter free tier hits 429 under rapid calls — bot handles with HOLD fallback
 
+## AI confidence validation framework (added 2026-06-24)
+
+The AI confidence score IS the strategy signal — indicators are context, not generators.
+Validation measures whether confidence predicts outcome, not an indicator-only backtest PF.
+
+- `stock_bot/analysis/accuracy_tracker.py` — `ConfidenceBandTracker`
+  - `load_trades(csv_path)` — reads paper_trades.csv, handles missing confidence column (pre-tracker trades get confidence=0)
+  - `pair_trades(trades)` — FIFO BUY→SELL pairing per symbol; skips open positions
+  - `band_report(pairs)` — table by band: LOW 70–79, MED 80–89, HIGH 90–100, PRE <70
+    Verdict per band: EDGE (win%≥55, n≥5), WEAK (win%≥45, n≥5), NOISE (win%<45 or n<5)
+  - `recommendation(pairs)` — one-line action recommendation
+
+- `stock_bot/analysis/paper_report.py` — `generate_report()`
+  - No network calls. Reads paper_trades.csv + paper_state.json.
+  - Shows: ACCOUNT / COMPLETED ROUND-TRIPS / OPEN POSITIONS / SUMMARY STATS
+  - paper_state.json now includes `starting_cash` (added 2026-06-24)
+
+- `stock_analysis.py` (project root) — CLI entry point
+  - `python stock_analysis.py` — accuracy report only
+  - `python stock_analysis.py --csv path` — custom CSV
+  - `python stock_analysis.py --report` — paper report + accuracy report
+
+**Live trading gate:** 80+ confidence win% >= 55%, completed trades >= 10
+
+## Strategy fixes (applied 2026-06-24)
+
+- **EMA 2-candle confirmation:** `trend(confirmation_candles=2)` checks both latest and prior candle EMA direction internally. External `_prev_trend` state dict removed from main.py.
+- **Universe composite momentum:** score = volume_ratio × (0.40×|change_1d| + 0.60×|change_5d|). Abs values (both directions count); 1d weighted 40%, 5d 60%.
+- **ATR context for AI:** `atr(highs, lows, closes, period=14)` added to indicators.py (Wilder's). Passed to AI prompt: "ATR(14): $X.XX (X.X%)" with bucket + instruction that high ATR = noisy SL.
+
 ## File map
 
 ```
@@ -336,10 +366,11 @@ stock_bot/
   data/
     price_feed.py     ← yfinance OHLCV (plain yf.download only — NO session management)
     watchlist.py      ← default symbol list + parser
-    universe.py       ← StockUniverse: S&P500+TSX60 ranked by volume×momentum
+    universe.py       ← StockUniverse: S&P500+TSX60 ranked by volume×composite_momentum
     screener.py       ← StockScreener: price filter ($5-$200) + momentum gate
   indicators/
-    indicators.py     ← RSI, EMA, SMA, ADX, MACD — pure functions
+    indicators.py     ← RSI, EMA, SMA, ADX, MACD, ATR — pure functions
+                         trend() has confirmation_candles=1 (default) or 2 (internal 2-candle check)
   research/
     news_fetcher.py   ← RSS headlines (Yahoo Finance + Google News), 5 per symbol
     sentiment_scraper.py ← headline sentiment scoring
@@ -351,6 +382,7 @@ stock_bot/
   ai/
     verdict.py        ← AIVerdict dataclass
     prompt_builder.py ← assembles indicators + research into <800-token prompt
+                         includes ATR(14) volatility context + AI instruction
     ai_engine.py      ← multi-provider HTTP client, JSON parse, HOLD fallback
   dashboard/
     renderer.py       ← DashboardRenderer, ScanResult dataclass → stock_dashboard.html
@@ -363,17 +395,26 @@ stock_bot/
                          Validates: shares 0-100k, avg_cost 0-100k, stores int(shares)
   execution/
     paper.py          ← StockPaperExecutor: virtual $1k, paper buy/sell, realized PnL
+                         buy() now accepts confidence=0 → written to CSV column 9
+                         save_state() now includes starting_cash
                          Guards: price type check, price 0-500k, shares 0-100k
-                         State guard: rejects cash>$1M or |realized_pnl|>$1M on load
     base.py           ← Order, OrderStatus base types
+  analysis/
+    __init__.py       ← empty
+    accuracy_tracker.py ← ConfidenceBandTracker: load, pair, band_report, recommendation
+    paper_report.py   ← generate_report(): file-only paper trading summary
   config.py           ← StockConfig from stock_bot/.env, all settings + validation
   main.py             ← entry point — scan loop, stop loss/take profit, max positions, dashboard
+                         trend() now uses confirmation_candles=2 (no external state)
+                         ATR computed per symbol and passed to AI
   .env                ← local config (not committed)
   .env.example        ← template with all options documented
+stock_analysis.py     ← CLI: accuracy + paper report (project root)
 ```
 
 ## Next steps
 
-1. Accumulate 30-50 paper trades and compare paper PF/win rate to real market behavior
-2. Consider backtester for stock bot (Part 2 of this stability session)
-3. ETH/BTC universe expansion once stock paper trading is validated
+1. Accumulate 30-50 paper trades to populate confidence band accuracy data
+2. Check `python stock_analysis.py --report` after each live session
+3. Gate for live trading: 80+ confidence win% >= 55%, completed trades >= 10
+4. ETH/BTC universe expansion once stock paper trading is validated

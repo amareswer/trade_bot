@@ -33,6 +33,7 @@ from stock_bot.data.universe  import StockUniverse
 from stock_bot.data.screener  import StockScreener
 from stock_bot.indicators.indicators import (
     adx   as calc_adx,
+    atr   as calc_atr,
     macd  as calc_macd,
     rsi   as calc_rsi,
     trend as calc_trend,
@@ -182,7 +183,6 @@ def _fetch_symbol_data(
     screener:      StockScreener | None,
     watchlist_set: set[str],
     market_status: dict | None = None,
-    prev_trend:    str | None  = None,
 ) -> dict | None:
     """
     Fetch candles + compute indicators. Returns:
@@ -208,9 +208,11 @@ def _fetch_symbol_data(
     lows   = [c.low   for c in candles]
 
     rsi_val   = calc_rsi(closes)
-    trend_val = "NEW IPO" if len(closes) < 21 else calc_trend(closes, prev_trend=prev_trend)
+    # 2-candle confirmation: both latest and prior candle must show same EMA crossover
+    trend_val = "NEW IPO" if len(closes) < 21 else calc_trend(closes, fast_period=9, slow_period=21, confirmation_candles=2)
     adx_val   = calc_adx(highs, lows, closes)
     macd_val  = calc_macd(closes)
+    atr_val   = calc_atr(highs, lows, closes, period=14)
 
     if symbol not in watchlist_set and screener is not None and not screener.screen(symbol, candles):
         return {"screened": True, "price": closes[-1]}
@@ -223,6 +225,7 @@ def _fetch_symbol_data(
         "trend":       trend_val,
         "adx":         adx_val,
         "macd":        macd_val,
+        "atr":         atr_val,
     }
 
 
@@ -241,6 +244,7 @@ def _run_ai_call(
         "adx":         data["adx"],
         "macd_line":   data["macd"][0] if data["macd"] else None,
         "macd_signal": data["macd"][1] if data["macd"] else None,
+        "atr":         data.get("atr"),
     }
     return engine.analyze(symbol, data["last_candle"], indicators, report,
                           stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct)
@@ -589,7 +593,6 @@ def run() -> None:
         logger.info("SL/TP watcher thread started (30s interval)")
 
     tick = 0
-    _prev_trend: dict[str, str | None] = {}
     try:
       while True:
         market_status = _get_market_status()
@@ -655,7 +658,7 @@ def run() -> None:
             futs = {
                 ex.submit(
                     _fetch_symbol_data, sym, cfg, screener, watchlist_set,
-                    market_status, _prev_trend.get(sym),
+                    market_status,
                 ): sym
                 for sym in all_symbols
             }
@@ -666,11 +669,6 @@ def run() -> None:
                 except Exception as exc:
                     logger.warning("Price fetch failed for %s: %s", sym, exc)
                     price_data[sym] = None
-
-        # Update prev_trend tracking after all fetches complete
-        for sym, data in price_data.items():
-            if isinstance(data, dict) and "trend" in data:
-                _prev_trend[sym] = data["trend"]
 
         active_symbols = [
             s for s in all_symbols
@@ -835,6 +833,7 @@ def run() -> None:
                                     reason = f"BUY {verdict.confidence}% {verdict.trading_style}"
                                     order  = executor.buy(
                                         symbol, shares, execution_price, reason=reason,
+                                        confidence=verdict.confidence,
                                         candle_close=px, live_price=raw_live_price,
                                     )
                                     if order.status == OrderStatus.FILLED:
