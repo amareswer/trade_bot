@@ -11,6 +11,53 @@ Running log of feature decisions. Most recent first.
 
 ---
 
+## 2026-06-24 (continued) — Crypto Hardening + Stock Bot Stability (BUILT ✓)
+
+### Limit order post-only chase with PO rejection retry (BUILT ✓)
+Post-only limit BUY placed at bid-side offset; retries on POST_ONLY_REJECT with adjusted price.
+Maker rate (0.16%) vs taker (0.80%) — 0.64% saving per round trip.
+
+### REGIME_ENABLED flag (BUILT ✓)
+`_ranging_signal()` disabled when `REGIME_ENABLED=false`. Unvalidated signal — safe to disable live.
+New env var: `REGIME_ENABLED=false`.
+
+### ATR_SL_MULT=0.0 guard (BUILT ✓)
+When `ATR_SL_MULT=0.0`, ATR-based stop-loss is skipped entirely. Fixed 1.5% SL stays active.
+Prevents division-by-zero and untested ATR stop widths.
+
+### position_manager.py ZeroDivisionError guard (BUILT ✓)
+`on_buy()` / `on_sell()` had division by zero when qty=0. Guard added — logs warning and skips.
+
+### Stock bot pre-trade price sanity check (BUILT ✓)
+`paper.py buy()`: rejects BUY if `|candle_close - live_price| / live_price > 0.10`.
+Root cause: yfinance `fast_info` returned $103 for a $24 stock (CAD/USD currency mismatch).
+Previous corruption: bot bought at $103, SL fired at $24 → -$300 paper loss.
+
+### Stock bot duplicate price relative tolerance (BUILT ✓)
+Changed from absolute `$0.01` to relative `0.1%` tolerance in `_is_duplicate_price()`.
+Old: same price within $0.01 = corrupt. New: same price within 0.1% = corrupt.
+Fix: legitimate stocks at similar price points ($24.29 ≈ $24.30) were being rejected as corrupt.
+
+### Stock bot weekend message fix (BUILT ✓)
+Weekend log message now shows actual day name + next trading day date.
+Old: "Market closed — weekend". New: "Market closed — Saturday, next open Monday 2026-06-29".
+
+---
+
+## 2026-06-24 (DEFERRED) — Phase 5 REBUILD: Unified Tabbed Dashboard
+
+**Plan:** Replace current split dashboard (unified_dashboard.py + two separate HTML files) with a single HTML file using tabs: Crypto | Stocks | Portfolio.
+
+**Why deferred:** Current dashboards functional. Rebuild is cosmetic/UX. Prioritize after 30 paper trades and live stability confirmed.
+
+**Scope when built:**
+- Single `unified_dashboard.html` with tab switching (pure JS, no server)
+- Tab: Crypto — existing crypto bot panels
+- Tab: Stocks — existing stock bot panels
+- Tab: Portfolio — combined P&L, capital allocation, live vs paper vs backtest comparison
+
+---
+
 ## 2026-06-24 — AI Confidence Tracker + Three Strategy Fixes (BUILT ✓)
 
 ### Confidence band accuracy tracker (BUILT ✓)

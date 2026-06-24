@@ -39,6 +39,9 @@ metadata:
 | 2026-06-19 | _get_loop_mode() partial-holiday fix | US-only holidays killed TSX pre-market news scan (fell through to WEEKEND) | Changed to not (us_holiday AND ca_holiday) — partial holidays keep news scan running |
 | 2026-06-19 | _run_news_scan covers universe | Overnight universe mover news invisible until next LIVE cycle (up to 24h) | _run_news_scan(watchlist + universe_symbols) — covers all known symbols |
 
+| 2026-06-23 | AC.TO price corruption | yfinance `fast_info` returned $103 for a $24 stock (CAD/USD mismatch). Bot bought at corrupted price; SL fired at real price → -$300 paper loss. | Pre-trade sanity check in `paper.py`: reject BUY if `|candle_close - live_price| / live_price > 0.10`. `raw_live_price` preserved in `main.py` before sanity null. |
+| 2026-06-23 | Duplicate price check too tight | `$0.01` absolute tolerance rejected legitimate stocks at similar price points (e.g. $24.29 ≈ $24.30 flagged as corrupt). | Changed to relative `0.1%` tolerance in `_is_duplicate_price()`. |
+
 ### Why **Why:** lines matter
 
 - **yfinance session management**: yfinance uses Yahoo Finance's crumb-based authentication internally. Adding a custom requests.Session overrides yfinance's own cookie management, causing 401 Unauthorized errors on every request after the first. This was discovered after the session code caused complete price feed failure.

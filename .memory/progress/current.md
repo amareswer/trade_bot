@@ -5,7 +5,7 @@ metadata:
   type: project
 ---
 
-**Status as of 2026-06-24 (updated):** Two bots active. Crypto bot live on Kraken. Stock bot in paper trading observation. Walk-forward on 1d swing strategy: VALIDATED. Week 2 hardening complete. AI confidence band tracker built. Three strategy fixes applied.
+**Status as of 2026-06-24 (updated):** Two bots active. Crypto bot live on Kraken (ETH/CAD, limit orders active). Stock bot in paper trading with AC.TO open position ($24.29). Walk-forward on 1d swing strategy: VALIDATED. Week 2 hardening complete. AI confidence band tracker built. Three strategy fixes applied.
 
 **Paper state RESET 2026-06-23:** Both `stock_bot/paper_trades.csv` and `stock_bot/paper_state.json` deleted and reset to $1,000.00 clean.
 - **Reason:** Corrupted data from early development — prices in millions (TSX currency mismatch bug), share counts of 43,984 on a $1k account, self-test data leaked into real CSV before tempfile fix was applied.
@@ -13,6 +13,29 @@ metadata:
 - **Paper trading clock restarts** from $1,000.00 clean as of 2026-06-23. Confidence tracking now active from first real trade.
 - **paper_state.json** written fresh: `{"cash": 1000.00, "starting_cash": 1000.00, "positions": {}, "realized_pnl": 0.0, "orders": []}`.
 - **paper_trades.csv** not recreated — will be auto-created with correct 9-column header on first real fill.
+
+---
+
+## Session 2026-06-24 (continued) — Crypto Config Updates + Stock Bot Stability (COMPLETE ✅)
+
+### Crypto bot — active config changes
+- **SYMBOL changed to ETH/CAD** (not ETH/USD — Kraken balance is CAD)
+- **LIMIT_ORDER_ENABLED=true** — post-only limit orders active (maker 0.16% rate)
+- **REGIME_ENABLED=false** — `_ranging_signal()` disabled; unvalidated, not safe to run live
+- **ATR_SL_MULT=0.0** — ATR stops disabled; fixed 1.5% SL active
+- **ZeroDivisionError fixed** in `position_manager.py` `on_buy()` / `on_sell()` — division by zero guard added
+- **One crashed trade 08:00 UTC Jun 23** — no funds lost, cash $99.86 CAD; bot recovered and is live
+
+### Stock bot — AC.TO corruption root cause found and fixed
+- **Root cause:** yfinance `fast_info` returned $103 for an actual $24 stock (currency mismatch)
+  - Bot bought at corrupted $103 price; SL fired at real ~$24 price → -$300 paper loss
+- **Fix A:** Pre-trade sanity check in `paper.py` — rejects BUY if `|candle_close - live_price| / live_price > 0.10` (10% deviation)
+- **Fix B:** `raw_live_price` preserved in `main.py` before sanity null — price object wasn't surviving the check
+- **Fix C:** Duplicate price tolerance fixed — changed from absolute `$0.01` to relative `0.1%` (was rejecting legitimate same-priced stocks)
+- **AC.TO restored** to watchlist (was briefly replaced with TD.TO during investigation)
+- **Paper state reset** — clean $1,000 start as of 2026-06-24
+- **First clean trade:** AC.TO 10 shares @ $24.29 (open position)
+- **Realized P&L:** $0.00 (no completed round-trips yet)
 
 ---
 
@@ -374,9 +397,12 @@ TRAIL_STOP_PCT, PARTIAL_TP_PCT, PARTIAL_TP_SIZE
 | Setting | Value |
 |---|---|
 | EXCHANGE | kraken |
-| SYMBOL | BTC/CAD |
+| SYMBOL | ETH/CAD |
 | CANDLE_MINUTES | 240 |
 | ORDER_TYPE | limit |
+| LIMIT_ORDER_ENABLED | true |
+| REGIME_ENABLED | false |
+| ATR_SL_MULT | 0.0 |
 | ADX_THRESHOLD | 18 |
 | RSI_FILTER_ENABLED | true |
 | RSI_OVERSOLD | 30.0 |
