@@ -323,6 +323,7 @@ File: `stock_backtest.py` (project root)
 
 ## Known issues
 
+- **Paper state reset 2026-06-23:** Both state files were deleted and rebuilt from $1,000.00. Root causes: (1) early runs before int(shares) fix generated 43,984-share positions; (2) TSX currency mismatch bug inflated prices 10×; (3) self-test `if __name__ == "__main__":` was writing to real CSV before tempfile fix. Self-test now uses `tempfile.mkdtemp()` — verified isolated (5/5 PASS, trade count stays 0 after run). Paper trading clock restarts clean from 2026-06-23.
 - Yahoo Finance crumb (401) errors on cycle 2+ when yfinance session expires between cycles — bot handles gracefully (returns None, skips symbol, continues)
 - On US market holidays, yfinance returns NaN or stale cross-contaminated prices — resolved on next trading day
 - EBON ($1.95) and IGC ($0.2799) in PORTFOLIO are penny stocks — screener would reject them as universe symbols (price < $5), but they're watchlist and pass through to display-only portfolio section

@@ -7,6 +7,13 @@ metadata:
 
 **Status as of 2026-06-24 (updated):** Two bots active. Crypto bot live on Kraken. Stock bot in paper trading observation. Walk-forward on 1d swing strategy: VALIDATED. Week 2 hardening complete. AI confidence band tracker built. Three strategy fixes applied.
 
+**Paper state RESET 2026-06-23:** Both `stock_bot/paper_trades.csv` and `stock_bot/paper_state.json` deleted and reset to $1,000.00 clean.
+- **Reason:** Corrupted data from early development — prices in millions (TSX currency mismatch bug), share counts of 43,984 on a $1k account, self-test data leaked into real CSV before tempfile fix was applied.
+- **Self-test isolation:** The `if __name__ == "__main__":` block in paper.py already uses `tempfile.mkdtemp()` to redirect state files — verified working, does not touch real files.
+- **Paper trading clock restarts** from $1,000.00 clean as of 2026-06-23. Confidence tracking now active from first real trade.
+- **paper_state.json** written fresh: `{"cash": 1000.00, "starting_cash": 1000.00, "positions": {}, "realized_pnl": 0.0, "orders": []}`.
+- **paper_trades.csv** not recreated — will be auto-created with correct 9-column header on first real fill.
+
 ---
 
 ## Session 2026-06-24 — AI Confidence Tracker + Strategy Fixes (COMPLETE ✅)
