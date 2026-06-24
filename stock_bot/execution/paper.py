@@ -12,6 +12,12 @@ moving to a real broker by implementing StockExecutorBase.
 """
 from __future__ import annotations
 
+import sys as _sys
+import os as _os
+_PROJECT_ROOT = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+if _PROJECT_ROOT not in _sys.path:
+    _sys.path.insert(0, _PROJECT_ROOT)
+
 import csv
 import json
 import logging
@@ -64,6 +70,7 @@ class StockPaperExecutor(StockExecutorBase):
         self._daily_loss_limit_pct: float = 0.03   # overridden by config
         self._daily_loss_tripped: bool = False
         self._slippage_bps: int = 15   # 0.15% — override via set_slippage_bps()
+        self._open_position_value: float = 0.0
 
         if os.path.exists(_RESET_FLAG):
             os.remove(_RESET_FLAG)
@@ -105,22 +112,36 @@ class StockPaperExecutor(StockExecutorBase):
 
     def _is_daily_loss_tripped(self) -> bool:
         """
-        Returns True if current cash drawdown from session start exceeds the limit.
+        Returns True if total portfolio drawdown from session start exceeds the limit.
+        Total = cash + mark-to-market of open positions (cached via _update_position_value).
         Once tripped, stays tripped for the rest of the session.
         """
         if self._daily_loss_tripped:
             return True
         if self._session_start_value <= 0:
             return False
-        drawdown = (self._session_start_value - self._cash) / self._session_start_value
+        current_total = self._cash + self._open_position_value
+        drawdown = (self._session_start_value - current_total) / self._session_start_value
         if drawdown >= self._daily_loss_limit_pct:
             self._daily_loss_tripped = True
             logger.warning(
                 "PAPER daily loss limit hit: %.1f%% drawdown from session start $%.2f → current $%.2f",
-                drawdown * 100, self._session_start_value, self._cash,
+                drawdown * 100, self._session_start_value, current_total,
             )
             return True
         return False
+
+    def _update_position_value(self, prices: dict[str, float]) -> None:
+        """
+        Recalculate cached mark-to-market value of all open positions.
+        Called after every fill. Uses provided prices for known symbols;
+        falls back to avg_cost for others to avoid stale-price API calls.
+        """
+        total = 0.0
+        for sym, (shares, avg_cost) in self._positions.items():
+            px = prices.get(sym, avg_cost)
+            total += shares * px
+        self._open_position_value = total
 
     def buy(
         self,
@@ -255,6 +276,7 @@ class StockPaperExecutor(StockExecutorBase):
             self._trade_log.append(trade)
             self._log_trade_csv(trade)
             self.save_state()
+            self._update_position_value({sym: fill_px})
 
             logger.info(
                 "PAPER BUY FILLED   %s  %d shares @ $%.2f  "
@@ -304,6 +326,7 @@ class StockPaperExecutor(StockExecutorBase):
             self._trade_log.append(trade)
             self._log_trade_csv(trade)
             self.save_state()
+            self._update_position_value({sym: fill_px})
 
             logger.info(
                 "PAPER SELL FILLED  %s  %.4f shares @ $%.2f  "
@@ -553,3 +576,66 @@ class StockPaperExecutor(StockExecutorBase):
             status     = OrderStatus.PENDING,
             created_at = datetime.now(timezone.utc),
         )
+
+
+if __name__ == "__main__":
+    import shutil
+    import tempfile
+
+    # Pre-populate sector cache to avoid network calls during the test
+    from stock_bot.data.price_feed import _sector_cache
+    _sector_cache["TEST"]  = "other"
+    _sector_cache["TEST2"] = "other"
+
+    _tmpdir = tempfile.mkdtemp()
+    try:
+        # Redirect state files so test never touches live paper trading data
+        _STATE_JSON = _os.path.join(_tmpdir, "state.json")
+        _TRADES_CSV = _os.path.join(_tmpdir, "trades.csv")
+        _RESET_FLAG = _os.path.join(_tmpdir, ".reset")
+
+        _results = {"passes": 0, "fails": 0}
+
+        def _chk(label: str, ok: bool) -> None:
+            if ok:
+                _results["passes"] += 1
+                print(f"  PASS  {label}")
+            else:
+                _results["fails"] += 1
+                print(f"  FAIL  {label}")
+
+        # ── Test 1: breaker fires when position value drops 7% ─────────────
+        ex = StockPaperExecutor(starting_cash=1000.0)
+        order = ex.buy("TEST", 10, 50.0, reason="test")
+        _chk("BUY 10×TEST @ $50 filled", order.status == OrderStatus.FILLED)
+
+        # Simulate price drop: 10 shares × $43 = $430 mark value
+        ex._update_position_value({"TEST": 43.0})
+        _chk("_open_position_value == $430.00",
+             abs(ex._open_position_value - 430.0) < 0.01)
+
+        # cash ≈ $499.25 (after slippage), pos = $430 → total ≈ $929.25
+        # drawdown ≈ ($1000 − $929.25) / $1000 ≈ 7.1% > 3% → TRIPPED
+        _chk("Breaker TRIPPED at ~7% loss (>3% limit)",
+             ex._is_daily_loss_tripped())
+
+        # ── Test 2: breaker stays silent when position is only down 2% ─────
+        # Clear test-1 state so ex2 starts with a clean $1000 slate
+        if _os.path.exists(_STATE_JSON):
+            _os.remove(_STATE_JSON)
+        ex2 = StockPaperExecutor(starting_cash=1000.0)
+        order2 = ex2.buy("TEST2", 10, 50.0, reason="test")
+        _chk("BUY 10×TEST2 @ $50 filled", order2.status == OrderStatus.FILLED)
+
+        # Simulate small drop: 10 shares × $48 = $480 mark value
+        ex2._update_position_value({"TEST2": 48.0})
+        # cash ≈ $499.25, pos = $480 → total ≈ $979.25
+        # drawdown ≈ 2.1% < 3% → NOT tripped
+        _chk("Breaker NOT tripped at ~2% loss (<3% limit)",
+             not ex2._is_daily_loss_tripped())
+
+        p, f = _results["passes"], _results["fails"]
+        print(f"\n{'ALL PASS' if f == 0 else 'FAILURES FOUND'} — {p} passed, {f} failed")
+        _sys.exit(0 if f == 0 else 1)
+    finally:
+        shutil.rmtree(_tmpdir, ignore_errors=True)

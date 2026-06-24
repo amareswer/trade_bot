@@ -5,7 +5,62 @@ metadata:
   type: project
 ---
 
-**Status as of 2026-06-23 (updated):** Two bots active. Crypto bot live on Kraken. Stock bot in paper trading observation. Walk-forward on 1d swing strategy: VALIDATED. Week 2 hardening A–D complete.
+**Status as of 2026-06-23 (updated):** Two bots active. Crypto bot live on Kraken. Stock bot in paper trading observation. Walk-forward on 1d swing strategy: VALIDATED. Week 2 hardening A–D complete. Daily loss circuit breaker fixed. Stock backtester built (baseline: FAIL — strategy too selective without AI).
+
+---
+
+## Session 2026-06-23 (continued x2) — Daily Loss Fix + Stock Backtester (COMPLETE ✅)
+
+### Task 1 — Daily loss circuit breaker fix — paper.py (DONE ✓)
+Bug: `_is_daily_loss_tripped()` compared cash-only drawdown, ignoring open position losses.
+If 3 positions each down 4%, cash was unchanged — breaker never fired.
+
+Fix applied to `stock_bot/execution/paper.py`:
+- Added `self._open_position_value: float = 0.0` in `__init__`
+- New method `_update_position_value(prices: dict[str, float])` — called after every fill
+  - Uses fresh fill price for the traded symbol, avg_cost proxy for others
+- `_is_daily_loss_tripped()` now uses `current_total = self._cash + self._open_position_value`
+- Called in `buy()` and `sell()` after FILLED, passing `{sym: fill_px}`
+- Self-test: `python stock_bot/execution/paper.py` → ALL PASS (5/5 checks)
+
+### Task 2 — Stock bot backtester — stock_backtest.py (DONE ✓)
+New file: `stock_backtest.py` in project root.
+- Uses `yf.download(period="5y", interval="1d")` per symbol; 0.5s sleep between
+- Indicator-only: RSI<35 + BULLISH EMA trend + ADX≥20 → BUY; SL/TP/strategy SELL
+- Shared cash pool, max 4 positions, 25% risk/trade, 0.5% commission, 15 bps slippage
+- Saves to `stock_bot/logs/stock_backtest_YYYYMMDD.csv`
+
+**BASELINE RESULTS (2026-06-23, 11 symbols, 5 years):**
+
+| Symbol     | Trades | Win% | PF   | Return% | MaxDD% |
+|------------|--------|------|------|---------|--------|
+| HOOD       | 0      |  0%  | 0.00 | +0.00%  | -0.00% |
+| MRNA       | 0      |  0%  | 0.00 | +0.00%  | -0.00% |
+| NCLH       | 0      |  0%  | 0.00 | +0.00%  | -0.00% |
+| CCL        | 0      |  0%  | 0.00 | +0.00%  | -0.00% |
+| INTC       | 0      |  0%  | 0.00 | +0.00%  | -0.00% |
+| AAPL       | 0      |  0%  | 0.00 | +0.00%  | -0.00% |
+| NVDA       | 0      |  0%  | 0.00 | +0.00%  | -0.00% |
+| AMD        | 1      |100%  | inf  | +14.88% | -0.00% |
+| AC.TO      | 0      |  0%  | 0.00 | +0.00%  | -0.00% |
+| BMO.TO     | 1      |  0%  | 0.00 | -5.78%  | -0.00% |
+| CM.TO      | 0      |  0%  | 0.00 | +0.00%  | -0.00% |
+
+**AGGREGATE:**
+- Total trades: 2 | Win rate: 50.0% | PF: 2.45
+- Return: +1.87% | Max DD: -1.54% | Sharpe: 3.07
+- Commission: $50.53
+
+**BASELINE VERDICT: FAIL** (only 2 trades — too few to be statistically significant)
+
+**Interpretation:** RSI<35 + BULLISH EMA trend + ADX≥20 is an extremely selective combination
+that rarely fires without AI as the primary signal generator. The live paper bot uses AI with
+indicators as gates, not indicator-only. Paper trading PF cannot meaningfully be compared to
+this indicator-only baseline. Paper bot's primary signal is AI confidence ≥ 70.
+
+**What paper trading must beat:** N/A as a direct comparison — the backtester confirms the
+pure indicator strategy is too rare to establish a stat-sig baseline. Paper trades should be
+compared to each other over time (30+ trades needed for meaningful PF).
 
 ---
 

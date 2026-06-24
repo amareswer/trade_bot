@@ -282,10 +282,15 @@ File: `stock_bot/research/news_fetcher.py`
 
 ## Paper trading hardening (2026-06-19)
 
-### Daily loss circuit breaker
+### Daily loss circuit breaker (UPDATED 2026-06-23)
 File: `stock_bot/execution/paper.py`
+- **Bug fixed 2026-06-23**: breaker now uses `cash + _open_position_value` (not cash only)
+  - Added `_open_position_value: float = 0.0` in `__init__`
+  - New `_update_position_value(prices: dict[str, float])` — called in `buy()` + `sell()` after FILLED
+  - Uses fill price for traded symbol; avg_cost proxy for others (no extra API calls)
+  - `_is_daily_loss_tripped()` now: `current_total = cash + _open_position_value`
+  - Self-test at bottom of paper.py: `python stock_bot/execution/paper.py` → 5/5 PASS
 - `StockPaperExecutor._session_start_value` synced after `_load_state()` (not constructor)
-- `_is_daily_loss_tripped()` blocks new BUYs when cash drawdown ≥ `daily_loss_limit_pct`
 - `set_daily_loss_limit(pct)` wired from `cfg.paper_daily_loss_pct`
 Config: `PAPER_DAILY_LOSS_PCT=0.03` (default 3%)
 
@@ -303,6 +308,18 @@ PAPER_TAKE_PROFIT_PCT=0.12    # SL/TP watcher threshold
 PAPER_DAILY_LOSS_PCT=0.03     # circuit breaker
 PAPER_SLIPPAGE_BPS=15         # fill slippage simulation
 ```
+
+## Backtester (2026-06-23)
+
+File: `stock_backtest.py` (project root)
+- Indicator-only strategy: RSI<35 + BULLISH EMA trend + ADX≥20 → BUY; SL(5%)/TP(12%)/strategy SELL
+- 5 years daily candles, 11 symbols (8 US + 3 CA), shared cash pool, max 4 positions
+- Config: SL=5%, TP=12%, Risk=25%, Commission=0.5%, Slippage=15bps, Starting cash=$10k
+- Saves fills to `stock_bot/logs/stock_backtest_YYYYMMDD.csv`
+- **Baseline verdict (2026-06-23): FAIL** — only 2 trades generated (AMD +14.88%, BMO.TO -5.78%)
+- Key insight: RSI<35 AND BULLISH AND ADX≥20 rarely fire simultaneously. Live bot uses AI as
+  primary signal; indicators are pre-screening gates. Cannot compare paper PF to this baseline.
+- Paper trading needs 30+ trades before meaningful PF can be assessed.
 
 ## Known issues
 

@@ -11,6 +11,23 @@ Running log of feature decisions. Most recent first.
 
 ---
 
+## 2026-06-23 — Daily Loss Fix + Stock Backtester (BUILT ✓)
+
+### Daily loss circuit breaker — paper.py (BUILT ✓)
+Bug: breaker used cash-only drawdown, invisible to unrealized position losses.
+Fix: `_update_position_value(prices)` caches mark-to-market after each fill.
+`_is_daily_loss_tripped()` now uses `cash + _open_position_value` vs session start.
+Self-test added at bottom of paper.py: `python stock_bot/execution/paper.py` → 5/5 PASS.
+
+### Stock backtester — stock_backtest.py (BUILT ✓)
+New script at project root. Indicator-only (no AI) strategy over 5 years.
+Baseline: FAIL — only 2 trades from RSI<35 + BULLISH + ADX≥20 combo over 5 years.
+Key insight: indicator-only strategy is too selective; live bot depends on AI as primary signal.
+Paper trading results cannot be compared to this baseline directly.
+Saved: `stock_bot/logs/stock_backtest_20260623.csv`
+
+---
+
 ## 2026-06-23 — Swing Walk-Forward + Week 2 Hardening (BUILT ✓)
 
 ### 1D swing walk-forward — swing_walkforward.py (BUILT ✓)
