@@ -1,9 +1,16 @@
 """
-Unified dashboard generator — crypto bot + stock bot side by side.
+Unified tabbed dashboard — crypto bot + stock bot + portfolio.
 
 Usage:
     python unified_dashboard.py           # generate once and exit
     python unified_dashboard.py --watch   # regenerate every 30s (Ctrl+C to stop)
+
+Tabs:
+    Crypto    → embeds dashboard.html (written by bot/dashboard/renderer.py)
+    Stocks    → embeds stock_dashboard.html (written by stock_bot/dashboard/renderer.py)
+    Portfolio → inline summary from logs/live_state.json + stock_bot/paper_state.json
+
+Tab selection is saved in localStorage — auto-refresh does not lose your spot.
 """
 from __future__ import annotations
 
@@ -13,18 +20,13 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-# ── Paths (all relative to project root) ─────────────────────────────────────
-CRYPTO_STATE_PATH   = "logs/live_state.json"
-STOCK_STATE_PATH    = "stock_bot/paper_state.json"
-OUTPUT_PATH         = "unified_dashboard.html"
-
-CRYPTO_DASHBOARD    = "./dashboard.html"
-STOCK_DASHBOARD     = "./stock_dashboard.html"
-
-REFRESH_INTERVAL_S  = 30
+CRYPTO_STATE_PATH = "logs/live_state.json"
+STOCK_STATE_PATH  = "stock_bot/paper_state.json"
+OUTPUT_PATH       = "unified_dashboard.html"
+REFRESH_S         = 30
 
 
-# ── State loaders ─────────────────────────────────────────────────────────────
+# ── State helpers ─────────────────────────────────────────────────────────────
 
 def _load_json(path: str) -> dict | None:
     try:
@@ -34,299 +36,381 @@ def _load_json(path: str) -> dict | None:
         return None
 
 
-# ── Formatting helpers ────────────────────────────────────────────────────────
-
-def _pnl_span(value: float, fmt: str = "+.2f") -> str:
-    cls = "pos" if value >= 0 else "neg"
-    sign = "+" if value >= 0 else ""
-    return f'<span class="{cls}">{sign}{value:{fmt[1:]}}</span>'
-
-
 def _fmt_ts(ts: str | None) -> str:
     if not ts:
         return "—"
     try:
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
     except Exception:
         return ts
 
 
-# ── Section builders ──────────────────────────────────────────────────────────
+# ── HTML micro-helpers ────────────────────────────────────────────────────────
 
-def _crypto_section(state: dict | None) -> str:
+def _pnl(v: float) -> str:
+    col = "#3fb950" if v >= 0 else "#f85149"
+    s   = "+" if v >= 0 else ""
+    return f'<span style="color:{col};font-weight:600">{s}${v:,.2f}</span>'
+
+
+def _kv(key: str, val: str) -> str:
+    return (
+        f'<div style="display:flex;justify-content:space-between;align-items:baseline;'
+        f'border-bottom:1px solid #21262d;padding:6px 0">'
+        f'<span style="font-size:12px;color:#8b949e">{key}</span>'
+        f'<span style="font-size:13px;font-weight:600;color:#e6edf3;text-align:right">{val}</span>'
+        f'</div>'
+    )
+
+
+def _stat_block(label: str, val: str, sub: str = "") -> str:
+    sub_html = f'<div style="font-size:11px;color:#8b949e;margin-top:3px">{sub}</div>' if sub else ""
+    return (
+        f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px 20px">'
+        f'<div style="font-size:10px;color:#8b949e;text-transform:uppercase;'
+        f'letter-spacing:.06em;margin-bottom:6px">{label}</div>'
+        f'<div style="font-size:24px;font-weight:700;color:#e6edf3">{val}</div>'
+        f'{sub_html}'
+        f'</div>'
+    )
+
+
+# ── Portfolio tab sections ────────────────────────────────────────────────────
+
+def _combined_stats(crypto: dict | None, stock: dict | None) -> str:
+    crypto_cash  = float(crypto.get("cash", 0))          if crypto else 0.0
+    crypto_basis = float(crypto.get("cost_basis", 0))    if crypto else 0.0
+    crypto_pos   = float(crypto.get("position", 0))      if crypto else 0.0
+    crypto_rpnl  = float(crypto.get("realized_pnl", 0))  if crypto else 0.0
+    crypto_fees  = float(crypto.get("fees_paid", 0))     if crypto else 0.0
+
+    stock_cash   = float(stock.get("cash", 0))           if stock else 0.0
+    stock_rpnl   = float(stock.get("realized_pnl", 0))   if stock else 0.0
+    stock_pos    = stock.get("positions", {})             if stock else {}
+    stock_pv     = sum(
+        float(p.get("shares", 0)) * float(p.get("avg_cost", 0))
+        for p in stock_pos.values()
+    )
+
+    crypto_pv  = crypto_basis if crypto_pos > 0 else 0.0
+    total      = crypto_cash + crypto_pv + stock_cash + stock_pv
+    total_rpnl = crypto_rpnl + stock_rpnl
+
+    rpnl_col = "#3fb950" if total_rpnl >= 0 else "#f85149"
+    rpnl_s   = "+" if total_rpnl >= 0 else ""
+
+    return (
+        f'<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));'
+        f'gap:12px;margin-bottom:24px">'
+        + _stat_block(
+            "Combined Capital", f"${total:,.2f}",
+            "crypto + stock · crypto uses cost basis as proxy"
+        )
+        + _stat_block(
+            "Realized P&L",
+            f'<span style="color:{rpnl_col}">{rpnl_s}${total_rpnl:,.2f}</span>',
+            "crypto (live) + stock (paper)"
+        )
+        + _stat_block(
+            "Crypto Fees Paid", f"${crypto_fees:.4f}",
+            "Kraken taker + CAD pair surcharge"
+        )
+        + "</div>"
+    )
+
+
+def _crypto_card(state: dict | None) -> str:
     if state is None:
-        return """
-        <div class="bot-card offline">
-          <div class="offline-label">Crypto bot offline</div>
-          <div class="offline-sub">logs/live_state.json not found or unreadable</div>
-        </div>"""
+        return (
+            '<div class="pf-card offline">'
+            '<div>⚡ Crypto bot offline</div>'
+            '<div style="font-size:11px;color:#8b949e;margin-top:4px">'
+            'logs/live_state.json not found</div>'
+            '</div>'
+        )
 
-    symbol       = state.get("symbol", "—")
-    cash         = float(state.get("cash", 0))
-    position     = float(state.get("position", 0))
-    cost_basis   = float(state.get("cost_basis", 0))
-    realized_pnl = float(state.get("realized_pnl", 0))
-    fees_paid    = float(state.get("fees_paid", 0))
-    saved_at     = _fmt_ts(state.get("saved_at"))
+    symbol   = state.get("symbol", "—")
+    cash     = float(state.get("cash", 0))
+    position = float(state.get("position", 0))
+    basis    = float(state.get("cost_basis", 0))
+    rpnl     = float(state.get("realized_pnl", 0))
+    fees     = float(state.get("fees_paid", 0))
+    saved    = _fmt_ts(state.get("saved_at"))
+    base     = symbol.split("/")[0] if "/" in symbol else "crypto"
 
-    base = symbol.split("/")[0] if "/" in symbol else "crypto"
+    pos_val  = basis if position > 0 else 0.0
+    total    = cash + pos_val
 
-    return f"""
-        <div class="bot-card">
-          <div class="bot-header">
-            <span class="bot-title">Crypto Bot</span>
-            <span class="bot-symbol">{symbol}</span>
-          </div>
-          <div class="kv-grid">
-            <div class="kv-row"><span class="kv-key">Cash</span>
-              <span class="kv-val">${cash:,.2f}</span></div>
-            <div class="kv-row"><span class="kv-key">Position</span>
-              <span class="kv-val">{position:.6f} {base}</span></div>
-            <div class="kv-row"><span class="kv-key">Cost basis</span>
-              <span class="kv-val">${cost_basis:,.2f}</span></div>
-            <div class="kv-row"><span class="kv-key">Realized P&amp;L</span>
-              <span class="kv-val">{_pnl_span(realized_pnl)}</span></div>
-            <div class="kv-row"><span class="kv-key">Fees paid</span>
-              <span class="kv-val">${fees_paid:.4f}</span></div>
-            <div class="kv-row"><span class="kv-key">Saved at</span>
-              <span class="kv-val muted">{saved_at}</span></div>
-          </div>
-          <a class="dash-link" href="{CRYPTO_DASHBOARD}">Open full dashboard →</a>
-        </div>"""
+    holding_row = _kv("Position", f"{position:.6f} {base}") if position > 0 else _kv("Position", "Flat")
+    basis_row   = _kv("Cost basis", f"${basis:,.2f}") if position > 0 else ""
+
+    return (
+        '<div class="pf-card">'
+        '<div class="pf-card-header">'
+        '<span class="pf-card-title">⚡ Crypto Bot</span>'
+        f'<span class="pf-card-badge" style="background:#1f6feb22;color:#58a6ff;border-color:#1f6feb55">LIVE · {symbol}</span>'
+        '</div>'
+        + _kv("Cash", f"${cash:,.2f} CAD")
+        + holding_row
+        + basis_row
+        + _kv("Realized P&L", _pnl(rpnl))
+        + _kv("Fees paid", f"${fees:.4f}")
+        + _kv("Total value", f"${total:,.2f}")
+        + _kv("Last saved", saved)
+        + "</div>"
+    )
 
 
-def _positions_table(positions: dict) -> str:
+def _stock_card(state: dict | None) -> str:
+    if state is None:
+        return (
+            '<div class="pf-card offline">'
+            '<div>📈 Stock bot offline</div>'
+            '<div style="font-size:11px;color:#8b949e;margin-top:4px">'
+            'stock_bot/paper_state.json not found</div>'
+            '</div>'
+        )
+
+    cash      = float(state.get("cash", 0))
+    rpnl      = float(state.get("realized_pnl", 0))
+    positions = state.get("positions", {})
+    starting  = float(state.get("starting_cash", 1000))
+    updated   = _fmt_ts(state.get("last_updated"))
+
+    pos_val = sum(
+        float(p.get("shares", 0)) * float(p.get("avg_cost", 0))
+        for p in positions.values()
+    )
+    total   = cash + pos_val
+    ret_pct = (total - starting) / starting * 100 if starting else 0.0
+    ret_col = "#3fb950" if ret_pct >= 0 else "#f85149"
+    ret_s   = "+" if ret_pct >= 0 else ""
+
+    return (
+        '<div class="pf-card">'
+        '<div class="pf-card-header">'
+        '<span class="pf-card-title">📈 Stock Bot</span>'
+        '<span class="pf-card-badge" style="background:#7c8cf822;color:#7c8cf8;border-color:#7c8cf855">PAPER</span>'
+        '</div>'
+        + _kv("Cash", f"${cash:,.2f}")
+        + _kv("Open positions", str(len(positions)))
+        + _kv("Position value (est.)", f"${pos_val:,.2f}")
+        + _kv("Realized P&L", _pnl(rpnl))
+        + _kv(
+            "Total value",
+            f'${total:,.2f} <span style="color:{ret_col};font-size:12px">{ret_s}{ret_pct:.1f}%</span>',
+        )
+        + _kv("Starting cash", f"${starting:,.2f}")
+        + _kv("Last updated", updated)
+        + "</div>"
+    )
+
+
+def _stock_positions_table(state: dict | None) -> str:
+    if state is None:
+        return ""
+    positions = state.get("positions", {})
     if not positions:
-        return '<p class="muted" style="margin-top:8px">No open positions</p>'
+        return (
+            '<p style="color:#8b949e;font-size:12px;font-style:italic;'
+            'margin-top:8px">No open stock positions</p>'
+        )
+
+    th = (
+        'style="text-align:left;padding:7px 12px;font-size:10px;color:#8b949e;'
+        'font-weight:600;text-transform:uppercase;letter-spacing:.05em;'
+        'border-bottom:1px solid #30363d;white-space:nowrap"'
+    )
+    td = (
+        'style="padding:8px 12px;border-bottom:1px solid #21262d;'
+        'font-size:12px;color:#c9d1d9;white-space:nowrap"'
+    )
 
     rows = ""
     for sym, pos in positions.items():
         shares   = float(pos.get("shares", 0))
         avg_cost = float(pos.get("avg_cost", 0))
-        rows += f"""
-            <tr>
-              <td>{sym}</td>
-              <td>{shares:,.0f}</td>
-              <td>${avg_cost:,.2f}</td>
-              <td class="muted">—</td>
-            </tr>"""
+        rows += (
+            f"<tr>"
+            f"<td {td}><strong>{sym}</strong></td>"
+            f"<td {td}>{shares:,.0f}</td>"
+            f"<td {td}>${avg_cost:,.2f}</td>"
+            f'<td {td} style="color:#8b949e">—</td>'
+            f"</tr>"
+        )
 
-    return f"""
-          <table>
-            <thead>
-              <tr>
-                <th>Symbol</th><th>Shares</th><th>Avg Cost</th><th>Current P&amp;L</th>
-              </tr>
-            </thead>
-            <tbody>{rows}
-            </tbody>
-          </table>"""
-
-
-def _stock_section(state: dict | None) -> str:
-    if state is None:
-        return """
-        <div class="bot-card offline">
-          <div class="offline-label">Stock bot offline</div>
-          <div class="offline-sub">stock_bot/paper_state.json not found or unreadable</div>
-        </div>"""
-
-    cash         = float(state.get("cash", 0))
-    realized_pnl = float(state.get("realized_pnl", 0))
-    last_updated = _fmt_ts(state.get("last_updated"))
-    positions    = state.get("positions", {})
-
-    return f"""
-        <div class="bot-card">
-          <div class="bot-header">
-            <span class="bot-title">Stock Bot</span>
-            <span class="bot-symbol">Paper</span>
-          </div>
-          <div class="kv-grid">
-            <div class="kv-row"><span class="kv-key">Cash</span>
-              <span class="kv-val">${cash:,.2f}</span></div>
-            <div class="kv-row"><span class="kv-key">Realized P&amp;L</span>
-              <span class="kv-val">{_pnl_span(realized_pnl)}</span></div>
-            <div class="kv-row"><span class="kv-key">Open positions</span>
-              <span class="kv-val">{len(positions)}</span></div>
-            <div class="kv-row"><span class="kv-key">Last updated</span>
-              <span class="kv-val muted">{last_updated}</span></div>
-          </div>
-          {_positions_table(positions)}
-          <a class="dash-link" href="{STOCK_DASHBOARD}">Open full dashboard →</a>
-        </div>"""
+    return (
+        '<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;'
+        'overflow:hidden;overflow-x:auto;margin-top:16px">'
+        '<div style="padding:10px 14px;border-bottom:1px solid #30363d;font-size:11px;'
+        'color:#8b949e;text-transform:uppercase;letter-spacing:.05em;font-weight:600">'
+        "📦 Stock Paper Positions"
+        "</div>"
+        '<table style="width:100%;border-collapse:collapse">'
+        "<thead><tr>"
+        f"<th {th}>Symbol</th>"
+        f"<th {th}>Shares</th>"
+        f"<th {th}>Avg Cost</th>"
+        f"<th {th}>Live P&L</th>"
+        f"</tr></thead>"
+        f"<tbody>{rows}</tbody>"
+        "</table>"
+        "</div>"
+    )
 
 
-def _combined_section(crypto: dict | None, stock: dict | None) -> str:
-    crypto_cash    = float(crypto.get("cash", 0))          if crypto else 0.0
-    crypto_pos     = float(crypto.get("position", 0))      if crypto else 0.0
-    crypto_basis   = float(crypto.get("cost_basis", 0))    if crypto else 0.0
-    crypto_pnl     = float(crypto.get("realized_pnl", 0))  if crypto else 0.0
-    crypto_fees    = float(crypto.get("fees_paid", 0))      if crypto else 0.0
+def _portfolio_tab_html(crypto: dict | None, stock: dict | None) -> str:
+    return (
+        '<div style="padding:24px 20px;max-width:1000px;margin:0 auto">'
+        '<div style="margin-bottom:24px">'
+        '<div style="font-size:18px;font-weight:700;color:#e6edf3;margin-bottom:4px">'
+        "Portfolio Overview"
+        "</div>"
+        '<div style="font-size:12px;color:#8b949e">'
+        "Crypto live (Kraken) · Stocks paper ($1,000 account)"
+        "</div>"
+        "</div>"
+        + _combined_stats(crypto, stock)
+        + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px">'
+        + _crypto_card(crypto)
+        + _stock_card(stock)
+        + "</div>"
+        + _stock_positions_table(stock)
+        + "</div>"
+    )
 
-    stock_cash     = float(stock.get("cash", 0))           if stock  else 0.0
-    stock_pnl      = float(stock.get("realized_pnl", 0))   if stock  else 0.0
 
-    # Proxy for crypto position value: use total cost_basis if holding
-    crypto_pos_value = crypto_basis if crypto_pos > 0 else 0.0
-    total_value      = crypto_cash + crypto_pos_value + stock_cash
-    total_pnl        = crypto_pnl + stock_pnl
-    total_fees       = crypto_fees
+# ── CSS ───────────────────────────────────────────────────────────────────────
 
-    crypto_note = " (cost basis proxy)" if crypto_pos > 0 else ""
+_CSS = """
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", monospace;
+      background: #0d1117; color: #e6edf3; font-size: 13px;
+    }
 
-    return f"""
-        <div class="summary-card">
-          <div class="summary-title">Combined Summary</div>
-          <div class="summary-grid">
-            <div class="summary-item">
-              <div class="summary-label">Total Paper Value</div>
-              <div class="summary-value">${total_value:,.2f}<span class="muted" style="font-size:11px"> {crypto_note}</span></div>
-            </div>
-            <div class="summary-item">
-              <div class="summary-label">Total Realized P&amp;L</div>
-              <div class="summary-value">{_pnl_span(total_pnl)}</div>
-            </div>
-            <div class="summary-item">
-              <div class="summary-label">Total Fees Paid</div>
-              <div class="summary-value">${total_fees:.4f}</div>
-            </div>
-          </div>
-        </div>"""
+    /* Fixed tab bar */
+    .tab-bar {
+      position: fixed; top: 0; left: 0; right: 0; height: 48px;
+      display: flex; align-items: center; gap: 6px; padding: 0 16px;
+      background: #161b22; border-bottom: 1px solid #30363d; z-index: 100;
+    }
+    .tab-btn {
+      padding: 5px 18px; border-radius: 6px; border: 1px solid #30363d;
+      background: transparent; color: #8b949e; cursor: pointer;
+      font-size: 13px; font-weight: 600; font-family: inherit;
+    }
+    .tab-btn:hover { border-color: #58a6ff; color: #e6edf3; }
+    .tab-btn.active { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+    .tab-spacer { flex: 1; }
+    .tab-ts { font-size: 11px; color: #8b949e; white-space: nowrap; }
+
+    /* Tab content areas — fill below tab bar */
+    .tab-content {
+      display: none;
+      position: fixed; top: 48px; left: 0; right: 0; bottom: 0;
+    }
+    .tab-content.active { display: block; }
+
+    /* Iframe tabs: iframe fills the area */
+    .iframe-tab iframe { width: 100%; height: 100%; border: none; display: block; }
+
+    /* Portfolio tab: scrollable */
+    .portfolio-tab { overflow-y: auto; }
+
+    /* Portfolio cards */
+    .pf-card {
+      background: #161b22; border: 1px solid #30363d;
+      border-radius: 10px; padding: 18px;
+    }
+    .pf-card.offline {
+      display: flex; flex-direction: column; justify-content: center;
+      align-items: center; min-height: 120px; opacity: .6; color: #8b949e;
+    }
+    .pf-card-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 12px;
+    }
+    .pf-card-title { font-size: 14px; font-weight: 700; color: #e6edf3; }
+    .pf-card-badge {
+      font-size: 11px; font-weight: 600; padding: 2px 9px;
+      border-radius: 10px; border: 1px solid;
+    }
+
+    @media (max-width: 680px) {
+      .tab-ts { display: none; }
+      .tab-btn { padding: 5px 10px; font-size: 12px; }
+    }
+"""
+
+
+# ── JS ────────────────────────────────────────────────────────────────────────
+
+_JS = """
+  <script>
+    function showTab(name) {
+      document.querySelectorAll('.tab-content').forEach(function(el) {
+        el.classList.remove('active');
+      });
+      document.querySelectorAll('.tab-btn').forEach(function(el) {
+        el.classList.remove('active');
+      });
+      var content = document.getElementById('tab-' + name);
+      if (content) content.classList.add('active');
+      var btn = document.querySelector('[data-tab="' + name + '"]');
+      if (btn) btn.classList.add('active');
+      try { localStorage.setItem('activeTab', name); } catch(e) {}
+    }
+
+    (function() {
+      var saved = 'crypto';
+      try { saved = localStorage.getItem('activeTab') || 'crypto'; } catch(e) {}
+      showTab(saved);
+    })();
+  </script>
+"""
 
 
 # ── HTML assembler ────────────────────────────────────────────────────────────
 
-_CSS = """
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", monospace;
-      background: #0d1117; color: #e6edf3; font-size: 13px;
-      padding: 24px 20px; min-height: 100vh;
-    }
-    a { color: #58a6ff; text-decoration: none; }
-    a:hover { text-decoration: underline; }
-
-    /* Header */
-    .page-header {
-      display: flex; align-items: baseline; justify-content: space-between;
-      flex-wrap: wrap; gap: 8px; margin-bottom: 28px;
-      border-bottom: 1px solid #30363d; padding-bottom: 16px;
-    }
-    .page-title  { font-size: 20px; font-weight: 700; color: #e6edf3; }
-    .page-sub    { font-size: 12px; color: #8b949e; margin-top: 3px; }
-    .page-ts     { font-size: 12px; color: #8b949e; }
-
-    /* Two-column bot grid */
-    .bots-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 20px; margin-bottom: 20px;
-    }
-    @media (max-width: 720px) {
-      .bots-grid { grid-template-columns: 1fr; }
-    }
-
-    /* Bot card */
-    .bot-card {
-      background: #161b22; border: 1px solid #30363d;
-      border-radius: 10px; padding: 20px;
-      display: flex; flex-direction: column; gap: 14px;
-    }
-    .bot-header {
-      display: flex; align-items: center; justify-content: space-between;
-    }
-    .bot-title  { font-size: 14px; font-weight: 700; color: #e6edf3;
-                   text-transform: uppercase; letter-spacing: .05em; }
-    .bot-symbol { font-size: 12px; font-weight: 600; color: #58a6ff;
-                   background: #1f2937; padding: 2px 8px; border-radius: 10px; }
-
-    /* Key-value grid */
-    .kv-grid { display: flex; flex-direction: column; gap: 6px; }
-    .kv-row  { display: flex; justify-content: space-between; align-items: baseline;
-                border-bottom: 1px solid #21262d; padding-bottom: 5px; }
-    .kv-row:last-child { border-bottom: none; padding-bottom: 0; }
-    .kv-key  { font-size: 12px; color: #8b949e; }
-    .kv-val  { font-size: 13px; font-weight: 600; color: #e6edf3; text-align: right; }
-
-    /* Offline card */
-    .offline { border-color: #30363d; justify-content: center; align-items: center;
-                min-height: 120px; opacity: 0.6; }
-    .offline-label { font-size: 15px; font-weight: 600; color: #8b949e; }
-    .offline-sub   { font-size: 11px; color: #6e7681; margin-top: 4px; }
-
-    /* Positions table */
-    table { width: 100%; border-collapse: collapse; margin-top: 4px; }
-    th {
-      text-align: left; font-size: 11px; color: #8b949e;
-      text-transform: uppercase; letter-spacing: .04em;
-      padding: 5px 8px; border-bottom: 1px solid #30363d;
-    }
-    td { padding: 6px 8px; font-size: 12px; border-bottom: 1px solid #21262d; }
-    tr:last-child td { border-bottom: none; }
-
-    /* Dashboard link */
-    .dash-link {
-      font-size: 12px; color: #58a6ff; margin-top: auto;
-      padding-top: 4px;
-    }
-
-    /* Combined summary */
-    .summary-card {
-      background: #161b22; border: 1px solid #30363d;
-      border-radius: 10px; padding: 20px;
-    }
-    .summary-title {
-      font-size: 12px; font-weight: 700; color: #8b949e;
-      text-transform: uppercase; letter-spacing: .05em; margin-bottom: 16px;
-    }
-    .summary-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-      gap: 16px;
-    }
-    .summary-item  { }
-    .summary-label { font-size: 11px; color: #8b949e; text-transform: uppercase;
-                      letter-spacing: .04em; margin-bottom: 4px; }
-    .summary-value { font-size: 22px; font-weight: 700; color: #e6edf3; }
-
-    /* Colours */
-    .pos   { color: #3fb950; }
-    .neg   { color: #f85149; }
-    .muted { color: #8b949e; }
-"""
-
-
 def _build_html(crypto: dict | None, stock: dict | None) -> str:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now       = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    portfolio = _portfolio_tab_html(crypto, stock)
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="refresh" content="{REFRESH_INTERVAL_S}">
+  <meta http-equiv="refresh" content="{REFRESH_S}">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>APEX TRADER — Unified Dashboard</title>
-  <style>{_CSS}
-  </style>
+  <title>APEX TRADER</title>
+  <style>{_CSS}</style>
 </head>
 <body>
 
-  <div class="page-header">
-    <div>
-      <div class="page-title">APEX TRADER</div>
-      <div class="page-sub">Unified Dashboard</div>
-    </div>
-    <div class="page-ts">Updated: {now} &nbsp;·&nbsp; auto-refresh {REFRESH_INTERVAL_S}s</div>
+  <div class="tab-bar">
+    <button class="tab-btn" data-tab="crypto"    onclick="showTab('crypto')">⚡ Crypto</button>
+    <button class="tab-btn" data-tab="stocks"    onclick="showTab('stocks')">📈 Stocks</button>
+    <button class="tab-btn" data-tab="portfolio" onclick="showTab('portfolio')">💼 Portfolio</button>
+    <div class="tab-spacer"></div>
+    <span class="tab-ts">Updated {now} · auto-refresh {REFRESH_S}s</span>
   </div>
 
-  <div class="bots-grid">
-    {_crypto_section(crypto)}
-    {_stock_section(stock)}
+  <div id="tab-crypto" class="tab-content iframe-tab">
+    <iframe src="dashboard.html" title="Crypto Bot Dashboard"></iframe>
   </div>
 
-  {_combined_section(crypto, stock)}
+  <div id="tab-stocks" class="tab-content iframe-tab">
+    <iframe src="stock_dashboard.html" title="Stock Bot Dashboard"></iframe>
+  </div>
 
+  <div id="tab-portfolio" class="tab-content portfolio-tab">
+    {portfolio}
+  </div>
+
+{_JS}
 </body>
 </html>"""
 
@@ -339,17 +423,17 @@ def generate() -> None:
     html   = _build_html(crypto, stock)
     Path(OUTPUT_PATH).write_text(html, encoding="utf-8")
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"Dashboard updated: {ts}")
+    print(f"[{ts}] unified_dashboard.html written")
 
 
 def main() -> None:
     watch = "--watch" in sys.argv
     if watch:
-        print(f"Watching — regenerating every {REFRESH_INTERVAL_S}s. Ctrl+C to stop.")
+        print(f"Watching — regenerating every {REFRESH_S}s. Ctrl+C to stop.")
         try:
             while True:
                 generate()
-                time.sleep(REFRESH_INTERVAL_S)
+                time.sleep(REFRESH_S)
         except KeyboardInterrupt:
             print("\nStopped.")
     else:

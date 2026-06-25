@@ -618,7 +618,13 @@ def run() -> None:
             eastern_now = datetime.now(eastern)
             day_name    = eastern_now.strftime("%A")
             wd = eastern_now.weekday()
-            next_trading_day = (eastern_now + timedelta(days=1)).strftime("%A") if wd <= 3 else "Monday"
+            market_open_today = wd < 5 and (eastern_now.hour < 9 or (eastern_now.hour == 9 and eastern_now.minute < 30))
+            if market_open_today:
+                next_trading_day = "Today"
+            elif wd <= 3:
+                next_trading_day = (eastern_now + timedelta(days=1)).strftime("%A")
+            else:
+                next_trading_day = "Monday"
             print(f"📅 {day_name} {time_str} — markets closed. Next open: {next_trading_day} 9:30am EST")
             time.sleep(3600)
             continue

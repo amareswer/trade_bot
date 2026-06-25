@@ -44,17 +44,21 @@ Old: "Market closed — weekend". New: "Market closed — Saturday, next open Mo
 
 ---
 
-## 2026-06-24 (DEFERRED) — Phase 5 REBUILD: Unified Tabbed Dashboard
+## 2026-06-24 — Phase 5 REBUILD: Unified Tabbed Dashboard (BUILT ✓)
 
-**Plan:** Replace current split dashboard (unified_dashboard.py + two separate HTML files) with a single HTML file using tabs: Crypto | Stocks | Portfolio.
+Rewrote `unified_dashboard.py`. Single entry point — open `unified_dashboard.html` in browser.
 
-**Why deferred:** Current dashboards functional. Rebuild is cosmetic/UX. Prioritize after 30 paper trades and live stability confirmed.
-
-**Scope when built:**
-- Single `unified_dashboard.html` with tab switching (pure JS, no server)
-- Tab: Crypto — existing crypto bot panels
-- Tab: Stocks — existing stock bot panels
-- Tab: Portfolio — combined P&L, capital allocation, live vs paper vs backtest comparison
+- **3 tabs:** Crypto | Stocks | Portfolio
+- **Crypto tab:** embeds `dashboard.html` via `<iframe>` (full crypto bot dashboard)
+- **Stocks tab:** embeds `stock_dashboard.html` via `<iframe>` (full stock bot dashboard)
+- **Portfolio tab:** inline from `logs/live_state.json` + `stock_bot/paper_state.json`
+  - Combined capital stat blocks (total value, realized P&L, crypto fees)
+  - Crypto bot card: cash, position, cost basis, fees, total value
+  - Stock bot card: cash, open positions, position value (est.), return %
+  - Stock open positions table
+- **Tab persistence:** `localStorage` — survives 30s auto-refresh, no tab jump
+- **Bot renderers unchanged:** `dashboard.html` and `stock_dashboard.html` still written independently by each bot's main loop
+- **CLI:** `python unified_dashboard.py` (once) or `python unified_dashboard.py --watch` (30s loop)
 
 ---
 
