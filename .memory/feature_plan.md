@@ -11,6 +11,14 @@ Running log of feature decisions. Most recent first.
 
 ---
 
+## Deferred / Tech Debt
+
+| Item | Detail |
+|---|---|
+| Fix 5 pre-existing failing crypto bot tests | `test_halt_blocks_all_signals` (risk_manager), `test_fetch_order_polling_timeout_uses_partial_fill`, `test_state_save_load_roundtrip`, `test_sync_cash_uses_exchange_free_balance`, `test_restart_recovery_seeds_position_manager` (all in live_executor). All are balance-sync / mock issues in the test environment — live bot unaffected. Fix when test suite is next touched. |
+
+---
+
 ## 2026-06-24 (continued) — Crypto Hardening + Stock Bot Stability (BUILT ✓)
 
 ### Limit order post-only chase with PO rejection retry (BUILT ✓)

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -19,6 +21,9 @@ import yfinance as yf
 logger = logging.getLogger(__name__)
 
 MINIMUM_VALID_PRICE = 1.00  # reject any candle set whose latest close is below this
+
+# Serializes yf.download() calls across threads; 0.5s sleep follows each call
+_yf_download_lock = threading.Lock()
 
 # Module-level cache reset each scan cycle via reset_price_cache()
 _last_prices: dict[str, float] = {}
@@ -107,24 +112,27 @@ def fetch_candles(
       - US equities:  "AAPL", "NVDA", "MSFT"
       - TSX equities: "SHOP.TO", "RY.TO", "AC.TO"
     """
-    try:
-        df = yf.download(
-            symbol,
-            period=f"{lookback_days}d",
-            interval=interval,
-            auto_adjust=True,
-            progress=False,
-        )
-        if df is None or df.empty:
+    with _yf_download_lock:
+        try:
+            df = yf.download(
+                symbol,
+                period=f"{lookback_days}d",
+                interval=interval,
+                auto_adjust=True,
+                progress=False,
+            )
+        except Exception as e:
+            logger.warning("fetch failed %s: %s", symbol, e)
             return None
+        finally:
+            time.sleep(0.5)
 
-        # Flatten MultiIndex columns yfinance >= 0.2.38 returns for a single ticker
-        if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
-            df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
-
-    except Exception as e:
-        logger.warning("fetch failed %s: %s", symbol, e)
+    if df is None or df.empty:
         return None
+
+    # Flatten MultiIndex columns yfinance >= 0.2.38 returns for a single ticker
+    if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
+        df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
 
     candles: list[Candle] = []
     for ts, row in df.iterrows():
@@ -174,6 +182,25 @@ def fetch_candles(
 
     if _is_duplicate_price(symbol, latest):
         return None
+
+    # Cross-validate against previous close from a separate fast_info call.
+    # Guards against same-source corruption where both candle and live price
+    # are wrong (e.g. AC.TO holiday bleed returning $61 instead of ~$17).
+    prev_close = None
+    try:
+        fi = yf.Ticker(symbol).fast_info
+        prev_close = getattr(fi, "previous_close", None) or getattr(fi, "previousClose", None)
+    except Exception:
+        pass
+
+    if prev_close and prev_close > 0:
+        deviation = abs(latest - prev_close) / prev_close
+        if deviation > 0.20:
+            logger.warning(
+                "%s — rejected: close $%.2f deviates %.1f%% from previous close $%.2f (data corruption)",
+                symbol, latest, deviation * 100, prev_close,
+            )
+            return None
 
     logger.debug("Fetched %d candles for %s (interval=%s)", len(candles), symbol, interval)
     return candles

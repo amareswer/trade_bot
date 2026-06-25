@@ -709,7 +709,7 @@ def _stock_card_html(r: ScanResult, pos: Optional[PortfolioPosition] = None, ext
     else:
         sent_str = '<span style="color:#484f58">No headlines to score</span>'
 
-    mts        = r.research.market_trends_score
+    mts        = r.research.market_trends_score if isinstance(r.research.market_trends_score, (int, float)) else 0
     trends_col = _GREEN if mts > 70 else _MUTED
     trends_str = f'<span style="color:{trends_col};font-weight:600">{mts}/100</span>'
     if mts > 70:
