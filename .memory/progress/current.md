@@ -5,6 +5,86 @@ metadata:
   type: project
 ---
 
+**Status as of 2026-06-25 Late:** Multi-symbol parallel execution live in paper mode. 5 CAD crypto symbols running simultaneously, each with independent strategy/state machine/position manager. Bot at 22:04 UTC, next candle close ~1h 55m.
+
+---
+
+## Session 2026-06-25 Late — Multi-Symbol Parallel Execution (COMPLETE ✅)
+
+**Phase 6C: symbol_state dict built in bot/main.py only — no other files touched.**
+
+### Architecture
+- `symbol_state: dict[str, dict]` — 5 symbols, each holding:
+  `strategy`, `sm` (TradingStateMachine), `pm` (PositionManager),
+  `last_ts_ms`, `trail_peak`, `partial_done`, `atr_sl`, `atr_tp`, `last_price`
+- Shared across all symbols: `RiskManager`, `LiveExecutor` (single cash pool)
+- Per-symbol cash cap: `executor.cash / cfg.universe.size` (= $200 each at $1k)
+- All 5 symbols warm up sequentially on startup (~7s total)
+
+### Changes made (bot/main.py only)
+1. `_warmup_strategy()` — added `symbol: str = None` param; falls back to `cfg.exchange.symbol`
+2. `_fetch_completed_candle()` — added `symbol: str = None` param; same fallback pattern
+3. `per_symbol_max_pct()` helper added to `config.py` (standalone function before `_load()`)
+4. Startup: `symbol_state` dict replaces single `state_machine` / `position_manager` init
+5. Restart recovery moved to after `symbol_state` loop; uses `symbol_state[_active_symbol]`
+6. Main loop: `for sym, ss in symbol_state.items()` wraps all per-symbol processing
+7. Price fetch: `live_exchange.fetch_ticker(sym)['last']` per symbol (was `feed.get_price()`)
+8. Intra-candle SL/TP fully migrated — all refs use `ss['trail_peak']`, `ss['atr_sl']` etc.
+9. **3 `executor.position` bugs fixed → `ss['pm'].quantity`** (lines 656, 658, 709)
+10. Display/tick-log/dashboard: only rendered for `sym == _active_symbol`
+11. `live_signals.csv` gains `symbol` column
+12. Backward-compat aliases kept: `state_machine`, `position_manager` (used by `_render_dashboard` closure + `display.stopped()`)
+13. `last_candle_ts_ms` alias removed (zero remaining uses)
+
+### Active symbols (2026-06-25, Kraken CAD pairs)
+| Symbol | Price |
+|---|---|
+| BTC/CAD | $84,307 |
+| ETH/CAD | $2,222 |
+| XRP/CAD | $1.48 |
+| SOL/CAD | $96.06 |
+| DOGE/CAD | $0.11 |
+
+**Bot running:** 5 symbols, PAPER_MODE=true, $1,000 virtual cash ($200/symbol cap)
+**Next candle close:** ~1h 55m from 22:04 UTC
+
+---
+
+**Status as of 2026-06-25 (updated):** Crypto bot switched to BTC/CAD paper mode with CryptoUniverse auto-selection. MR_RSI_OVERSOLD tuned to 38 (Config C). Waiting for first paper signal.
+
+---
+
+## Session 2026-06-25 Evening — CryptoUniverse + Paper Mode (IN PROGRESS)
+
+- **MR_RSI_OVERSOLD changed 35 → 38** (Config C validated)
+- **CryptoUniverse built** (`bot/data/crypto_universe.py`)
+  - Scans 7 CAD crypto pairs on Kraken
+  - Ranks by volume × momentum
+  - Config-driven quote currency and exclusion list
+- **UNIVERSE_ENABLED=true** — auto-selects BTC/CAD today
+- **PAPER_MODE=true** — $1,000 virtual cash, dry_run=True
+- **PaperConfig added** to config.py
+- Both symbol sync issues fixed
+- Bot now running on BTC/CAD paper mode
+
+**Active .env flags (crypto bot):**
+
+| Setting | Value |
+|---|---|
+| SYMBOL | ETH/CAD (overridden by universe to BTC/CAD) |
+| UNIVERSE_ENABLED | true |
+| UNIVERSE_SIZE | 5 |
+| UNIVERSE_QUOTE | CAD |
+| UNIVERSE_EXCLUDE | EUR,USD,USDC,USDT,DAI,BUSD |
+| PAPER_MODE | true |
+| PAPER_STARTING_CASH | 1000.00 |
+| MR_RSI_OVERSOLD | 38 |
+| REGIME_ENABLED | true |
+
+**Next:** Wait for first BTC/CAD paper signal on candle close. After 15 paper trades — evaluate PF and consider going live.
+
+---
+
 **Status as of 2026-06-24 (updated):** Two bots active. Crypto bot live on Kraken (ETH/CAD, limit orders active). Stock bot in paper trading with AC.TO open position ($24.29). Walk-forward on 1d swing strategy: VALIDATED. Week 2 hardening complete. AI confidence band tracker built. Three strategy fixes applied.
 
 **Paper state RESET 2026-06-23:** Both `stock_bot/paper_trades.csv` and `stock_bot/paper_state.json` deleted and reset to $1,000.00 clean.

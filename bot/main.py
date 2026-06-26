@@ -59,6 +59,7 @@ from bot.dashboard import renderer as _dashboard
 from bot.signals.external_signals import ExternalSignalGate, ExternalSignalsConfig as _ExtSigsCfg
 from bot.alerts.telegram import TelegramAlerter
 from bot.data.trade_log import TradeLog
+from bot.data.crypto_universe import CryptoUniverse
 
 # ── Dashboard path ────────────────────────────────────────────────────────────
 _DASHBOARD_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dashboard.html")
@@ -115,19 +116,21 @@ def _candle_countdown(timeframe: str) -> str:
     return f"{h}h {m:02d}m" if h else f"{m}m"
 
 
-def _warmup_strategy(strategy, exchange, timeframe: str = None) -> "int | None":
+def _warmup_strategy(strategy, exchange, timeframe: str = None, symbol: str = None) -> "int | None":
     """
     Fetch completed candles and warm up the strategy indicators.
     Returns the timestamp_ms of the last candle fed, or None on failure.
     timeframe: ccxt timeframe string (e.g. '1h', '4h'). Defaults to cfg.backtest.timeframe.
+    symbol: override exchange symbol; falls back to cfg.exchange.symbol.
     """
     if timeframe is None:
         timeframe = cfg.backtest.timeframe
+    _sym = symbol if symbol is not None else cfg.exchange.symbol
 
     print(f"\n  Fetching historical {timeframe} candles for warmup …", flush=True)
     try:
         _WARMUP_CANDLES = max(strategy._warmup + 100, 150)
-        raw = exchange.fetch_ohlcv(cfg.exchange.symbol, timeframe=timeframe, limit=_WARMUP_CANDLES + 1)
+        raw = exchange.fetch_ohlcv(_sym, timeframe=timeframe, limit=_WARMUP_CANDLES + 1)
     except Exception as exc:
         print(f"  WARNING: historical warmup failed ({exc}) — starting cold", flush=True)
         return None
@@ -163,14 +166,17 @@ def _fetch_completed_candle(
     exchange,
     last_ts_ms: "int | None",
     timeframe: str,
+    symbol: str = None,
 ) -> "tuple[_Candle | None, int | None]":
     """
     Fetch the most recently completed candle.
     Returns (Candle, ts_ms) when a new candle is available, else (None, None).
     raw[-1] is still forming; raw[-2] is the last fully closed candle.
+    symbol: override fetch symbol; falls back to cfg.exchange.symbol.
     """
+    _sym = symbol if symbol is not None else cfg.exchange.symbol
     try:
-        raw = exchange.fetch_ohlcv(cfg.exchange.symbol, timeframe=timeframe, limit=2)
+        raw = exchange.fetch_ohlcv(_sym, timeframe=timeframe, limit=2)
     except Exception as exc:
         logger.warning("live candle fetch error: %s", exc)
         return None, None
@@ -251,19 +257,59 @@ def build_strategy():
 def run():
     cfg.log_startup()
 
-    feed     = build_feed()
     strategy = build_strategy()
+    is_indicator = isinstance(strategy, IndicatorStrategy)
+
+    # Universe state — scan runs before build_feed() so CcxtFeed.symbol is correct at init
+    _universe = CryptoUniverse()
+    _universe_last_refresh = 0.0
+    _UNIVERSE_REFRESH_S = 86400
+    _active_symbol = cfg.exchange.symbol
+    _universe_symbols = [cfg.exchange.symbol]
+
+    # Build live exchange + run universe scan BEFORE feed init
+    live_exchange = None
+    last_candle_ts_ms: "int | None" = None
+
+    if is_indicator and cfg.exchange.feed_mode == "live":
+        live_exchange = _build_exchange()
+        if cfg.universe.enabled:
+            print(f"[UNIVERSE] Scanning for top movers on {cfg.exchange.exchange.upper()} …", flush=True)
+            _universe_symbols = _universe.get_top_movers(live_exchange, cfg.universe.size)
+            _active_symbol = _universe_symbols[0]
+            print(f"[UNIVERSE] Active symbol: {_active_symbol}", flush=True)
+            if _active_symbol != cfg.exchange.symbol:
+                logger.info("Universe override: %s → %s", cfg.exchange.symbol, _active_symbol)
+                cfg.exchange.symbol = _active_symbol
+        else:
+            _universe_symbols = [cfg.exchange.symbol]
+        _universe_last_refresh = time.time()
+
+    feed = build_feed()
+
     if cfg.exchange.live_trading:
-        executor = LiveExecutor(
-            exchange_id   = cfg.exchange.exchange,
-            symbol        = cfg.exchange.symbol,
-            api_key       = cfg.exchange.api_key,
-            api_secret    = cfg.exchange.api_secret,
-            starting_cash = cfg.portfolio.starting_cash,
-            dry_run       = cfg.exchange.dry_run,
-            order_type    = cfg.exchange.order_type,
-        )
-        mode_str = "[DRY RUN] " if cfg.exchange.dry_run else ""
+        if cfg.paper.paper_mode:
+            executor = LiveExecutor(
+                exchange_id   = cfg.exchange.exchange,
+                symbol        = _active_symbol,
+                api_key       = cfg.exchange.api_key,
+                api_secret    = cfg.exchange.api_secret,
+                starting_cash = cfg.paper.paper_starting_cash,
+                dry_run       = True,
+                order_type    = cfg.exchange.order_type,
+            )
+            logger.info("PAPER MODE active — $%.2f virtual cash", cfg.paper.paper_starting_cash)
+        else:
+            executor = LiveExecutor(
+                exchange_id   = cfg.exchange.exchange,
+                symbol        = _active_symbol,
+                api_key       = cfg.exchange.api_key,
+                api_secret    = cfg.exchange.api_secret,
+                starting_cash = cfg.portfolio.starting_cash,
+                dry_run       = cfg.exchange.dry_run,
+                order_type    = cfg.exchange.order_type,
+            )
+        mode_str = "[DRY RUN] " if (cfg.exchange.dry_run or cfg.paper.paper_mode) else ""
         print(
             f"\n  {mode_str}LIVE TRADING ENABLED"
             f" — real orders will be placed on"
@@ -275,35 +321,18 @@ def run():
             symbol        = cfg.exchange.symbol,
             starting_cash = cfg.portfolio.starting_cash,
         )
+    if cfg.exchange.live_trading:
+        try:
+            executor._save_state()
+            logger.info("State saved with symbol: %s", _active_symbol)
+        except Exception as e:
+            logger.warning("State save on startup failed: %s", e)
     risk = RiskManager(RiskConfig(
         max_position_pct     = cfg.risk.max_position_pct,
         daily_loss_limit_pct = cfg.risk.daily_loss_limit_pct,
         max_drawdown_pct     = cfg.risk.max_drawdown_pct,
         max_trades_per_day   = cfg.risk.max_trades_per_day,
     ))
-    state_machine    = TradingStateMachine(cooldown_ticks=cfg.risk.cooldown_ticks)
-    position_manager = PositionManager()
-
-    # ── Restart recovery ──────────────────────────────────────────────────────
-    if cfg.exchange.live_trading and executor.position > 1e-9:
-        position_manager.seed(
-            quantity     = executor.position,
-            avg_entry    = executor.avg_entry,
-            realized_pnl = executor.portfolio.realized_pnl,
-        )
-        state_machine.recover_long(executor.avg_entry)
-        logger.warning(
-            "Recovered position seeded: qty=%.6f entry=%.2f — state machine set to LONG",
-            executor.position, executor.avg_entry,
-        )
-        print(
-            f"  POSITION RECOVERED: {executor.position:.6f}"
-            f" {cfg.exchange.symbol.split('/')[0]}"
-            f" @ ${executor.avg_entry:,.2f}"
-            f" — state machine set to LONG",
-            flush=True,
-        )
-
     ai = AIEngine(
         model          = cfg.ai.model,
         min_confidence = cfg.ai.min_confidence,
@@ -361,27 +390,83 @@ def run():
     _mode_label = "LIVE" if cfg.exchange.live_trading else ("DRY RUN" if cfg.exchange.dry_run else "PAPER")
     alerter.startup(cfg.exchange.exchange, cfg.exchange.symbol, _mode_label)
 
-    is_indicator = isinstance(strategy, IndicatorStrategy)
-
     # ── Derive live candle timeframe from CANDLE_MINUTES ─────────────────────
     # This is the timeframe used for ALL live candle operations:
     # warmup fetch, candle polling, and countdown display.
     # BACKTEST_TIMEFRAME is only used for backtesting, not live trading.
     _LIVE_TF = _minutes_to_timeframe(cfg.exchange.candle_minutes)
 
-    # ── Historical warmup (live + indicator mode only) ────────────────────────
-    live_exchange = None
-    last_candle_ts_ms: "int | None" = None
+    # ── Multi-symbol state initialisation ────────────────────────────────────
+    symbol_state: dict[str, dict] = {}
 
     if is_indicator and cfg.exchange.feed_mode == "live":
-        live_exchange     = _build_exchange()
-        last_candle_ts_ms = _warmup_strategy(strategy, live_exchange, _LIVE_TF)
+        for sym in _universe_symbols:
+            strat = build_strategy()
+            sm    = TradingStateMachine(cooldown_ticks=cfg.risk.cooldown_ticks)
+            pm    = PositionManager()
+
+            print(f"  Warming up {sym} …", flush=True)
+            last_ts = _warmup_strategy(strat, live_exchange, _LIVE_TF, symbol=sym)
+
+            symbol_state[sym] = {
+                'strategy':     strat,
+                'sm':           sm,
+                'pm':           pm,
+                'last_ts_ms':   last_ts,
+                'trail_peak':   0.0,
+                'partial_done': False,
+                'atr_sl':       0.0,
+                'atr_tp':       0.0,
+                'last_price':   0.0,
+            }
+            logger.info("Symbol ready: %s", sym)
+
+        print(f"\n  {len(symbol_state)} symbols ready: {list(symbol_state.keys())}", flush=True)
+
         try:
-            _raw_1d = live_exchange.fetch_ohlcv(cfg.exchange.symbol, timeframe="1d", limit=30)
+            _raw_1d = live_exchange.fetch_ohlcv(_active_symbol, timeframe="1d", limit=30)
             _mtf_1d_closes = [float(r[4]) for r in _raw_1d[:-1]]
             print(f"  MTF: loaded {len(_mtf_1d_closes)} daily candles for regime check.", flush=True)
         except Exception as _mtf_exc:
             print(f"  MTF: daily candle fetch failed ({_mtf_exc}) — MTF disabled this session.", flush=True)
+    else:
+        symbol_state[_active_symbol] = {
+            'strategy':     strategy,
+            'sm':           TradingStateMachine(cooldown_ticks=cfg.risk.cooldown_ticks),
+            'pm':           PositionManager(),
+            'last_ts_ms':   None,
+            'trail_peak':   0.0,
+            'partial_done': False,
+            'atr_sl':       0.0,
+            'atr_tp':       0.0,
+            'last_price':   0.0,
+        }
+
+    # ── Restart recovery ──────────────────────────────────────────────────────
+    if cfg.exchange.live_trading and executor.position > 1e-9:
+        _rec_sm = symbol_state[_active_symbol]['sm']
+        _rec_pm = symbol_state[_active_symbol]['pm']
+        _rec_pm.seed(
+            quantity     = executor.position,
+            avg_entry    = executor.avg_entry,
+            realized_pnl = executor.portfolio.realized_pnl,
+        )
+        _rec_sm.recover_long(executor.avg_entry)
+        logger.warning(
+            "Recovered position seeded: qty=%.6f entry=%.2f — state machine set to LONG",
+            executor.position, executor.avg_entry,
+        )
+        print(
+            f"  POSITION RECOVERED: {executor.position:.6f}"
+            f" {cfg.exchange.symbol.split('/')[0]}"
+            f" @ ${executor.avg_entry:,.2f}"
+            f" — state machine set to LONG",
+            flush=True,
+        )
+
+    # Aliases for _render_dashboard closure and display.stopped()
+    state_machine    = symbol_state[_active_symbol]['sm']
+    position_manager = symbol_state[_active_symbol]['pm']
 
     tick        = 0
     tick_log:   deque[dict] = deque(maxlen=200)
@@ -460,68 +545,105 @@ def run():
     while _running:
         tick += 1
 
-        # ── 1. Advance state machine ──────────────────────────────────
-        state_machine.tick()
-
-        # ── 2. Fetch live price ───────────────────────────────────────
-        try:
-            price = feed.get_price()
-            _consecutive_errors = 0
-        except Exception as exc:
-            _consecutive_errors += 1
-            if _consecutive_errors >= 5:
-                alerter.error(f"Price feed down {_consecutive_errors} consecutive ticks — {exc}")
-            print(f"  TICK {tick:04d} | price fetch failed: {exc}")
-            time.sleep(cfg.exchange.loop_interval)
-            continue
-
-        # ── 2b. Candle watchdog (live mode) ──────────────────────────
-        if cfg.exchange.feed_mode == "live":
-            _candle_stale_s = cfg.exchange.candle_minutes * 60 * 2
-            if time.time() - _last_candle_time > _candle_stale_s:
-                alerter.error(
-                    f"Candle watchdog: no new {cfg.exchange.candle_minutes}min candle "
-                    f"for {int((time.time()-_last_candle_time)/60)} minutes — feed may be stale"
-                )
-                _last_candle_time = time.time()  # reset so we don't spam every tick
-
-        # ── 2c. Position drift reconciliation (every 60 ticks, live only) ──
-        if cfg.exchange.live_trading and tick % 60 == 0:
+        # ── 0. Universe refresh (every 24h) ──────────────────────────
+        if (cfg.universe.enabled and
+                time.time() - _universe_last_refresh > _UNIVERSE_REFRESH_S):
             try:
-                balance = executor._exchange.fetch_balance()
-                base = cfg.exchange.symbol.split("/")[0]
-                exchange_pos = float(balance.get("free", {}).get(base, 0))
-                bot_pos = executor.position
-                drift = abs(exchange_pos - bot_pos)
-                if drift > 0.000010:  # 10 satoshi threshold
-                    logger.warning(
-                        "POSITION DRIFT: exchange=%.6f bot=%.6f drift=%.6f %s",
-                        exchange_pos, bot_pos, drift, base,
+                _universe_symbols = _universe.get_top_movers(
+                    live_exchange,
+                    cfg.universe.size,
+                )
+                new_symbol = _universe_symbols[0]
+                if new_symbol != _active_symbol:
+                    logger.info(
+                        "Universe refresh: switching %s → %s",
+                        _active_symbol, new_symbol,
                     )
-                    alerter.error(
-                        f"Position drift detected: exchange={exchange_pos:.6f} "
-                        f"bot={bot_pos:.6f} {base} — check logs/live_state.json"
-                    )
-            except Exception as _drift_exc:
-                logger.warning("Position drift check failed: %s", _drift_exc)
+                    _active_symbol = new_symbol
+                    cfg.exchange.symbol = new_symbol
+                _universe_last_refresh = time.time()
+            except Exception as _univ_exc:
+                logger.warning(
+                    "Universe refresh failed: %s — keeping %s",
+                    _univ_exc, _active_symbol,
+                )
 
-        # ── 3. Strategy signal ────────────────────────────────────────
-        if is_indicator:
+        # ── Per-symbol processing ─────────────────────────────────────
+        for sym, ss in symbol_state.items():
+
+            # ── 1. Fetch live price ───────────────────────────────────
             if live_exchange is not None:
-                # ── Intra-candle SL/TP + Trailing Stop + Partial TP ──────
-                if position_manager.has_position and position_manager.avg_entry > 0:
-                    _ic_entry = position_manager.avg_entry
-                    # Update trailing peak on every tick
-                    _trail_peak = max(_trail_peak, price)
+                try:
+                    price = float(live_exchange.fetch_ticker(sym)['last'])
+                    ss['last_price'] = price
+                    _consecutive_errors = 0
+                except Exception as exc:
+                    _consecutive_errors += 1
+                    if _consecutive_errors >= 5:
+                        alerter.error(
+                            f"Price feed down {_consecutive_errors} consecutive ticks — {exc}"
+                        )
+                    logger.warning("price fetch failed for %s: %s", sym, exc)
+                    price = ss['last_price']
+                    if not price:
+                        continue
+            else:
+                try:
+                    price = feed.get_price()
+                    ss['last_price'] = price
+                    _consecutive_errors = 0
+                except Exception as exc:
+                    _consecutive_errors += 1
+                    if _consecutive_errors >= 5:
+                        alerter.error(
+                            f"Price feed down {_consecutive_errors} consecutive ticks — {exc}"
+                        )
+                    print(f"  TICK {tick:04d} | price fetch failed: {exc}")
+                    continue
+
+            # ── 1b. Candle watchdog (active symbol, live only) ────────
+            if cfg.exchange.feed_mode == "live" and sym == _active_symbol:
+                _candle_stale_s = cfg.exchange.candle_minutes * 60 * 2
+                if time.time() - _last_candle_time > _candle_stale_s:
+                    alerter.error(
+                        f"Candle watchdog: no new {cfg.exchange.candle_minutes}min candle "
+                        f"for {int((time.time()-_last_candle_time)/60)} minutes — feed may be stale"
+                    )
+                    _last_candle_time = time.time()
+
+            # ── 1c. Position drift reconciliation (every 60 ticks, live) ──
+            if cfg.exchange.live_trading and sym == _active_symbol and tick % 60 == 0:
+                try:
+                    balance = executor._exchange.fetch_balance()
+                    base = sym.split("/")[0]
+                    exchange_pos = float(balance.get("free", {}).get(base, 0))
+                    bot_pos = executor.position
+                    drift = abs(exchange_pos - bot_pos)
+                    if drift > 0.000010:
+                        logger.warning(
+                            "POSITION DRIFT: exchange=%.6f bot=%.6f drift=%.6f %s",
+                            exchange_pos, bot_pos, drift, base,
+                        )
+                        alerter.error(
+                            f"Position drift detected: exchange={exchange_pos:.6f} "
+                            f"bot={bot_pos:.6f} {base} — check logs/live_state.json"
+                        )
+                except Exception as _drift_exc:
+                    logger.warning("Position drift check failed: %s", _drift_exc)
+
+            # ── 2. Intra-candle SL/TP + Trailing Stop + Partial TP ───
+            if is_indicator and live_exchange is not None:
+                if ss['pm'].has_position and ss['pm'].avg_entry > 0:
+                    _ic_entry = ss['pm'].avg_entry
+                    ss['trail_peak'] = max(ss['trail_peak'], price)
                     _trail_sl_level = (
-                        _atr_sl_price if _atr_sl_price > 0
+                        ss['atr_sl'] if ss['atr_sl'] > 0
                         else (
-                            _trail_peak * (1 - cfg.backtest.stop_loss_pct)
-                            if _trail_peak > 0 and cfg.backtest.stop_loss_pct > 0 else 0.0
+                            ss['trail_peak'] * (1 - cfg.backtest.stop_loss_pct)
+                            if ss['trail_peak'] > 0 and cfg.backtest.stop_loss_pct > 0 else 0.0
                         )
                     )
 
-                    # Partial TP — sell cfg.backtest.partial_tp_size at partial_tp_pct gain
                     _partial_tp_level = (
                         _ic_entry * (1 + cfg.backtest.partial_tp_pct)
                         if cfg.backtest.partial_tp_pct > 0 else None
@@ -529,25 +651,25 @@ def run():
                     if (
                         _partial_tp_level is not None
                         and price >= _partial_tp_level
-                        and not _partial_tp_done
-                        and executor.position > 0
+                        and not ss['partial_done']
+                        and ss['pm'].quantity > 0
                     ):
-                        _p_qty = round(executor.position * cfg.backtest.partial_tp_size, 6)
+                        _p_qty = round(ss['pm'].quantity * cfg.backtest.partial_tp_size, 6)
                         if _p_qty > 0:
                             _p_approval = risk.evaluate(Signal.SELL, price, executor.portfolio, _p_qty)
                             if _p_approval.approved:
                                 _p_order = executor.execute(Signal.SELL, price, quantity=_p_qty)
                                 if _p_order and _p_order.status == OrderStatus.FILLED:
                                     risk.record_fill()
-                                    state_machine.on_fill(Signal.SELL, _p_order.price)
-                                    _p_pnl = position_manager.on_sell(_p_order.price, _p_order.quantity)
-                                    _partial_tp_done = True
-                                    state_machine.recover_long(_p_order.price)
-                                    print(f"           📊 PARTIAL TP:  {_p_qty:.6f} @ {price:,.2f}  PnL={_p_pnl:+.2f}", flush=True)
-                                    logger.warning("PARTIAL TP: sold %.6f @ %.2f  pnl=%.2f", _p_qty, price, _p_pnl)
+                                    ss['sm'].on_fill(Signal.SELL, _p_order.price)
+                                    _p_pnl = ss['pm'].on_sell(_p_order.price, _p_order.quantity)
+                                    ss['partial_done'] = True
+                                    ss['sm'].recover_long(_p_order.price)
+                                    print(f"           📊 PARTIAL TP [{sym}]:  {_p_qty:.6f} @ {price:,.2f}  PnL={_p_pnl:+.2f}", flush=True)
+                                    logger.warning("PARTIAL TP [%s]: sold %.6f @ %.2f  pnl=%.2f", sym, _p_qty, price, _p_pnl)
                                     trade_log.log_fill(
                                         side          = "SELL",
-                                        symbol        = cfg.exchange.symbol,
+                                        symbol        = sym,
                                         quantity      = _p_qty,
                                         price         = _p_order.price,
                                         pnl           = _p_pnl,
@@ -556,7 +678,7 @@ def run():
                                     )
                                     alerter.fill(
                                         side        = "SELL",
-                                        symbol      = cfg.exchange.symbol,
+                                        symbol      = sym,
                                         quantity    = _p_qty,
                                         price       = _p_order.price,
                                         total_value = _p_order.total_value,
@@ -566,42 +688,42 @@ def run():
 
                     _ic_sl = _trail_sl_level > 0 and price <= _trail_sl_level
                     _ic_tp = (
-                        price >= _atr_tp_price if _atr_tp_price > 0
+                        price >= ss['atr_tp'] if ss['atr_tp'] > 0
                         else (cfg.backtest.take_profit_pct > 0
                               and price >= _ic_entry * (1 + cfg.backtest.take_profit_pct))
                     )
                     if _ic_sl or _ic_tp:
                         if _ic_sl:
                             logger.warning(
-                                "TRAIL STOP triggered: price=%.2f peak=%.2f trail_sl=%.2f",
-                                price, _trail_peak, _trail_sl_level,
+                                "TRAIL STOP [%s]: price=%.2f peak=%.2f trail_sl=%.2f",
+                                sym, price, ss['trail_peak'], _trail_sl_level,
                             )
-                            print(f"           🛑 TRAIL STOP  price={price:,.2f}  peak={_trail_peak:,.2f}  sl={_trail_sl_level:,.2f}", flush=True)
+                            print(f"           🛑 TRAIL STOP [{sym}]  price={price:,.2f}  peak={ss['trail_peak']:,.2f}  sl={_trail_sl_level:,.2f}", flush=True)
                         else:
                             logger.warning(
-                                "TAKE PROFIT triggered: price=%.2f entry=%.2f tp=%.1f%%",
-                                price, _ic_entry, cfg.backtest.take_profit_pct * 100,
+                                "TAKE PROFIT [%s]: price=%.2f entry=%.2f tp=%.1f%%",
+                                sym, price, _ic_entry, cfg.backtest.take_profit_pct * 100,
                             )
-                            print(f"           ✅ TAKE PROFIT  price={price:,.2f}  entry={_ic_entry:,.2f}", flush=True)
-                        _ic_qty      = executor.position
+                            print(f"           ✅ TAKE PROFIT [{sym}]  price={price:,.2f}  entry={_ic_entry:,.2f}", flush=True)
+                        _ic_qty      = ss['pm'].quantity
                         _ic_approval = risk.evaluate(Signal.SELL, price, executor.portfolio, _ic_qty)
                         if _ic_approval.approved:
                             _ic_order = executor.execute(Signal.SELL, price, quantity=_ic_qty)
                             if _ic_order and _ic_order.status == OrderStatus.FILLED:
                                 risk.record_fill()
-                                state_machine.on_fill(Signal.SELL, _ic_order.price)
-                                _ic_pnl = position_manager.on_sell(_ic_order.price, _ic_order.quantity)
-                                _trail_peak = 0.0
-                                _partial_tp_done = False
+                                ss['sm'].on_fill(Signal.SELL, _ic_order.price)
+                                _ic_pnl = ss['pm'].on_sell(_ic_order.price, _ic_order.quantity)
+                                ss['trail_peak'] = 0.0
+                                ss['partial_done'] = False
                                 _ic_reason = "trail_stop" if _ic_sl else "take_profit"
                                 display.fill(
                                     _ic_order.side.value, _ic_order.quantity,
-                                    cfg.exchange.symbol, _ic_order.price,
+                                    sym, _ic_order.price,
                                     _ic_order.total_value, _ic_pnl,
                                 )
                                 trade_log.log_fill(
                                     side          = "SELL",
-                                    symbol        = cfg.exchange.symbol,
+                                    symbol        = sym,
                                     quantity      = _ic_order.quantity,
                                     price         = _ic_order.price,
                                     pnl           = _ic_pnl,
@@ -610,7 +732,7 @@ def run():
                                 )
                                 alerter.fill(
                                     side        = "SELL",
-                                    symbol      = cfg.exchange.symbol,
+                                    symbol      = sym,
                                     quantity    = _ic_order.quantity,
                                     price       = _ic_order.price,
                                     total_value = _ic_order.total_value,
@@ -619,14 +741,14 @@ def run():
                                 )
                         else:
                             logger.warning(
-                                "SL/TP SELL blocked by risk gate: %s", _ic_approval.message,
+                                "SL/TP SELL blocked by risk gate [%s]: %s", sym, _ic_approval.message,
                             )
                         display.position_line(
-                            quantity       = position_manager.quantity,
-                            symbol         = cfg.exchange.symbol,
-                            avg_entry      = position_manager.avg_entry,
-                            unrealized_pnl = position_manager.unrealized_pnl(price),
-                            realized_pnl   = position_manager.realized_pnl,
+                            quantity       = ss['pm'].quantity,
+                            symbol         = sym,
+                            avg_entry      = ss['pm'].avg_entry,
+                            unrealized_pnl = ss['pm'].unrealized_pnl(price),
+                            realized_pnl   = ss['pm'].realized_pnl,
                             cash           = executor.cash,
                         )
                         tick_log.append({
@@ -636,327 +758,335 @@ def run():
                             "signal": "SELL",
                             "rsi":    _dash_rsi,
                             "trend":  _dash_trend,
-                            "state":  state_machine.state.value,
+                            "state":  ss['sm'].state.value,
                             "reason": "trail_stop" if _ic_sl else "take_profit",
                         })
                         _render_dashboard("SELL", _dash_rsi, _dash_trend)
-                        time.sleep(cfg.exchange.loop_interval)
-                        continue
+                        continue  # skip candle eval for this symbol this tick
 
                 # Live mode: evaluate only when a new candle has closed
-                # Uses _LIVE_TF (derived from CANDLE_MINUTES) — NOT backtest timeframe
                 candle, new_ts = _fetch_completed_candle(
-                    live_exchange, last_candle_ts_ms, _LIVE_TF
+                    live_exchange, ss['last_ts_ms'], _LIVE_TF, symbol=sym
                 )
                 if candle is None:
-                    countdown = _candle_countdown(_LIVE_TF)
-                    display.next_candle(price, tick, countdown)
-                    tick_log.append({
-                        "tick":   tick,
-                        "time":   datetime.now().strftime("%H:%M:%S"),
-                        "price":  price,
-                        "signal": _dash_signal,
-                        "rsi":    _dash_rsi,
-                        "trend":  _dash_trend,
-                        "state":  state_machine.state.value,
-                        "reason": _dash_filter or _dash_block,
-                    })
-                    _render_dashboard(_dash_signal, _dash_rsi, _dash_trend)
-                    time.sleep(cfg.exchange.loop_interval)
-                    continue
-                last_candle_ts_ms = new_ts
-                _last_candle_time = time.time()  # watchdog: new candle received
-                raw_signal = strategy.evaluate(candle)
-            else:
+                    if sym == _active_symbol:
+                        countdown = _candle_countdown(_LIVE_TF)
+                        display.next_candle(price, tick, countdown)
+                        tick_log.append({
+                            "tick":   tick,
+                            "time":   datetime.now().strftime("%H:%M:%S"),
+                            "price":  price,
+                            "signal": _dash_signal,
+                            "rsi":    _dash_rsi,
+                            "trend":  _dash_trend,
+                            "state":  ss['sm'].state.value,
+                            "reason": _dash_filter or _dash_block,
+                        })
+                        _render_dashboard(_dash_signal, _dash_rsi, _dash_trend)
+                    continue  # no new candle for this symbol
+                ss['last_ts_ms'] = new_ts
+                if sym == _active_symbol:
+                    _last_candle_time = time.time()
+                raw_signal = ss['strategy'].evaluate(candle)
+            elif is_indicator:
                 # Simulated mode: flat fake candle per tick
                 fake_candle = _Candle(
                     timestamp=datetime.now(_tz.utc),
                     open=price, high=price, low=price, close=price, volume=0.0,
                 )
-                raw_signal = strategy.evaluate(fake_candle)
-        else:
-            raw_signal = strategy.evaluate(price)
+                raw_signal = ss['strategy'].evaluate(fake_candle)
+            else:
+                raw_signal = ss['strategy'].evaluate(price)
 
-        # ── 3b. Candle-close diagnostic log ──────────────────────────
-        if is_indicator and live_exchange is not None:
-            _adx_live  = strategy.last_adx
-            _rsi_live  = strategy.last_rsi
-            _trnd_live = strategy.last_trend or "UNKNOWN"
-            _cl = list(strategy._closes)
-            _ef = _ema_fn(_cl, strategy.config.fast_ema_period)
-            _es = _ema_fn(_cl, strategy.config.slow_ema_period)
-            _spread = abs(_ef - _es) / _es * 100 if (_ef and _es and _es > 0) else 0.0
-            _sig_str = raw_signal.value if hasattr(raw_signal, 'value') else str(raw_signal)
+            # ── 2b. Candle-close diagnostic log ──────────────────────
+            if is_indicator and live_exchange is not None:
+                _adx_live  = ss['strategy'].last_adx
+                _rsi_live  = ss['strategy'].last_rsi
+                _trnd_live = ss['strategy'].last_trend or "UNKNOWN"
+                _cl = list(ss['strategy']._closes)
+                _ef = _ema_fn(_cl, ss['strategy'].config.fast_ema_period)
+                _es = _ema_fn(_cl, ss['strategy'].config.slow_ema_period)
+                _spread = abs(_ef - _es) / _es * 100 if (_ef and _es and _es > 0) else 0.0
+                _sig_str = raw_signal.value if hasattr(raw_signal, 'value') else str(raw_signal)
 
-            _reason = ""
-            if _sig_str == "HOLD":
-                if _adx_live is not None and _adx_live < strategy.config.adx_threshold:
-                    _reason = f"ADX {_adx_live:.1f} < {strategy.config.adx_threshold}"
-                elif _trnd_live == "NEUTRAL":
-                    _reason = "trend NEUTRAL"
-                elif _spread > strategy.config.max_ema_spread_pct * 100 and strategy.config.max_ema_spread_pct > 0:
-                    _reason = f"EMA spread {_spread:.3f}% > {strategy.config.max_ema_spread_pct*100:.1f}%"
-                elif _rsi_live is not None:
-                    _reason = f"RSI {_rsi_live:.1f} filtered"
-                else:
-                    _reason = "warmup"
-
-            _rsi_str = f"  RSI={_rsi_live:.1f}" if _rsi_live is not None else "  RSI=n/a"
-            _adx_str = f"  ADX={_adx_live:.1f}" if _adx_live is not None else "  ADX=n/a"
-            print(
-                f"  candle {candle.timestamp.strftime('%Y-%m-%d %H:%M')} UTC"
-                f"  close={price:,.2f}"
-                + _rsi_str
-                + _adx_str,
-                flush=True
-            )
-            print(
-                f"  trend={_trnd_live}"
-                f"  EMA_spread={_spread:.3f}%"
-                f"  signal={_sig_str}"
-                + (f"  [{_reason}]" if _reason else ""),
-                flush=True
-            )
-
-            _live_log = os.path.join(_log_dir, "live_signals.csv")
-            _write_header = not os.path.exists(_live_log)
-            with open(_live_log, "a", newline="") as _f:
-                _w = csv.writer(_f)
-                if _write_header:
-                    _w.writerow([
-                        "timestamp", "close", "rsi", "adx",
-                        "trend", "ema_spread_pct", "signal", "reason"
-                    ])
-                _w.writerow([
-                    candle.timestamp.strftime("%Y-%m-%d %H:%M"),
-                    round(price, 2),
-                    round(_rsi_live, 2) if _rsi_live is not None else "",
-                    round(_adx_live, 2) if _adx_live is not None else "",
-                    _trnd_live,
-                    round(_spread, 4),
-                    _sig_str,
-                    _reason,
-                ])
-
-        # ── 3d. MTF gate: block BUY when daily trend is BEARISH ─────────
-        if is_indicator and raw_signal == Signal.BUY and _mtf_1d_closes:
-            _mtf_trend = _trend_fn(_mtf_1d_closes)
-            if _mtf_trend == "BEARISH":
-                raw_signal = Signal.HOLD
-                print(f"  MTF gate: 1D trend BEARISH — BUY suppressed", flush=True)
-                logger.info("MTF gate: BUY suppressed — daily trend BEARISH")
-            # Refresh 1D closes each candle close
-            try:
-                _raw_1d_refresh = live_exchange.fetch_ohlcv(cfg.exchange.symbol, timeframe="1d", limit=30) if live_exchange else None
-                if _raw_1d_refresh:
-                    _mtf_1d_closes = [float(r[4]) for r in _raw_1d_refresh[:-1]]
-            except Exception:
-                pass  # keep stale 1D data if refresh fails
-
-        # ── 3e. External signal gate (live only) ──────────────────────
-        if raw_signal == Signal.BUY and ext_gate is not None:
-            _ext_approved, _ext_reason = ext_gate.approve_buy()
-            if not _ext_approved:
-                raw_signal = Signal.HOLD
-                print(f"  EXT gate: {_ext_reason}", flush=True)
-                logger.info("External signal gate blocked BUY: %s", _ext_reason)
-
-        # ── 4. Warmup guard ───────────────────────────────────────────
-        if is_indicator and not strategy.is_warmed_up:
-            display.warmup(tick, strategy.tick_count, strategy._warmup, price)
-            time.sleep(cfg.exchange.loop_interval)
-            continue
-
-        rsi_val   = strategy.last_rsi   if is_indicator else None
-        trend_val = strategy.last_trend if is_indicator else None
-
-        # ── 5. Position-aware filter + deduplication ──────────────────
-        filtered_signal, filter_reason = state_machine.filter_signal(raw_signal)
-
-        # ── 6. Dynamic position sizing ─────────────────────────────────
-        if filtered_signal == Signal.SELL:
-            trade_qty = executor.position
-        else:
-            trade_qty = cfg.calc_trade_qty(executor.cash, price)
-            # Safety: never use more than 98% of available cash.
-            # Prevents "Insufficient funds" from rounding at exchange.
-            max_affordable = (executor.cash * 0.98) / price
-            trade_qty = min(trade_qty, max_affordable)
-            trade_qty = round(trade_qty, 6)
-
-        # ── 7. AI advisory (optional) ──────────────────────────────────
-        advice       = None
-        final_signal = filtered_signal
-        if ai and ai.enabled and filtered_signal != Signal.HOLD:
-            advice = ai.advise(
-                price           = price,
-                rsi             = rsi_val,
-                trend           = trend_val,
-                strategy_signal = filtered_signal,
-                recent_prices   = list(strategy._closes) if is_indicator else [price],
-                portfolio       = executor.portfolio,
-                symbol          = cfg.exchange.symbol,
-            )
-            final_signal = merge_signals(filtered_signal, advice)
-
-        # ── 8. Risk gate ───────────────────────────────────────────────
-        approval     = risk.evaluate(final_signal, price, executor.portfolio, trade_qty)
-        block_reason = "" if approval else approval.message
-
-        # ── 8b. Candle-close structured log ───────────────────────────
-        if is_indicator and live_exchange is not None:
-            _rsi_log = f"{_rsi_live:.1f}" if _rsi_live is not None else "n/a"
-            _adx_log = f"{_adx_live:.1f}" if _adx_live is not None else "n/a"
-            _action  = (
-                final_signal.value
-                if approval else
-                f"BLOCKED[{approval.block_reason.value if approval.block_reason else '?'}]"
-            )
-            logger.info(
-                "CANDLE %s UTC | close=%.2f RSI=%s ADX=%s trend=%s spread=%.3f%% signal=%s -> %s",
-                candle.timestamp.strftime("%Y-%m-%d %H:%M"),
-                price,
-                _rsi_log,
-                _adx_log,
-                _trnd_live,
-                _spread,
-                _sig_str,
-                _action,
-            )
-            candle_log.append({
-                "ts":     candle.timestamp.strftime("%Y-%m-%d %H:%M"),
-                "close":  price,
-                "rsi":    round(_rsi_live, 1) if _rsi_live is not None else None,
-                "adx":    round(_adx_live, 1) if _adx_live is not None else None,
-                "trend":  _trnd_live,
-                "spread": round(_spread, 3),
-                "signal": _sig_str,
-                "action": _action,
-                "reason": _reason,
-            })
-
-        # ── 9. Display tick ────────────────────────────────────────────
-        display.tick(
-            tick_n        = tick,
-            price         = price,
-            raw_signal    = raw_signal.value,
-            final_signal  = final_signal.value,
-            rsi           = rsi_val,
-            trend         = trend_val,
-            filter_reason = filter_reason,
-            block_reason  = block_reason,
-        )
-        display.state_line(
-            state      = state_machine.state.value,
-            cooldown   = state_machine.cooldown_remaining,
-            last_trade = state_machine.last_trade_label,
-        )
-
-        if advice:
-            vetoed = final_signal != filtered_signal
-            display.ai_advice(
-                advice.signal.value, advice.confidence,
-                advice.reasoning, advice.latency_ms, vetoed,
-            )
-
-        # ── 10. Execute ────────────────────────────────────────────────
-        if approval:
-            order = executor.execute(final_signal, price, quantity=trade_qty)
-            if order:
-                if order.status == OrderStatus.FILLED:
-                    risk.record_fill()
-                    state_machine.on_fill(final_signal, order.price)
-
-                    pnl = None
-                    if order.side == OrderSide.BUY:
-                        position_manager.on_buy(order.price, order.quantity)
-                        _trail_peak = order.price  # seed trailing peak at entry
-                        _partial_tp_done = False
-                        _atr_sl_price = 0.0
-                        _atr_tp_price = 0.0
-                        if is_indicator:
-                            _atr_val = _atr_fn(
-                                list(strategy._highs),
-                                list(strategy._lows),
-                                list(strategy._closes),
-                                cfg.strategy.atr_period,
-                            )
-                            if _atr_val is None or _atr_val <= 0 or cfg.strategy.atr_sl_mult <= 0:
-                                _atr_sl_price = 0.0
-                                logger.info("ATR SL disabled or unavailable — using fixed SL/TP")
-                            else:
-                                _atr_sl_price = order.price - _atr_val * cfg.strategy.atr_sl_mult
-                                logger.info(
-                                    "ATR SL/TP: entry=%.2f atr=%.2f sl=%.2f mult=%.1f",
-                                    order.price, _atr_val, _atr_sl_price, cfg.strategy.atr_sl_mult,
-                                )
+                _reason = ""
+                if _sig_str == "HOLD":
+                    if _adx_live is not None and _adx_live < ss['strategy'].config.adx_threshold:
+                        _reason = f"ADX {_adx_live:.1f} < {ss['strategy'].config.adx_threshold}"
+                    elif _trnd_live == "NEUTRAL":
+                        _reason = "trend NEUTRAL"
+                    elif (_spread > ss['strategy'].config.max_ema_spread_pct * 100
+                          and ss['strategy'].config.max_ema_spread_pct > 0):
+                        _reason = f"EMA spread {_spread:.3f}% > {ss['strategy'].config.max_ema_spread_pct*100:.1f}%"
+                    elif _rsi_live is not None:
+                        _reason = f"RSI {_rsi_live:.1f} filtered"
                     else:
-                        pnl = position_manager.on_sell(order.price, order.quantity)
-                        _trail_peak = 0.0
-                        _partial_tp_done = False
-                        _atr_sl_price = 0.0
-                        _atr_tp_price = 0.0
+                        _reason = "warmup"
 
-                    display.fill(
-                        order.side.value, order.quantity,
-                        cfg.exchange.symbol, order.price, order.total_value, pnl,
+                _rsi_str = f"  RSI={_rsi_live:.1f}" if _rsi_live is not None else "  RSI=n/a"
+                _adx_str = f"  ADX={_adx_live:.1f}" if _adx_live is not None else "  ADX=n/a"
+                print(
+                    f"  [{sym}] candle {candle.timestamp.strftime('%Y-%m-%d %H:%M')} UTC"
+                    f"  close={price:,.2f}"
+                    + _rsi_str
+                    + _adx_str,
+                    flush=True
+                )
+                print(
+                    f"  trend={_trnd_live}"
+                    f"  EMA_spread={_spread:.3f}%"
+                    f"  signal={_sig_str}"
+                    + (f"  [{_reason}]" if _reason else ""),
+                    flush=True
+                )
+
+                _live_log = os.path.join(_log_dir, "live_signals.csv")
+                _write_header = not os.path.exists(_live_log)
+                with open(_live_log, "a", newline="") as _f:
+                    _w = csv.writer(_f)
+                    if _write_header:
+                        _w.writerow([
+                            "timestamp", "symbol", "close", "rsi", "adx",
+                            "trend", "ema_spread_pct", "signal", "reason"
+                        ])
+                    _w.writerow([
+                        candle.timestamp.strftime("%Y-%m-%d %H:%M"),
+                        sym,
+                        round(price, 2),
+                        round(_rsi_live, 2) if _rsi_live is not None else "",
+                        round(_adx_live, 2) if _adx_live is not None else "",
+                        _trnd_live,
+                        round(_spread, 4),
+                        _sig_str,
+                        _reason,
+                    ])
+
+            # ── 2c. MTF gate ──────────────────────────────────────────
+            if is_indicator and raw_signal == Signal.BUY and _mtf_1d_closes:
+                _mtf_trend = _trend_fn(_mtf_1d_closes)
+                if _mtf_trend == "BEARISH":
+                    raw_signal = Signal.HOLD
+                    print(f"  [{sym}] MTF gate: 1D trend BEARISH — BUY suppressed", flush=True)
+                    logger.info("MTF gate [%s]: BUY suppressed — daily trend BEARISH", sym)
+                if live_exchange and sym == _active_symbol:
+                    try:
+                        _raw_1d_refresh = live_exchange.fetch_ohlcv(sym, timeframe="1d", limit=30)
+                        if _raw_1d_refresh:
+                            _mtf_1d_closes = [float(r[4]) for r in _raw_1d_refresh[:-1]]
+                    except Exception:
+                        pass
+
+            # ── 2d. External signal gate ──────────────────────────────
+            if raw_signal == Signal.BUY and ext_gate is not None:
+                _ext_approved, _ext_reason = ext_gate.approve_buy()
+                if not _ext_approved:
+                    raw_signal = Signal.HOLD
+                    print(f"  [{sym}] EXT gate: {_ext_reason}", flush=True)
+                    logger.info("External signal gate blocked BUY [%s]: %s", sym, _ext_reason)
+
+            # ── 3. Warmup guard ───────────────────────────────────────
+            if is_indicator and not ss['strategy'].is_warmed_up:
+                if sym == _active_symbol:
+                    display.warmup(tick, ss['strategy'].tick_count, ss['strategy']._warmup, price)
+                continue
+
+            rsi_val   = ss['strategy'].last_rsi   if is_indicator else None
+            trend_val = ss['strategy'].last_trend if is_indicator else None
+
+            # ── 4. State machine filter + tick ────────────────────────
+            filtered_signal, filter_reason = ss['sm'].filter_signal(raw_signal)
+            ss['sm'].tick()
+
+            # ── 5. Dynamic position sizing ────────────────────────────
+            _max_cash_for_sym = executor.cash / max(len(symbol_state), 1)
+            if filtered_signal == Signal.SELL:
+                trade_qty = ss['pm'].quantity
+            else:
+                trade_qty = cfg.calc_trade_qty(_max_cash_for_sym, price)
+                max_affordable = (_max_cash_for_sym * 0.98) / price
+                trade_qty = min(trade_qty, max_affordable)
+                trade_qty = round(trade_qty, 6)
+
+            # ── 6. AI advisory ────────────────────────────────────────
+            advice       = None
+            final_signal = filtered_signal
+            if ai and ai.enabled and filtered_signal != Signal.HOLD:
+                advice = ai.advise(
+                    price           = price,
+                    rsi             = rsi_val,
+                    trend           = trend_val,
+                    strategy_signal = filtered_signal,
+                    recent_prices   = list(ss['strategy']._closes) if is_indicator else [price],
+                    portfolio       = executor.portfolio,
+                    symbol          = sym,
+                )
+                final_signal = merge_signals(filtered_signal, advice)
+
+            # ── 7. Risk gate ──────────────────────────────────────────
+            approval     = risk.evaluate(final_signal, price, executor.portfolio, trade_qty)
+            block_reason = "" if approval else approval.message
+
+            # ── 7b. Candle-close structured log ───────────────────────
+            if is_indicator and live_exchange is not None:
+                _rsi_log = f"{_rsi_live:.1f}" if _rsi_live is not None else "n/a"
+                _adx_log = f"{_adx_live:.1f}" if _adx_live is not None else "n/a"
+                _action  = (
+                    final_signal.value
+                    if approval else
+                    f"BLOCKED[{approval.block_reason.value if approval.block_reason else '?'}]"
+                )
+                logger.info(
+                    "CANDLE [%s] %s UTC | close=%.2f RSI=%s ADX=%s trend=%s spread=%.3f%% signal=%s -> %s",
+                    sym,
+                    candle.timestamp.strftime("%Y-%m-%d %H:%M"),
+                    price,
+                    _rsi_log,
+                    _adx_log,
+                    _trnd_live,
+                    _spread,
+                    _sig_str,
+                    _action,
+                )
+                candle_log.append({
+                    "sym":    sym,
+                    "ts":     candle.timestamp.strftime("%Y-%m-%d %H:%M"),
+                    "close":  price,
+                    "rsi":    round(_rsi_live, 1) if _rsi_live is not None else None,
+                    "adx":    round(_adx_live, 1) if _adx_live is not None else None,
+                    "trend":  _trnd_live,
+                    "spread": round(_spread, 3),
+                    "signal": _sig_str,
+                    "action": _action,
+                    "reason": _reason,
+                })
+
+            # ── 8. Display tick (active symbol only) ──────────────────
+            if sym == _active_symbol:
+                display.tick(
+                    tick_n        = tick,
+                    price         = price,
+                    raw_signal    = raw_signal.value,
+                    final_signal  = final_signal.value,
+                    rsi           = rsi_val,
+                    trend         = trend_val,
+                    filter_reason = filter_reason,
+                    block_reason  = block_reason,
+                )
+                display.state_line(
+                    state      = ss['sm'].state.value,
+                    cooldown   = ss['sm'].cooldown_remaining,
+                    last_trade = ss['sm'].last_trade_label,
+                )
+                if advice:
+                    vetoed = final_signal != filtered_signal
+                    display.ai_advice(
+                        advice.signal.value, advice.confidence,
+                        advice.reasoning, advice.latency_ms, vetoed,
                     )
-                    trade_log.log_fill(
-                        side          = order.side.value,
-                        symbol        = cfg.exchange.symbol,
-                        quantity      = order.quantity,
-                        price         = order.price,
-                        pnl           = pnl,
-                        exchange      = cfg.exchange.exchange,
-                        signal_reason = filter_reason or raw_signal.value,
-                    )
-                    alerter.fill(
-                        side        = order.side.value,
-                        symbol      = cfg.exchange.symbol,
-                        quantity    = order.quantity,
-                        price       = order.price,
-                        total_value = order.total_value,
-                        pnl         = pnl,
-                        exchange    = cfg.exchange.exchange,
-                    )
-                else:
-                    display.reject(order.reject_reason or "")
 
-        # ── 11. Position summary ───────────────────────────────────────
-        display.position_line(
-            quantity       = position_manager.quantity,
-            symbol         = cfg.exchange.symbol,
-            avg_entry      = position_manager.avg_entry,
-            unrealized_pnl = position_manager.unrealized_pnl(price),
-            realized_pnl   = position_manager.realized_pnl,
-            cash           = executor.cash,
-        )
+            # ── 9. Execute ────────────────────────────────────────────
+            if approval:
+                order = executor.execute(final_signal, price, quantity=trade_qty)
+                if order:
+                    if order.status == OrderStatus.FILLED:
+                        risk.record_fill()
+                        ss['sm'].on_fill(final_signal, order.price)
 
-        # ── 12. Tick log + dashboard ───────────────────────────────────
-        _dash_signal = final_signal.value
-        _dash_rsi    = rsi_val
-        _dash_trend  = trend_val
-        _dash_filter = filter_reason
-        _dash_block  = block_reason
-        tick_log.append({
-            "tick":   tick,
-            "time":   datetime.now().strftime("%H:%M:%S"),
-            "price":  price,
-            "signal": final_signal.value,
-            "rsi":    rsi_val,
-            "trend":  trend_val,
-            "state":  state_machine.state.value,
-            "reason": filter_reason or block_reason,
-        })
-        _render_dashboard(final_signal.value, rsi_val, trend_val)
+                        pnl = None
+                        if order.side == OrderSide.BUY:
+                            ss['pm'].on_buy(order.price, order.quantity)
+                            ss['trail_peak'] = order.price
+                            ss['partial_done'] = False
+                            ss['atr_sl'] = 0.0
+                            ss['atr_tp'] = 0.0
+                            if is_indicator:
+                                _atr_val = _atr_fn(
+                                    list(ss['strategy']._highs),
+                                    list(ss['strategy']._lows),
+                                    list(ss['strategy']._closes),
+                                    cfg.strategy.atr_period,
+                                )
+                                if _atr_val is None or _atr_val <= 0 or cfg.strategy.atr_sl_mult <= 0:
+                                    ss['atr_sl'] = 0.0
+                                    logger.info("ATR SL disabled or unavailable — using fixed SL/TP")
+                                else:
+                                    ss['atr_sl'] = order.price - _atr_val * cfg.strategy.atr_sl_mult
+                                    logger.info(
+                                        "ATR SL/TP [%s]: entry=%.2f atr=%.2f sl=%.2f mult=%.1f",
+                                        sym, order.price, _atr_val, ss['atr_sl'], cfg.strategy.atr_sl_mult,
+                                    )
+                        else:
+                            pnl = ss['pm'].on_sell(order.price, order.quantity)
+                            ss['trail_peak'] = 0.0
+                            ss['partial_done'] = False
+                            ss['atr_sl'] = 0.0
+                            ss['atr_tp'] = 0.0
 
+                        display.fill(
+                            order.side.value, order.quantity,
+                            sym, order.price, order.total_value, pnl,
+                        )
+                        trade_log.log_fill(
+                            side          = order.side.value,
+                            symbol        = sym,
+                            quantity      = order.quantity,
+                            price         = order.price,
+                            pnl           = pnl,
+                            exchange      = cfg.exchange.exchange,
+                            signal_reason = filter_reason or raw_signal.value,
+                        )
+                        alerter.fill(
+                            side        = order.side.value,
+                            symbol      = sym,
+                            quantity    = order.quantity,
+                            price       = order.price,
+                            total_value = order.total_value,
+                            pnl         = pnl,
+                            exchange    = cfg.exchange.exchange,
+                        )
+                    else:
+                        display.reject(order.reject_reason or "")
+
+            # ── 10. Position summary ──────────────────────────────────
+            display.position_line(
+                quantity       = ss['pm'].quantity,
+                symbol         = sym,
+                avg_entry      = ss['pm'].avg_entry,
+                unrealized_pnl = ss['pm'].unrealized_pnl(price),
+                realized_pnl   = ss['pm'].realized_pnl,
+                cash           = executor.cash,
+            )
+
+            # ── 11. Tick log + dashboard (active symbol only) ─────────
+            if sym == _active_symbol:
+                _dash_signal = final_signal.value
+                _dash_rsi    = rsi_val
+                _dash_trend  = trend_val
+                _dash_filter = filter_reason
+                _dash_block  = block_reason
+                tick_log.append({
+                    "tick":   tick,
+                    "time":   datetime.now().strftime("%H:%M:%S"),
+                    "price":  price,
+                    "signal": final_signal.value,
+                    "rsi":    rsi_val,
+                    "trend":  trend_val,
+                    "state":  ss['sm'].state.value,
+                    "reason": filter_reason or block_reason,
+                })
+                _render_dashboard(final_signal.value, rsi_val, trend_val)
+
+        # ── End of per-symbol loop ────────────────────────────────────
         time.sleep(cfg.exchange.loop_interval)
         _now_utc = datetime.now(_tz.utc)
         if _now_utc.hour == 0 and _now_utc.minute == 0:
+            _act_ss = symbol_state.get(_active_symbol, next(iter(symbol_state.values())))
             alerter.daily_pnl(
-                symbol       = cfg.exchange.symbol,
-                realized_pnl = position_manager.realized_pnl,
-                total_value  = executor.portfolio.total_value(price),
+                symbol       = _active_symbol,
+                realized_pnl = _act_ss['pm'].realized_pnl,
+                total_value  = executor.portfolio.total_value(
+                    _act_ss.get('last_price') or 0
+                ),
                 trade_count  = risk._fills_today,
             )
 

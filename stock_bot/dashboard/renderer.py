@@ -789,8 +789,8 @@ def _portfolio_overview_html(
     """
     all_positions: list[dict] = []
 
-    # Real positions — PortfolioSummary.positions is list[PortfolioPosition]
-    if portfolio_summary and portfolio_summary.positions:
+    # Real positions — skip when paper_summary has positions (same executor source — avoids duplicates)
+    if portfolio_summary and portfolio_summary.positions and not (paper_summary and paper_summary.positions):
         for p in portfolio_summary.positions:
             all_positions.append({
                 "symbol":   p.symbol,

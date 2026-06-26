@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
@@ -283,6 +283,27 @@ class AlertConfig:
     telegram_chat_id:  str  = ""
 
 
+@dataclass
+class UniverseConfig:
+    enabled:         bool  = False                        # UNIVERSE_ENABLED
+    size:            int   = 5                            # UNIVERSE_SIZE
+    min_vol:         float = 1000.0                       # UNIVERSE_MIN_VOL_CAD
+    universe_quote:  str   = "CAD"                        # UNIVERSE_QUOTE
+    universe_exclude: str  = "EUR,USD,USDC,USDT,DAI,BUSD"  # UNIVERSE_EXCLUDE
+
+    def __post_init__(self):
+        if self.size < 1:
+            raise ValueError("UNIVERSE_SIZE must be >= 1")
+        if self.min_vol < 0:
+            raise ValueError("UNIVERSE_MIN_VOL_CAD must be >= 0")
+
+
+@dataclass
+class PaperConfig:
+    paper_mode:          bool  = False
+    paper_starting_cash: float = 1000.0
+
+
 # ---------------------------------------------------------------------------
 # Root config
 # ---------------------------------------------------------------------------
@@ -298,6 +319,8 @@ class AppConfig:
     backtest:  BacktestConfig
     signals:   ExternalSignalsConfig
     alerts:    AlertConfig
+    universe:  UniverseConfig
+    paper:     PaperConfig = field(default_factory=PaperConfig)
 
     def calc_trade_qty(self, cash: float, price: float) -> float:
         """
@@ -375,6 +398,9 @@ class AppConfig:
             self.risk.cooldown_ticks)
         logger.info("CONFIG  portfolio  starting_cash=$%.2f  AI=%s",
             self.portfolio.starting_cash, self.ai.enabled)
+        if self.paper.paper_mode:
+            logger.info("CONFIG  paper_mode=True  starting_cash=$%.2f",
+                self.paper.paper_starting_cash)
 
         if self.risk.max_position_pct <= self.risk.risk_per_trade_pct * 1.05:
             logger.warning(
@@ -390,6 +416,18 @@ class AppConfig:
             )
 
         logger.info("─" * 60)
+
+
+# ---------------------------------------------------------------------------
+# Helpers — called at runtime with live values, not cached
+# ---------------------------------------------------------------------------
+
+def per_symbol_max_pct(universe_size: int, max_position_pct: float) -> float:
+    """Max position fraction per symbol slot.
+    e.g. universe_size=5, max_position_pct=0.55 → 0.11 per symbol"""
+    if universe_size <= 0:
+        return 0.0
+    return max_position_pct / universe_size
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +529,17 @@ def _load() -> AppConfig:
             telegram_enabled    = _bool("TELEGRAM_ENABLED",    False),
             telegram_bot_token  = _str ("TELEGRAM_BOT_TOKEN",  ""),
             telegram_chat_id    = _str ("TELEGRAM_CHAT_ID",    ""),
+        ),
+        universe=UniverseConfig(
+            enabled           = _bool ("UNIVERSE_ENABLED",       False),
+            size              = _int  ("UNIVERSE_SIZE",          5),
+            min_vol           = _float("UNIVERSE_MIN_VOL_CAD",   1000.0),
+            universe_quote    = _str  ("UNIVERSE_QUOTE",         "CAD"),
+            universe_exclude  = _str  ("UNIVERSE_EXCLUDE",       "EUR,USD,USDC,USDT,DAI,BUSD"),
+        ),
+        paper=PaperConfig(
+            paper_mode          = _bool ("PAPER_MODE",          False),
+            paper_starting_cash = _float("PAPER_STARTING_CASH", 1000.0),
         ),
     )
 

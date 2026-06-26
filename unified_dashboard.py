@@ -120,6 +120,22 @@ def _combined_stats(crypto: dict | None, stock: dict | None) -> str:
     )
 
 
+def _fetch_crypto_price(symbol: str) -> str:
+    try:
+        import urllib.request
+        pair = symbol.replace("/", "").replace("BTC", "XBT")
+        url = f"https://api.kraken.com/0/public/Ticker?pair={pair}"
+        with urllib.request.urlopen(url, timeout=3) as r:
+            data = json.loads(r.read())
+            result = data.get("result", {})
+            if result:
+                ticker = list(result.values())[0]
+                return f"${float(ticker['c'][0]):,.2f}"
+    except Exception:
+        pass
+    return "—"
+
+
 def _crypto_card(state: dict | None) -> str:
     if state is None:
         return (
@@ -139,8 +155,9 @@ def _crypto_card(state: dict | None) -> str:
     saved    = _fmt_ts(state.get("saved_at"))
     base     = symbol.split("/")[0] if "/" in symbol else "crypto"
 
-    pos_val  = basis if position > 0 else 0.0
-    total    = cash + pos_val
+    pos_val    = basis if position > 0 else 0.0
+    total      = cash + pos_val
+    live_price = _fetch_crypto_price(symbol)
 
     holding_row = _kv("Position", f"{position:.6f} {base}") if position > 0 else _kv("Position", "Flat")
     basis_row   = _kv("Cost basis", f"${basis:,.2f}") if position > 0 else ""
@@ -151,6 +168,7 @@ def _crypto_card(state: dict | None) -> str:
         '<span class="pf-card-title">⚡ Crypto Bot</span>'
         f'<span class="pf-card-badge" style="background:#1f6feb22;color:#58a6ff;border-color:#1f6feb55">LIVE · {symbol}</span>'
         '</div>'
+        + _kv("Live Price", f"<strong>{live_price}</strong>")
         + _kv("Cash", f"${cash:,.2f} CAD")
         + holding_row
         + basis_row
