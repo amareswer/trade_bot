@@ -36,6 +36,20 @@ def _load_json(path: str) -> dict | None:
         return None
 
 
+def read_live_signals() -> dict:
+    import csv
+    try:
+        with open("logs/live_signals.csv", encoding="utf-8", newline="") as f:
+            last: dict = {}
+            for row in csv.DictReader(f):
+                sym = (row.get("symbol") or "").strip()
+                if sym:
+                    last[sym] = row
+        return last
+    except Exception:
+        return {}
+
+
 def _fmt_ts(ts: str | None) -> str:
     if not ts:
         return "—"
@@ -120,6 +134,70 @@ def _combined_stats(crypto: dict | None, stock: dict | None) -> str:
     )
 
 
+def _signals_section(signals: dict) -> str:
+    if not signals:
+        return (
+            '<div style="margin-top:14px;padding:10px 14px;background:#0d1117;'
+            'border:1px solid #30363d;border-radius:6px;font-size:11px;color:#8b949e;'
+            'font-style:italic">No candle closes yet — waiting for signals</div>'
+        )
+
+    TH = ('style="text-align:left;padding:6px 10px;font-size:10px;color:#8b949e;'
+          'font-weight:600;text-transform:uppercase;letter-spacing:.05em;'
+          'border-bottom:1px solid #30363d;white-space:nowrap"')
+    TD = 'padding:7px 10px;border-bottom:1px solid #21262d;font-size:12px;white-space:nowrap'
+
+    rows = ""
+    for sym in sorted(signals):
+        row = signals[sym]
+        try:
+            price_str = f"${float(row.get('close', 0)):,.2f}"
+        except Exception:
+            price_str = row.get("close", "—")
+        try:
+            rsi = f"{float(row.get('rsi', 0)):.1f}"
+        except Exception:
+            rsi = row.get("rsi", "—")
+        try:
+            adx = f"{float(row.get('adx', 0)):.1f}"
+        except Exception:
+            adx = row.get("adx", "—")
+        signal = (row.get("signal") or "—").strip()
+        reason = (row.get("reason") or "—").strip()
+        sig_color = {"BUY": "#3fb950", "SELL": "#f85149"}.get(signal.upper(), "#8b949e")
+        rows += (
+            f'<tr>'
+            f'<td style="{TD};color:#c9d1d9"><strong>{sym}</strong></td>'
+            f'<td style="{TD};color:#c9d1d9">{price_str}</td>'
+            f'<td style="{TD};color:#c9d1d9">{rsi}</td>'
+            f'<td style="{TD};color:#c9d1d9">{adx}</td>'
+            f'<td style="{TD};color:{sig_color};font-weight:600">{signal}</td>'
+            f'<td style="{TD};color:#8b949e">{reason}</td>'
+            f'</tr>'
+        )
+
+    return (
+        '<div style="margin-top:14px;background:#0d1117;border:1px solid #30363d;'
+        'border-radius:6px;overflow:hidden;overflow-x:auto">'
+        '<div style="padding:8px 12px;border-bottom:1px solid #30363d;font-size:10px;'
+        'color:#8b949e;text-transform:uppercase;letter-spacing:.05em;font-weight:600">'
+        'Active Signals'
+        '</div>'
+        '<table style="width:100%;border-collapse:collapse">'
+        '<thead><tr>'
+        f'<th {TH}>Symbol</th>'
+        f'<th {TH}>Price</th>'
+        f'<th {TH}>RSI</th>'
+        f'<th {TH}>ADX</th>'
+        f'<th {TH}>Signal</th>'
+        f'<th {TH}>Reason</th>'
+        '</tr></thead>'
+        f'<tbody>{rows}</tbody>'
+        '</table>'
+        '</div>'
+    )
+
+
 def _fetch_crypto_price(symbol: str) -> str:
     try:
         import urllib.request
@@ -169,6 +247,7 @@ def _crypto_card(state: dict | None) -> str:
         f'<span class="pf-card-badge" style="background:#1f6feb22;color:#58a6ff;border-color:#1f6feb55">LIVE · {symbol}</span>'
         '</div>'
         + _kv("Live Price", f"<strong>{live_price}</strong>")
+        + _signals_section(read_live_signals())
         + _kv("Cash", f"${cash:,.2f} CAD")
         + holding_row
         + basis_row

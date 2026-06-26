@@ -612,7 +612,7 @@ def run():
                     _last_candle_time = time.time()
 
             # ── 1c. Position drift reconciliation (every 60 ticks, live) ──
-            if cfg.exchange.live_trading and sym == _active_symbol and tick % 60 == 0:
+            if cfg.exchange.live_trading and not cfg.exchange.dry_run and sym == _active_symbol and tick % 60 == 0:
                 try:
                     balance = executor._exchange.fetch_balance()
                     base = sym.split("/")[0]
