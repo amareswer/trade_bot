@@ -290,7 +290,11 @@ class LiveExecutor:
             )
             return False
 
-        # Only restore accounting fields — position and cash come from the exchange
+        # Restore all fields. In live mode, cash and position are subsequently
+        # overwritten by _sync_cash / _sync_position (exchange is authoritative).
+        # In dry-run there is no exchange sync, so these values must come from state.
+        self._portfolio.cash          = float(state.get("cash",         self._starting_cash))
+        self._portfolio.position      = float(state.get("position",     0.0))
         self._portfolio._cost_basis   = float(state.get("cost_basis",   0.0))
         self._portfolio.realized_pnl  = float(state.get("realized_pnl", 0.0))
         self._fees_paid               = float(state.get("fees_paid",     0.0))
@@ -373,7 +377,7 @@ class LiveExecutor:
                     limit_price_f = bid * (1.0 + tick_pct)
                 else:
                     ask           = float(book["asks"][0][0])
-                    limit_price_f = ask * (1.0 - tick_pct)
+                    limit_price_f = ask * (1.0 + tick_pct)
                 limit_price = self._exchange.price_to_precision(self.symbol, limit_price_f)
             except Exception as exc:
                 logger.warning(
@@ -525,10 +529,23 @@ class LiveExecutor:
                 else:
                     if self._order_type == "limit" and side == OrderSide.BUY:
                         # Passive bid 0.2% below market — qualifies for Kraken maker rate (0.16%)
-                        # SELL is always market for guaranteed exit regardless of ORDER_TYPE
                         limit_price = round(price * 0.998, 2)
                         logger.warning(
                             "LIMIT BUY: %.6f %s @ %.2f (0.2%% below %.2f)",
+                            quantity, self.symbol, limit_price, price,
+                        )
+                        raw = self._exchange.create_order(
+                            symbol = self.symbol,
+                            type   = "limit",
+                            side   = ccxt_side,
+                            amount = quantity,
+                            price  = limit_price,
+                        )
+                    elif self._order_type == "limit" and side == OrderSide.SELL:
+                        # Passive ask 0.1% above market — qualifies for Kraken maker rate (0.16%)
+                        limit_price = round(price * 1.001, 2)
+                        logger.warning(
+                            "LIMIT SELL: %.6f %s @ %.2f (0.1%% above %.2f)",
                             quantity, self.symbol, limit_price, price,
                         )
                         raw = self._exchange.create_order(

@@ -217,7 +217,10 @@ def test_live_sell_updates_portfolio():
 # Test 6: fetch_order polling resolves when order reaches 'closed'
 # ---------------------------------------------------------------------------
 
-def test_fetch_order_polling_resolves_on_close():
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_fetch_order_polling_resolves_on_close(mock_cfg, mock_sleep):
+    mock_cfg.exchange.limit_order_enabled = False  # force market-order path so range(1,10) poll loop runs
     ex, mock_ex = _make(dry_run=False, starting_cash=1000.0)
 
     # create_order returns 'open' (not yet filled)
@@ -246,26 +249,31 @@ def test_fetch_order_polling_resolves_on_close():
 # Test 7: 3 polls, never 'closed' — partial fill saved, warning logged
 # ---------------------------------------------------------------------------
 
-def test_fetch_order_polling_timeout_uses_partial_fill(caplog):
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_fetch_order_polling_timeout_uses_partial_fill(mock_cfg, mock_sleep, caplog):
     import logging
+    mock_cfg.exchange.limit_order_enabled = False  # force market-order path so range(1,10) poll loop runs
     ex, mock_ex = _make(dry_run=False, starting_cash=1000.0)
 
     mock_ex.create_order.return_value = {
         "id": "order-003", "status": "open", "filled": 0.0,
         "average": None, "price": 90_000.0, "fee": {},
     }
-    # All 3 polls still 'open', partial fill accumulates
+    # All 9 polls (range(1,10)) still 'open'; partial fill accumulates through first 3 then holds
+    _open = lambda filled: {"id": "order-003", "status": "open", "filled": filled,
+                             "average": None, "price": 90_000.0, "fee": {}}
     mock_ex.fetch_order.side_effect = [
-        {"id": "order-003", "status": "open", "filled": 0.0003, "average": None, "price": 90_000.0, "fee": {}},
-        {"id": "order-003", "status": "open", "filled": 0.0006, "average": None, "price": 90_000.0, "fee": {}},
-        {"id": "order-003", "status": "open", "filled": 0.0008, "average": None, "price": 90_000.0, "fee": {}},
+        _open(0.0003), _open(0.0006), _open(0.0008),
+        _open(0.0008), _open(0.0008), _open(0.0008),
+        _open(0.0008), _open(0.0008), _open(0.0008),
     ]
 
     with caplog.at_level(logging.WARNING, logger="bot.execution.live_executor"):
         order = ex.execute(Signal.BUY, 90_000.0, 0.001)
 
     assert order.status == OrderStatus.FILLED
-    assert mock_ex.fetch_order.call_count == 3
+    assert mock_ex.fetch_order.call_count == 9  # range(1,10) exhausted before 'closed'
     # Uses last reported filled amount
     assert abs(order.quantity - 0.0008) < 1e-9
     # Warning was logged
@@ -327,7 +335,17 @@ def test_state_save_load_roundtrip():
 
         assert os.path.exists(state_path)
 
-        # Load a second executor from same state_path
+        # Configure the mock exchange to report the values that match the saved state.
+        # _sync_cash needs free.CAD; _sync_position needs free+total.BTC;
+        # fetch_ticker is called to reseed cost_basis if prev_position was 0 on load.
+        mock_ex.fetch_balance.return_value = {
+            "free":  {"CAD": ex.cash, "BTC": ex.position},
+            "total": {"CAD": ex.cash, "BTC": ex.position},
+        }
+        mock_ex.fetch_ticker.return_value = {"last": ex.avg_entry}
+
+        # Second executor simulates a live restart: dry_run=False so _sync_cash and
+        # _sync_position run and pull cash/position from the mocked exchange.
         with patch.object(le_mod.ccxt, "kraken") as mock_cls2:
             mock_cls2.return_value = mock_ex
             ex2 = LiveExecutor(
@@ -336,7 +354,7 @@ def test_state_save_load_roundtrip():
                 api_key       = "k",
                 api_secret    = "s",
                 starting_cash = 1000.0,
-                dry_run       = True,
+                dry_run       = False,
                 state_path    = state_path,
             )
 
@@ -351,9 +369,9 @@ def test_state_save_load_roundtrip():
 
 def test_sync_cash_uses_exchange_free_balance():
     ex, mock_ex = _make(dry_run=False, starting_cash=100.0, balance={"free": {"CAD": 150.75}})
-    # After __init__, cash should be the exchange balance
+    # After __init__, cash should be the exchange balance (_sync_cash + _sync_position both call fetch_balance)
     assert abs(ex.cash - 150.75) < 0.01
-    mock_ex.fetch_balance.assert_called_once()
+    assert mock_ex.fetch_balance.call_count >= 1
 
 
 def test_sync_cash_falls_back_on_error(caplog):
@@ -436,7 +454,10 @@ def test_restart_recovery_seeds_position_manager_and_state_machine():
 
         mock_ex = MagicMock()
         mock_ex.load_markets.return_value = _DEFAULT_MARKETS
-        mock_ex.fetch_balance.return_value = {"free": {"CAD": 89.88}}
+        mock_ex.fetch_balance.return_value = {
+            "free":  {"CAD": 89.88, "BTC": 0.000113},
+            "total": {"CAD": 89.88, "BTC": 0.000113},
+        }
 
         with patch.object(le_mod.ccxt, "kraken") as mock_cls:
             mock_cls.return_value = mock_ex

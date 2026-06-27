@@ -634,13 +634,20 @@ def run():
             # ── 2. Intra-candle SL/TP + Trailing Stop + Partial TP ───
             if is_indicator and live_exchange is not None:
                 if ss['pm'].has_position and ss['pm'].avg_entry > 0:
-                    _ic_entry = ss['pm'].avg_entry
-                    ss['trail_peak'] = max(ss['trail_peak'], price)
+                    _ic_entry       = ss['pm'].avg_entry
+                    _trail_stop_pct = cfg.backtest.trail_stop_pct
+                    _trail_act_pct  = cfg.backtest.trail_stop_activation_pct
+                    if _trail_stop_pct > 0:
+                        if ss['trail_peak'] == 0.0:
+                            if _trail_act_pct == 0.0 or price >= _ic_entry * (1 + _trail_act_pct):
+                                ss['trail_peak'] = price
+                        else:
+                            ss['trail_peak'] = max(ss['trail_peak'], price)
                     _trail_sl_level = (
                         ss['atr_sl'] if ss['atr_sl'] > 0
                         else (
-                            ss['trail_peak'] * (1 - cfg.backtest.stop_loss_pct)
-                            if ss['trail_peak'] > 0 and cfg.backtest.stop_loss_pct > 0 else 0.0
+                            ss['trail_peak'] * (1 - _trail_stop_pct)
+                            if ss['trail_peak'] > 0 and _trail_stop_pct > 0 else 0.0
                         )
                     )
 
@@ -883,6 +890,51 @@ def run():
                     raw_signal = Signal.HOLD
                     print(f"  [{sym}] EXT gate: {_ext_reason}", flush=True)
                     logger.info("External signal gate blocked BUY [%s]: %s", sym, _ext_reason)
+
+            # ── 2e. Regime gate ───────────────────────────────────────
+            # Independent check: ADX ≥ threshold AND EMA spread ≥ MIN_EMA_SPREAD_PCT.
+            # Runs after strategy evaluation so it can override BUY → HOLD when the
+            # broader regime is degraded even if this specific candle passed strategy filters.
+            if is_indicator and live_exchange is not None:
+                _rg_adx_ok    = _adx_live is not None and _adx_live >= cfg.strategy.adx_threshold
+                _rg_spread_ok = _spread >= cfg.strategy.min_ema_spread_pct * 100
+                _rg_ok        = _rg_adx_ok and _rg_spread_ok
+
+                if not _rg_ok:
+                    _rg_parts = []
+                    if not _rg_adx_ok:
+                        _rg_parts.append(
+                            f"ADX {_adx_live:.1f} < {cfg.strategy.adx_threshold:.0f}"
+                            if _adx_live is not None else "ADX n/a"
+                        )
+                    if not _rg_spread_ok:
+                        _rg_parts.append(
+                            f"EMA spread {_spread:.3f}% < {cfg.strategy.min_ema_spread_pct * 100:.1f}%"
+                        )
+                    _rg_status_msg = "  ".join(_rg_parts)
+
+                    if raw_signal == Signal.BUY:
+                        raw_signal = Signal.HOLD
+                        print(
+                            f"  [{sym}] REGIME GATE: BUY overridden → HOLD"
+                            f"  ({_rg_status_msg})",
+                            flush=True,
+                        )
+                        logger.warning(
+                            "REGIME GATE [%s]: BUY overridden → HOLD  %s", sym, _rg_status_msg
+                        )
+                    else:
+                        print(
+                            f"  [{sym}] REGIME GATE: degraded  ({_rg_status_msg})"
+                            f"  — BUY would be blocked",
+                            flush=True,
+                        )
+                        logger.info(
+                            "REGIME GATE [%s]: degraded  %s  — no BUY to override",
+                            sym, _rg_status_msg,
+                        )
+                else:
+                    logger.info("REGIME GATE [%s]: OK  ADX=%.1f  spread=%.3f%%", sym, _adx_live, _spread)
 
             # ── 3. Warmup guard ───────────────────────────────────────
             if is_indicator and not ss['strategy'].is_warmed_up:

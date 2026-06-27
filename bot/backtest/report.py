@@ -74,9 +74,10 @@ def print_report(metrics: BacktestMetrics, result: BacktestResult) -> None:
 
         sl_exits = sum(1 for f in result.fills if f.side == "SELL" and f.reason == "stop_loss")
         tp_exits = sum(1 for f in result.fills if f.side == "SELL" and f.reason == "take_profit")
+        ts_exits = sum(1 for f in result.fills if f.side == "SELL" and f.reason == "trail_stop")
         st_exits = sum(1 for f in result.fills if f.side == "SELL" and f.reason == "strategy")
-        if sl_exits or tp_exits:
-            _row("Exit reasons",  f"SL={sl_exits}  TP={tp_exits}  strategy={st_exits}")
+        if sl_exits or tp_exits or ts_exits:
+            _row("Exit reasons",  f"SL={sl_exits}  TP={tp_exits}  TS={ts_exits}  strategy={st_exits}")
 
     print(f"\n  {_B}RISK{_R}")
     print(f"  {'─'*46}")

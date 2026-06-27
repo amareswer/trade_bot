@@ -128,18 +128,13 @@ class StrategyConfig:
     adx_period:              int   = 14
     adx_threshold:           float = 25.0  # < this = ranging market → HOLD
     adx_max:                 float = 0.0   # 0 = disabled; 30.0 = reject ADX > 30
+    min_ema_spread_pct:      float = 0.002 # require fast EMA ≥ this % above slow EMA to enter
     max_ema_spread_pct:      float = 0.0   # 0 = disabled; 0.005 = 0.5% ceiling
     rsi_filter_enabled:      bool  = True  # False = bypass RSI level/direction checks
     regime_ema_period:       int   = 200   # BUY only when price > this EMA (0 = disabled)
     regime_ema_slope_filter: bool  = False # BUY only when EMA200 slope > 0 (rising)
     volume_k:                float = 0.0   # volume filter multiplier (0 = disabled)
     macd_enabled:            bool  = True  # BUY only when MACD histogram is rising
-    # ── Dual-regime additions ─────────────────────────────────────────────────
-    regime_enabled:          bool  = True  # True = dual-regime; False = trend-only (original)
-    bb_period:               int   = 20    # Bollinger Band period for ranging detection
-    bb_std_dev:              float = 2.0   # Bollinger Band std-dev multiplier
-    mr_rsi_oversold:         float = 35.0  # mean-reversion BUY threshold (ranging mode)
-    mr_rsi_overbought:       float = 65.0  # mean-reversion SELL threshold (ranging mode)
     atr_volatile_multiplier: float = 1.5   # ATR > mult × avg ATR → sit flat (VOLATILE)
     atr_sl_mult:             float = 2.0   # reads ATR_SL_MULT — SL = entry - atr × mult
     atr_tp_mult:             float = 4.0   # reads ATR_TP_MULT — TP = entry + atr × mult
@@ -240,7 +235,8 @@ class BacktestConfig:
     fee_pct:             float = 0.008   # 0.8% Kraken taker fee (validated 2026-06-19)
     stop_loss_pct:       float = 0.015   # exit if price drops 1.5% from entry (0 = disabled)
     take_profit_pct:     float = 0.10    # exit if price rises 10% from entry (0 = disabled)
-    trail_stop_pct:      float = 0.0     # trailing stop distance from peak (0 = disabled)
+    trail_stop_pct:             float = 0.0  # trailing stop distance from peak (0 = disabled)
+    trail_stop_activation_pct:  float = 0.03 # min profit before trail activates (0 = immediate)
     partial_tp_pct:      float = 0.0     # sell partial_tp_size at this gain (0 = disabled)
     partial_tp_size:     float = 0.5     # fraction of position to sell at partial TP
     atr_sl_enabled:      bool  = False   # True = ATR-based SL; False = fixed % SL
@@ -464,17 +460,13 @@ def _load() -> AppConfig:
             adx_period              = _int  ("ADX_PERIOD",              14),
             adx_threshold           = _float("ADX_THRESHOLD",           25.0),  # live .env must set 18
             adx_max                 = _float("ADX_MAX",                 0.0),
+            min_ema_spread_pct      = _float("MIN_EMA_SPREAD_PCT",      0.002),
             max_ema_spread_pct      = _float("MAX_EMA_SPREAD_PCT",      0.0),
             rsi_filter_enabled      = _bool ("RSI_FILTER_ENABLED",      True),
             regime_ema_period       = _int  ("REGIME_EMA_PERIOD",       200),
             regime_ema_slope_filter = _bool ("REGIME_EMA_SLOPE_FILTER", False),
             volume_k                = _float("VOLUME_K",                0.0),
             macd_enabled            = _bool ("MACD_ENABLED",            True),
-            regime_enabled          = _bool ("REGIME_ENABLED",          True),
-            bb_period               = _int  ("BB_PERIOD",               20),
-            bb_std_dev              = _float("BB_STD_DEV",              2.0),
-            mr_rsi_oversold         = _float("MR_RSI_OVERSOLD",         35.0),
-            mr_rsi_overbought       = _float("MR_RSI_OVERBOUGHT",       65.0),
             atr_volatile_multiplier = _float("ATR_VOLATILE_MULTIPLIER", 1.5),
             atr_sl_mult             = _float("ATR_SL_MULT",              2.0),
             atr_tp_mult             = _float("ATR_TP_MULT",              4.0),
@@ -509,7 +501,8 @@ def _load() -> AppConfig:
             fee_pct          = _float("BACKTEST_FEE_PCT",     0.008),
             stop_loss_pct    = _float("STOP_LOSS_PCT",        0.015),
             take_profit_pct  = _float("TAKE_PROFIT_PCT",      0.10),
-            trail_stop_pct   = _float("TRAIL_STOP_PCT",       0.0),
+            trail_stop_pct              = _float("TRAILING_STOP_PCT",            0.0),
+            trail_stop_activation_pct   = _float("TRAILING_STOP_ACTIVATION_PCT", 0.03),
             partial_tp_pct   = _float("PARTIAL_TP_PCT",       0.0),
             partial_tp_size  = _float("PARTIAL_TP_SIZE",      0.5),
             atr_sl_enabled   = _bool ("ATR_SL_ENABLED",       False),

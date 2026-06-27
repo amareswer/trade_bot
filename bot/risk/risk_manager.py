@@ -118,8 +118,8 @@ class RiskManager:
         if signal == Signal.HOLD:
             return APPROVED
 
-        # ── Check 1: manual halt (BUY only — SELL must always be allowed to close positions) ──
-        if signal == Signal.BUY and self.config.halt:
+        # ── Check 1: manual halt — blocks BUY and SELL (HOLD returns early above) ──
+        if self.config.halt:
             return ApprovalResult(
                 approved=False,
                 message="Trading is halted (config.halt=True)",

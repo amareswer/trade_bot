@@ -1,0 +1,385 @@
+"""
+regime_monitor.py — BTC/CAD live strategy regime health check.
+
+Fetches the last 200 × 1h Kraken candles and reports four metrics:
+
+  1. Current ADX(14)      — must be ≥ 18 for trend-following to have edge
+  2. ADX-active %         — % of last 50 candles where ADX ≥ 18  (threshold: ≥ 40%)
+  3. Rolling PF           — simulated profit factor over last 50 candles using live
+                            SL=1.5% / TP=10% settings (threshold: ≥ 1.2)
+  4. Current EMA spread   — (EMA9 − EMA21) / EMA21 as %; must be ≥ 0.4% to confirm
+                            the EMAs are separated enough for a genuine trend signal
+
+BUY signal for rolling PF uses simplified trend conditions (no EMA200 filter —
+200 candles is the full dataset so EMA200 would leave zero tradeable candles):
+  - ADX(14) ≥ ADX_THRESHOLD
+  - EMA(9) > EMA(21)   (fast above slow = bullish trend)
+  - RSI(14) < RSI_OVERSOLD  (pullback entry trigger)
+
+Exits are resolved forward: first candle whose high ≥ TP price → profit,
+first candle whose low ≤ SL price → loss. Unresolved entries are excluded.
+
+Logs one line per run to logs/regime_health.log. Never places orders.
+
+Usage:
+    python regime_monitor.py
+
+Cron (every 4 hours):
+    0 */4 * * *  cd /path/to/trade_bot && python regime_monitor.py
+"""
+from __future__ import annotations
+
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ── Settings ——————————————————————————————————————————————————————————————————
+# Defaults match live Kraken config (CLAUDE.md). Override with env vars if needed.
+EXCHANGE_ID     = os.getenv("MONITOR_EXCHANGE",   "kraken")
+SYMBOL          = os.getenv("MONITOR_SYMBOL",     "BTC/CAD")
+TIMEFRAME       = os.getenv("MONITOR_TIMEFRAME",  "1h")
+FETCH_LIMIT     = int(os.getenv("MONITOR_LIMIT",  "200"))
+WINDOW          = int(os.getenv("MONITOR_WINDOW", "50"))
+ADX_PERIOD      = 14
+ADX_THRESHOLD   = float(os.getenv("ADX_THRESHOLD",    "18.0"))
+STOP_LOSS_PCT    = float(os.getenv("STOP_LOSS_PCT",       "0.015"))
+TAKE_PROFIT_PCT  = float(os.getenv("TAKE_PROFIT_PCT",     "0.10"))
+RSI_OVERSOLD     = float(os.getenv("RSI_OVERSOLD",        "30.0"))
+FAST_EMA_PERIOD  = int(os.getenv("FAST_EMA_PERIOD",       "9"))
+SLOW_EMA_PERIOD  = int(os.getenv("SLOW_EMA_PERIOD",       "21"))
+MIN_EMA_SPREAD_PCT = float(os.getenv("MIN_EMA_SPREAD_PCT", "0.004"))
+
+# Health pass/fail thresholds (what the strategy needs for edge)
+PF_MIN           = 1.2
+ADX_PCT_MIN      = 40.0
+EMA_SPREAD_MIN   = MIN_EMA_SPREAD_PCT * 100  # convert to % for display (0.4)
+
+# ── Log file ——————————————————————————————————————————————————————————————————
+LOG_DIR  = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+LOG_FILE = LOG_DIR / "regime_health.log"
+
+
+# ── Indicator helpers (inlined — no import chain needed) ——————————————————————
+
+def _ema(prices: list[float], period: int) -> float | None:
+    if len(prices) < period:
+        return None
+    k = 2.0 / (period + 1)
+    v = sum(prices[:period]) / period
+    for p in prices[period:]:
+        v = p * k + v * (1.0 - k)
+    return v
+
+
+def _rsi(prices: list[float], period: int = 14) -> float | None:
+    if len(prices) < period + 1:
+        return None
+    changes = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
+    gains   = [max(c, 0.0) for c in changes]
+    losses  = [abs(min(c, 0.0)) for c in changes]
+    avg_g   = sum(gains[:period]) / period
+    avg_l   = sum(losses[:period]) / period
+    for i in range(period, len(changes)):
+        avg_g = (avg_g * (period - 1) + gains[i]) / period
+        avg_l = (avg_l * (period - 1) + losses[i]) / period
+    if avg_l == 0.0:
+        return 100.0
+    return 100.0 - (100.0 / (1.0 + avg_g / avg_l))
+
+
+def _adx(
+    highs: list[float],
+    lows:  list[float],
+    closes: list[float],
+    period: int = 14,
+) -> float | None:
+    n = len(closes)
+    if n < 2 * period + 1 or len(highs) != n or len(lows) != n:
+        return None
+    tr_list, pdm_list, ndm_list = [], [], []
+    for i in range(1, n):
+        h, lo, pc = highs[i], lows[i], closes[i - 1]
+        ph, pl    = highs[i - 1], lows[i - 1]
+        tr   = max(h - lo, abs(h - pc), abs(lo - pc))
+        up   = h - ph
+        down = pl - lo
+        pdm  = up   if up > down and up > 0   else 0.0
+        ndm  = down if down > up and down > 0 else 0.0
+        tr_list.append(tr)
+        pdm_list.append(pdm)
+        ndm_list.append(ndm)
+    atr  = sum(tr_list[:period])
+    apdm = sum(pdm_list[:period])
+    andm = sum(ndm_list[:period])
+    dx_list: list[float] = []
+    for i in range(period, len(tr_list)):
+        atr  = atr  - atr  / period + tr_list[i]
+        apdm = apdm - apdm / period + pdm_list[i]
+        andm = andm - andm / period + ndm_list[i]
+        pdi  = 100.0 * apdm / atr if atr > 0 else 0.0
+        ndi  = 100.0 * andm / atr if atr > 0 else 0.0
+        denom = pdi + ndi
+        dx_list.append(100.0 * abs(pdi - ndi) / denom if denom > 0 else 0.0)
+    if len(dx_list) < period:
+        return None
+    adx_val = sum(dx_list[:period]) / period
+    for dx in dx_list[period:]:
+        adx_val = (adx_val * (period - 1) + dx) / period
+    return adx_val
+
+
+# ── Metric computation ————————————————————————————————————————————————————————
+
+def compute_adx_metrics(
+    highs:  list[float],
+    lows:   list[float],
+    closes: list[float],
+) -> tuple[float | None, float]:
+    """
+    Returns (current_adx, adx_active_pct).
+
+    current_adx    — ADX(14) on the most recent candle (uses all FETCH_LIMIT candles).
+    adx_active_pct — % of candles in the last WINDOW positions where ADX ≥ ADX_THRESHOLD.
+    """
+    n     = len(closes)
+    start = max(0, n - WINDOW)
+
+    adx_series: list[float | None] = []
+    for i in range(start, n):
+        adx_series.append(_adx(highs[: i + 1], lows[: i + 1], closes[: i + 1], period=ADX_PERIOD))
+
+    current_adx = adx_series[-1] if adx_series else None
+
+    valid      = [v for v in adx_series if v is not None]
+    active_pct = (sum(1 for v in valid if v >= ADX_THRESHOLD) / len(valid) * 100) if valid else 0.0
+
+    return current_adx, active_pct
+
+
+def compute_rolling_pf(
+    highs:  list[float],
+    lows:   list[float],
+    closes: list[float],
+) -> tuple[float, int]:
+    """
+    Simulate BUY entries on trend signals over the last WINDOW candles.
+
+    Signal: ADX ≥ threshold  AND  EMA(fast) > EMA(slow)  AND  RSI < RSI_OVERSOLD.
+    Exit:   first subsequent candle whose high ≥ TP price  → profit;
+            first subsequent candle whose low  ≤ SL price  → loss.
+    Unresolved entries (no SL/TP hit before end of data) are excluded.
+
+    Returns (profit_factor, completed_trade_count).
+    """
+    n     = len(closes)
+    start = max(0, n - WINDOW)
+
+    gross_profit = 0.0
+    gross_loss   = 0.0
+    trade_count  = 0
+
+    for i in range(start, n):
+        h  = highs[:i + 1]
+        lo = lows[:i + 1]
+        c  = closes[:i + 1]
+
+        adx_val  = _adx(h, lo, c, period=ADX_PERIOD)
+        rsi_val  = _rsi(c, period=14)
+        fast_val = _ema(c, period=FAST_EMA_PERIOD)
+        slow_val = _ema(c, period=SLOW_EMA_PERIOD)
+
+        if any(v is None for v in [adx_val, rsi_val, fast_val, slow_val]):
+            continue
+
+        is_buy = (
+            adx_val  >= ADX_THRESHOLD
+            and fast_val > slow_val
+            and rsi_val  < RSI_OVERSOLD
+        )
+        if not is_buy:
+            continue
+
+        entry    = closes[i]
+        tp_price = entry * (1.0 + TAKE_PROFIT_PCT)
+        sl_price = entry * (1.0 - STOP_LOSS_PCT)
+
+        for j in range(i + 1, n):
+            if highs[j] >= tp_price:
+                gross_profit += TAKE_PROFIT_PCT
+                trade_count  += 1
+                break
+            if lows[j] <= sl_price:
+                gross_loss  += STOP_LOSS_PCT
+                trade_count += 1
+                break
+
+    if gross_loss == 0.0:
+        pf = float("inf") if gross_profit > 0.0 else 0.0
+    else:
+        pf = gross_profit / gross_loss
+
+    return pf, trade_count
+
+
+def compute_ema_spread(closes: list[float]) -> float | None:
+    """
+    Returns current EMA spread as a percentage: (EMA_fast − EMA_slow) / EMA_slow × 100.
+    Positive = fast above slow (bullish). None if insufficient data.
+    """
+    fast = _ema(closes, FAST_EMA_PERIOD)
+    slow = _ema(closes, SLOW_EMA_PERIOD)
+    if fast is None or slow is None or slow == 0.0:
+        return None
+    return (fast - slow) / slow * 100.0
+
+
+# ── Display ———————————————————————————————————————————————————————————————————
+
+def print_table(
+    now_str:     str,
+    current_adx: float | None,
+    adx_pct:     float,
+    pf:          float,
+    trade_count: int,
+    ema_spread:  float | None,
+) -> None:
+    adx_str    = f"{current_adx:.1f}" if current_adx is not None else "N/A"
+    pf_str     = f"{pf:.2f}" if pf != float("inf") else "inf (no losses)"
+    spread_str = f"{ema_spread:+.3f}%" if ema_spread is not None else "N/A"
+
+    adx_ok     = current_adx is not None and current_adx >= ADX_THRESHOLD
+    adx_pct_ok = adx_pct >= ADX_PCT_MIN
+    pf_ok      = pf >= PF_MIN  # float("inf") >= 1.2 is True — no losses counts as pass
+    spread_ok  = ema_spread is not None and ema_spread >= EMA_SPREAD_MIN
+
+    def mark(ok: bool) -> str:
+        return "PASS" if ok else "WARN"
+
+    w = 36
+    print()
+    print(f"  ── Regime Monitor  [{now_str}] ──")
+    print(f"  {EXCHANGE_ID.capitalize()}  {SYMBOL}  {TIMEFRAME}  |  "
+          f"{FETCH_LIMIT} candles  |  window={WINDOW}")
+    print()
+    print(f"  {'Metric':<{w}}  {'Value':>12}  {'Threshold':>12}  Status")
+    print("  " + "─" * (w + 38))
+    print(f"  {'Current ADX(14)':<{w}}  {adx_str:>12}  "
+          f"{'≥ ' + str(int(ADX_THRESHOLD)):>12}  {mark(adx_ok)}")
+    print(f"  {'ADX ≥ 18  (last ' + str(WINDOW) + ' candles)':<{w}}  "
+          f"{adx_pct:>11.1f}%  {'≥ ' + str(int(ADX_PCT_MIN)) + '%':>12}  {mark(adx_pct_ok)}")
+    print(f"  {'Rolling PF  (last ' + str(WINDOW) + ' candles)':<{w}}  "
+          f"{pf_str:>12}  {'≥ ' + str(PF_MIN):>12}  {mark(pf_ok)}")
+    print(f"  {'EMA spread  (EMA9 − EMA21) / EMA21':<{w}}  "
+          f"{spread_str:>12}  {'≥ ' + f'{EMA_SPREAD_MIN:.1f}%':>12}  {mark(spread_ok)}")
+    print()
+
+    if trade_count == 0:
+        print(f"  Rolling PF: 0 completed trades — ADX+EMA+RSI conditions not met in window")
+    else:
+        print(f"  Rolling PF from {trade_count} completed trade(s)  "
+              f"|  SL={STOP_LOSS_PCT * 100:.1f}%  TP={TAKE_PROFIT_PCT * 100:.1f}%")
+    if trade_count < 5:
+        print(f"  Note: PF is unreliable with fewer than 5 trades — use as indicative only")
+
+    print()
+    ok_count = sum([adx_ok, adx_pct_ok, pf_ok, spread_ok])
+    if ok_count == 4:
+        verdict = "EDGE PRESENT   — all 4/4 conditions met"
+    else:
+        verdict = f"DEGRADED       — {ok_count}/4 conditions met  (review before new entries)"
+    print(f"  Verdict: {verdict}")
+    print()
+
+
+# ── Log file ——————————————————————————————————————————————————————————————————
+
+def append_log(
+    now_str:     str,
+    current_adx: float | None,
+    adx_pct:     float,
+    pf:          float,
+    trade_count: int,
+    ema_spread:  float | None,
+) -> None:
+    adx_str    = f"{current_adx:.2f}" if current_adx is not None else "N/A"
+    pf_str     = f"{pf:.3f}" if pf != float("inf") else "inf"
+    spread_str = f"{ema_spread:.4f}" if ema_spread is not None else "N/A"
+
+    ok = (
+        current_adx is not None
+        and current_adx >= ADX_THRESHOLD
+        and adx_pct     >= ADX_PCT_MIN
+        and pf          >= PF_MIN
+        and ema_spread  is not None
+        and ema_spread  >= EMA_SPREAD_MIN
+    )
+    verdict = "EDGE" if ok else "DEGRADED"
+
+    line = (
+        f"{now_str}  "
+        f"ADX={adx_str:>6}  "
+        f"ADX%={adx_pct:>5.1f}  "
+        f"PF={pf_str:>7}  "
+        f"trades={trade_count:>3}  "
+        f"spread={spread_str:>7}%  "
+        f"verdict={verdict}\n"
+    )
+    with open(LOG_FILE, "a") as f:
+        f.write(line)
+
+
+# ── Main ——————————————————————————————————————————————————————————————————————
+
+def main() -> None:
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    print(
+        f"\n  Fetching {FETCH_LIMIT} × {TIMEFRAME} candles of {SYMBOL} "
+        f"from {EXCHANGE_ID.capitalize()} …",
+        flush=True,
+    )
+
+    try:
+        import ccxt  # noqa: PLC0415
+    except ImportError:
+        print("  ERROR: ccxt not installed. Run: pip install ccxt")
+        sys.exit(1)
+
+    try:
+        exchange_cls = getattr(ccxt, EXCHANGE_ID.lower())
+        exchange     = exchange_cls({"timeout": 20_000})
+        raw          = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=FETCH_LIMIT)
+    except Exception as exc:
+        print(f"  ERROR fetching candles: {exc}")
+        sys.exit(1)
+
+    if not raw:
+        print(f"  ERROR: no data returned for {SYMBOL} on {EXCHANGE_ID}")
+        sys.exit(1)
+
+    closes = [float(row[4]) for row in raw]
+    highs  = [float(row[2]) for row in raw]
+    lows   = [float(row[3]) for row in raw]
+
+    min_required = ADX_PERIOD * 2 + 1 + WINDOW
+    if len(closes) < min_required:
+        print(f"  ERROR: need ≥ {min_required} candles for warmup, got {len(closes)}")
+        sys.exit(1)
+
+    from_dt = datetime.fromtimestamp(raw[0][0]  / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+    to_dt   = datetime.fromtimestamp(raw[-1][0] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+    print(f"  {len(closes)} candles  ({from_dt} → {to_dt})\n")
+
+    current_adx, adx_pct = compute_adx_metrics(highs, lows, closes)
+    pf, trade_count       = compute_rolling_pf(highs, lows, closes)
+    ema_spread            = compute_ema_spread(closes)
+
+    print_table(now_str, current_adx, adx_pct, pf, trade_count, ema_spread)
+    append_log(now_str, current_adx, adx_pct, pf, trade_count, ema_spread)
+    print(f"  Logged → {LOG_FILE}\n")
+
+
+if __name__ == "__main__":
+    main()

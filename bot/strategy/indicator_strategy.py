@@ -1,13 +1,14 @@
 """
-Dual-regime indicator strategy.
+Trend-following indicator strategy with volatility guard.
 
 Regime classification runs first on every candle:
   VOLATILE  — ATR > 1.5× 20-period ATR average      → sit flat (HOLD)
   TRENDING  — ADX ≥ adx_threshold                   → trend-following (EMA/RSI/ADX)
-  RANGING   — ADX < adx_threshold, not volatile      → mean-reversion (BB + RSI)
+  RANGING   — ADX < adx_threshold, not volatile      → HOLD (no signal)
 
-When regime_enabled=False the strategy falls back to the original behaviour:
-ADX < threshold = HOLD (no mean-reversion module fires).
+All signals come from _trend_signal(). The mean-reversion (ranging) branch
+was removed after entry-condition analysis showed it added no alpha over 5000
+candles — 12 ranging entries, 25% win rate, identical to trend entries.
 """
 from __future__ import annotations
 
@@ -25,7 +26,6 @@ from bot.indicators.indicators import (
     adx   as calc_adx,
     atr   as calc_atr,
     macd  as calc_macd,
-    bollinger_bands,
 )
 from bot.data.historical_feed import Candle
 
@@ -61,12 +61,6 @@ class IndicatorConfig:
     rsi_filter_enabled:       bool  = True
     regime_ema_period:        int   = 200
     regime_ema_slope_filter:  bool  = False
-    # ── Dual-regime additions ─────────────────────────────────────────
-    regime_enabled:           bool  = True   # False = original single-strategy behaviour
-    bb_period:                int   = 20     # Bollinger Band period
-    bb_std_dev:               float = 2.0    # Bollinger Band standard deviation multiplier
-    mr_rsi_oversold:          float = 35.0   # mean-reversion BUY: RSI must be below this
-    mr_rsi_overbought:        float = 65.0   # mean-reversion SELL: RSI must be above this
     atr_volatile_multiplier:  float = 1.5    # ATR > multiplier × avg ATR → VOLATILE
 
 
@@ -83,7 +77,6 @@ class IndicatorStrategy:
             self.config.slow_ema_period,
             2 * self.config.adx_period + 1,
             self.config.regime_ema_period if self.config.regime_ema_period > 0 else 0,
-            self.config.bb_period,
         ) + 2
 
         buf = max(self._warmup + 50, self.config.regime_ema_period + 16)
@@ -98,9 +91,6 @@ class IndicatorStrategy:
         self._last_adx:       Optional[float]  = None
         self._last_atr:       Optional[float]  = None
         self._last_regime:    Optional[Regime] = None
-        self._last_bb_upper:  Optional[float]  = None
-        self._last_bb_middle: Optional[float]  = None
-        self._last_bb_lower:  Optional[float]  = None
         self._prev_rsi:       Optional[float]  = None
         self._last_macd_hist: Optional[float]  = None
 
@@ -115,25 +105,19 @@ class IndicatorStrategy:
             "regime_rejected": 0,
             "volume_rejected": 0,
             "volatile_skipped": 0,
-            "ranging_buy":     0,
-            "ranging_sell":    0,
             "buy_signals":     0,
             "sell_signals":    0,
             "hold_signals":    0,
         }
 
         logger.info(
-            "IndicatorStrategy (dual-regime) | RSI(%d) ob=%.0f os=%.0f"
+            "IndicatorStrategy | RSI(%d) ob=%.0f os=%.0f"
             " | EMA(%d/%d) | ADX(%d) thr=%.0f"
-            " | BB(%d,%.1f) mr_os=%.0f mr_ob=%.0f"
-            " | regime=%s volatile_mult=%.1f | warmup=%d",
+            " | volatile_mult=%.1f | warmup=%d",
             self.config.rsi_period,
             self.config.rsi_overbought, self.config.rsi_oversold,
             self.config.fast_ema_period, self.config.slow_ema_period,
             self.config.adx_period, self.config.adx_threshold,
-            self.config.bb_period, self.config.bb_std_dev,
-            self.config.mr_rsi_oversold, self.config.mr_rsi_overbought,
-            "ON" if self.config.regime_enabled else "OFF",
             self.config.atr_volatile_multiplier,
             self._warmup,
         )
@@ -187,11 +171,6 @@ class IndicatorStrategy:
             self._atr_history.append(atr_val)
         self._last_atr = atr_val
 
-        # ── Bollinger Bands (ranging detection + mean-reversion) ──────
-        bb_result = bollinger_bands(closes, self.config.bb_period, self.config.bb_std_dev)
-        if bb_result is not None:
-            self._last_bb_upper, self._last_bb_middle, self._last_bb_lower = bb_result
-
         # ── Regime classification ─────────────────────────────────────
         regime = self._classify_regime(adx_val, atr_val)
         self._last_regime = regime
@@ -220,10 +199,7 @@ class IndicatorStrategy:
             self.stats["hold_signals"] += 1
             return Signal.HOLD
 
-        if self.config.regime_enabled and regime == Regime.RANGING:
-            return self._ranging_signal(price, rsi_val, bb_result)
-
-        # TRENDING (or regime_enabled=False) → existing trend logic ───
+        # RANGING → _trend_signal rejects via adx_rejected (ADX < threshold)
         return self._trend_signal(
             price, rsi_val, rsi_rising, rsi_falling,
             trend_val, fast_ema, slow_ema, ema_spread_pct, closes, adx_val,
@@ -246,33 +222,6 @@ class IndicatorStrategy:
             return Regime.VOLATILE
 
         return Regime.TRENDING
-
-    def _ranging_signal(
-        self,
-        price:     float,
-        rsi_val:   float,
-        bb_result: tuple | None,
-    ) -> Signal:
-        """
-        Mean-reversion BUY only.
-        Exits are handled by SL/TP or the trend SELL module — never by this path.
-        Reason: ranging SELL fires on profitable trending positions (upper-BB touch
-        during a rising trend), cutting winners short and lowering PF.
-        """
-        if bb_result is None or rsi_val is None:
-            self.stats["hold_signals"] += 1
-            return Signal.HOLD
-
-        _upper, _middle, lower = bb_result
-
-        # BUY: price touches lower band + RSI oversold
-        if price <= lower * 1.001 and rsi_val < self.config.mr_rsi_oversold:
-            self.stats["ranging_buy"] += 1
-            self.stats["buy_signals"] += 1
-            return Signal.BUY
-
-        self.stats["hold_signals"] += 1
-        return Signal.HOLD
 
     def _trend_signal(
         self,
@@ -396,14 +345,6 @@ class IndicatorStrategy:
     @property
     def last_regime(self) -> Optional[str]:
         return self._last_regime.value if self._last_regime else None
-
-    @property
-    def last_bb_upper(self) -> Optional[float]:
-        return self._last_bb_upper
-
-    @property
-    def last_bb_lower(self) -> Optional[float]:
-        return self._last_bb_lower
 
     @property
     def is_warmed_up(self) -> bool:

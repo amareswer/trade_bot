@@ -172,10 +172,20 @@ As of 2026-06-19, the following configuration has passed:
 - ADX sweep (18 / 25 / 30 / 35): ADX=18 is best on both full history and recent window
 - RSI filter confirmed ON: RSI_FILTER_ENABLED=false drops PF from 1.38 → 1.19 and return from +1.51% → -0.10%
 - Volume filter tested (VOLUME_K=1.2) and disabled: hurt PF (1.38→1.00), added noise not quality
+- EMA spread filter validated 2026-06-27: MIN_EMA_SPREAD_PCT=0.004 (≥0.4%) confirmed real edge:
+
+  | Window                    | Baseline PF | Filtered PF | ΔPF   | Trades filtered |
+  |---------------------------|-------------|-------------|-------|-----------------|
+  | In-sample  Mar24–Jun26    | 1.61        | 1.78        | +0.17 | 9               |
+  | Out-of-sample 2019–2021   | 1.85        | 2.00        | +0.15 | 8               |
+
+  ΔPF nearly identical across periods → not curve fitting. Ranging mode also deleted 2026-06-27
+  (25% ranging win rate = trend win rate → no alpha). These two changes together bring in-sample PF from 1.21→1.78.
 
 ### Active .env settings (do not change without re-running validation)
 ADX_THRESHOLD=18
 RSI_FILTER_ENABLED=true
+MIN_EMA_SPREAD_PCT=0.004   # validated 2026-06-27: improves PF +0.15–0.17 in both in-sample and OOS
 VOLUME_K=0
 STOP_LOSS_PCT=0.015
 TAKE_PROFIT_PCT=0.10   # was 0.045 — validated 2026-06-19

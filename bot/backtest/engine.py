@@ -78,6 +78,7 @@ def run(
     adx_period:               int   = 14,
     adx_threshold:            float = 25.0,
     adx_max:                  float = 0.0,
+    min_ema_spread_pct:       float = 0.002,
     max_ema_spread_pct:       float = 0.0,
     rsi_filter_enabled:       bool  = True,
     macd_enabled:             bool  = False,
@@ -92,7 +93,8 @@ def run(
     # Exit rules
     stop_loss_pct:            float = 0.02,
     take_profit_pct:          float = 0.04,
-    trail_stop_pct:           float = 0.0,
+    trail_stop_pct:               float = 0.0,
+    trail_stop_activation_pct:    float = 0.0,
     partial_tp_pct:           float = 0.0,
     partial_tp_size:          float = 0.5,
     slippage_pct:             float = 0.0,
@@ -101,12 +103,6 @@ def run(
     regime_ema_slope_filter:  bool  = False,
     # Volume filter
     volume_k:                 float = 1.2,
-    # Dual-regime
-    regime_enabled:           bool  = True,
-    bb_period:                int   = 20,
-    bb_std_dev:               float = 2.0,
-    mr_rsi_oversold:          float = 35.0,
-    mr_rsi_overbought:        float = 65.0,
     atr_volatile_multiplier:  float = 1.5,
     # ATR-based SL
     atr_sl_enabled:           bool  = False,
@@ -125,17 +121,13 @@ def run(
             adx_period               = adx_period,
             adx_threshold            = adx_threshold,
             adx_max                  = adx_max,
+            min_ema_spread_pct       = min_ema_spread_pct,
             max_ema_spread_pct       = max_ema_spread_pct,
             rsi_filter_enabled       = rsi_filter_enabled,
             macd_enabled             = macd_enabled,
             regime_ema_period        = regime_ema_period,
             regime_ema_slope_filter  = regime_ema_slope_filter,
             volume_k                 = volume_k,
-            regime_enabled           = regime_enabled,
-            bb_period                = bb_period,
-            bb_std_dev               = bb_std_dev,
-            mr_rsi_oversold          = mr_rsi_oversold,
-            mr_rsi_overbought        = mr_rsi_overbought,
             atr_volatile_multiplier  = atr_volatile_multiplier,
         ))
         is_indicator = True
@@ -180,8 +172,14 @@ def run(
             continue
 
         # ── Trailing peak update ──────────────────────────────────────
-        if executor.position > 0 and _trail_peak > 0:
-            _trail_peak = max(_trail_peak, candle.high)
+        if executor.position > 0 and entry_price > 0 and trail_stop_pct > 0:
+            if _trail_peak == 0.0:
+                # Activate once candle.high crosses the activation threshold
+                if (trail_stop_activation_pct == 0.0
+                        or candle.high >= entry_price * (1 + trail_stop_activation_pct)):
+                    _trail_peak = candle.high
+            else:
+                _trail_peak = max(_trail_peak, candle.high)
 
         # ── Partial TP: sell 50% at partial_tp_pct (only when explicitly set) ─
         if (
@@ -287,7 +285,7 @@ def run(
                 if order.side == OrderSide.BUY:
                     position_manager.on_buy(order.price, order.quantity)
                     entry_price = order.price
-                    _trail_peak = order.price
+                    _trail_peak = 0.0  # activates once activation_pct profit is reached
                     _partial_tp_done = False
                     _entry_atr = strategy.last_atr or 0.0
                     _adx  = strategy.last_adx   if is_indicator else None

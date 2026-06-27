@@ -18,6 +18,7 @@ Date filtering (for regime testing):
 """
 import argparse
 import logging
+import os
 logging.basicConfig(level=logging.WARNING)
 
 from config import cfg
@@ -27,8 +28,9 @@ from bot.backtest.attribution import compute_attribution, print_attribution, sav
 
 # ── Date filter for regime testing ────────────────────────────────────────────
 # Set to "YYYY-MM-DD" to slice candles, or None to use full dataset.
-BEFORE_DATE = None   # keep candles BEFORE this date (old half / bear test)
-AFTER_DATE  = None   # keep candles FROM this date onward (recent half)
+# Override via env: BACKTEST_START (lower bound) / BACKTEST_END (upper bound).
+BEFORE_DATE = os.environ.get("BACKTEST_END")   or None  # keep candles BEFORE this date
+AFTER_DATE  = os.environ.get("BACKTEST_START") or None  # keep candles FROM this date onward
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -95,6 +97,7 @@ def main():
         adx_period              = cfg.strategy.adx_period,
         adx_threshold           = cfg.strategy.adx_threshold,
         adx_max                 = cfg.strategy.adx_max,
+        min_ema_spread_pct      = cfg.strategy.min_ema_spread_pct,
         max_ema_spread_pct      = cfg.strategy.max_ema_spread_pct,
         rsi_filter_enabled      = cfg.strategy.rsi_filter_enabled,
         buy_threshold           = cfg.strategy.buy_threshold,
@@ -105,17 +108,13 @@ def main():
         max_trades_per_day      = cfg.risk.max_trades_per_day,
         stop_loss_pct           = args.stop_loss,
         take_profit_pct         = args.take_profit,
-        trail_stop_pct          = cfg.backtest.trail_stop_pct,
+        trail_stop_pct              = cfg.backtest.trail_stop_pct,
+        trail_stop_activation_pct   = cfg.backtest.trail_stop_activation_pct,
         partial_tp_pct          = cfg.backtest.partial_tp_pct,
         partial_tp_size         = cfg.backtest.partial_tp_size,
         regime_ema_period       = cfg.strategy.regime_ema_period,
         regime_ema_slope_filter = cfg.strategy.regime_ema_slope_filter,
         volume_k                = cfg.strategy.volume_k,
-        regime_enabled          = cfg.strategy.regime_enabled,
-        bb_period               = cfg.strategy.bb_period,
-        bb_std_dev              = cfg.strategy.bb_std_dev,
-        mr_rsi_oversold         = cfg.strategy.mr_rsi_oversold,
-        mr_rsi_overbought       = cfg.strategy.mr_rsi_overbought,
         atr_volatile_multiplier = cfg.strategy.atr_volatile_multiplier,
         atr_sl_enabled          = cfg.backtest.atr_sl_enabled,
         atr_sl_multiplier       = cfg.backtest.atr_sl_multiplier,
@@ -145,8 +144,6 @@ def main():
         regime_n   = rs.get("regime_rejected", 0)
         vol_n      = rs.get("volume_rejected", 0)
         volatile_n = rs.get("volatile_skipped", 0)
-        r_buy_n    = rs.get("ranging_buy", 0)
-        r_sell_n   = rs.get("ranging_sell", 0)
         print(f"  ADX rejected              {adx_n:>6}{pct(adx_n)}")
         print(f"  Trend rejected (NEUTRAL)  {trend_n:>6}{pct(trend_n)}")
         print(f"  EMA spread rejected       {ema_n:>6}{pct(ema_n)}")
@@ -157,10 +154,8 @@ def main():
         print(f"  ─────────────────────────────────────────")
         buy_n  = rs.get("buy_signals", 0)
         sell_n = rs.get("sell_signals", 0)
-        print(f"  BUY  signals (trend)      {buy_n - r_buy_n:>6}{pct(buy_n - r_buy_n)}")
-        print(f"  SELL signals (trend)      {sell_n - r_sell_n:>6}{pct(sell_n - r_sell_n)}")
-        print(f"  BUY  signals (ranging)    {r_buy_n:>6}{pct(r_buy_n)}")
-        print(f"  SELL signals (ranging)    {r_sell_n:>6}{pct(r_sell_n)}")
+        print(f"  BUY  signals              {buy_n:>6}{pct(buy_n)}")
+        print(f"  SELL signals              {sell_n:>6}{pct(sell_n)}")
         print()
 
     csv_path = report.save_csv(result)
