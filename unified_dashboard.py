@@ -20,10 +20,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-CRYPTO_STATE_PATH = "logs/live_state.json"
-STOCK_STATE_PATH  = "stock_bot/paper_state.json"
-OUTPUT_PATH       = "unified_dashboard.html"
-REFRESH_S         = 30
+CRYPTO_STATE_PATH   = "logs/live_state.json"
+STOCK_STATE_PATH    = "stock_bot/paper_state.json"
+KRAKEN_HOLDINGS_PATH = "logs/kraken_holdings.json"
+OUTPUT_PATH         = "unified_dashboard.html"
+REFRESH_S           = 30
 
 
 # ── State helpers ─────────────────────────────────────────────────────────────
@@ -214,6 +215,113 @@ def _fetch_crypto_price(symbol: str) -> str:
     return "—"
 
 
+def _fetch_kraken_price_raw(asset: str) -> float | None:
+    try:
+        import urllib.request
+        sym = asset.replace("BTC", "XBT")
+        pair = f"{sym}CAD"
+        url = f"https://api.kraken.com/0/public/Ticker?pair={pair}"
+        with urllib.request.urlopen(url, timeout=3) as r:
+            data = json.loads(r.read())
+            result = data.get("result", {})
+            if result:
+                return float(list(result.values())[0]["c"][0])
+    except Exception:
+        pass
+    return None
+
+
+def _fmt_price(p: float) -> str:
+    return f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
+
+
+def _fmt_balance(b: float) -> str:
+    if b < 0.01:
+        return f"{b:.6f}"
+    if b < 1:
+        return f"{b:.5f}"
+    return f"{b:,.2f}"
+
+
+def _kraken_holdings_card(bot_cash: float) -> str:
+    holdings = _load_json(KRAKEN_HOLDINGS_PATH)
+    if not holdings:
+        return ""
+
+    TH = ('style="text-align:left;padding:6px 10px;font-size:10px;color:#8b949e;'
+          'font-weight:600;text-transform:uppercase;letter-spacing:.05em;'
+          'border-bottom:1px solid #30363d;white-space:nowrap"')
+    TD = "padding:7px 10px;border-bottom:1px solid #21262d;font-size:12px;white-space:nowrap"
+
+    rows = ""
+    total_value = 0.0
+
+    for asset, info in holdings.items():
+        balance   = float(info.get("balance", 0))
+        avg_price = float(info.get("avg_price", 0))
+        cost_val  = balance * avg_price
+        current   = _fetch_kraken_price_raw(asset)
+
+        if current is not None:
+            cur_val  = balance * current
+            pnl      = cur_val - cost_val
+            pnl_pct  = pnl / cost_val * 100 if cost_val else 0.0
+            pnl_col  = "#3fb950" if pnl >= 0 else "#f85149"
+            pnl_s    = "+" if pnl >= 0 else ""
+            cur_str  = _fmt_price(current)
+            val_str  = f"${cur_val:,.2f}"
+            pnl_str  = f'<span style="color:{pnl_col}">{pnl_s}${pnl:,.2f}</span>'
+            pct_str  = f'<span style="color:{pnl_col}">{pnl_s}{pnl_pct:.1f}%</span>'
+            total_value += cur_val
+        else:
+            cur_str = "—"
+            val_str = f"${cost_val:,.2f}"
+            pnl_str = "—"
+            pct_str = "—"
+            total_value += cost_val
+
+        rows += (
+            f"<tr>"
+            f'<td style="{TD};color:#c9d1d9"><strong>{asset}</strong></td>'
+            f'<td style="{TD};color:#c9d1d9">{_fmt_balance(balance)}</td>'
+            f'<td style="{TD};color:#c9d1d9">{_fmt_price(avg_price)}</td>'
+            f'<td style="{TD};color:#c9d1d9">{cur_str}</td>'
+            f'<td style="{TD};color:#c9d1d9">{val_str}</td>'
+            f'<td style="{TD}">{pnl_str}</td>'
+            f'<td style="{TD}">{pct_str}</td>'
+            f"</tr>"
+        )
+
+    total_combined = bot_cash + total_value
+
+    return (
+        '<div style="margin-top:14px;background:#0d1117;border:1px solid #30363d;'
+        'border-radius:6px;overflow:hidden;overflow-x:auto">'
+        '<div style="padding:8px 12px;border-bottom:1px solid #30363d;font-size:10px;'
+        'color:#8b949e;text-transform:uppercase;letter-spacing:.05em;font-weight:600">'
+        'Kraken Holdings'
+        '</div>'
+        '<table style="width:100%;border-collapse:collapse">'
+        '<thead><tr>'
+        f'<th {TH}>Asset</th>'
+        f'<th {TH}>Balance</th>'
+        f'<th {TH}>Avg Cost</th>'
+        f'<th {TH}>Current</th>'
+        f'<th {TH}>Value CAD</th>'
+        f'<th {TH}>P&amp;L CAD</th>'
+        f'<th {TH}>P&amp;L %</th>'
+        '</tr></thead>'
+        f'<tbody>{rows}</tbody>'
+        '</table>'
+        '<div style="padding:10px 12px;border-top:1px solid #30363d;font-size:12px;color:#8b949e">'
+        f'Bot Cash: <strong style="color:#e6edf3">${bot_cash:,.2f}</strong>'
+        f' + Holdings: <strong style="color:#e6edf3">${total_value:,.2f}</strong>'
+        f' = Total: <strong style="color:#3fb950">${total_combined:,.2f}</strong>'
+        '</div>'
+        '</div>'
+    )
+
+
 def _crypto_card(state: dict | None) -> str:
     if state is None:
         return (
@@ -248,6 +356,7 @@ def _crypto_card(state: dict | None) -> str:
         '</div>'
         + _kv("Live Price", f"<strong>{live_price}</strong>")
         + _signals_section(read_live_signals())
+        + _kraken_holdings_card(cash)
         + _kv("Cash", f"${cash:,.2f} CAD")
         + holding_row
         + basis_row
