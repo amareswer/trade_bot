@@ -287,16 +287,66 @@ All critical bugs resolved:
 |---|---|---|
 | 1h backtest PF > 1.0 confirmed | Run this week | Validates live config isn't a gamble |
 | 30–50 live trades accumulated | ~2–3 months | Compare live PF vs backtest |
-| Kraken maker fee confirmed <0.20% | Test one limit order | Unlocks ETH/CAD expansion |
+| Kraken maker fee confirmed <0.20% | Test one limit order | Validates limit-order cost model for XRP/CAD |
 | Stock bot: 30 paper trades, PF ≥ 1.2, win rate ≥ 30% | ~4–6 weeks | Gate for Phase 7 IBKR live |
 | Capital grows to $500+ | Organic | Lower RISK_PER_TRADE_PCT from 10% → 2% |
 | Add 5-day earnings blackout to stock_bot BUY | After paper validated | Avoid pre-earnings gap risk |
 | Add oversold recovery to universe pre_filter | After paper validated | AI rejects overbought momentum leaders |
 
 - Can evolve into a professional-grade trading platform
+## Live Symbol Universe (updated 2026-06-27)
+
+### Approved for live trading
+| Symbol | Status | Basis |
+|--------|--------|-------|
+| BTC/CAD | ACTIVE | Original validated pair |
+| XRP/CAD | ACTIVE | Walk-forward passed (Binance USDT proxy, all 3 windows PF > 1.0, 1000c PF 1.54); Kraken liquidity confirmed at $228,592 CAD/24h; min order 1.65 XRP (~$2.46 CAD) |
+
+### Watchlist (not yet tradeable)
+| Symbol | Status | Reason |
+|--------|--------|--------|
+| DOGE/CAD | WATCHLIST | Walk-forward passed (PF 1.43 on 1000c) but Kraken 24h volume only $12,439 CAD — too thin for limit orders; revisit when volume exceeds $50k CAD/day |
+
+### Blocked (walk-forward failed)
+| Symbol | Status | Reason |
+|--------|--------|--------|
+| ETH/CAD | BLOCKED | Walk-forward failed on all windows (5000c PF 0.57, deteriorating to 0.44); SL:TP exit ratio 85:7 — strategy has no edge on ETH with this config |
+| SOL/CAD | BLOCKED | Walk-forward failed — marginal on full history (PF 1.15) but collapses on recent windows (1000c PF 0.72) |
+
+### Implementation
+- `.env`: `UNIVERSE_WHITELIST=BTC/CAD,XRP/CAD` — bot uses fixed whitelist, skips dynamic momentum scan
+- `regime_monitor.py`: tracks both BTC/CAD and XRP/CAD
+
+---
+
+## Capital Sizing Rules
+
+### Starting capital
+$100 CAD per symbol. BTC/CAD and XRP/CAD trade independently — each symbol has its own capital allocation, trade counter, and sizing tier.
+
+### First increase — $100 → $250 CAD per symbol
+Requires ALL of the following on live fills (not backtest):
+- Minimum 15 completed trades on that symbol
+- Live profit factor ≥ 1.2
+- No single trade loss exceeding 3% of account
+- Regime monitor showing PASS on all metrics for at least 2 consecutive readings before the increase
+
+### Second increase — $250 → $500 CAD per symbol
+Requires ALL of the following:
+- Minimum 30 completed live trades on that symbol
+- Live profit factor ≥ 1.3 sustained over last 20 trades
+- Maximum drawdown on live account ≤ 5% at any point
+
+### Hard rules that override everything
+- **Never increase capital after a winning streak** — only increase after the trade count threshold is met
+- **Never increase capital on both symbols simultaneously** — increase one, wait 10 trades, then evaluate the second
+- **If live PF drops below 1.0 over any 10-trade window**, reduce back to previous capital tier immediately regardless of overall account performance
+
+---
+
 ## Exchange Setup
 - Backtesting: EXCHANGE=binance, SYMBOL=BTC/USDT
-- Live trading: EXCHANGE=kraken, SYMBOL=BTC/USD
+- Live trading: EXCHANGE=kraken, SYMBOL=BTC/CAD (primary), XRP/CAD (secondary via UNIVERSE_WHITELIST)
 - Reason: Kraken OHLCV history limited to ~720 candles, Binance has 5000+
 - Price diff confirmed: 0.048% — negligible
 - Kraken API key: generate at Security → API once KYC clears

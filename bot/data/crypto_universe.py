@@ -26,14 +26,26 @@ class CryptoUniverse:
         min_quote_vol: Optional[float] = None,
     ) -> List[str]:
         """
-        Scan all quote-currency pairs on exchange, rank by momentum score,
-        return top n symbols.
+        Return the approved symbol list.
 
-        Score = quoteVolume × percentage (positive-only first pass).
+        When UNIVERSE_WHITELIST is set (comma-separated), returns those symbols
+        directly without hitting the exchange for a momentum scan — the whitelist
+        represents pre-validated pairs (walk-forward passed + liquidity confirmed).
+
+        Otherwise: scan all quote-currency pairs on exchange, rank by momentum
+        score, return top n symbols. Score = quoteVolume × percentage.
         Fills remaining slots with highest-volume pairs when fewer than n
         positive movers exist. Never returns empty — fallback is [f'ETH/{quote}'].
         """
         quote = (quote or cfg.universe.universe_quote).upper()
+
+        whitelist_raw = cfg.universe.universe_whitelist.strip()
+        if whitelist_raw:
+            symbols = [s.strip() for s in whitelist_raw.split(",") if s.strip()]
+            logger.info("universe: whitelist mode — %d symbols: %s", len(symbols), symbols)
+            print(f"[UNIVERSE] Whitelist: {symbols}", flush=True)
+            return symbols
+
         min_quote_vol = min_quote_vol if min_quote_vol is not None else cfg.universe.min_vol
         exclude_set = {
             s.strip().upper()

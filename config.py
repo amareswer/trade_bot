@@ -281,11 +281,12 @@ class AlertConfig:
 
 @dataclass
 class UniverseConfig:
-    enabled:         bool  = False                        # UNIVERSE_ENABLED
-    size:            int   = 5                            # UNIVERSE_SIZE
-    min_vol:         float = 1000.0                       # UNIVERSE_MIN_VOL_CAD
-    universe_quote:  str   = "CAD"                        # UNIVERSE_QUOTE
-    universe_exclude: str  = "EUR,USD,USDC,USDT,DAI,BUSD"  # UNIVERSE_EXCLUDE
+    enabled:          bool  = False                        # UNIVERSE_ENABLED
+    size:             int   = 5                            # UNIVERSE_SIZE
+    min_vol:          float = 1000.0                       # UNIVERSE_MIN_VOL_CAD
+    universe_quote:   str   = "CAD"                        # UNIVERSE_QUOTE
+    universe_exclude: str   = "EUR,USD,USDC,USDT,DAI,BUSD"  # UNIVERSE_EXCLUDE
+    universe_whitelist: str = ""                           # UNIVERSE_WHITELIST — comma-separated fixed list; skips dynamic scan when set
 
     def __post_init__(self):
         if self.size < 1:
@@ -524,11 +525,12 @@ def _load() -> AppConfig:
             telegram_chat_id    = _str ("TELEGRAM_CHAT_ID",    ""),
         ),
         universe=UniverseConfig(
-            enabled           = _bool ("UNIVERSE_ENABLED",       False),
-            size              = _int  ("UNIVERSE_SIZE",          5),
-            min_vol           = _float("UNIVERSE_MIN_VOL_CAD",   1000.0),
-            universe_quote    = _str  ("UNIVERSE_QUOTE",         "CAD"),
-            universe_exclude  = _str  ("UNIVERSE_EXCLUDE",       "EUR,USD,USDC,USDT,DAI,BUSD"),
+            enabled             = _bool ("UNIVERSE_ENABLED",       False),
+            size                = _int  ("UNIVERSE_SIZE",          5),
+            min_vol             = _float("UNIVERSE_MIN_VOL_CAD",   1000.0),
+            universe_quote      = _str  ("UNIVERSE_QUOTE",         "CAD"),
+            universe_exclude    = _str  ("UNIVERSE_EXCLUDE",       "EUR,USD,USDC,USDT,DAI,BUSD"),
+            universe_whitelist  = _str  ("UNIVERSE_WHITELIST",     ""),
         ),
         paper=PaperConfig(
             paper_mode          = _bool ("PAPER_MODE",          False),

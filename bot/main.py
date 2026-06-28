@@ -16,6 +16,7 @@ import csv
 import logging
 import os
 import signal as _signal_module
+import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone as _tz
@@ -251,6 +252,48 @@ def build_strategy():
 
 
 # ---------------------------------------------------------------------------
+# Regime monitor background thread
+# ---------------------------------------------------------------------------
+
+def _regime_monitor_loop(symbols: list, exchange_id: str, interval_seconds: int = 14400) -> None:
+    """Daemon thread: run regime health check for all live symbols on startup
+    and then every interval_seconds (default 4 h).
+
+    Spawns regime_monitor.py as a subprocess each cycle so its Kraken
+    connections are fully isolated from the main process's connections.
+    Running inside the same process causes intermittent OHLCV hangs because
+    Kraken enforces per-IP concurrent connection limits that the bot's startup
+    burst exhausts."""
+    import subprocess
+    import sys as _sys
+
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    monitor_script = os.path.join(project_root, "regime_monitor.py")
+
+    env_override = {
+        **os.environ,
+        "MONITOR_SYMBOLS": ",".join(symbols),
+        "MONITOR_EXCHANGE": exchange_id,
+    }
+
+    while True:
+        try:
+            result = subprocess.run(
+                [_sys.executable, monitor_script],
+                env=env_override,
+                cwd=project_root,
+                timeout=120,
+            )
+            if result.returncode != 0:
+                logger.warning("Regime monitor subprocess exited with code %d", result.returncode)
+        except subprocess.TimeoutExpired:
+            logger.warning("Regime monitor subprocess timed out after 120s")
+        except Exception as exc:
+            logger.warning("Regime monitor error: %s", exc)
+        time.sleep(interval_seconds)
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
@@ -289,26 +332,35 @@ def run():
 
     if cfg.exchange.live_trading:
         if cfg.paper.paper_mode:
-            executor = LiveExecutor(
-                exchange_id   = cfg.exchange.exchange,
-                symbol        = _active_symbol,
-                api_key       = cfg.exchange.api_key,
-                api_secret    = cfg.exchange.api_secret,
-                starting_cash = cfg.paper.paper_starting_cash,
-                dry_run       = True,
-                order_type    = cfg.exchange.order_type,
-            )
-            logger.info("PAPER MODE active — $%.2f virtual cash", cfg.paper.paper_starting_cash)
+            executors = {
+                sym: LiveExecutor(
+                    exchange_id   = cfg.exchange.exchange,
+                    symbol        = sym,
+                    api_key       = cfg.exchange.api_key,
+                    api_secret    = cfg.exchange.api_secret,
+                    starting_cash = cfg.paper.paper_starting_cash,
+                    dry_run       = True,
+                    order_type    = cfg.exchange.order_type,
+                    state_path    = f"logs/live_state_{sym.replace('/', '_')}.json",
+                )
+                for sym in _universe_symbols
+            }
+            logger.info("PAPER MODE active — $%.2f virtual cash per symbol", cfg.paper.paper_starting_cash)
         else:
-            executor = LiveExecutor(
-                exchange_id   = cfg.exchange.exchange,
-                symbol        = _active_symbol,
-                api_key       = cfg.exchange.api_key,
-                api_secret    = cfg.exchange.api_secret,
-                starting_cash = cfg.portfolio.starting_cash,
-                dry_run       = cfg.exchange.dry_run,
-                order_type    = cfg.exchange.order_type,
-            )
+            executors = {
+                sym: LiveExecutor(
+                    exchange_id   = cfg.exchange.exchange,
+                    symbol        = sym,
+                    api_key       = cfg.exchange.api_key,
+                    api_secret    = cfg.exchange.api_secret,
+                    starting_cash = cfg.portfolio.starting_cash,
+                    dry_run       = cfg.exchange.dry_run,
+                    order_type    = cfg.exchange.order_type,
+                    state_path    = f"logs/live_state_{sym.replace('/', '_')}.json",
+                )
+                for sym in _universe_symbols
+            }
+        executor = executors[_active_symbol]   # alias for pre-loop header/recovery code
         mode_str = "[DRY RUN] " if (cfg.exchange.dry_run or cfg.paper.paper_mode) else ""
         print(
             f"\n  {mode_str}LIVE TRADING ENABLED"
@@ -317,16 +369,20 @@ def run():
             flush=True,
         )
     else:
-        executor = PaperExecutor(
-            symbol        = cfg.exchange.symbol,
-            starting_cash = cfg.portfolio.starting_cash,
-        )
+        executors = {
+            cfg.exchange.symbol: PaperExecutor(
+                symbol        = cfg.exchange.symbol,
+                starting_cash = cfg.portfolio.starting_cash,
+            )
+        }
+        executor = executors[cfg.exchange.symbol]
     if cfg.exchange.live_trading:
-        try:
-            executor._save_state()
-            logger.info("State saved with symbol: %s", _active_symbol)
-        except Exception as e:
-            logger.warning("State save on startup failed: %s", e)
+        for _sym, _exc in executors.items():
+            try:
+                _exc._save_state()
+                logger.info("State saved with symbol: %s", _sym)
+            except Exception as e:
+                logger.warning("State save on startup failed [%s]: %s", _sym, e)
     risk = RiskManager(RiskConfig(
         max_position_pct     = cfg.risk.max_position_pct,
         daily_loss_limit_pct = cfg.risk.daily_loss_limit_pct,
@@ -412,6 +468,7 @@ def run():
                 'strategy':     strat,
                 'sm':           sm,
                 'pm':           pm,
+                'executor':     executors[sym],
                 'last_ts_ms':   last_ts,
                 'trail_peak':   0.0,
                 'partial_done': False,
@@ -422,6 +479,17 @@ def run():
             logger.info("Symbol ready: %s", sym)
 
         print(f"\n  {len(symbol_state)} symbols ready: {list(symbol_state.keys())}", flush=True)
+
+        # ── Regime monitor background thread ──────────────────────────────────
+        _rm_interval = int(os.getenv("REGIME_MONITOR_INTERVAL", "14400"))
+        _monitor_thread = threading.Thread(
+            target=_regime_monitor_loop,
+            args=(list(_universe_symbols), cfg.exchange.exchange, _rm_interval),
+            daemon=True,
+            name="regime-monitor",
+        )
+        _monitor_thread.start()
+        logger.info("Regime monitor thread started (interval=%ds)", _rm_interval)
 
         try:
             _raw_1d = live_exchange.fetch_ohlcv(_active_symbol, timeframe="1d", limit=30)
@@ -434,6 +502,7 @@ def run():
             'strategy':     strategy,
             'sm':           TradingStateMachine(cooldown_ticks=cfg.risk.cooldown_ticks),
             'pm':           PositionManager(),
+            'executor':     executor,
             'last_ts_ms':   None,
             'trail_peak':   0.0,
             'partial_done': False,
@@ -443,30 +512,32 @@ def run():
         }
 
     # ── Restart recovery ──────────────────────────────────────────────────────
-    if cfg.exchange.live_trading and executor.position > 1e-9:
-        _rec_sm = symbol_state[_active_symbol]['sm']
-        _rec_pm = symbol_state[_active_symbol]['pm']
-        _rec_pm.seed(
-            quantity     = executor.position,
-            avg_entry    = executor.avg_entry,
-            realized_pnl = executor.portfolio.realized_pnl,
-        )
-        _rec_sm.recover_long(executor.avg_entry)
-        logger.warning(
-            "Recovered position seeded: qty=%.6f entry=%.2f — state machine set to LONG",
-            executor.position, executor.avg_entry,
-        )
-        print(
-            f"  POSITION RECOVERED: {executor.position:.6f}"
-            f" {cfg.exchange.symbol.split('/')[0]}"
-            f" @ ${executor.avg_entry:,.2f}"
-            f" — state machine set to LONG",
-            flush=True,
-        )
+    if cfg.exchange.live_trading:
+        for _rsym, _rexc in executors.items():
+            if _rexc.position > 1e-9:
+                _rec_ss = symbol_state[_rsym]
+                _rec_ss['pm'].seed(
+                    quantity     = _rexc.position,
+                    avg_entry    = _rexc.avg_entry,
+                    realized_pnl = _rexc.portfolio.realized_pnl,
+                )
+                _rec_ss['sm'].recover_long(_rexc.avg_entry)
+                logger.warning(
+                    "Recovered position seeded [%s]: qty=%.6f entry=%.2f — state machine set to LONG",
+                    _rsym, _rexc.position, _rexc.avg_entry,
+                )
+                print(
+                    f"  POSITION RECOVERED [{_rsym}]: {_rexc.position:.6f}"
+                    f" {_rsym.split('/')[0]}"
+                    f" @ ${_rexc.avg_entry:,.2f}"
+                    f" — state machine set to LONG",
+                    flush=True,
+                )
 
     # Aliases for _render_dashboard closure and display.stopped()
     state_machine    = symbol_state[_active_symbol]['sm']
     position_manager = symbol_state[_active_symbol]['pm']
+    executor         = symbol_state[_active_symbol]['executor']  # alias for dashboard closure
 
     tick        = 0
     tick_log:   deque[dict] = deque(maxlen=200)
@@ -614,10 +685,10 @@ def run():
             # ── 1c. Position drift reconciliation (every 60 ticks, live) ──
             if cfg.exchange.live_trading and not cfg.exchange.dry_run and sym == _active_symbol and tick % 60 == 0:
                 try:
-                    balance = executor._exchange.fetch_balance()
+                    balance = ss['executor']._exchange.fetch_balance()
                     base = sym.split("/")[0]
                     exchange_pos = float(balance.get("free", {}).get(base, 0))
-                    bot_pos = executor.position
+                    bot_pos = ss['executor'].position
                     drift = abs(exchange_pos - bot_pos)
                     if drift > 0.000010:
                         logger.warning(
@@ -663,9 +734,9 @@ def run():
                     ):
                         _p_qty = round(ss['pm'].quantity * cfg.backtest.partial_tp_size, 6)
                         if _p_qty > 0:
-                            _p_approval = risk.evaluate(Signal.SELL, price, executor.portfolio, _p_qty)
+                            _p_approval = risk.evaluate(Signal.SELL, price, ss['executor'].portfolio, _p_qty)
                             if _p_approval.approved:
-                                _p_order = executor.execute(Signal.SELL, price, quantity=_p_qty)
+                                _p_order = ss['executor'].execute(Signal.SELL, price, quantity=_p_qty)
                                 if _p_order and _p_order.status == OrderStatus.FILLED:
                                     risk.record_fill()
                                     ss['sm'].on_fill(Signal.SELL, _p_order.price)
@@ -713,9 +784,9 @@ def run():
                             )
                             print(f"           ✅ TAKE PROFIT [{sym}]  price={price:,.2f}  entry={_ic_entry:,.2f}", flush=True)
                         _ic_qty      = ss['pm'].quantity
-                        _ic_approval = risk.evaluate(Signal.SELL, price, executor.portfolio, _ic_qty)
+                        _ic_approval = risk.evaluate(Signal.SELL, price, ss['executor'].portfolio, _ic_qty)
                         if _ic_approval.approved:
-                            _ic_order = executor.execute(Signal.SELL, price, quantity=_ic_qty)
+                            _ic_order = ss['executor'].execute(Signal.SELL, price, quantity=_ic_qty)
                             if _ic_order and _ic_order.status == OrderStatus.FILLED:
                                 risk.record_fill()
                                 ss['sm'].on_fill(Signal.SELL, _ic_order.price)
@@ -756,7 +827,7 @@ def run():
                             avg_entry      = ss['pm'].avg_entry,
                             unrealized_pnl = ss['pm'].unrealized_pnl(price),
                             realized_pnl   = ss['pm'].realized_pnl,
-                            cash           = executor.cash,
+                            cash           = ss['executor'].cash,
                         )
                         tick_log.append({
                             "tick":   tick,
@@ -950,7 +1021,7 @@ def run():
             ss['sm'].tick()
 
             # ── 5. Dynamic position sizing ────────────────────────────
-            _max_cash_for_sym = executor.cash / max(len(symbol_state), 1)
+            _max_cash_for_sym = ss['executor'].cash / max(len(symbol_state), 1)
             if filtered_signal == Signal.SELL:
                 trade_qty = ss['pm'].quantity
             else:
@@ -969,13 +1040,13 @@ def run():
                     trend           = trend_val,
                     strategy_signal = filtered_signal,
                     recent_prices   = list(ss['strategy']._closes) if is_indicator else [price],
-                    portfolio       = executor.portfolio,
+                    portfolio       = ss['executor'].portfolio,
                     symbol          = sym,
                 )
                 final_signal = merge_signals(filtered_signal, advice)
 
             # ── 7. Risk gate ──────────────────────────────────────────
-            approval     = risk.evaluate(final_signal, price, executor.portfolio, trade_qty)
+            approval     = risk.evaluate(final_signal, price, ss['executor'].portfolio, trade_qty)
             block_reason = "" if approval else approval.message
 
             # ── 7b. Candle-close structured log ───────────────────────
@@ -1038,7 +1109,7 @@ def run():
 
             # ── 9. Execute ────────────────────────────────────────────
             if approval:
-                order = executor.execute(final_signal, price, quantity=trade_qty)
+                order = ss['executor'].execute(final_signal, price, quantity=trade_qty)
                 if order:
                     if order.status == OrderStatus.FILLED:
                         risk.record_fill()
@@ -1106,7 +1177,7 @@ def run():
                 avg_entry      = ss['pm'].avg_entry,
                 unrealized_pnl = ss['pm'].unrealized_pnl(price),
                 realized_pnl   = ss['pm'].realized_pnl,
-                cash           = executor.cash,
+                cash           = ss['executor'].cash,
             )
 
             # ── 11. Tick log + dashboard (active symbol only) ─────────
@@ -1133,10 +1204,11 @@ def run():
         _now_utc = datetime.now(_tz.utc)
         if _now_utc.hour == 0 and _now_utc.minute == 0:
             _act_ss = symbol_state.get(_active_symbol, next(iter(symbol_state.values())))
+            _act_ex = executors.get(_active_symbol, next(iter(executors.values())))
             alerter.daily_pnl(
                 symbol       = _active_symbol,
                 realized_pnl = _act_ss['pm'].realized_pnl,
-                total_value  = executor.portfolio.total_value(
+                total_value  = _act_ex.portfolio.total_value(
                     _act_ss.get('last_price') or 0
                 ),
                 trade_count  = risk._fills_today,
@@ -1144,10 +1216,10 @@ def run():
 
     display.stopped(
         ticks        = tick,
-        fills        = len(executor.filled_orders()),
-        rejects      = len(executor.rejected_orders()),
+        fills        = sum(len(exc.filled_orders()) for exc in executors.values()),
+        rejects      = sum(len(exc.rejected_orders()) for exc in executors.values()),
         pos          = position_manager.quantity,
-        cash         = executor.cash,
+        cash         = sum(exc.cash for exc in executors.values()),
         realized_pnl = position_manager.realized_pnl,
     )
 

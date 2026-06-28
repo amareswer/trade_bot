@@ -1,7 +1,7 @@
 """
-regime_monitor.py — BTC/CAD live strategy regime health check.
+regime_monitor.py — BTC/CAD and XRP/CAD live strategy regime health check.
 
-Fetches the last 200 × 1h Kraken candles and reports four metrics:
+Fetches the last 200 × 1h Kraken candles per symbol and reports four metrics:
 
   1. Current ADX(14)      — must be ≥ 18 for trend-following to have edge
   2. ADX-active %         — % of last 50 candles where ADX ≥ 18  (threshold: ≥ 40%)
@@ -36,8 +36,11 @@ from pathlib import Path
 
 # ── Settings ——————————————————————————————————————————————————————————————————
 # Defaults match live Kraken config (CLAUDE.md). Override with env vars if needed.
+# MONITOR_SYMBOLS: comma-separated list; falls back to MONITOR_SYMBOL for compatibility.
 EXCHANGE_ID     = os.getenv("MONITOR_EXCHANGE",   "kraken")
-SYMBOL          = os.getenv("MONITOR_SYMBOL",     "BTC/CAD")
+_sym_env        = os.getenv("MONITOR_SYMBOLS", os.getenv("MONITOR_SYMBOL", "BTC/CAD,XRP/CAD"))
+SYMBOLS         = [s.strip() for s in _sym_env.split(",") if s.strip()]
+SYMBOL          = SYMBOLS[0]   # kept for backward-compat references in helpers
 TIMEFRAME       = os.getenv("MONITOR_TIMEFRAME",  "1h")
 FETCH_LIMIT     = int(os.getenv("MONITOR_LIMIT",  "200"))
 WINDOW          = int(os.getenv("MONITOR_WINDOW", "50"))
@@ -54,6 +57,10 @@ MIN_EMA_SPREAD_PCT = float(os.getenv("MIN_EMA_SPREAD_PCT", "0.004"))
 PF_MIN           = 1.2
 ADX_PCT_MIN      = 40.0
 EMA_SPREAD_MIN   = MIN_EMA_SPREAD_PCT * 100  # convert to % for display (0.4)
+
+# DOGE/CAD liquidity watchlist gate — not a trading symbol yet
+DOGE_SYMBOL      = "DOGE/CAD"
+DOGE_VOL_MIN_CAD = float(os.getenv("DOGE_VOL_MIN_CAD", "50000.0"))  # threshold to unlock
 
 # ── Log file ——————————————————————————————————————————————————————————————————
 LOG_DIR  = Path("logs")
@@ -239,6 +246,7 @@ def compute_ema_spread(closes: list[float]) -> float | None:
 
 def print_table(
     now_str:     str,
+    symbol:      str,
     current_adx: float | None,
     adx_pct:     float,
     pf:          float,
@@ -260,7 +268,7 @@ def print_table(
     w = 36
     print()
     print(f"  ── Regime Monitor  [{now_str}] ──")
-    print(f"  {EXCHANGE_ID.capitalize()}  {SYMBOL}  {TIMEFRAME}  |  "
+    print(f"  {EXCHANGE_ID.capitalize()}  {symbol}  {TIMEFRAME}  |  "
           f"{FETCH_LIMIT} candles  |  window={WINDOW}")
     print()
     print(f"  {'Metric':<{w}}  {'Value':>12}  {'Threshold':>12}  Status")
@@ -297,6 +305,7 @@ def print_table(
 
 def append_log(
     now_str:     str,
+    symbol:      str,
     current_adx: float | None,
     adx_pct:     float,
     pf:          float,
@@ -319,6 +328,7 @@ def append_log(
 
     line = (
         f"{now_str}  "
+        f"{symbol:<8}  "
         f"ADX={adx_str:>6}  "
         f"ADX%={adx_pct:>5.1f}  "
         f"PF={pf_str:>7}  "
@@ -330,34 +340,82 @@ def append_log(
         f.write(line)
 
 
+# ── DOGE/CAD liquidity watchlist ——————————————————————————————————————————————
+
+def _check_doge_liquidity(exchange, now_str: str) -> None:
+    """
+    Fetch the DOGE/CAD 24h ticker and report volume vs the $50k CAD unlock gate.
+    Appends one line to the log. Does not affect trading — display only.
+    """
+    w = 36
+    print()
+    print(f"  ── Watchlist  [{now_str}] ──")
+    print(f"  {EXCHANGE_ID.capitalize()}  {DOGE_SYMBOL}  |  liquidity gate only — not currently traded")
+    print()
+    print(f"  {'Metric':<{w}}  {'Value':>14}  {'Threshold':>12}  Status")
+    print("  " + "─" * (w + 40))
+
+    try:
+        ticker   = exchange.fetch_ticker(DOGE_SYMBOL)
+        last     = ticker.get("last") or 0.0
+        vol_base = ticker.get("baseVolume")          # volume in DOGE
+        vol_cad  = (vol_base * last) if vol_base else None
+    except Exception as exc:
+        print(f"  {'24h Volume (CAD)':<{w}}  {'ERROR':>14}  "
+              f"{'≥ $' + f'{DOGE_VOL_MIN_CAD:,.0f}':>12}  WARN")
+        print(f"  (ticker fetch failed: {exc})")
+        print()
+        return
+
+    if vol_cad is None:
+        vol_str = "N/A"
+        gate_ok = False
+    else:
+        vol_str = f"${vol_cad:>12,.0f}"
+        gate_ok = vol_cad >= DOGE_VOL_MIN_CAD
+
+    threshold_str = f"≥ ${DOGE_VOL_MIN_CAD:,.0f}"
+    status        = "PASS" if gate_ok else "WARN"
+    print(f"  {'24h Volume (CAD)':<{w}}  {vol_str:>14}  {threshold_str:>12}  {status}")
+
+    note = "volume gate OPEN — eligible for live trading" if gate_ok else \
+           f"volume gate CLOSED — needs ${DOGE_VOL_MIN_CAD:,.0f} CAD/day"
+    print()
+    print(f"  {note}")
+    print()
+
+    vol_log = f"{vol_cad:,.0f}" if vol_cad is not None else "N/A"
+    line = (
+        f"{now_str}  "
+        f"{'DOGE/CAD':<8}  "
+        f"vol_cad={vol_log}  "
+        f"threshold={DOGE_VOL_MIN_CAD:,.0f}  "
+        f"verdict={'PASS' if gate_ok else 'WARN'}\n"
+    )
+    with open(LOG_FILE, "a") as f:
+        f.write(line)
+
+
 # ── Main ——————————————————————————————————————————————————————————————————————
 
-def main() -> None:
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
+def _check_symbol(exchange, symbol: str, now_str: str) -> bool:
+    """Fetch candles for one symbol, compute metrics, print table, append log.
+    Returns True on success, False on error."""
     print(
-        f"\n  Fetching {FETCH_LIMIT} × {TIMEFRAME} candles of {SYMBOL} "
+        f"\n  Fetching {FETCH_LIMIT} × {TIMEFRAME} candles of {symbol} "
         f"from {EXCHANGE_ID.capitalize()} …",
         flush=True,
     )
 
     try:
-        import ccxt  # noqa: PLC0415
-    except ImportError:
-        print("  ERROR: ccxt not installed. Run: pip install ccxt")
-        sys.exit(1)
-
-    try:
-        exchange_cls = getattr(ccxt, EXCHANGE_ID.lower())
-        exchange     = exchange_cls({"timeout": 20_000})
-        raw          = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=FETCH_LIMIT)
+        raw = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=FETCH_LIMIT)
     except Exception as exc:
-        print(f"  ERROR fetching candles: {exc}")
-        sys.exit(1)
+        print(f"  ERROR fetching candles for {symbol}: {exc}")
+        return False
 
     if not raw:
-        print(f"  ERROR: no data returned for {SYMBOL} on {EXCHANGE_ID}")
-        sys.exit(1)
+        print(f"  ERROR: no data returned for {symbol} on {EXCHANGE_ID}")
+        return False
 
     closes = [float(row[4]) for row in raw]
     highs  = [float(row[2]) for row in raw]
@@ -366,7 +424,7 @@ def main() -> None:
     min_required = ADX_PERIOD * 2 + 1 + WINDOW
     if len(closes) < min_required:
         print(f"  ERROR: need ≥ {min_required} candles for warmup, got {len(closes)}")
-        sys.exit(1)
+        return False
 
     from_dt = datetime.fromtimestamp(raw[0][0]  / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
     to_dt   = datetime.fromtimestamp(raw[-1][0] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
@@ -376,9 +434,35 @@ def main() -> None:
     pf, trade_count       = compute_rolling_pf(highs, lows, closes)
     ema_spread            = compute_ema_spread(closes)
 
-    print_table(now_str, current_adx, adx_pct, pf, trade_count, ema_spread)
-    append_log(now_str, current_adx, adx_pct, pf, trade_count, ema_spread)
-    print(f"  Logged → {LOG_FILE}\n")
+    print_table(now_str, symbol, current_adx, adx_pct, pf, trade_count, ema_spread)
+    append_log(now_str, symbol, current_adx, adx_pct, pf, trade_count, ema_spread)
+    return True
+
+
+def main() -> None:
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    try:
+        import ccxt  # noqa: PLC0415
+    except ImportError:
+        print("  ERROR: ccxt not installed. Run: pip install ccxt")
+        sys.exit(1)
+
+    exchange_cls = getattr(ccxt, EXCHANGE_ID.lower())
+    exchange     = exchange_cls({"timeout": 20_000})
+
+    any_ok = False
+    for sym in SYMBOLS:
+        ok = _check_symbol(exchange, sym, now_str)
+        if ok:
+            any_ok = True
+
+    _check_doge_liquidity(exchange, now_str)
+
+    if any_ok:
+        print(f"  Logged → {LOG_FILE}\n")
+    else:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
