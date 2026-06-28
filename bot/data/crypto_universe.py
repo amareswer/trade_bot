@@ -9,12 +9,36 @@ Usage:
     symbols = CryptoUniverse().get_top_movers(ex, n=5)
 """
 
+import json
 import logging
+import os
 from typing import List, Optional
 
 from config import cfg
 
 logger = logging.getLogger(__name__)
+
+_REGISTRY_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "config", "approved_symbols.json",
+)
+
+
+def load_approved_symbols() -> List[str]:
+    """
+    Return the list of approved symbols from config/approved_symbols.json,
+    or an empty list if the file doesn't exist or has no approved entries.
+    """
+    if not os.path.exists(_REGISTRY_PATH):
+        return []
+    try:
+        with open(_REGISTRY_PATH) as f:
+            data = json.load(f)
+        approved = [e["symbol"] for e in data.get("approved", []) if e.get("symbol")]
+        return approved
+    except Exception as exc:
+        logger.warning("Failed to load approved_symbols.json: %s", exc)
+        return []
 
 
 class CryptoUniverse:
@@ -39,11 +63,19 @@ class CryptoUniverse:
         """
         quote = (quote or cfg.universe.universe_quote).upper()
 
+        # Priority 1: config/approved_symbols.json (managed by universe_manager.py)
+        registry_symbols = load_approved_symbols()
+        if registry_symbols:
+            logger.info("universe: registry mode — %d symbols: %s", len(registry_symbols), registry_symbols)
+            print(f"[UNIVERSE] Registry (approved_symbols.json): {registry_symbols}", flush=True)
+            return registry_symbols
+
+        # Priority 2: UNIVERSE_WHITELIST in .env (manual override)
         whitelist_raw = cfg.universe.universe_whitelist.strip()
         if whitelist_raw:
             symbols = [s.strip() for s in whitelist_raw.split(",") if s.strip()]
             logger.info("universe: whitelist mode — %d symbols: %s", len(symbols), symbols)
-            print(f"[UNIVERSE] Whitelist: {symbols}", flush=True)
+            print(f"[UNIVERSE] Whitelist (.env): {symbols}", flush=True)
             return symbols
 
         min_quote_vol = min_quote_vol if min_quote_vol is not None else cfg.universe.min_vol

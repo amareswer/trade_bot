@@ -51,8 +51,10 @@ from bot.strategy.indicator_strategy import IndicatorStrategy, IndicatorConfig
 from bot.execution.executor import PaperExecutor, OrderStatus, OrderSide
 from bot.execution.live_executor import LiveExecutor
 from bot.risk.risk_manager import RiskManager, RiskConfig
+from bot.risk.correlation import fetch_correlation, CORRELATION_THRESHOLD
 from bot.state.trade_state import TradingStateMachine
 from bot.portfolio.position_manager import PositionManager
+from bot.portfolio.capital_pool import CapitalPool
 from bot.indicators.indicators import ema as _ema_fn, trend as _trend_fn, atr as _atr_fn
 from bot.ai.ai_engine import AIEngine, merge_signals
 from bot import display
@@ -383,6 +385,31 @@ def run():
                 logger.info("State saved with symbol: %s", _sym)
             except Exception as e:
                 logger.warning("State save on startup failed [%s]: %s", _sym, e)
+
+    # ── Capital pool — single cash pool shared across all symbols ─────────────
+    # For live trading: use actual Kraken balance from the first executor as
+    # the pool total (both executors read the same account, so we only count it once).
+    # For paper/simulated: use STARTING_CASH as the total pool.
+    _max_conc = cfg.portfolio.max_concurrent_positions
+    if cfg.exchange.live_trading and not cfg.paper.paper_mode:
+        _first_exec = next(iter(executors.values()))
+        _pool_total = _first_exec.cash   # real Kraken CAD balance
+    else:
+        _pool_total = cfg.portfolio.starting_cash
+    capital_pool = CapitalPool(total_capital=_pool_total, max_concurrent=_max_conc)
+    _slot = capital_pool.slot_cash
+    for _exc in executors.values():
+        _exc._portfolio.cash = _slot
+    print(
+        f"\n  Capital pool: ${_pool_total:.2f} total"
+        f" / {_max_conc} slots = ${_slot:.2f} per symbol\n",
+        flush=True,
+    )
+    logger.info(
+        "CapitalPool init: total=%.2f  slots=%d  slot_cash=%.2f",
+        _pool_total, _max_conc, _slot,
+    )
+
     risk = RiskManager(RiskConfig(
         max_position_pct     = cfg.risk.max_position_pct,
         daily_loss_limit_pct = cfg.risk.daily_loss_limit_pct,
@@ -793,6 +820,8 @@ def run():
                                 _ic_pnl = ss['pm'].on_sell(_ic_order.price, _ic_order.quantity)
                                 ss['trail_peak'] = 0.0
                                 ss['partial_done'] = False
+                                if not ss['pm'].has_position:
+                                    capital_pool.release(sym, ss['executor'].cash)
                                 _ic_reason = "trail_stop" if _ic_sl else "take_profit"
                                 display.fill(
                                     _ic_order.side.value, _ic_order.quantity,
@@ -1007,6 +1036,30 @@ def run():
                 else:
                     logger.info("REGIME GATE [%s]: OK  ADX=%.1f  spread=%.3f%%", sym, _adx_live, _spread)
 
+            # ── 2f. Correlation gate ──────────────────────────────────
+            # Block BUY when this symbol's 30-day returns are highly correlated
+            # (> 0.70) with any currently-open position. Prevents simultaneous
+            # exposure to assets that move together during a drawdown.
+            # Only runs in live mode where we can fetch daily closes; skipped
+            # when there are no other open positions (nothing to correlate against).
+            if raw_signal == Signal.BUY and live_exchange is not None:
+                _open_peers = [
+                    other_sym
+                    for other_sym, other_ss in symbol_state.items()
+                    if other_sym != sym and other_ss['pm'].has_position
+                ]
+                for _peer in _open_peers:
+                    _corr = fetch_correlation(live_exchange, sym, _peer)
+                    if _corr is not None and _corr > CORRELATION_THRESHOLD:
+                        raw_signal = Signal.HOLD
+                        _corr_msg = (
+                            f"CORRELATION GATE: BUY blocked — {sym} correlation"
+                            f" {_corr:.2f} with open {_peer}"
+                        )
+                        print(f"  [{sym}] {_corr_msg}", flush=True)
+                        logger.warning(_corr_msg)
+                        break
+
             # ── 3. Warmup guard ───────────────────────────────────────
             if is_indicator and not ss['strategy'].is_warmed_up:
                 if sym == _active_symbol:
@@ -1021,7 +1074,15 @@ def run():
             ss['sm'].tick()
 
             # ── 5. Dynamic position sizing ────────────────────────────
-            _max_cash_for_sym = ss['executor'].cash / max(len(symbol_state), 1)
+            # executor.cash is already capped to its pool slot — no division needed.
+            # Block BUY when the pool has no slot available for a new position.
+            if filtered_signal == Signal.BUY and not capital_pool.can_open_position(sym):
+                filtered_signal = Signal.HOLD
+                logger.info(
+                    "CapitalPool: BUY blocked for %s — pool exhausted (%d/%d slots used)",
+                    sym, len(capital_pool.allocated_symbols), _max_conc,
+                )
+            _max_cash_for_sym = ss['executor'].cash
             if filtered_signal == Signal.SELL:
                 trade_qty = ss['pm'].quantity
             else:
@@ -1118,6 +1179,7 @@ def run():
                         pnl = None
                         if order.side == OrderSide.BUY:
                             ss['pm'].on_buy(order.price, order.quantity)
+                            capital_pool.allocate(sym)
                             ss['trail_peak'] = order.price
                             ss['partial_done'] = False
                             ss['atr_sl'] = 0.0
@@ -1144,6 +1206,8 @@ def run():
                             ss['partial_done'] = False
                             ss['atr_sl'] = 0.0
                             ss['atr_tp'] = 0.0
+                            if not ss['pm'].has_position:
+                                capital_pool.release(sym, ss['executor'].cash)
 
                         display.fill(
                             order.side.value, order.quantity,

@@ -1,8 +1,9 @@
 """Unit tests for CryptoUniverse — no network calls."""
 
 from typing import Optional
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from bot.data.crypto_universe import CryptoUniverse
+from config import cfg
 
 
 def _make_exchange(tickers: dict, pairs: Optional[list] = None) -> MagicMock:
@@ -32,7 +33,8 @@ def test_returns_top_n_by_score():
         "DOT/CAD": _ticker(1.0, 10_000),   # score  10_000  ← rank 5
     }
     ex = _make_exchange(tickers)
-    result = CryptoUniverse().get_top_movers(ex, n=3)
+    with patch.object(cfg.universe, "universe_whitelist", ""):
+        result = CryptoUniverse().get_top_movers(ex, n=3)
 
     assert result == ["BTC/CAD", "ADA/CAD", "ETH/CAD"], result
 
@@ -47,7 +49,8 @@ def test_filters_negative_momentum():
         "SOL/CAD": _ticker(3.0,   10_000),  # positive ← only positive
     }
     ex = _make_exchange(tickers)
-    result = CryptoUniverse().get_top_movers(ex, n=3)
+    with patch.object(cfg.universe, "universe_whitelist", ""):
+        result = CryptoUniverse().get_top_movers(ex, n=3)
 
     assert "SOL/CAD" in result
     assert result[0] == "SOL/CAD"
@@ -66,7 +69,8 @@ def test_fallback_on_fetch_error():
     }
     ex.fetch_tickers.side_effect = Exception("network timeout")
 
-    result = CryptoUniverse().get_top_movers(ex, n=5)
+    with patch.object(cfg.universe, "universe_whitelist", ""):
+        result = CryptoUniverse().get_top_movers(ex, n=5)
 
     assert result == ["ETH/CAD"]
 
@@ -81,7 +85,8 @@ def test_fallback_fills_when_few_positive():
         "SOL/CAD": _ticker(-3.0,  50_000),  # negative, lower vol  ← fill slot 3
     }
     ex = _make_exchange(tickers)
-    result = CryptoUniverse().get_top_movers(ex, n=3)
+    with patch.object(cfg.universe, "universe_whitelist", ""):
+        result = CryptoUniverse().get_top_movers(ex, n=3)
 
     assert len(result) == 3
     assert result[0] == "ETH/CAD"          # only positive first

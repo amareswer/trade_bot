@@ -1,0 +1,168 @@
+{
+  "approved": [],
+  "watchlist": [
+    {
+      "base": "LINK",
+      "symbol": "LINK/CAD",
+      "verdict": "WATCHLIST",
+      "validated_at": "2026-06-28",
+      "timeframe": "4h",
+      "pf_5000": 1.135,
+      "pf_3000": 1.47,
+      "pf_1000": 1.073,
+      "vol_cad": null,
+      "spread_pct": null,
+      "pair_exists": false,
+      "reasons": [
+        "LINK/CAD does not exist on Kraken \u2014 cannot trade live."
+      ]
+    },
+    {
+      "base": "MATIC",
+      "symbol": "MATIC/CAD",
+      "verdict": "WATCHLIST",
+      "validated_at": "2026-06-28",
+      "timeframe": "4h",
+      "pf_5000": 0.426,
+      "pf_3000": 0.426,
+      "pf_1000": 0.426,
+      "vol_cad": null,
+      "spread_pct": null,
+      "pair_exists": false,
+      "reasons": [
+        "Too few trades in window(s) 5,000c, 3,000c, 1,000c \u2014 PF is unreliable with < 10 closed trades."
+      ]
+    }
+  ],
+  "blocked": [
+    {
+      "base": "LTC",
+      "symbol": "LTC/CAD",
+      "verdict": "BLOCKED",
+      "validated_at": "2026-06-28",
+      "timeframe": "4h",
+      "pf_5000": 0.374,
+      "pf_3000": 0.359,
+      "pf_1000": 0.004,
+      "vol_cad": null,
+      "spread_pct": null,
+      "pair_exists": false,
+      "reasons": [
+        "Walk-forward failed: 5,000c PF=0.37, 3,000c PF=0.36"
+      ]
+    },
+    {
+      "base": "ADA",
+      "symbol": "ADA/CAD",
+      "verdict": "BLOCKED",
+      "validated_at": "2026-06-28",
+      "timeframe": "4h",
+      "pf_5000": 0.87,
+      "pf_3000": 0.759,
+      "pf_1000": 0.152,
+      "vol_cad": null,
+      "spread_pct": null,
+      "pair_exists": false,
+      "reasons": [
+        "Walk-forward failed: 5,000c PF=0.87, 3,000c PF=0.76, 1,000c PF=0.15"
+      ]
+    },
+    {
+      "base": "AVAX",
+      "symbol": "AVAX/CAD",
+      "verdict": "BLOCKED",
+      "validated_at": "2026-06-28",
+      "timeframe": "4h",
+      "pf_5000": 0.779,
+      "pf_3000": 0.59,
+      "pf_1000": 0.238,
+      "vol_cad": null,
+      "spread_pct": null,
+      "pair_exists": false,
+      "reasons": [
+        "Walk-forward failed: 5,000c PF=0.78, 3,000c PF=0.59, 1,000c PF=0.24"
+      ]
+    },
+    {
+      "base": "DOT",
+      "symbol": "DOT/CAD",
+      "verdict": "BLOCKED",
+      "validated_at": "2026-06-28",
+      "timeframe": "4h",
+      "pf_5000": 0.631,
+      "pf_3000": 0.767,
+      "pf_1000": 0.932,
+      "vol_cad": null,
+      "spread_pct": null,
+      "pair_exists": false,
+      "reasons": [
+        "Walk-forward failed: 5,000c PF=0.63, 3,000c PF=0.77"
+      ]
+    },
+    {
+      "base": "UNI",
+      "symbol": "UNI/CAD",
+      "verdict": "BLOCKED",
+      "validated_at": "2026-06-28",
+      "timeframe": "4h",
+      "pf_5000": 0.629,
+      "pf_3000": 0.649,
+      "pf_1000": 0.845,
+      "vol_cad": null,
+      "spread_pct": null,
+      "pair_exists": false,
+      "reasons": [
+        "Walk-forward failed: 5,000c PF=0.63, 3,000c PF=0.65, 1,000c PF=0.85"
+      ]
+    },
+    {
+      "base": "ATOM",
+      "symbol": "ATOM/CAD",
+      "verdict": "BLOCKED",
+      "validated_at": "2026-06-28",
+      "timeframe": "4h",
+      "pf_5000": 0.524,
+      "pf_3000": 0.667,
+      "pf_1000": 0.137,
+      "vol_cad": null,
+      "spread_pct": null,
+      "pair_exists": false,
+      "reasons": [
+        "Walk-forward failed: 5,000c PF=0.52, 3,000c PF=0.67, 1,000c PF=0.14"
+      ]
+    },
+    {
+      "base": "PEPE",
+      "symbol": "PEPE/CAD",
+      "verdict": "BLOCKED",
+      "validated_at": "2026-06-28",
+      "timeframe": "4h",
+      "pf_5000": 0.459,
+      "pf_3000": 0.34,
+      "pf_1000": 0.509,
+      "vol_cad": 967,
+      "spread_pct": 2.2043,
+      "pair_exists": true,
+      "reasons": [
+        "Walk-forward failed: 5,000c PF=0.46, 3,000c PF=0.34, 1,000c PF=0.51"
+      ]
+    },
+    {
+      "base": "XDC",
+      "symbol": "XDC/CAD",
+      "verdict": "BLOCKED",
+      "validated_at": "2026-06-28",
+      "timeframe": "4h",
+      "pf_5000": null,
+      "pf_3000": null,
+      "pf_1000": null,
+      "vol_cad": 12438,
+      "spread_pct": 0.3809,
+      "pair_exists": true,
+      "reasons": [
+        "Walk-forward data could not be fetched from Binance."
+      ]
+    }
+  ],
+  "last_updated": "2026-06-28T13:25:52.680660+00:00"
+}

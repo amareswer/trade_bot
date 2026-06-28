@@ -195,13 +195,16 @@ class RiskConfig:
 
 @dataclass
 class PortfolioConfig:
-    starting_cash:   float = 10_000.0
-    sim_start_price: float = 68_500.0  # simulated feed start price
-    sim_volatility:  float = 200.0     # simulated feed volatility per tick
+    starting_cash:          float = 10_000.0
+    sim_start_price:        float = 68_500.0  # simulated feed start price
+    sim_volatility:         float = 200.0     # simulated feed volatility per tick
+    max_concurrent_positions: int = 2         # MAX_CONCURRENT_POSITIONS — capital pool slots
 
     def __post_init__(self):
         if self.starting_cash <= 0:
             raise ValueError("STARTING_CASH must be > 0")
+        if self.max_concurrent_positions < 1:
+            raise ValueError("MAX_CONCURRENT_POSITIONS must be >= 1")
 
 
 @dataclass
@@ -393,8 +396,8 @@ class AppConfig:
             self.risk.max_drawdown_pct * 100,
             self.risk.max_trades_per_day,
             self.risk.cooldown_ticks)
-        logger.info("CONFIG  portfolio  starting_cash=$%.2f  AI=%s",
-            self.portfolio.starting_cash, self.ai.enabled)
+        logger.info("CONFIG  portfolio  starting_cash=$%.2f  max_concurrent=%d  AI=%s",
+            self.portfolio.starting_cash, self.portfolio.max_concurrent_positions, self.ai.enabled)
         if self.paper.paper_mode:
             logger.info("CONFIG  paper_mode=True  starting_cash=$%.2f",
                 self.paper.paper_starting_cash)
@@ -482,9 +485,10 @@ def _load() -> AppConfig:
             cooldown_ticks       = _int  ("COOLDOWN_TICKS",          10),
         ),
         portfolio=PortfolioConfig(
-            starting_cash   = _float("STARTING_CASH",    10_000.0),
-            sim_start_price = _float("SIM_START_PRICE",  68_500.0),
-            sim_volatility  = _float("SIM_VOLATILITY",   200.0),
+            starting_cash            = _float("STARTING_CASH",            10_000.0),
+            sim_start_price          = _float("SIM_START_PRICE",           68_500.0),
+            sim_volatility           = _float("SIM_VOLATILITY",            200.0),
+            max_concurrent_positions = _int  ("MAX_CONCURRENT_POSITIONS",  2),
         ),
         ai=AIConfig(
             enabled        = _bool ("AI_ENABLED",        True),
