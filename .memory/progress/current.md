@@ -354,15 +354,47 @@ New file: `dca_bot.py`
 - BMO.TO: 5 shares @ $66.10 | CM.TO: 4 @ $41.15 | SPCX: 2 @ $160.00
 - EBON: 3 @ $1.95 | IGC: 50 @ $0.2799
 
-**Next for stock bot:**
-1. Accumulate 30-50 paper trades and compare paper PF/win rate to real behavior
-2. Stock bot backtester (backtest against historical data)
-3. Validate paper P&L after 1 week of clean runs
-4. Three remaining strategy-level fixes (when paper baseline established):
-   a. EMA crossover confirmation (2+ candle requirement)
-   b. Universe momentum ranking (1d+5d composite vs 5d only)
-   c. AI-generated target/stop → ATR-based calculation in code
-5. Phase 7: Live execution via Interactive Brokers (after paper validated)
+## Stock Bot — Next Steps (updated 2026-06-28)
+
+### Completed this session ✅
+- [x] Watchlist expanded: 6 → 14 symbols (added NVDA, AMD, TSLA, SHOP.TO, RY.TO, PLTR, META, AMZN)
+- [x] PAPER_MIN_CONFIDENCE lowered: 70 → 65
+- [x] UNIVERSE_ENABLED confirmed true, UNIVERSE_SIZE set to 15
+- [x] PAPER_RISK_PCT lowered: 0.25 → 0.20 (wider watchlist needs smaller per-trade allocation)
+- [x] PAPER_TAKE_PROFIT_PCT raised: 0.12 → 0.15 (let winners run on momentum names)
+- [x] Screener confirmed no upper bound (removed in prior session)
+- [x] Phase 7 IBKR executor skeleton built: stock_bot/execution/ibkr_executor.py
+      - 6/6 self-tests PASS
+      - Same interface as StockPaperExecutor — one-line swap in main.py
+      - All methods fail-safe (no exceptions propagate)
+      - Default IBKR_PAPER=true (cannot accidentally go live)
+
+### Active config (stock_bot/.env)
+WATCHLIST=HOOD,MRNA,NCLH,AC.TO,CCL,INTC,NVDA,AMD,TSLA,SHOP.TO,RY.TO,PLTR,META,AMZN
+PAPER_MIN_CONFIDENCE=65
+UNIVERSE_ENABLED=true
+UNIVERSE_SIZE=15
+PAPER_RISK_PCT=0.20
+PAPER_STOP_LOSS_PCT=0.05
+PAPER_TAKE_PROFIT_PCT=0.15
+PAPER_DAILY_LOSS_PCT=0.03
+PAPER_SLIPPAGE_BPS=15
+
+### Paper trading state (as of 2026-06-28)
+- Cash: $520.71 | Open: AC.TO (10 @ $24.29), DLTR (2 @ $118.22)
+- Completed round-trips: 0
+- Target before IBKR activation: 30 completed trades
+
+### Remaining gates before Phase 7 (IBKR live)
+1. 30+ completed paper round-trips accumulated
+2. python stock_analysis.py --report → PF >= 1.2, win rate >= 30%
+3. HIGH confidence band (80+): win% >= 55%, trades >= 10
+4. pip install ib_insync → run 10 IBKR paper trades → verify fills
+
+### Next development work (do NOT touch until paper gates met)
+- Earnings blackout: 5-day window before earnings → block BUY (add to prompt_builder.py)
+- Oversold recovery filter: universe pre_filter rejects RSI > 60 on universe symbols
+- IBKR paper mode test: activate IBKRExecutor with IBKR_PAPER=true, 10 trades, verify
 
 ---
 
