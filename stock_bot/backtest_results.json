@@ -1,0 +1,197 @@
+{
+  "run_at": "2026-06-29T11:35:31",
+  "pass_threshold_pf": 1.3,
+  "config": {
+    "sl_pct": 0.05,
+    "tp_pct": 0.15,
+    "adx_min": 15.0,
+    "rsi_max": 75.0,
+    "ema_fast": 9,
+    "ema_slow": 21,
+    "fee_per_side": 5e-05,
+    "regime_filter": true,
+    "regime_ma": 200,
+    "regime_fast_ma": 50
+  },
+  "windows": [
+    {
+      "label": "2019\u20132021",
+      "start": "2019-01-01",
+      "end": "2021-12-31"
+    },
+    {
+      "label": "2022\u20132023",
+      "start": "2022-01-01",
+      "end": "2023-12-31"
+    },
+    {
+      "label": "2024\u2013now",
+      "start": "2024-01-01",
+      "end": "2026-06-29"
+    }
+  ],
+  "results": [
+    {
+      "symbol": "AAPL",
+      "verdict": "PASS",
+      "windows": [
+        {
+          "label": "2019\u20132021",
+          "start": "2019-01-01",
+          "end": "2021-12-31",
+          "total_trades": 17,
+          "wins": 10,
+          "win_rate": 0.5882,
+          "profit_factor": 5.0993,
+          "max_drawdown": 0.076,
+          "sharpe": 1.6513,
+          "total_return": 1.498,
+          "sl_exits": 4,
+          "tp_exits": 8,
+          "signal_exits": 5,
+          "avg_hold_days": 35.6
+        },
+        {
+          "label": "2022\u20132023",
+          "start": "2022-01-01",
+          "end": "2023-12-31",
+          "total_trades": 5,
+          "wins": 2,
+          "win_rate": 0.4,
+          "profit_factor": 1.9947,
+          "max_drawdown": 0.1429,
+          "sharpe": 0.7096,
+          "total_return": 0.1333,
+          "sl_exits": 3,
+          "tp_exits": 2,
+          "signal_exits": 0,
+          "avg_hold_days": 40.6
+        },
+        {
+          "label": "2024\u2013now",
+          "start": "2024-01-01",
+          "end": "2026-06-29",
+          "total_trades": 15,
+          "wins": 7,
+          "win_rate": 0.4667,
+          "profit_factor": 2.434,
+          "max_drawdown": 0.1093,
+          "sharpe": 0.7952,
+          "total_return": 0.33,
+          "sl_exits": 3,
+          "tp_exits": 3,
+          "signal_exits": 9,
+          "avg_hold_days": 31.2
+        }
+      ]
+    },
+    {
+      "symbol": "MSFT",
+      "verdict": "FAIL",
+      "windows": [
+        {
+          "label": "2019\u20132021",
+          "start": "2019-01-01",
+          "end": "2021-12-31",
+          "total_trades": 18,
+          "wins": 7,
+          "win_rate": 0.3889,
+          "profit_factor": 1.2713,
+          "max_drawdown": 0.2319,
+          "sharpe": 0.2309,
+          "total_return": 0.0762,
+          "sl_exits": 8,
+          "tp_exits": 3,
+          "signal_exits": 7,
+          "avg_hold_days": 31.8
+        },
+        {
+          "label": "2022\u20132023",
+          "start": "2022-01-01",
+          "end": "2023-12-31",
+          "total_trades": 8,
+          "wins": 4,
+          "win_rate": 0.5,
+          "profit_factor": 2.7249,
+          "max_drawdown": 0.0824,
+          "sharpe": 1.2118,
+          "total_return": 0.2975,
+          "sl_exits": 3,
+          "tp_exits": 3,
+          "signal_exits": 2,
+          "avg_hold_days": 27.2
+        },
+        {
+          "label": "2024\u2013now",
+          "start": "2024-01-01",
+          "end": "2026-06-29",
+          "total_trades": 10,
+          "wins": 2,
+          "win_rate": 0.2,
+          "profit_factor": 0.2901,
+          "max_drawdown": 0.287,
+          "sharpe": -1.3217,
+          "total_return": -0.2353,
+          "sl_exits": 4,
+          "tp_exits": 0,
+          "signal_exits": 6,
+          "avg_hold_days": 28.3
+        }
+      ]
+    },
+    {
+      "symbol": "SPY",
+      "verdict": "PASS",
+      "windows": [
+        {
+          "label": "2019\u20132021",
+          "start": "2019-01-01",
+          "end": "2021-12-31",
+          "total_trades": 9,
+          "wins": 6,
+          "win_rate": 0.6667,
+          "profit_factor": 4.3047,
+          "max_drawdown": 0.0501,
+          "sharpe": 0.9574,
+          "total_return": 0.3044,
+          "sl_exits": 1,
+          "tp_exits": 1,
+          "signal_exits": 7,
+          "avg_hold_days": 71.6
+        },
+        {
+          "label": "2022\u20132023",
+          "start": "2022-01-01",
+          "end": "2023-12-31",
+          "total_trades": 3,
+          "wins": 1,
+          "win_rate": 0.3333,
+          "profit_factor": 1.5908,
+          "max_drawdown": 0.0406,
+          "sharpe": 0.3468,
+          "total_return": 0.0312,
+          "sl_exits": 0,
+          "tp_exits": 0,
+          "signal_exits": 3,
+          "avg_hold_days": 58.0
+        },
+        {
+          "label": "2024\u2013now",
+          "start": "2024-01-01",
+          "end": "2026-06-29",
+          "total_trades": 9,
+          "wins": 5,
+          "win_rate": 0.5556,
+          "profit_factor": 4.1766,
+          "max_drawdown": 0.0386,
+          "sharpe": 1.0656,
+          "total_return": 0.1947,
+          "sl_exits": 0,
+          "tp_exits": 0,
+          "signal_exits": 9,
+          "avg_hold_days": 56.9
+        }
+      ]
+    }
+  ]
+}

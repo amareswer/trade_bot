@@ -1,25 +1,28 @@
 """
-Confidence band accuracy tracker for the stock bot AI signal system.
+Confidence band accuracy tracker + Live Trading Gate for the stock bot.
 
-Reads paper_trades.csv, pairs BUY→SELL round trips, and reports
-whether the AI confidence score actually predicts profitable outcomes.
+ConfidenceBandTracker — reads paper_trades.csv, pairs BUY→SELL round trips,
+and reports whether the AI confidence score predicts profitable outcomes.
 
-The AI confidence score IS the primary strategy signal — indicators are
-context fed to the AI, not signal generators. Validating accuracy by
-confidence band measures whether the AI has genuine edge.
-
-Gate for live trading: 80+ confidence band win% >= 55%, trades >= 10.
+LiveTradingGate — four-gate check-list that must all PASS before switching
+to live IBKR trading.  Call print_gate_status() to see current state.
 """
 from __future__ import annotations
 
 import csv
+import json
 import os
 from datetime import datetime
 
-_TRADES_CSV = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "paper_trades.csv",
-)
+# ─────────────────────────────── paths ────────────────────────────────────────
+
+_STOCK_BOT_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+_TRADES_CSV      = os.path.join(_STOCK_BOT_DIR, "paper_trades.csv")
+_FAST_TRADES_CSV = os.path.join(_STOCK_BOT_DIR, "fast_trades.csv")
+_BACKTEST_JSON   = os.path.join(_STOCK_BOT_DIR, "backtest_results.json")
+
+# ─────────────────────── confidence band constants ────────────────────────────
 
 _BAND_NAMES = {
     "HIGH": "90–100",
@@ -43,6 +46,10 @@ def _confidence_band(confidence: int) -> str:
         return "LOW"
     return "PRE"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ConfidenceBandTracker
+# ─────────────────────────────────────────────────────────────────────────────
 
 class ConfidenceBandTracker:
     """Tracks and reports AI signal accuracy per confidence band."""
@@ -244,3 +251,268 @@ class ConfidenceBandTracker:
         if all_win < 50:
             return "NO EDGE DETECTED: AI accuracy below 50% across all bands"
         return f"TRACKING: {total} completed trades, {all_win:.0f}% win rate — continue accumulating"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Live Trading Gate
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Gate thresholds — change only after re-validation
+_GATE_SYMBOLS       = ("AAPL", "SPY")   # MSFT excluded — walk-forward FAIL 2024-now (monitor only)
+_GATE1_MIN_PASS     = 2      # symbols (of 2) that must pass all WF windows
+_GATE2_MIN_TRADES   = 20
+_GATE2_MIN_WIN_PCT  = 50.0   # percent
+_GATE3_MIN_TRADES   = 5
+
+_STATUS_DISPLAY = {
+    "PASS":    "PASS    ✓",
+    "FAIL":    "FAIL    ✗",
+    "PENDING": "PENDING  ",
+    "NOT_RUN": "NOT_RUN  ",
+}
+
+
+class LiveTradingGate:
+    """
+    Four-gate live trading readiness check.
+
+    Gate 1 — Backtest walk-forward (backtest_results.json):
+              At least 2 of 2 symbols (AAPL/SPY) must have PF ≥ 1.3
+              in all 3 walk-forward windows.
+              (MSFT excluded — walk-forward FAIL 2024-now, monitor only)
+
+    Gate 2 — Fast validator (fast_trades.csv):
+              ≥ 20 completed 1h-candle round-trips with ≥ 50% win rate.
+
+    Gate 3 — Swing paper (paper_trades.csv):
+              ≥ 5 completed daily-candle round-trips (any confidence band).
+
+    Gate 4 — Infrastructure:
+              AI signal memory importable; TSX price-audit function importable.
+
+    Statuses:  PASS | FAIL | PENDING | NOT_RUN
+      PENDING — not enough data yet (gate not failed, just needs more trades)
+      NOT_RUN — gate 1 only, when backtest_results.json has never been written
+    """
+
+    # ── Gate 1: backtest walk-forward ─────────────────────────────────────────
+
+    def check_gate1(self) -> dict:
+        if not os.path.exists(_BACKTEST_JSON):
+            return {
+                "status":        "NOT_RUN",
+                "detail":        "backtest_results.json missing — run: python -m stock_bot.backtest --walkforward",
+                "passing_count": 0,
+                "total_count":   len(_GATE_SYMBOLS),
+            }
+
+        try:
+            with open(_BACKTEST_JSON, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            return {"status": "FAIL", "detail": f"backtest_results.json unreadable ({exc})"}
+
+        pass_pf = float(data.get("pass_threshold_pf", 1.3))
+        run_at  = (data.get("run_at") or "")[:10]
+        sym_map = {r["symbol"].upper(): r for r in data.get("results", [])}
+
+        passing: list[str] = []
+        failing: list[str] = []
+        for sym in sorted(s.upper() for s in _GATE_SYMBOLS):
+            r = sym_map.get(sym)
+            if r is None:
+                failing.append(sym)
+                continue
+            windows = r.get("windows", [])
+            sym_ok  = len(windows) >= 3 and all(
+                w.get("total_trades", 0) > 0
+                and (
+                    w.get("profit_factor") is None        # null = ∞ → always pass
+                    or float(w["profit_factor"]) >= pass_pf
+                )
+                for w in windows
+            )
+            (passing if sym_ok else failing).append(sym)
+
+        run_note = f"  (run {run_at})" if run_at else ""
+
+        _total    = len(_GATE_SYMBOLS)
+        _msft_note = " | MSFT excluded — walk-forward FAIL 2024-now"
+        if len(passing) >= _GATE1_MIN_PASS:
+            return {
+                "status":        "PASS",
+                "detail":        (
+                    f"{len(passing)}/{_total} symbols pass all windows"
+                    f" (PF≥{pass_pf:.1f}): {', '.join(passing)}{run_note}{_msft_note}"
+                ),
+                "passing_count": len(passing),
+                "total_count":   _total,
+            }
+        return {
+            "status":        "FAIL",
+            "detail":        (
+                f"{len(passing)}/{_total} pass, need {_GATE1_MIN_PASS}"
+                f" — failing: {', '.join(failing)}{run_note}{_msft_note}"
+            ),
+            "passing_count": len(passing),
+            "total_count":   _total,
+        }
+
+    # ── Gate 2: fast validator ────────────────────────────────────────────────
+
+    def check_gate2(self) -> dict:
+        tracker = ConfidenceBandTracker()
+        trades  = tracker.load_trades(_FAST_TRADES_CSV)
+        pairs   = tracker.pair_trades(trades)
+        n       = len(pairs)
+        wins    = sum(1 for p in pairs if p["pnl_pct"] > 0)
+        win_pct = wins / n * 100 if n > 0 else 0.0
+
+        if n < _GATE2_MIN_TRADES:
+            return {
+                "status":  "PENDING",
+                "detail":  (
+                    f"{n} / {_GATE2_MIN_TRADES} trades"
+                    f"  ({win_pct:.1f}% win rate, need {_GATE2_MIN_WIN_PCT:.0f}%)"
+                ),
+                "trades":  n,
+                "win_pct": win_pct,
+            }
+        if win_pct >= _GATE2_MIN_WIN_PCT:
+            return {
+                "status":  "PASS",
+                "detail":  f"{n} trades  {win_pct:.1f}% win rate",
+                "trades":  n,
+                "win_pct": win_pct,
+            }
+        return {
+            "status":  "FAIL",
+            "detail":  (
+                f"{n} trades  {win_pct:.1f}% win rate"
+                f" (need {_GATE2_MIN_WIN_PCT:.0f}%)"
+            ),
+            "trades":  n,
+            "win_pct": win_pct,
+        }
+
+    # ── Gate 3: swing paper ───────────────────────────────────────────────────
+
+    def check_gate3(self) -> dict:
+        tracker = ConfidenceBandTracker()
+        trades  = tracker.load_trades()          # default → paper_trades.csv
+        pairs   = tracker.pair_trades(trades)
+        n       = len(pairs)
+
+        if n >= _GATE3_MIN_TRADES:
+            return {"status": "PASS", "detail": f"{n} round-trips", "pairs": n}
+
+        return {
+            "status": "PENDING",
+            "detail": f"{n} / {_GATE3_MIN_TRADES} round-trips",
+            "pairs":  n,
+        }
+
+    # ── Gate 4: infrastructure ────────────────────────────────────────────────
+
+    def check_gate4(self) -> dict:
+        ai_ok  = False
+        tsx_ok = False
+
+        try:
+            import stock_bot.ai.ai_engine as _ai_mod
+            _ = _ai_mod._signal_memory   # AttributeError if symbol was removed
+            ai_ok = True
+        except (ImportError, AttributeError):
+            pass
+
+        try:
+            from stock_bot.data.price_feed import get_tsx_warnings  # noqa: F401
+            tsx_ok = True
+        except ImportError:
+            pass
+
+        detail = f"AI memory {'✓' if ai_ok else '✗'}  TSX audit {'✓' if tsx_ok else '✗'}"
+        return {
+            "status": "PASS" if (ai_ok and tsx_ok) else "FAIL",
+            "detail": detail,
+            "ai_ok":  ai_ok,
+            "tsx_ok": tsx_ok,
+        }
+
+    # ── Evaluate all gates ────────────────────────────────────────────────────
+
+    def evaluate(self) -> list[dict]:
+        """Run all four gates. Returns list of gate-result dicts."""
+        return [
+            {"gate": 1, "description": "Backtest walk-forward",    **self.check_gate1()},
+            {"gate": 2, "description": "Fast validator (1h paper)", **self.check_gate2()},
+            {"gate": 3, "description": "Swing paper (daily)",       **self.check_gate3()},
+            {"gate": 4, "description": "Infrastructure",            **self.check_gate4()},
+        ]
+
+    def get_gate_status(self) -> dict:
+        """Return structured gate data for dashboard rendering."""
+        gates     = self.evaluate()
+        remaining = sum(1 for g in gates if g["status"] != "PASS")
+        return {
+            "gates":      gates,
+            "remaining":  remaining,
+            "ready":      remaining == 0,
+            "thresholds": {
+                "gate2_min_trades":  _GATE2_MIN_TRADES,
+                "gate2_min_win_pct": _GATE2_MIN_WIN_PCT,
+                "gate3_min_trades":  _GATE3_MIN_TRADES,
+            },
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# print_gate_status
+# ─────────────────────────────────────────────────────────────────────────────
+
+def print_gate_status() -> None:
+    """
+    Evaluate all live trading gates and print a status table to stdout.
+
+    Output example:
+      ══════════════════════════════════════════════════════════════════════
+        LIVE TRADING GATE STATUS
+      ══════════════════════════════════════════════════════════════════════
+        #   Gate                           Status     Detail
+        ──────────────────────────────────────────────────────────────────
+        1   Backtest walk-forward          PASS    ✓  3/3 symbols pass…
+        2   Fast validator (1h paper)      PENDING    7 / 20 trades …
+        3   Swing paper (daily)            PENDING    2 / 5 round-trips
+        4   Infrastructure                 PASS    ✓  AI memory ✓  TSX audit ✓
+        ──────────────────────────────────────────────────────────────────
+        LIVE TRADING: 2 gates remaining
+      ══════════════════════════════════════════════════════════════════════
+    """
+    gate    = LiveTradingGate()
+    results = gate.evaluate()
+
+    W     = 72
+    thick = "═" * W
+    thin  = "─" * W
+
+    print(thick)
+    print("  LIVE TRADING GATE STATUS")
+    print(thick)
+    print(f"  {'#':<4} {'Gate':<30} {'Status':<12} Detail")
+    print(f"  {thin}")
+
+    for r in results:
+        label = _STATUS_DISPLAY.get(r["status"], r["status"])
+        print(f"  {r['gate']:<4} {r['description']:<30} {label:<12} {r.get('detail', '')}")
+
+    print(f"  {thin}")
+
+    remaining = sum(1 for r in results if r["status"] != "PASS")
+    if remaining == 0:
+        verdict = "LIVE TRADING: READY"
+    else:
+        noun = "gate" if remaining == 1 else "gates"
+        verdict = f"LIVE TRADING: {remaining} {noun} remaining"
+
+    print(f"  {verdict}")
+    print(thick)

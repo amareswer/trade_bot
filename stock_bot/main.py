@@ -21,6 +21,8 @@ import sys
 import threading
 import time
 from collections import Counter
+
+import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime as _dt
 import pytz as _pytz
@@ -32,11 +34,12 @@ from stock_bot.data.intraday_price import get_live_price
 from stock_bot.data.universe  import StockUniverse
 from stock_bot.data.screener  import StockScreener
 from stock_bot.indicators.indicators import (
-    adx   as calc_adx,
-    atr   as calc_atr,
-    macd  as calc_macd,
-    rsi   as calc_rsi,
-    trend as calc_trend,
+    adx    as calc_adx,
+    atr    as calc_atr,
+    macd   as calc_macd,
+    regime as regime,
+    rsi    as calc_rsi,
+    trend  as calc_trend,
 )
 from stock_bot.research.aggregator  import fetch_research, ResearchReport, get_company_name
 from stock_bot.research.fear_greed   import fetch_fear_greed
@@ -49,6 +52,8 @@ from stock_bot.alerts.evaluator     import AlertEvaluator
 from stock_bot.alerts.notifier      import AlertNotifier
 from stock_bot.execution.paper      import StockPaperExecutor
 from stock_bot.execution.base       import OrderStatus
+from stock_bot.fast_validator       import FastValidator
+from stock_bot.analysis.accuracy_tracker import LiveTradingGate
 
 from colorama import Fore, Style, init as _colorama_init
 _colorama_init(autoreset=True)
@@ -592,6 +597,10 @@ def run() -> None:
     if executor:
         executor.set_slippage_bps(cfg.paper_slippage_bps)
 
+    _fast_enabled       = _os.getenv("FAST_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+    _fast_loop_interval = int(_os.getenv("FAST_LOOP_INTERVAL", "300").strip() or "300")
+    fast_validator      = FastValidator() if _fast_enabled else None
+
     print()
     print("  Stock Bot — Running 24/7")
     print(f"  {'─' * 45}")
@@ -615,6 +624,8 @@ def run() -> None:
         print(f"  AI engine  : disabled")
     if executor:
         print(f"  Paper trading: ON  cash=${cfg.paper_starting_cash:,.2f}  risk={cfg.paper_risk_pct*100:.0f}%/trade  min_conf={cfg.paper_min_confidence}%")
+    if fast_validator:
+        print(f"  Fast validator: ON  interval={_fast_loop_interval}s  state=fast_validator_state.json")
     print(f"  Dashboard : file://{_os.path.abspath('stock_dashboard.html')}")
     print(f"  Logs      : {_os.path.join(_LOG_DIR, 'stock_bot.log')}")
     print()
@@ -632,6 +643,22 @@ def run() -> None:
         _watcher = threading.Thread(target=_sl_tp_watcher, daemon=True)
         _watcher.start()
         logger.info("SL/TP watcher thread started (30s interval)")
+
+    def _fast_validator_worker() -> None:
+        while True:
+            try:
+                result  = fast_validator.run_cycle(watchlist_symbols, ai_engine)
+                open_c  = result["open_count"]
+                exits_c = len(result["exits"])
+                logger.info("FastValidator: %d open, %d completed today", open_c, exits_c)
+            except Exception as _exc:
+                logger.warning("FastValidator error: %s", _exc)
+            time.sleep(_fast_loop_interval)
+
+    if fast_validator:
+        _fv_thread = threading.Thread(target=_fast_validator_worker, daemon=True)
+        _fv_thread.start()
+        logger.info("FastValidator thread started (%ds interval)", _fast_loop_interval)
 
     tick = 0
     try:
@@ -678,8 +705,23 @@ def run() -> None:
         fear_greed_data      = fetch_fear_greed()
         market_trends_score  = fetch_market_trends()
 
+        # Fetch SPY closes once per cycle for regime filter
+        spy_closes: list[float] = []
+        if cfg.regime_filter_enabled:
+            try:
+                _spy_raw = yf.download("SPY", interval="1d", period="1y", progress=False, auto_adjust=True)
+                if _spy_raw is not None and not _spy_raw.empty:
+                    if hasattr(_spy_raw.columns, "nlevels") and _spy_raw.columns.nlevels > 1:
+                        _spy_raw.columns = [c[0] if isinstance(c, tuple) else c for c in _spy_raw.columns]
+                    spy_closes = [float(v) for v in _spy_raw["Close"].dropna().tolist()]
+            except Exception as _spy_exc:
+                logger.warning("Regime filter: SPY fetch failed — BUY signals blocked this cycle: %s", _spy_exc)
+        _cycle_regime = regime(spy_closes, cfg.regime_ma_period, cfg.regime_fast_ma) if spy_closes else "UNKNOWN"
+
+        _regime_icons = {"BULL": "🟢", "BEAR": "🔴", "NEUTRAL": "🟡", "UNKNOWN": "⚪"}
         print(f"  ── Scan #{tick:04d}  {now} {'─' * 30}")
         print(f"  😨 Market: Fear & Greed {fear_greed_data.score} — {fear_greed_data.label}  |  📈 Trends: {market_trends_score}/100")
+        print(f"  Regime: {_cycle_regime} {_regime_icons.get(_cycle_regime, '⚪')}")
         print(f"  {'Symbol':<10}  {'Price':>10}  {'RSI':^7}  {'Trend':<10}  {'ADX':^13}  MACD")
         print(f"  {'─'*10}  {'─'*10}  {'─'*7}  {'─'*10}  {'─'*13}  {'─'*30}")
 
@@ -873,7 +915,12 @@ def run() -> None:
                             )
                             print(f"  {'─' * 70}")
                             continue
-                        if executor.position(symbol) == 0:
+                        _regime_ok = True
+                        if cfg.regime_filter_enabled and (not spy_closes or _cycle_regime != "BULL"):
+                            logger.info("REGIME_SKIP: %s — market is %s", symbol, _cycle_regime)
+                            print(f"  📛 REGIME_SKIP: {symbol} — market is {_cycle_regime}")
+                            _regime_ok = False
+                        if _regime_ok and executor.position(symbol) == 0:
                             _price_map_now = {r.symbol: r.price for r in scan_results}
                             if not executor.check_exposure(_price_map_now):
                                 print(f"  📄 SKIP: {symbol} — max exposure ({cfg.paper_max_exposure_pct*100:.0f}%) reached")
@@ -1017,6 +1064,12 @@ def run() -> None:
 
         # Write dashboard
         try:
+            try:
+                _gate_status = LiveTradingGate().get_gate_status()
+            except Exception as _ge:
+                logger.debug("Gate status check failed: %s", _ge)
+                _gate_status = None
+
             renderer.render(
                 scan_results, fear_greed_data, portfolio_summary, alerts,
                 paper         = paper_summary,
@@ -1028,6 +1081,7 @@ def run() -> None:
                 },
                 market_status = market_status,
                 loop_mode     = mode,
+                gate_status   = _gate_status,
             )
         except Exception as exc:
             logger.warning("Dashboard render failed: %s", exc)

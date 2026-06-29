@@ -245,3 +245,36 @@ def trend(
     if prev_trend is None or prev_trend == opposite:
         return "NEUTRAL"
     return current
+
+
+def regime(
+    spy_closes:  list[float],
+    ma_period:   int = 200,
+    fast_period: int = 50,
+) -> str:
+    """
+    Macro market regime from SPY price position vs two SMAs.
+
+    Returns 'BULL', 'BEAR', or 'NEUTRAL'.
+      BULL = SPY close > SMA(ma_period) and SMA(fast_period) > SMA(ma_period) (golden cross)
+      BEAR = SPY close < SMA(ma_period) and SMA(fast_period) < SMA(ma_period) (death cross)
+      NEUTRAL = anything else (mixed signals or insufficient data)
+
+    Requires at least ma_period + 1 closes; returns 'NEUTRAL' if data is insufficient.
+    All period thresholds come from the caller — none are hardcoded here.
+    """
+    if len(spy_closes) < ma_period + 1:
+        return "NEUTRAL"
+
+    slow_ma = sma(spy_closes, ma_period)
+    fast_ma = sma(spy_closes, fast_period)
+
+    if slow_ma is None or fast_ma is None:
+        return "NEUTRAL"
+
+    current = spy_closes[-1]
+    if current > slow_ma and fast_ma > slow_ma:
+        return "BULL"
+    if current < slow_ma and fast_ma < slow_ma:
+        return "BEAR"
+    return "NEUTRAL"

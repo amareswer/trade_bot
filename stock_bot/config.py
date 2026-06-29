@@ -98,6 +98,9 @@ class StockConfig:
     price_sanity_pct:      float # reject live price if it deviates >this from candle close (e.g. 0.05)
     nvidia_api_key:        str   # NVIDIA NIM API key (nvidia_nim provider)
     nvidia_model:          str   # NVIDIA NIM model name
+    regime_filter_enabled: bool  # block BUY when SPY is not in BULL regime
+    regime_ma_period:      int   # slow SMA period for golden/death cross (default 200)
+    regime_fast_ma:        int   # fast SMA period for golden/death cross (default 50)
     watchlist:             list[str] = field(init=False)
 
     def __post_init__(self) -> None:
@@ -187,4 +190,7 @@ def load() -> StockConfig:
         price_sanity_pct       = _float("PRICE_SANITY_PCT",        0.05),
         nvidia_api_key         = _str  ("NVIDIA_API_KEY",          ""),
         nvidia_model           = _str  ("NVIDIA_MODEL",            "nvidia/nemotron-3-ultra-550b-a55b"),
+        regime_filter_enabled  = _bool ("REGIME_FILTER_ENABLED",   True),
+        regime_ma_period       = _int  ("REGIME_MA_PERIOD",        200),
+        regime_fast_ma         = _int  ("REGIME_FAST_MA",          50),
     )

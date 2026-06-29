@@ -14,6 +14,7 @@ DEFAULT_WATCHLIST: list[str] = [
     # US
     "AAPL",      # Apple
     "NVDA",      # Nvidia — AI/GPU proxy
+    # MSFT removed — walk-forward FAIL on 2024-now window (PF 0.29). Re-evaluate after strategy update.
 ]
 
 

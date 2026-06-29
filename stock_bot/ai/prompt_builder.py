@@ -38,12 +38,13 @@ def _macd_note(macd_line: float | None, macd_signal: float | None) -> str:
 
 
 def build_prompt(
-    symbol:          str,
-    candle,                           # stock_bot.data.price_feed.Candle
-    indicators:      dict,            # keys: rsi, trend, adx, macd_line, macd_signal, atr
-    research:        ResearchReport,
-    stop_loss_pct:   float = 0.05,
-    take_profit_pct: float = 0.12,
+    symbol:           str,
+    candle,                            # stock_bot.data.price_feed.Candle
+    indicators:       dict,            # keys: rsi, trend, adx, macd_line, macd_signal, atr
+    research:         ResearchReport,
+    stop_loss_pct:    float = 0.05,
+    take_profit_pct:  float = 0.12,
+    previous_signals: list[dict] | None = None,
 ) -> str:
     price       = candle.close
     sl_price    = round(price * (1 - stop_loss_pct),   2)
@@ -125,6 +126,24 @@ def build_prompt(
         if trend == "NEW IPO" else ""
     )
 
+    # Previous signals section — only present when memory exists for this symbol
+    if previous_signals:
+        parts: list[str] = []
+        for sig in previous_signals:
+            ts = sig.get("timestamp")
+            time_str = ts.strftime("%H:%M") if hasattr(ts, "strftime") else str(ts)[:16]
+            summary  = sig.get("reasoning_summary", "")
+            reason_part = f", reason: '{summary}'" if summary else ""
+            parts.append(
+                f"{sig['signal']} at {time_str} (conf {sig['confidence']}%{reason_part})"
+            )
+        prior_block = (
+            "\n=== PRIOR ANALYSIS THIS SESSION ===\n"
+            f"Previous signals: {', '.join(parts)}\n"
+        )
+    else:
+        prior_block = ""
+
     return f"""You are an expert stock analyst covering both US and Canadian markets.
 Analyze the following data for {symbol} and give a clear trading recommendation.
 {ipo_note}
@@ -155,7 +174,7 @@ Next earnings: {next_earn_str}
 
 === MARKET SENTIMENT ===
 CNN Fear & Greed Index: {fg.score} — {fg.label}
-
+{prior_block}
 === YOUR TASK ===
 Respond ONLY with a JSON object. No markdown, no explanation outside the JSON.
 Use this exact structure (stop_loss and target_price are pre-calculated — copy them verbatim):

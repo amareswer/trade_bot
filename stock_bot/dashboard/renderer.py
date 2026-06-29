@@ -369,6 +369,52 @@ def _css() -> str:
       .portfolio-summary-bar { gap: 12px; }
       body { padding: 10px; }
     }
+    .gate-panel {
+      background: #161b22; border: 1px solid #30363d;
+      border-radius: 10px; padding: 16px 20px;
+      margin-bottom: 24px;
+    }
+    .gate-panel-title {
+      font-size: 11px; font-weight: 600; color: #8b949e;
+      text-transform: uppercase; letter-spacing: .06em;
+      margin-bottom: 12px;
+    }
+    .gate-rows { display: flex; flex-direction: column; gap: 10px; }
+    .gate-row {
+      display: grid;
+      grid-template-columns: 20px 180px 80px 1fr;
+      align-items: center; gap: 12px;
+      padding: 8px 10px; background: #0d1117;
+      border: 1px solid #21262d; border-radius: 6px;
+    }
+    .gate-num  { font-size: 11px; font-weight: 700; color: #8b949e; text-align: center; }
+    .gate-desc { font-size: 12px; color: #e6edf3; }
+    .gate-badge {
+      display: inline-block; font-size: 10px; font-weight: 700;
+      padding: 2px 8px; border-radius: 10px; letter-spacing: .04em;
+      text-align: center; white-space: nowrap;
+    }
+    .gate-extra {
+      display: flex; align-items: center; gap: 8px;
+      font-size: 11px; color: #8b949e;
+    }
+    .gate-bar-wrap {
+      flex: 1; height: 6px; background: #21262d;
+      border-radius: 3px; overflow: hidden; min-width: 60px;
+    }
+    .gate-bar { height: 100%; border-radius: 3px; transition: width .3s; }
+    .gate-bar-label { font-size: 11px; color: #8b949e; white-space: nowrap; }
+    .gate-detail    { font-size: 11px; color: #8b949e; }
+    .gate-banner {
+      margin-top: 14px; padding: 9px 14px; border-radius: 6px;
+      font-size: 13px; font-weight: 700; text-align: center;
+    }
+    .gate-banner-ready { background: #12261e; color: #3fb950; border: 1px solid #2ea04340; }
+    .gate-banner-wait  { background: #1f1318; color: #f85149; border: 1px solid #f8514940; }
+    @media (max-width: 640px) {
+      .gate-row { grid-template-columns: 20px 1fr 70px; }
+      .gate-extra { display: none; }
+    }
 """
 
 
@@ -1090,6 +1136,108 @@ def _paper_section_html(paper: PaperSummary) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Trading readiness panel
+# ---------------------------------------------------------------------------
+
+def _readiness_panel_html(gate_status: Optional[dict]) -> str:
+    if not gate_status:
+        return ""
+
+    gates      = gate_status.get("gates", [])
+    remaining  = gate_status.get("remaining", 4)
+    ready      = gate_status.get("ready", False)
+    thresholds = gate_status.get("thresholds", {})
+
+    t2_trades = int(thresholds.get("gate2_min_trades",  20))
+    t2_win    = float(thresholds.get("gate2_min_win_pct", 50.0))
+    t3_pairs  = int(thresholds.get("gate3_min_trades",  5))
+
+    _STATUS_COL = {
+        "PASS":    _GREEN,
+        "FAIL":    _RED,
+        "PENDING": _YELLOW,
+        "NOT_RUN": _MUTED,
+    }
+
+    def _badge(status: str) -> str:
+        col = _STATUS_COL.get(status, _MUTED)
+        return (
+            f'<span class="gate-badge"'
+            f' style="background:{col}18;color:{col};border:1px solid {col}44">'
+            f'{_e(status)}</span>'
+        )
+
+    def _progress_bar(current: int, total: int, color: str) -> str:
+        pct = min(100, round(current / max(total, 1) * 100))
+        return (
+            f'<div class="gate-bar-wrap">'
+            f'<div class="gate-bar" style="width:{pct}%;background:{color}"></div>'
+            f'</div>'
+            f'<span class="gate-bar-label">{current}/{total}</span>'
+        )
+
+    rows_html = ""
+    for g in gates:
+        gn     = g["gate"]
+        desc   = g["description"]
+        status = g["status"]
+        badge  = _badge(status)
+        col    = _STATUS_COL.get(status, _MUTED)
+
+        if gn == 1:
+            extra = f'<span class="gate-detail">{_e(g.get("detail", ""))}</span>'
+
+        elif gn == 2:
+            tr  = g.get("trades",  0)
+            wp  = g.get("win_pct", 0.0)
+            bar = _progress_bar(tr, t2_trades, col)
+            extra = f'{bar}<span class="gate-detail">{wp:.1f}% win (need {t2_win:.0f}%)</span>'
+
+        elif gn == 3:
+            pr  = g.get("pairs", 0)
+            bar = _progress_bar(pr, t3_pairs, col)
+            extra = bar
+
+        elif gn == 4:
+            ai_ok  = g.get("ai_ok",  False)
+            tsx_ok = g.get("tsx_ok", False)
+            ai_col  = _GREEN if ai_ok  else _RED
+            tsx_col = _GREEN if tsx_ok else _RED
+            extra = (
+                f'<span style="color:{ai_col}">{"✓" if ai_ok else "✗"}</span>'
+                f'<span class="gate-detail">AI memory</span>'
+                f'&nbsp;&nbsp;'
+                f'<span style="color:{tsx_col}">{"✓" if tsx_ok else "✗"}</span>'
+                f'<span class="gate-detail">TSX audit</span>'
+            )
+
+        else:
+            extra = f'<span class="gate-detail">{_e(g.get("detail", ""))}</span>'
+
+        rows_html += f"""
+    <div class="gate-row">
+      <span class="gate-num">{gn}</span>
+      <span class="gate-desc">{_e(desc)}</span>
+      {badge}
+      <div class="gate-extra">{extra}</div>
+    </div>"""
+
+    if ready:
+        banner = '<div class="gate-banner gate-banner-ready">&#x1F7E2; READY FOR LIVE TRADING</div>'
+    else:
+        noun   = "gate" if remaining == 1 else "gates"
+        banner = f'<div class="gate-banner gate-banner-wait">&#x1F534; {remaining} {noun} remaining</div>'
+
+    return f"""
+  <div class="gate-panel">
+    <div class="gate-panel-title">Trading Readiness</div>
+    <div class="gate-rows">{rows_html}
+    </div>
+    {banner}
+  </div>"""
+
+
+# ---------------------------------------------------------------------------
 # Main HTML builder
 # ---------------------------------------------------------------------------
 
@@ -1103,6 +1251,7 @@ def _build_html(
     ai_stats:      Optional[dict]             = None,
     market_status: Optional[dict]             = None,
     loop_mode:     str                        = "LIVE",
+    gate_status:   Optional[dict]             = None,
 ) -> str:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1162,6 +1311,7 @@ def _build_html(
     paper_section      = _paper_section_html(paper) if paper else ""
     overview_section   = _portfolio_overview_html(portfolio, paper)
     alerts_section     = _alerts_panel_html(alerts or [])
+    readiness_section  = _readiness_panel_html(gate_status)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1181,6 +1331,7 @@ def _build_html(
 {paper_section}
 {overview_section}
 {_top_picks_html(results)}
+{readiness_section}
 {watchlist_section_html}
 {universe_section_html}
 
@@ -1228,8 +1379,9 @@ class DashboardRenderer:
         ai_stats:      Optional[dict]             = None,
         market_status: Optional[dict]             = None,
         loop_mode:     str                        = "LIVE",
+        gate_status:   Optional[dict]             = None,
     ) -> None:
-        html_str = _build_html(scan_results, fear_greed, self.loop_interval, portfolio, alerts, paper, ai_stats, market_status, loop_mode)
+        html_str = _build_html(scan_results, fear_greed, self.loop_interval, portfolio, alerts, paper, ai_stats, market_status, loop_mode, gate_status)
         os.makedirs(os.path.dirname(os.path.abspath(_OUTPUT_PATH)), exist_ok=True)
         with open(_OUTPUT_PATH, "w", encoding="utf-8") as f:
             f.write(html_str)

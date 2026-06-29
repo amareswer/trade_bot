@@ -34,6 +34,32 @@ from ollama import Client as OllamaClient
 
 logger = logging.getLogger(__name__)
 
+# ── Signal memory (per-session, not persisted to disk) ────────────────────────
+_signal_memory: dict[str, list[dict]] = {}
+_MEMORY_MAX = 3
+
+
+def get_signal_memory(symbol: str) -> list[dict]:
+    """Return up to the last 3 stored verdicts for symbol (oldest first)."""
+    return list(_signal_memory.get(symbol.upper(), []))
+
+
+def _store_verdict(symbol: str, verdict: AIVerdict) -> None:
+    """Append a successfully parsed verdict to the session memory. No-op for error verdicts."""
+    if verdict.provider in ("unavailable", "skipped"):
+        return
+    key = symbol.upper()
+    entry = {
+        "signal":            verdict.signal,
+        "confidence":        verdict.confidence,
+        "timestamp":         verdict.timestamp,
+        "reasoning_summary": (verdict.reasoning or "")[:80],
+    }
+    history = _signal_memory.setdefault(key, [])
+    history.append(entry)
+    if len(history) > _MEMORY_MAX:
+        _signal_memory[key] = history[-_MEMORY_MAX:]
+
 # Load root .env for OPENROUTER_API_KEY — kept separate from stock_bot/.env
 _ROOT_ENV = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..", ".env")
@@ -309,6 +335,7 @@ class AIEngine:
                 "AI verdict for %s (openrouter fallback): %s conf=%d style=%s",
                 symbol, verdict.signal, verdict.confidence, verdict.trading_style,
             )
+            _store_verdict(symbol, verdict)
             return verdict
         except Exception as exc:
             logger.warning("AI parse failed for %s (%s) | raw=%r", symbol, exc, raw[:120])
@@ -331,7 +358,8 @@ class AIEngine:
             return _hold_verdict(symbol, "AI unavailable — provider not configured")
 
         prompt = build_prompt(symbol, candle, indicators, research,
-                              stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct)
+                              stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct,
+                              previous_signals=get_signal_memory(symbol))
         t0     = time.monotonic()
         raw    = ""
 
@@ -376,6 +404,7 @@ class AIEngine:
                         symbol, verdict.signal, verdict.confidence,
                         verdict.trading_style, latency_ms,
                     )
+                    _store_verdict(symbol, verdict)
                     return verdict
                 except Exception as parse_exc:
                     logger.warning("AI parse failed for %s (%s) | raw=%r", symbol, parse_exc, response_text[:120])
@@ -418,6 +447,7 @@ class AIEngine:
                 symbol, verdict.signal, verdict.confidence,
                 verdict.trading_style, latency_ms, self._provider,
             )
+            _store_verdict(symbol, verdict)
             return verdict
         except Exception as exc:
             logger.warning("AI parse failed for %s (%s) | raw=%r", symbol, exc, raw[:120])

@@ -31,6 +31,14 @@ _last_prices: dict[str, float] = {}
 # Sector cache — persists for the process lifetime (one yfinance call per symbol)
 _sector_cache: dict[str, str] = {}
 
+# TSX-specific price corruption counter — incremented per rejection, never reset
+_tsx_corruption_warnings: int = 0
+
+
+def get_tsx_warnings() -> int:
+    """Return the number of TSX price corruption rejections since process start."""
+    return _tsx_corruption_warnings
+
 
 def get_sector(symbol: str) -> str:
     """
@@ -186,10 +194,14 @@ def fetch_candles(
     # Cross-validate against previous close from a separate fast_info call.
     # Guards against same-source corruption where both candle and live price
     # are wrong (e.g. AC.TO holiday bleed returning $61 instead of ~$17).
-    prev_close = None
+    # For .TO symbols only, also capture last_price for the stricter 5% TSX check below.
+    prev_close     = None
+    tsx_last_price = None
     try:
-        fi = yf.Ticker(symbol).fast_info
+        fi         = yf.Ticker(symbol).fast_info
         prev_close = getattr(fi, "previous_close", None) or getattr(fi, "previousClose", None)
+        if symbol.upper().endswith(".TO"):
+            tsx_last_price = getattr(fi, "last_price", None) or getattr(fi, "lastPrice", None)
     except Exception:
         pass
 
@@ -199,6 +211,22 @@ def fetch_candles(
             logger.warning(
                 "%s — rejected: close $%.2f deviates %.1f%% from previous close $%.2f (data corruption)",
                 symbol, latest, deviation * 100, prev_close,
+            )
+            return None
+
+    # TSX-specific secondary check: candle close vs live last_price (5% tolerance).
+    # Catches currency-mismatch corruption (e.g. USD price bled into a CAD ticker)
+    # that slips past the previous_close check when both sources are wrong.
+    # Non-.TO symbols are intentionally excluded — fast_info adds ~2s/symbol overhead.
+    if tsx_last_price and tsx_last_price > 0:
+        tsx_deviation = abs(latest - tsx_last_price) / tsx_last_price
+        if tsx_deviation > 0.05:
+            global _tsx_corruption_warnings
+            _tsx_corruption_warnings += 1
+            logger.warning(
+                "%s — TSX price mismatch: candle close $%.2f vs fast_info.last_price $%.2f "
+                "(%.1f%% deviation) — rejecting as corrupted data",
+                symbol, latest, tsx_last_price, tsx_deviation * 100,
             )
             return None
 
