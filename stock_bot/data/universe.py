@@ -21,6 +21,7 @@ import time
 import pandas as pd
 import requests
 import yfinance as yf
+from yfinance.exceptions import YFRateLimitError
 
 from stock_bot.data.ipo_tracker import IPOTracker
 
@@ -34,7 +35,8 @@ _SP400_URL    = "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies"
 _TSX_COMP_URL = "https://en.wikipedia.org/wiki/S%26P/TSX_Composite_Index"
 _USER_AGENT   = "Mozilla/5.0 (compatible; StockBot/1.0)"
 
-_BATCH_SIZE = 50   # infrastructure constant — not a strategy value
+_BATCH_SIZE  = int(os.getenv("UNIVERSE_BATCH_SIZE",  "25"))
+_BATCH_DELAY = float(os.getenv("UNIVERSE_BATCH_DELAY", "2.0"))
 
 _FALLBACK_SYMBOLS: list[str] = [
     "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "JPM",
@@ -332,8 +334,14 @@ class StockUniverse:
         result: dict[str, dict] = {}
 
         for i in range(0, len(symbols), _BATCH_SIZE):
-            batch = symbols[i : i + _BATCH_SIZE]
-            try:
+            batch   = symbols[i : i + _BATCH_SIZE]
+            batch_n = i // _BATCH_SIZE + 1
+
+            if i > 0:
+                time.sleep(_BATCH_DELAY)
+
+            data = None
+            for attempt in range(2):
                 devnull = open(os.devnull, "w")
                 old_stdout, old_stderr = sys.stdout, sys.stderr
                 sys.stdout = devnull
@@ -346,63 +354,77 @@ class StockUniverse:
                         auto_adjust = True,
                         progress    = False,
                     )
+                except YFRateLimitError:
+                    if attempt == 0:
+                        logger.warning(
+                            "Universe: rate limited on batch %d, retrying in 30s", batch_n
+                        )
+                        time.sleep(30)
+                    else:
+                        logger.warning(
+                            "Universe: batch %d failed after retry, skipping", batch_n
+                        )
+                    data = None
+                except Exception as exc:
+                    logger.warning("Batch download failed (batch %d): %s", batch_n, exc)
+                    data = None
+                    break
                 finally:
                     sys.stdout = old_stdout
                     sys.stderr = old_stderr
                     devnull.close()
-                if data.empty:
+
+                if data is not None:
+                    break
+
+            if data is None or data.empty:
+                continue
+
+            if isinstance(data.columns, pd.MultiIndex):
+                close_df  = data["Close"]
+                volume_df = data["Volume"]
+            else:
+                close_df  = data[["Close"]].rename(columns={"Close": batch[0]})
+                volume_df = data[["Volume"]].rename(columns={"Volume": batch[0]})
+
+            for sym in close_df.columns:
+                closes  = close_df[sym].dropna()
+                volumes = volume_df[sym].dropna()
+                if len(closes) < 7 or volumes.empty:
                     continue
 
-                if isinstance(data.columns, pd.MultiIndex):
-                    close_df  = data["Close"]
-                    volume_df = data["Volume"]
-                else:
-                    close_df  = data[["Close"]].rename(columns={"Close": batch[0]})
-                    volume_df = data[["Volume"]].rename(columns={"Volume": batch[0]})
+                close    = float(closes.iloc[-1])
+                close_1d = float(closes.iloc[-2])
+                close_5d = float(closes.iloc[-6])
 
-                for sym in close_df.columns:
-                    closes  = close_df[sym].dropna()
-                    volumes = volume_df[sym].dropna()
-                    if len(closes) < 7 or volumes.empty:
-                        continue
+                volume     = float(volumes.iloc[-1])
+                avg_vol_20 = float(volumes.iloc[-20:].mean()) if len(volumes) >= 20 else float(volumes.mean())
 
-                    close    = float(closes.iloc[-1])
-                    close_1d = float(closes.iloc[-2])
-                    close_5d = float(closes.iloc[-6])
+                change_1d    = (close - close_1d) / close_1d if close_1d > 0 else 0.0
+                change_5d    = (close - close_5d) / close_5d if close_5d > 0 else 0.0
+                volume_ratio = volume / avg_vol_20 if avg_vol_20 > 0 else 1.0
 
-                    volume     = float(volumes.iloc[-1])
-                    avg_vol_20 = float(volumes.iloc[-20:].mean()) if len(volumes) >= 20 else float(volumes.mean())
+                vol_surge    = min(volume_ratio, 10.0)
+                mom_5d       = abs(change_5d)
+                mom_1d       = abs(change_1d)
+                rel_strength = abs(change_5d - spy_5d_return)
 
-                    change_1d    = (close - close_1d) / close_1d if close_1d > 0 else 0.0
-                    change_5d    = (close - close_5d) / close_5d if close_5d > 0 else 0.0
-                    volume_ratio = volume / avg_vol_20 if avg_vol_20 > 0 else 1.0
-
-                    vol_surge    = min(volume_ratio, 10.0)
-                    mom_5d       = abs(change_5d)
-                    mom_1d       = abs(change_1d)
-                    rel_strength = abs(change_5d - spy_5d_return)
-
-                    score = (
-                        w_vol    * vol_surge
-                      + w_mom5d  * mom_5d
-                      + w_mom1d  * mom_1d
-                      + w_relstr * rel_strength
-                    )
-
-                    result[sym] = {
-                        "price":          close,
-                        "avg_volume":     avg_vol_20,
-                        "change_1d":      change_1d,
-                        "change_5d":      change_5d,
-                        "volume_ratio":   volume_ratio,
-                        "momentum_score": (w_mom5d * mom_5d + w_mom1d * mom_1d),
-                        "score":          score,
-                    }
-
-            except Exception as exc:
-                logger.warning(
-                    "Batch download failed (batch %d): %s", i // _BATCH_SIZE + 1, exc
+                score = (
+                    w_vol    * vol_surge
+                  + w_mom5d  * mom_5d
+                  + w_mom1d  * mom_1d
+                  + w_relstr * rel_strength
                 )
+
+                result[sym] = {
+                    "price":          close,
+                    "avg_volume":     avg_vol_20,
+                    "change_1d":      change_1d,
+                    "change_5d":      change_5d,
+                    "volume_ratio":   volume_ratio,
+                    "momentum_score": (w_mom5d * mom_5d + w_mom1d * mom_1d),
+                    "score":          score,
+                }
 
         return result
 

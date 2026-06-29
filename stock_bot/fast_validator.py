@@ -250,6 +250,7 @@ class FastValidator:
                     period       = period_str,
                     interval     = self.cfg.candle_interval,
                     auto_adjust  = True,
+                    actions      = False,
                     progress     = False,
                 )
             except Exception as exc:
@@ -712,6 +713,23 @@ class FastValidatorReport:
                 })
 
         return pairs
+
+    def get_stats(self, csv_path: str = _TRADES_CSV) -> dict:
+        """
+        Return summary stats as a dict for use by external reporters (e.g. weekly email).
+
+        Keys: completed (int), win_rate (float, percent), avg_hold_hours (float).
+        All values are 0 / 0.0 when no completed trades exist.
+        """
+        trades = self.load_trades(csv_path)
+        pairs  = self.pair_trades(trades)
+        n = len(pairs)
+        if n == 0:
+            return {"completed": 0, "win_rate": 0.0, "avg_hold_hours": 0.0}
+        wins          = sum(1 for p in pairs if p["pnl_pct"] > 0)
+        win_rate      = round(wins / n * 100, 1)
+        avg_hold_hours = round(sum(p["hold_hours"] for p in pairs) / n, 1)
+        return {"completed": n, "win_rate": win_rate, "avg_hold_hours": avg_hold_hours}
 
     def generate(self, csv_path: str = _TRADES_CSV) -> str:
         trades = self.load_trades(csv_path)

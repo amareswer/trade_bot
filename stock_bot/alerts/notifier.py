@@ -6,13 +6,21 @@ Delivers Alert objects via three channels:
   email     — opt-in via ALERT_EMAIL_ENABLED (Gmail SMTP, stdlib only)
   desktop   — opt-in via ALERT_DESKTOP_ENABLED (plyer, install separately)
 
+Also schedules a weekly summary email every Sunday at 18:00 local time
+(gate status, fast validator stats, swing paper stats, regime, TSX warnings).
+The timer is self-rearming — it reschedules itself each firing.
+
 Never crashes the scan loop — all delivery errors are caught and logged.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import smtplib
 import ssl
+import threading
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from typing import TYPE_CHECKING
 
@@ -24,6 +32,9 @@ if TYPE_CHECKING:
     from stock_bot.config import StockConfig
 
 logger = logging.getLogger(__name__)
+
+_STOCK_BOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PAPER_STATE   = os.path.join(_STOCK_BOT_DIR, "paper_state.json")
 
 # Warn once if plyer is absent, then stay silent
 _plyer_warned    = False
@@ -43,14 +54,200 @@ def _box_line(text: str = "", fill: str = " ") -> str:
     return f"║{padded:<{_BOX_WIDTH - 2}}║"
 
 
+def _seconds_until_next_sunday_18() -> float:
+    """
+    Return seconds from now until the next Sunday at 18:00 local time.
+    If it is already Sunday and past 18:00, schedules for the following Sunday.
+    Minimum 60 s so the timer never fires immediately.
+    """
+    now  = datetime.now()
+    days_ahead = (6 - now.weekday()) % 7   # Sunday = weekday 6
+    if days_ahead == 0 and now.hour >= 18:
+        days_ahead = 7
+    target = now.replace(hour=18, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
+    return max(60.0, (target - now).total_seconds())
+
+
 class AlertNotifier:
     """
     Delivers alerts to terminal and optionally to email and desktop.
     Instantiated once at startup.
+    Call start_weekly_summary() after __init__ to arm the Sunday 18:00 timer.
     """
 
     def __init__(self, config: StockConfig) -> None:
-        self._cfg = config
+        self._cfg   = config
+        self._timer: threading.Timer | None = None
+
+    def start_weekly_summary(self) -> None:
+        """
+        Arm a self-rearming threading.Timer that fires every Sunday at 18:00
+        local time and sends the weekly summary email.
+
+        Safe to call even when email is not configured — the callback will log
+        DEBUG and return without sending.  Never raises.
+        """
+        delay = _seconds_until_next_sunday_18()
+        self._timer = threading.Timer(delay, self._weekly_summary_callback)
+        self._timer.daemon = True
+        self._timer.start()
+        next_fire = datetime.now() + timedelta(seconds=delay)
+        logger.info(
+            "Weekly summary timer armed — next fire: %s (%.0fh away)",
+            next_fire.strftime("%Y-%m-%d %H:%M"),
+            delay / 3600,
+        )
+
+    def _weekly_summary_callback(self) -> None:
+        """Timer callback — send email then rearm for next Sunday."""
+        try:
+            self._send_weekly_summary()
+        except Exception as exc:
+            logger.warning("Weekly summary callback error: %s", exc)
+        finally:
+            # Always rearm, even if this firing failed
+            self.start_weekly_summary()
+
+    def _send_weekly_summary(self) -> None:
+        from_addr = self._cfg.alert_email_from.strip()
+        to_addr   = self._cfg.alert_email_to.strip()
+        password  = self._cfg.alert_email_password.strip()
+
+        if not self._cfg.alert_email_enabled or not from_addr or not to_addr or not password:
+            logger.debug("Weekly summary: email not configured")
+            return
+
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        # ── 1. Gate status ────────────────────────────────────────────────────
+        try:
+            from stock_bot.analysis.accuracy_tracker import LiveTradingGate
+            gate_data  = LiveTradingGate().get_gate_status()
+            remaining  = gate_data["remaining"]
+            gate_lines = []
+            for g in gate_data["gates"]:
+                gate_lines.append(
+                    f"  Gate {g['gate']} [{g['status']:<7}]: {g.get('detail', '')}"
+                )
+        except Exception as exc:
+            remaining  = -1
+            gate_lines = [f"  Gate status unavailable: {exc}"]
+
+        # ── 2. Fast validator stats ───────────────────────────────────────────
+        try:
+            from stock_bot.fast_validator import FastValidatorReport
+            fv_stats = FastValidatorReport().get_stats()
+            fv_lines = [
+                f"  Completed trades : {fv_stats['completed']}",
+                f"  Win rate         : {fv_stats['win_rate']:.1f}%",
+                f"  Avg hold (hours) : {fv_stats['avg_hold_hours']:.1f}h",
+            ]
+        except Exception as exc:
+            fv_lines = [f"  Fast validator stats unavailable: {exc}"]
+
+        # ── 3. Swing paper stats (paper_state.json — read-only) ───────────────
+        try:
+            with open(_PAPER_STATE, "r", encoding="utf-8") as f:
+                ps = json.load(f)
+            positions   = ps.get("positions", {})
+            open_count  = len(positions)
+            cash        = float(ps.get("cash", 0.0))
+            realized    = float(ps.get("realized_pnl", 0.0))
+            # Unrealized: sum of (avg_cost * shares) as a proxy — no live prices in email
+            cost_basis  = sum(
+                float(v.get("shares", 0)) * float(v.get("avg_cost", 0))
+                for v in positions.values()
+            )
+            paper_lines = [
+                f"  Open positions   : {open_count} ({', '.join(positions.keys()) or 'none'})",
+                f"  Cash             : ${cash:,.2f}",
+                f"  Cost basis (open): ${cost_basis:,.2f}",
+                f"  Realized P&L     : ${realized:+,.2f}",
+            ]
+        except FileNotFoundError:
+            paper_lines = ["  paper_state.json not found — no paper trades yet"]
+        except Exception as exc:
+            paper_lines = [f"  Swing paper stats unavailable: {exc}"]
+
+        # ── 4. Regime (SPY vs 200-day MA) ─────────────────────────────────────
+        try:
+            import yfinance as yf
+            from stock_bot.indicators.indicators import regime as _regime
+            _spy_raw = yf.download(
+                "SPY", interval="1d", period="1y", auto_adjust=True, actions=False, progress=False
+            )
+            if _spy_raw is not None and not _spy_raw.empty:
+                if hasattr(_spy_raw.columns, "nlevels") and _spy_raw.columns.nlevels > 1:
+                    _spy_raw.columns = [
+                        c[0] if isinstance(c, tuple) else c for c in _spy_raw.columns
+                    ]
+                spy_closes  = [float(v) for v in _spy_raw["Close"].dropna().tolist()]
+                regime_str  = _regime(
+                    spy_closes,
+                    self._cfg.regime_ma_period,
+                    self._cfg.regime_fast_ma,
+                )
+            else:
+                regime_str = "UNKNOWN"
+        except Exception as exc:
+            regime_str = f"UNKNOWN ({exc})"
+        regime_icons = {"BULL": "🟢", "BEAR": "🔴", "NEUTRAL": "🟡"}
+        regime_icon  = regime_icons.get(regime_str, "⚪")
+        regime_line  = f"  Regime: {regime_str} {regime_icon}"
+
+        # ── 5. TSX corruption warnings ────────────────────────────────────────
+        try:
+            from stock_bot.data.price_feed import get_tsx_warnings
+            tsx_warn_line = f"  TSX corruption warnings: {get_tsx_warnings()}"
+        except Exception as exc:
+            tsx_warn_line = f"  TSX warnings unavailable: {exc}"
+
+        # ── Compose email ─────────────────────────────────────────────────────
+        subject = f"Stock Bot Weekly — {today} — {remaining} gates remaining"
+
+        sep  = "=" * 50
+        body = "\n".join([
+            "Stock Bot — Weekly Summary",
+            sep,
+            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "GATE STATUS",
+            sep,
+            *gate_lines,
+            "",
+            "FAST VALIDATOR (1h candles)",
+            sep,
+            *fv_lines,
+            "",
+            "SWING PAPER (daily candles)",
+            sep,
+            *paper_lines,
+            "",
+            "MARKET REGIME",
+            sep,
+            regime_line,
+            "",
+            "PRICE FEED HEALTH",
+            sep,
+            tsx_warn_line,
+            "",
+            sep,
+            "Not financial advice. This is an automated report from Stock Bot.",
+        ])
+
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"]    = from_addr
+        msg["To"]      = to_addr
+
+        try:
+            ctx = ssl.create_default_context()
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as server:
+                server.login(from_addr, password)
+                server.sendmail(from_addr, to_addr, msg.as_string())
+            logger.info("Weekly summary email sent to %s", to_addr)
+        except Exception as exc:
+            logger.warning("Weekly summary email failed: %s", exc)
 
     def notify(self, alerts: list[Alert]) -> None:
         if not alerts:

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import statistics
 import threading
 import time
 from dataclasses import dataclass
@@ -17,6 +19,7 @@ from datetime import datetime
 from typing import Optional
 
 import yfinance as yf
+from yfinance.exceptions import YFRateLimitError
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +36,9 @@ _sector_cache: dict[str, str] = {}
 
 # TSX-specific price corruption counter — incremented per rejection, never reset
 _tsx_corruption_warnings: int = 0
+
+# Multiplier for the within-fetch outlier check; override via PRICE_OUTLIER_FACTOR in .env
+_PRICE_OUTLIER_FACTOR: float = float(os.getenv("PRICE_OUTLIER_FACTOR", "10"))
 
 
 def get_tsx_warnings() -> int:
@@ -120,20 +126,35 @@ def fetch_candles(
       - US equities:  "AAPL", "NVDA", "MSFT"
       - TSX equities: "SHOP.TO", "RY.TO", "AC.TO"
     """
+    _rl_delays = [5, 15, 30]
     with _yf_download_lock:
-        try:
-            df = yf.download(
-                symbol,
-                period=f"{lookback_days}d",
-                interval=interval,
-                auto_adjust=True,
-                progress=False,
-            )
-        except Exception as e:
-            logger.warning("fetch failed %s: %s", symbol, e)
-            return None
-        finally:
-            time.sleep(0.5)
+        df = None
+        for attempt, delay in enumerate(_rl_delays):
+            try:
+                df = yf.download(
+                    symbol,
+                    period=f"{lookback_days}d",
+                    interval=interval,
+                    auto_adjust=True,
+                    actions=False,
+                    progress=False,
+                )
+                break
+            except YFRateLimitError:
+                if attempt < len(_rl_delays) - 1:
+                    logger.warning("Rate limited fetching %s, waiting %ds", symbol, delay)
+                    time.sleep(delay)
+                else:
+                    logger.error(
+                        "Rate limit: giving up on %s after 3 attempts", symbol
+                    )
+                    time.sleep(0.5)
+                    return None
+            except Exception as e:
+                logger.warning("fetch failed %s: %s", symbol, e)
+                time.sleep(0.5)
+                return None
+        time.sleep(0.5)
 
     if df is None or df.empty:
         return None
@@ -191,44 +212,38 @@ def fetch_candles(
     if _is_duplicate_price(symbol, latest):
         return None
 
-    # Cross-validate against previous close from a separate fast_info call.
-    # Guards against same-source corruption where both candle and live price
-    # are wrong (e.g. AC.TO holiday bleed returning $61 instead of ~$17).
-    # For .TO symbols only, also capture last_price for the stricter 5% TSX check below.
-    prev_close     = None
-    tsx_last_price = None
-    try:
-        fi         = yf.Ticker(symbol).fast_info
-        prev_close = getattr(fi, "previous_close", None) or getattr(fi, "previousClose", None)
-        if symbol.upper().endswith(".TO"):
-            tsx_last_price = getattr(fi, "last_price", None) or getattr(fi, "lastPrice", None)
-    except Exception:
-        pass
+    # Outlier check: latest close vs median of this same download's candles.
+    # Catches single-candle corruption without relying on any stored historical state.
+    closes = [c.close for c in candles]
+    median_close = statistics.median(closes)
+    if median_close > 0 and latest > median_close * _PRICE_OUTLIER_FACTOR:
+        logger.warning(
+            "Price outlier detected: %s close $%.2f vs median $%.2f",
+            symbol, latest, median_close,
+        )
+        return None
 
-    if prev_close and prev_close > 0:
-        deviation = abs(latest - prev_close) / prev_close
-        if deviation > 0.20:
-            logger.warning(
-                "%s — rejected: close $%.2f deviates %.1f%% from previous close $%.2f (data corruption)",
-                symbol, latest, deviation * 100, prev_close,
-            )
-            return None
-
-    # TSX-specific secondary check: candle close vs live last_price (5% tolerance).
-    # Catches currency-mismatch corruption (e.g. USD price bled into a CAD ticker)
-    # that slips past the previous_close check when both sources are wrong.
+    # TSX-specific check: candle close vs live fast_info.last_price (5% tolerance).
+    # Catches currency-mismatch corruption (e.g. USD price bled into a CAD ticker).
     # Non-.TO symbols are intentionally excluded — fast_info adds ~2s/symbol overhead.
-    if tsx_last_price and tsx_last_price > 0:
-        tsx_deviation = abs(latest - tsx_last_price) / tsx_last_price
-        if tsx_deviation > 0.05:
-            global _tsx_corruption_warnings
-            _tsx_corruption_warnings += 1
-            logger.warning(
-                "%s — TSX price mismatch: candle close $%.2f vs fast_info.last_price $%.2f "
-                "(%.1f%% deviation) — rejecting as corrupted data",
-                symbol, latest, tsx_last_price, tsx_deviation * 100,
-            )
-            return None
+    if symbol.upper().endswith(".TO"):
+        tsx_last_price = None
+        try:
+            fi = yf.Ticker(symbol).fast_info
+            tsx_last_price = getattr(fi, "last_price", None) or getattr(fi, "lastPrice", None)
+        except Exception:
+            pass
+        if tsx_last_price and tsx_last_price > 0:
+            tsx_deviation = abs(latest - tsx_last_price) / tsx_last_price
+            if tsx_deviation > 0.05:
+                global _tsx_corruption_warnings
+                _tsx_corruption_warnings += 1
+                logger.warning(
+                    "%s — TSX price mismatch: candle close $%.2f vs fast_info.last_price $%.2f "
+                    "(%.1f%% deviation) — rejecting as corrupted data",
+                    symbol, latest, tsx_last_price, tsx_deviation * 100,
+                )
+                return None
 
     logger.debug("Fetched %d candles for %s (interval=%s)", len(candles), symbol, interval)
     return candles

@@ -557,7 +557,12 @@ def _run_news_scan(symbols: list[str]) -> None:
 # Main loop
 # ---------------------------------------------------------------------------
 
+_last_universe_refresh = None                                        # datetime | None
+_UNIVERSE_REFRESH_HOUR = int(_os.getenv("UNIVERSE_REFRESH_HOUR", "16"))  # 4pm ET default
+
+
 def run() -> None:
+    global _last_universe_refresh
     cfg = load()
     cfg.log_startup()
 
@@ -572,16 +577,11 @@ def run() -> None:
 
     if cfg.universe_enabled:
         _universe = StockUniverse(cfg=cfg, refresh_hours=cfg.universe_refresh_hours)
-        raw_symbols      = _universe.get_universe()
-        _startup_market  = _get_market_status()
-        universe_symbols = _universe.pre_filter(raw_symbols, cfg.universe_size, market_status=_startup_market)
-        _universe_refreshed_at = time.time()
     else:
-        _universe        = None
-        universe_symbols = []
-        _universe_refreshed_at = 0.0
+        _universe = None
+    top_movers: list[str] = []
 
-    all_symbols = list(dict.fromkeys(watchlist_symbols + universe_symbols))
+    all_symbols = list(dict.fromkeys(watchlist_symbols + top_movers))
 
     screener = StockScreener() if cfg.screener_enabled else None
 
@@ -612,8 +612,8 @@ def run() -> None:
     print(f"  {'─' * 45}")
     print(f"  My Watchlist : {', '.join(watchlist_symbols)}")
     if cfg.universe_enabled:
-        print(f"  Universe     : S&P500 + TSX60 → top {cfg.universe_size} movers")
-        print(f"  Top Movers   : {', '.join(universe_symbols)}")
+        print(f"  Universe     : S&P500 + TSX60 → top {cfg.universe_size} movers (refreshes at {_UNIVERSE_REFRESH_HOUR}:00 ET)")
+        print(f"  Top Movers   : {', '.join(top_movers) if top_movers else '(waiting for first refresh)'}")
     print(f"  Screener  : {'enabled' if screener else 'disabled'}")
     print(f"  Interval  : {cfg.interval}   Lookback: {cfg.lookback_days}d   Loop: {cfg.loop_interval}s")
     if ai_engine and ai_engine.enabled:
@@ -644,6 +644,8 @@ def run() -> None:
         _watcher.start()
         logger.info("SL/TP watcher thread started (30s interval)")
 
+    notifier.start_weekly_summary()
+
     def _fast_validator_worker() -> None:
         while True:
             try:
@@ -672,13 +674,13 @@ def run() -> None:
 
         if mode == "PRE_MARKET":
             print(f"🌅 Pre-market ({time_str}) — monitoring news...")
-            _run_news_scan(watchlist_symbols + universe_symbols)
+            _run_news_scan(watchlist_symbols + top_movers)
             time.sleep(900)
             continue
 
         elif mode == "AFTER_HOURS":
             print(f"🌙 After hours ({time_str}) — monitoring news...")
-            _run_news_scan(watchlist_symbols + universe_symbols)
+            _run_news_scan(watchlist_symbols + top_movers)
             time.sleep(1800)
             continue
 
@@ -709,7 +711,7 @@ def run() -> None:
         spy_closes: list[float] = []
         if cfg.regime_filter_enabled:
             try:
-                _spy_raw = yf.download("SPY", interval="1d", period="1y", progress=False, auto_adjust=True)
+                _spy_raw = yf.download("SPY", interval="1d", period="1y", auto_adjust=True, actions=False, progress=False)
                 if _spy_raw is not None and not _spy_raw.empty:
                     if hasattr(_spy_raw.columns, "nlevels") and _spy_raw.columns.nlevels > 1:
                         _spy_raw.columns = [c[0] if isinstance(c, tuple) else c for c in _spy_raw.columns]
@@ -725,17 +727,20 @@ def run() -> None:
         print(f"  {'Symbol':<10}  {'Price':>10}  {'RSI':^7}  {'Trend':<10}  {'ADX':^13}  MACD")
         print(f"  {'─'*10}  {'─'*10}  {'─'*7}  {'─'*10}  {'─'*13}  {'─'*30}")
 
-        # Refresh universe watchlist when its TTL has elapsed
+        # Refresh universe once per day at UNIVERSE_REFRESH_HOUR ET
         if cfg.universe_enabled and _universe is not None:
-            elapsed_h = (time.time() - _universe_refreshed_at) / 3600
-            if elapsed_h >= cfg.universe_refresh_hours:
-                raw_symbols      = _universe.get_universe()
-                universe_symbols = _universe.pre_filter(raw_symbols, cfg.universe_size, market_status=market_status)
-                all_symbols      = list(dict.fromkeys(watchlist_symbols + universe_symbols))
-                _universe_refreshed_at = time.time()
-                print(f"  Universe refreshed: {len(universe_symbols)} new movers")
+            if (now_et.hour == _UNIVERSE_REFRESH_HOUR
+                    and (_last_universe_refresh is None
+                         or _last_universe_refresh.date() != now_et.date())):
+                raw_symbols = _universe.get_universe()
+                top_movers  = _universe.pre_filter(raw_symbols, cfg.universe_size, market_status=market_status)
+                all_symbols = list(dict.fromkeys(watchlist_symbols + top_movers))
+                _last_universe_refresh = now_et
+                print(f"  Universe refreshed: {len(top_movers)} new movers")
                 print(f"  My Watchlist : {', '.join(watchlist_symbols)}")
-                print(f"  Top Movers   : {', '.join(universe_symbols)}")
+                print(f"  Top Movers   : {', '.join(top_movers)}")
+            elif not top_movers:
+                logger.info("Universe: waiting for %d:00 ET refresh", _UNIVERSE_REFRESH_HOUR)
 
         watchlist_set = set(cfg.watchlist)
         scan_results: list[ScanResult] = []

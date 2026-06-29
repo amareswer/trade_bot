@@ -96,6 +96,7 @@ class StockConfig:
     ai_gate_adx_min:       float # skip AI call when ADX < this (ranging, e.g. 15)
     earnings_blackout_days: int  # block BUY within N days of next earnings date
     price_sanity_pct:      float # reject live price if it deviates >this from candle close (e.g. 0.05)
+    price_outlier_factor:  float # reject latest close if >Nx the median of the same fetch (default 10)
     nvidia_api_key:        str   # NVIDIA NIM API key (nvidia_nim provider)
     nvidia_model:          str   # NVIDIA NIM model name
     regime_filter_enabled: bool  # block BUY when SPY is not in BULL regime
@@ -188,6 +189,7 @@ def load() -> StockConfig:
         ai_gate_adx_min        = _float("AI_GATE_ADX_MIN",         15.0),
         earnings_blackout_days = _int  ("EARNINGS_BLACKOUT_DAYS",  5),
         price_sanity_pct       = _float("PRICE_SANITY_PCT",        0.05),
+        price_outlier_factor   = _float("PRICE_OUTLIER_FACTOR",    10.0),
         nvidia_api_key         = _str  ("NVIDIA_API_KEY",          ""),
         nvidia_model           = _str  ("NVIDIA_MODEL",            "nvidia/nemotron-3-ultra-550b-a55b"),
         regime_filter_enabled  = _bool ("REGIME_FILTER_ENABLED",   True),
