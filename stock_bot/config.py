@@ -82,6 +82,15 @@ class StockConfig:
     universe_enabled:      bool  # scan S&P500+TSX60 instead of fixed watchlist
     universe_size:         int   # top N symbols to scan per cycle
     universe_refresh_hours: int  # how often to refresh the symbol lists
+    universe_sources:      str   # comma-separated index sources (sp500,nasdaq100,…)
+    universe_etfs:         str   # comma-separated ETF list (user-controlled via .env)
+    universe_min_avg_volume: int   # minimum 20-day avg daily volume filter
+    universe_min_price:    float   # minimum stock price (penny stock filter)
+    universe_min_score:    float   # minimum composite momentum score
+    universe_weight_volume: float  # scoring weight: volume surge
+    universe_weight_mom5d:  float  # scoring weight: 5-day momentum
+    universe_weight_mom1d:  float  # scoring weight: 1-day momentum
+    universe_weight_relstr: float  # scoring weight: relative strength vs SPY
     screener_enabled:      bool  # skip AI on stocks with no momentum signal
     ai_gate_rsi_max:       float # skip AI call when RSI > this (overbought, e.g. 75)
     ai_gate_adx_min:       float # skip AI call when ADX < this (ranging, e.g. 15)
@@ -107,6 +116,16 @@ class StockConfig:
             raise ValueError("LOOKBACK_DAYS must be >= 5")
         if self.loop_interval < 10:
             raise ValueError("LOOP_INTERVAL must be >= 10 seconds")
+
+        total_weight = (
+            self.universe_weight_volume + self.universe_weight_mom5d
+            + self.universe_weight_mom1d + self.universe_weight_relstr
+        )
+        if abs(total_weight - 1.0) > 0.01:
+            raise ValueError(
+                f"Universe scoring weights must sum to 1.0, got {total_weight:.3f}. "
+                f"Check UNIVERSE_WEIGHT_* in stock_bot/.env"
+            )
 
     def log_startup(self) -> None:
         logger.info("─" * 50)
@@ -147,6 +166,20 @@ def load() -> StockConfig:
         universe_enabled       = _bool ("UNIVERSE_ENABLED",        False),
         universe_size          = _int  ("UNIVERSE_SIZE",           20),
         universe_refresh_hours = _int  ("UNIVERSE_REFRESH_HOURS",  24),
+        universe_sources        = _str  ("UNIVERSE_SOURCES",
+                                  "sp500,nasdaq100,sp400,tsx60,tsx_composite,etfs"),
+        universe_etfs           = _str  ("UNIVERSE_ETFS",
+                                  "XLK,XLF,XLE,XLV,XLI,XLY,XLP,XLB,XLU,XLRE,XLC,"
+                                  "SPY,QQQ,IWM,DIA,VTI,ARKK,ARKG,ARKW,SMH,SOXX,"
+                                  "EEM,EFA,GLD,SLV,USO,TLT,HYG,"
+                                  "XIU.TO,XIC.TO,ZEB.TO,XEG.TO,XFN.TO"),
+        universe_min_avg_volume = _int  ("UNIVERSE_MIN_AVG_VOLUME", 300_000),
+        universe_min_price      = _float("UNIVERSE_MIN_PRICE",      1.0),
+        universe_min_score      = _float("UNIVERSE_MIN_SCORE",      0.001),
+        universe_weight_volume  = _float("UNIVERSE_WEIGHT_VOL",     0.35),
+        universe_weight_mom5d   = _float("UNIVERSE_WEIGHT_MOM5D",   0.30),
+        universe_weight_mom1d   = _float("UNIVERSE_WEIGHT_MOM1D",   0.20),
+        universe_weight_relstr  = _float("UNIVERSE_WEIGHT_RELSTR",  0.15),
         screener_enabled       = _bool ("SCREENER_ENABLED",        True),
         ai_gate_rsi_max        = _float("AI_GATE_RSI_MAX",         75.0),
         ai_gate_adx_min        = _float("AI_GATE_ADX_MIN",         15.0),

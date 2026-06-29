@@ -72,6 +72,23 @@ PROTECTED=BMO.TO,CM.TO,SPCX              # display only, never paper-sell
 - Price guard in paper.py buy(): rejects price ≤ 0, > $500,000, or share count > 100,000
 - State validation in _load_state(): rejects cash > $1M or |realized_pnl| > $1M (corrupted state guard)
 - Screener price filter: $5–$200 only (universe symbols only; watchlist bypasses)
+- **Earnings blackout (added 2026-06-28):** BUY blocked when next_earnings_date ≤ EARNINGS_BLACKOUT_DAYS away
+
+## Earnings blackout (added 2026-06-28)
+
+File: `stock_bot/main.py` — `_is_earnings_blackout(symbol, research, cfg) -> bool`
+Config: `EARNINGS_BLACKOUT_DAYS=7` in `stock_bot/.env`
+
+Blocks BUY signals when next_earnings_date is within N days (inclusive boundary).
+Uses `ResearchReport.earnings.next_earnings_date` — zero extra API calls.
+Fail-open: any exception, missing date, None research → returns False (allow trade).
+
+Known upcoming earnings (as of 2026-06-28):
+  AC.TO  — Jul 27 2026 — blackout starts Jul 20
+  DLTR   — Aug 20 2026 — blackout starts Aug 13
+
+All 7 unit tests pass (5d→blocked, 14d→allowed, no date→allowed, None→allowed,
+today→blocked, exactly 7d→blocked, 8d→allowed).
 
 ## Key design: source separation
 
@@ -119,21 +136,39 @@ On first nvidia failure, automatically falls back to openrouter.
 | RSI_OVERBOUGHT | RSI > 75 on owned symbol | HIGH |
 | RSI_OVERSOLD | RSI < 25 on owned symbol | HIGH |
 
-## Universe scanner
+## Universe scanner (updated 2026-06-28)
 
-`data/universe.py` — StockUniverse
-- Fetches S&P500 + TSX60 symbols from Wikipedia
-- Ranks by `volume × |price_change|` (momentum × volume)
-- Returns top 10 (UNIVERSE_SIZE=10) as `universe_symbols`
-- TTL cache: refreshes every 24 hours
-- **Market-aware (2026-06-19):** `pre_filter(symbols, n, market_status=...)` accepts
-  the market_status dict — US closed → drops all non-.TO symbols before ranking;
-  CA closed → drops all .TO symbols; both closed → returns []; both open → all 560 ranked.
-  main.py passes market_status at startup and on every TTL refresh.
+`data/universe.py` — StockUniverse — fully dynamic, zero hardcoded values
+
+Symbol sources — controlled by UNIVERSE_SOURCES in .env:
+  sp500         — S&P 500 via Wikipedia (~503 symbols)
+  nasdaq100     — NASDAQ-100 via Wikipedia (~101, ~40 new vs S&P500)
+  sp400         — S&P MidCap 400 via Wikipedia (~400, all new)
+  tsx60         — S&P/TSX 60 via Wikipedia (~53)
+  tsx_composite — S&P/TSX Composite via Wikipedia (~190, ~140 new vs TSX60)
+  etfs          — ETF list from UNIVERSE_ETFS in .env (user-controlled, 33 default)
+
+Total universe: ~1,141 unique symbols after dedup (tested 2026-06-28)
+
+All thresholds from .env (zero hardcoded in Python):
+  UNIVERSE_MIN_AVG_VOLUME=300000
+  UNIVERSE_MIN_PRICE=1.0
+  UNIVERSE_MIN_SCORE=0.001
+  UNIVERSE_REFRESH_HOURS=4
+
+Scoring weights from .env (sum must = 1.0 — validated in __post_init__):
+  UNIVERSE_WEIGHT_VOL=0.35      volume surge (today/20d avg, capped 10x)
+  UNIVERSE_WEIGHT_MOM5D=0.30    5-day momentum (abs)
+  UNIVERSE_WEIGHT_MOM1D=0.20    1-day momentum (abs)
+  UNIVERSE_WEIGHT_RELSTR=0.15   relative strength vs SPY 5d
+
+SPY benchmark fetched once per _batch_metrics() call — not per symbol.
+StockUniverse(cfg=cfg) — cfg passed at construction; all values read via
+getattr with safe defaults so class still works in isolated testing.
 
 `data/screener.py` — StockScreener
 - Applied to universe symbols ONLY (watchlist bypasses)
-- Price range filter: `_MIN_PRICE = 5.0`, `_MAX_PRICE = 200.0`
+- Price floor: `_MIN_PRICE = 5.0` (no upper cap — removed in prior session)
 - Technical filter: RSI extremes, MACD cross, ≥3% price move (any one passes)
 
 ## What was reverted and why (2026-06-19 stability session)
@@ -419,3 +454,10 @@ stock_analysis.py     ← CLI: accuracy + paper report (project root)
 2. Check `python stock_analysis.py --report` after each live session
 3. Gate for live trading: 80+ confidence win% >= 55%, completed trades >= 10
 4. ETH/BTC universe expansion once stock paper trading is validated
+
+## Completed risk hardening (2026-06-28)
+
+- [x] Earnings blackout: `EARNINGS_BLACKOUT_DAYS=7`
+      `_is_earnings_blackout()` in main.py — 7/7 tests pass
+      Blocks BUY within 7 days of earnings — fail-open on any error
+      AC.TO blackout Jul 20 | DLTR blackout Aug 13

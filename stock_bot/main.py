@@ -459,6 +459,47 @@ def _check_price_uniformity(scan_results: list) -> bool:
     return True
 
 
+def _is_earnings_blackout(symbol: str, research, cfg) -> bool:
+    """
+    Returns True if symbol is within earnings_blackout_days of its next earnings date.
+
+    Fail-open: any exception, missing date, or None research → returns False (allow trade).
+    Boundary inclusive: exactly N days away → blocked.
+    Zero extra network calls — uses already-fetched ResearchReport.earnings.next_earnings_date.
+    """
+    try:
+        blackout_days = getattr(cfg, "earnings_blackout_days", 7)
+        if blackout_days <= 0:
+            return False
+
+        if research is None:
+            return False
+
+        earnings = getattr(research, "earnings", None)
+        if earnings is None:
+            return False
+
+        next_date = getattr(earnings, "next_earnings_date", None)
+        if next_date is None:
+            return False
+
+        from datetime import date as _date, datetime as _datetime
+        if isinstance(next_date, _datetime):
+            next_date = next_date.date()
+        elif not isinstance(next_date, _date):
+            try:
+                next_date = _date.fromisoformat(str(next_date)[:10])
+            except Exception:
+                return False
+
+        days_until = (next_date - _date.today()).days
+        return 0 <= days_until <= blackout_days
+
+    except Exception as exc:
+        logger.debug("Earnings blackout check failed for %s: %s", symbol, exc)
+        return False
+
+
 def _check_open_positions_sl_tp(executor, cfg) -> None:
     """
     Lightweight stop-loss / take-profit check for all open paper positions.
@@ -525,7 +566,7 @@ def run() -> None:
     logger.info("Sector cache ready.")
 
     if cfg.universe_enabled:
-        _universe = StockUniverse(refresh_hours=cfg.universe_refresh_hours)
+        _universe = StockUniverse(cfg=cfg, refresh_hours=cfg.universe_refresh_hours)
         raw_symbols      = _universe.get_universe()
         _startup_market  = _get_market_status()
         universe_symbols = _universe.pre_filter(raw_symbols, cfg.universe_size, market_status=_startup_market)
@@ -818,14 +859,20 @@ def run() -> None:
                     execution_price = live_price if live_price else px
                     sig = verdict.signal
                     if sig == "BUY":
-                        # Earnings blackout: no BUY within 5 days of earnings
-                        _rpt = research_data.get(symbol)
-                        if _rpt and _rpt.earnings.next_earnings_date is not None:
-                            _days_to_earn = (_rpt.earnings.next_earnings_date - date.today()).days
-                            if 0 <= _days_to_earn <= cfg.earnings_blackout_days:
-                                print(f"  📄 SKIP: {symbol} — earnings in {_days_to_earn}d (blackout)")
-                                print(f"  {'─' * 70}")
-                                continue
+                        if _is_earnings_blackout(symbol, report, cfg):
+                            _ned = report.earnings.next_earnings_date if report else None
+                            _days_left = (_ned - date.today()).days if _ned else "?"
+                            logger.info(
+                                "EARNINGS BLACKOUT: %s blocked — earnings in %s days (%s)",
+                                symbol, _days_left, _ned,
+                            )
+                            print(
+                                f"  🚫 EARNINGS BLACKOUT: {symbol} — "
+                                f"earnings in {_days_left}d ({_ned}) | "
+                                f"conf={verdict.confidence}% blocked"
+                            )
+                            print(f"  {'─' * 70}")
+                            continue
                         if executor.position(symbol) == 0:
                             _price_map_now = {r.symbol: r.price for r in scan_results}
                             if not executor.check_exposure(_price_map_now):

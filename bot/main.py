@@ -14,6 +14,7 @@ Architecture (top → bottom):
 """
 import csv
 import logging
+import logging.handlers
 import os
 import signal as _signal_module
 import threading
@@ -28,7 +29,11 @@ load_dotenv()
 # ── Logging setup ────────────────────────────────────────────────────────────
 _log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
 os.makedirs(_log_dir, exist_ok=True)
-_file_handler = logging.FileHandler(os.path.join(_log_dir, "trade_bot.log"))
+_file_handler = logging.handlers.RotatingFileHandler(
+    os.path.join(_log_dir, "trade_bot.log"),
+    maxBytes=10_000_000,
+    backupCount=5,
+)
 _file_handler.setLevel(logging.INFO)
 _file_handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
 _console_handler = logging.StreamHandler()
@@ -569,6 +574,7 @@ def run():
     tick        = 0
     tick_log:   deque[dict] = deque(maxlen=200)
     _consecutive_errors = 0
+    _drift_consecutive_failures = 0
     candle_log: deque[dict] = deque(maxlen=50)
     _last_candle_time = time.time()
 
@@ -709,25 +715,41 @@ def run():
                     )
                     _last_candle_time = time.time()
 
-            # ── 1c. Position drift reconciliation (every 60 ticks, live) ──
-            if cfg.exchange.live_trading and not cfg.exchange.dry_run and sym == _active_symbol and tick % 60 == 0:
-                try:
-                    balance = ss['executor']._exchange.fetch_balance()
-                    base = sym.split("/")[0]
-                    exchange_pos = float(balance.get("free", {}).get(base, 0))
-                    bot_pos = ss['executor'].position
-                    drift = abs(exchange_pos - bot_pos)
-                    if drift > 0.000010:
-                        logger.warning(
-                            "POSITION DRIFT: exchange=%.6f bot=%.6f drift=%.6f %s",
-                            exchange_pos, bot_pos, drift, base,
-                        )
-                        alerter.error(
-                            f"Position drift detected: exchange={exchange_pos:.6f} "
-                            f"bot={bot_pos:.6f} {base} — check logs/live_state.json"
-                        )
-                except Exception as _drift_exc:
-                    logger.warning("Position drift check failed: %s", _drift_exc)
+            # ── 1c. Position drift reconciliation (every 120 ticks, live) ──
+            if cfg.exchange.live_trading and not cfg.exchange.dry_run and sym == _active_symbol and tick % 120 == 0:
+                _drift_delays = [5, 15, 30]
+                _drift_succeeded = False
+                for _attempt, _delay in enumerate(_drift_delays):
+                    try:
+                        balance = ss['executor']._exchange.fetch_balance()
+                        base = sym.split("/")[0]
+                        exchange_pos = float(balance.get("free", {}).get(base, 0))
+                        bot_pos = ss['executor'].position
+                        drift = abs(exchange_pos - bot_pos)
+                        if drift > 0.000010:
+                            logger.warning(
+                                "POSITION DRIFT: exchange=%.6f bot=%.6f drift=%.6f %s",
+                                exchange_pos, bot_pos, drift, base,
+                            )
+                            alerter.error(
+                                f"Position drift detected: exchange={exchange_pos:.6f} "
+                                f"bot={bot_pos:.6f} {base} — check logs/live_state.json"
+                            )
+                        _drift_succeeded = True
+                        _drift_consecutive_failures = 0
+                        break
+                    except Exception as _drift_exc:
+                        if _attempt < len(_drift_delays) - 1:
+                            time.sleep(_delay)
+                        else:
+                            _drift_consecutive_failures += 1
+                            logger.warning("Position drift check failed: %s", _drift_exc)
+                            if _drift_consecutive_failures >= 5:
+                                logger.warning(
+                                    "WARNING: Position drift check: 5 consecutive failures"
+                                    " — Kraken BalanceEx may be rate-limited or session expired"
+                                )
+                                _drift_consecutive_failures = 0
 
             # ── 2. Intra-candle SL/TP + Trailing Stop + Partial TP ───
             if is_indicator and live_exchange is not None:
