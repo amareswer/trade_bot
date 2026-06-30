@@ -28,6 +28,7 @@ from typing import Optional
 import yfinance as yf
 from dotenv import load_dotenv
 
+from stock_bot.data.yf_client import fetch_with_retry
 from stock_bot.indicators.indicators import (
     adx   as calc_adx,
     atr   as calc_atr,
@@ -244,20 +245,18 @@ class FastValidator:
         period_str  = f"{min(days_needed, 729)}d"
 
         with _yf_lock:
-            try:
-                df = yf.download(
+            df = fetch_with_retry(
+                lambda: yf.download(
                     symbol,
                     period       = period_str,
                     interval     = self.cfg.candle_interval,
                     auto_adjust  = True,
                     actions      = False,
                     progress     = False,
-                )
-            except Exception as exc:
-                logger.warning("FastValidator fetch failed %s: %s", symbol, exc)
-                return None
-            finally:
-                time.sleep(0.5)
+                ),
+                label=f"{symbol}:fast_candles",
+            )
+            time.sleep(0.5)
 
         if df is None or df.empty:
             logger.debug("FastValidator: empty result for %s", symbol)
@@ -297,20 +296,24 @@ class FastValidator:
 
         # TSX sanity check: fast_info only for .TO symbols
         if symbol.upper().endswith(".TO"):
-            try:
-                fi            = yf.Ticker(symbol).fast_info
-                tsx_last      = getattr(fi, "last_price", None) or getattr(fi, "lastPrice", None)
-                if tsx_last and tsx_last > 0:
-                    deviation = abs(latest - tsx_last) / tsx_last
-                    if deviation > 0.05:
-                        logger.warning(
-                            "FastValidator %s: candle close $%.2f vs fast_info.last_price $%.2f "
-                            "(%.1f%%) — rejecting as corrupted",
-                            symbol, latest, tsx_last, deviation * 100,
-                        )
-                        return None
-            except Exception:
-                pass  # fast_info failure is non-fatal
+            def _fetch_tsx_fi():
+                fi = yf.Ticker(symbol).fast_info
+                return getattr(fi, "last_price", None) or getattr(fi, "lastPrice", None)
+
+            tsx_last = fetch_with_retry(
+                _fetch_tsx_fi,
+                label=f"{symbol}:fast_tsx_sanity",
+                max_attempts=2,
+            )
+            if tsx_last and tsx_last > 0:
+                deviation = abs(latest - tsx_last) / tsx_last
+                if deviation > 0.05:
+                    logger.warning(
+                        "FastValidator %s: candle close $%.2f vs fast_info.last_price $%.2f "
+                        "(%.1f%%) — rejecting as corrupted",
+                        symbol, latest, tsx_last, deviation * 100,
+                    )
+                    return None
 
         logger.debug("FastValidator: fetched %d 1h candles for %s", len(candles), symbol)
         return candles

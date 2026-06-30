@@ -30,8 +30,9 @@ from datetime import datetime, date, timedelta
 
 from stock_bot.config import load
 from stock_bot.data.price_feed    import fetch_candles, reset_price_cache, get_sector
+from stock_bot.data.yf_client     import fetch_with_retry
 from stock_bot.data.intraday_price import get_live_price
-from stock_bot.data.universe  import StockUniverse
+from stock_bot.data.universe  import StockUniverse, _FALLBACK_SYMBOLS as _UNIVERSE_FALLBACK
 from stock_bot.data.screener  import StockScreener
 from stock_bot.indicators.indicators import (
     adx    as calc_adx,
@@ -518,6 +519,7 @@ def _check_open_positions_sl_tp(executor, cfg) -> None:
             continue
         live = get_live_price(symbol)
         if live is None:
+            logger.debug("SL/TP check: skipping %s — no live price", symbol)
             continue
         pct_change = (live - avg_cost) / avg_cost
         if pct_change <= -abs(cfg.paper_stop_loss_pct):
@@ -710,14 +712,19 @@ def run() -> None:
         # Fetch SPY closes once per cycle for regime filter
         spy_closes: list[float] = []
         if cfg.regime_filter_enabled:
-            try:
-                _spy_raw = yf.download("SPY", interval="1d", period="1y", auto_adjust=True, actions=False, progress=False)
-                if _spy_raw is not None and not _spy_raw.empty:
-                    if hasattr(_spy_raw.columns, "nlevels") and _spy_raw.columns.nlevels > 1:
-                        _spy_raw.columns = [c[0] if isinstance(c, tuple) else c for c in _spy_raw.columns]
-                    spy_closes = [float(v) for v in _spy_raw["Close"].dropna().tolist()]
-            except Exception as _spy_exc:
-                logger.warning("Regime filter: SPY fetch failed — BUY signals blocked this cycle: %s", _spy_exc)
+            _spy_raw = fetch_with_retry(
+                lambda: yf.download(
+                    "SPY", interval="1d", period="1y",
+                    auto_adjust=True, actions=False, progress=False,
+                ),
+                label="SPY:regime",
+            )
+            if _spy_raw is not None and not _spy_raw.empty:
+                if hasattr(_spy_raw.columns, "nlevels") and _spy_raw.columns.nlevels > 1:
+                    _spy_raw.columns = [c[0] if isinstance(c, tuple) else c for c in _spy_raw.columns]
+                spy_closes = [float(v) for v in _spy_raw["Close"].dropna().tolist()]
+            elif _spy_raw is None:
+                logger.warning("Regime filter: SPY fetch failed — BUY signals blocked this cycle")
         _cycle_regime = regime(spy_closes, cfg.regime_ma_period, cfg.regime_fast_ma) if spy_closes else "UNKNOWN"
 
         _regime_icons = {"BULL": "🟢", "BEAR": "🔴", "NEUTRAL": "🟡", "UNKNOWN": "⚪"}
@@ -735,7 +742,17 @@ def run() -> None:
                 raw_symbols = _universe.get_universe()
                 top_movers  = _universe.pre_filter(raw_symbols, cfg.universe_size, market_status=market_status)
                 all_symbols = list(dict.fromkeys(watchlist_symbols + top_movers))
-                _last_universe_refresh = now_et
+                # Only mark today's refresh done when pre_filter returned real scored data.
+                # Fallback symbols mean the circuit breaker was active — leave
+                # _last_universe_refresh unset so the bot retries every cycle until real
+                # data arrives instead of running on stale fallback symbols for 24h.
+                _fallback_slice = list(_UNIVERSE_FALLBACK[:cfg.universe_size])
+                if top_movers != _fallback_slice:
+                    _last_universe_refresh = now_et
+                else:
+                    logger.warning(
+                        "Universe refresh returned fallback symbols — will retry next cycle"
+                    )
                 print(f"  Universe refreshed: {len(top_movers)} new movers")
                 print(f"  My Watchlist : {', '.join(watchlist_symbols)}")
                 print(f"  Top Movers   : {', '.join(top_movers)}")

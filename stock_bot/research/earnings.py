@@ -15,6 +15,8 @@ from typing import Optional
 import pandas as pd
 import yfinance as yf
 
+from stock_bot.data.yf_client import fetch_with_retry
+
 _earnings_cache: dict[str, tuple[any, float]] = {}
 _EARNINGS_TTL   = 86400  # 24 hours — earnings dates don't change intra-day
 
@@ -51,13 +53,24 @@ def fetch_earnings(symbol: str) -> EarningsInfo:
         if time.time() - ts < _EARNINGS_TTL:
             return info
 
-    try:
-        ticker = yf.Ticker(symbol)
+    def _fetch_earnings():
+        t   = yf.Ticker(symbol)
+        cal = t.calendar        # force lazy network call — RL surfaces here
+        ed  = t.earnings_dates  # same
+        return t, cal, ed
 
+    raw = fetch_with_retry(_fetch_earnings, label=f"{symbol}:earnings")
+    if raw is None:
+        fallback = EarningsInfo(earnings_note="No data")
+        _earnings_cache[symbol] = (fallback, time.time())
+        return fallback
+
+    ticker, cal, ed = raw
+
+    try:
         # ── Next earnings date ──────────────────────────────────────────────
         next_date: Optional[date] = None
         try:
-            cal = ticker.calendar
             if isinstance(cal, dict):
                 raw_dates = cal.get("Earnings Date", [])
                 if raw_dates:
@@ -75,7 +88,6 @@ def fetch_earnings(symbol: str) -> EarningsInfo:
         actual: Optional[float]   = None
         estimate: Optional[float] = None
         try:
-            ed = ticker.earnings_dates
             if ed is not None and isinstance(ed, pd.DataFrame) and not ed.empty:
                 # Drop rows where Reported EPS is NaN (future dates)
                 past = ed.dropna(subset=["Reported EPS"])

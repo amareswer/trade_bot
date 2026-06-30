@@ -21,7 +21,8 @@ import time
 import pandas as pd
 import requests
 import yfinance as yf
-from yfinance.exceptions import YFRateLimitError
+
+from stock_bot.data.yf_client import fetch_with_retry
 
 from stock_bot.data.ipo_tracker import IPOTracker
 
@@ -319,17 +320,18 @@ class StockUniverse:
 
         # SPY benchmark for relative strength — fetched once, reused for all symbols
         spy_5d_return = 0.0
-        try:
-            spy_raw = yf.download("SPY", period="10d", interval="1d",
-                                  auto_adjust=True, progress=False)
+        spy_raw = fetch_with_retry(
+            lambda: yf.download("SPY", period="10d", interval="1d",
+                                auto_adjust=True, progress=False),
+            label="SPY:universe_benchmark",
+        )
+        if spy_raw is not None:
             if isinstance(spy_raw.columns, pd.MultiIndex):
                 spy_raw.columns = spy_raw.columns.get_level_values(0)
             spy_closes = spy_raw["Close"].dropna().tolist()
             if len(spy_closes) >= 6:
                 spy_5d_return = (spy_closes[-1] - spy_closes[-6]) / spy_closes[-6]
                 logger.debug("SPY 5d return: %.3f%%", spy_5d_return * 100)
-        except Exception as exc:
-            logger.debug("SPY benchmark fetch failed (non-fatal): %s", exc)
 
         result: dict[str, dict] = {}
 
@@ -340,42 +342,25 @@ class StockUniverse:
             if i > 0:
                 time.sleep(_BATCH_DELAY)
 
-            data = None
-            for attempt in range(2):
+            def _fetch_batch(b=batch):
                 devnull = open(os.devnull, "w")
                 old_stdout, old_stderr = sys.stdout, sys.stderr
                 sys.stdout = devnull
                 sys.stderr = devnull
                 try:
-                    data = yf.download(
-                        batch,
+                    return yf.download(
+                        b,
                         period      = "30d",
                         interval    = "1d",
                         auto_adjust = True,
                         progress    = False,
                     )
-                except YFRateLimitError:
-                    if attempt == 0:
-                        logger.warning(
-                            "Universe: rate limited on batch %d, retrying in 30s", batch_n
-                        )
-                        time.sleep(30)
-                    else:
-                        logger.warning(
-                            "Universe: batch %d failed after retry, skipping", batch_n
-                        )
-                    data = None
-                except Exception as exc:
-                    logger.warning("Batch download failed (batch %d): %s", batch_n, exc)
-                    data = None
-                    break
                 finally:
                     sys.stdout = old_stdout
                     sys.stderr = old_stderr
                     devnull.close()
 
-                if data is not None:
-                    break
+            data = fetch_with_retry(_fetch_batch, label=f"universe:batch:{batch_n}")
 
             if data is None or data.empty:
                 continue

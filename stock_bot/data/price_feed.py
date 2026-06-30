@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Optional
 
 import yfinance as yf
-from yfinance.exceptions import YFRateLimitError
+from stock_bot.data.yf_client import fetch_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -56,15 +56,13 @@ def get_sector(symbol: str) -> str:
     sym = symbol.upper()
     if sym in _sector_cache:
         return _sector_cache[sym]
-    try:
-        info = yf.Ticker(sym).info
+    info = fetch_with_retry(lambda: yf.Ticker(sym).info, label=f"{sym}:sector")
+    if info is not None:
         sector = info.get("sector", "") or ""
-        normalized = sector.lower().strip()
-        if not normalized:
-            normalized = "other"
-        _sector_cache[sym] = normalized
-    except Exception:
-        _sector_cache[sym] = "other"
+        normalized = sector.lower().strip() or "other"
+    else:
+        normalized = "other"
+    _sector_cache[sym] = normalized
     return _sector_cache[sym]
 
 
@@ -126,34 +124,18 @@ def fetch_candles(
       - US equities:  "AAPL", "NVDA", "MSFT"
       - TSX equities: "SHOP.TO", "RY.TO", "AC.TO"
     """
-    _rl_delays = [5, 15, 30]
     with _yf_download_lock:
-        df = None
-        for attempt, delay in enumerate(_rl_delays):
-            try:
-                df = yf.download(
-                    symbol,
-                    period=f"{lookback_days}d",
-                    interval=interval,
-                    auto_adjust=True,
-                    actions=False,
-                    progress=False,
-                )
-                break
-            except YFRateLimitError:
-                if attempt < len(_rl_delays) - 1:
-                    logger.warning("Rate limited fetching %s, waiting %ds", symbol, delay)
-                    time.sleep(delay)
-                else:
-                    logger.error(
-                        "Rate limit: giving up on %s after 3 attempts", symbol
-                    )
-                    time.sleep(0.5)
-                    return None
-            except Exception as e:
-                logger.warning("fetch failed %s: %s", symbol, e)
-                time.sleep(0.5)
-                return None
+        df = fetch_with_retry(
+            lambda: yf.download(
+                symbol,
+                period=f"{lookback_days}d",
+                interval=interval,
+                auto_adjust=True,
+                actions=False,
+                progress=False,
+            ),
+            label=symbol,
+        )
         time.sleep(0.5)
 
     if df is None or df.empty:
@@ -229,12 +211,14 @@ def fetch_candles(
     if symbol.upper().endswith(".TO"):
         tsx_last_price = None
         tsx_prev_close = None
-        try:
-            fi = yf.Ticker(symbol).fast_info
+        fi = fetch_with_retry(
+            lambda: yf.Ticker(symbol).fast_info,
+            label=f"{symbol}:tsx_sanity",
+            max_attempts=2,
+        )
+        if fi is not None:
             tsx_last_price = getattr(fi, "last_price", None) or getattr(fi, "lastPrice", None)
             tsx_prev_close = getattr(fi, "previous_close", None) or getattr(fi, "previousClose", None)
-        except Exception:
-            pass
         if tsx_prev_close and tsx_prev_close > 0:
             prev_deviation = abs(latest - tsx_prev_close) / tsx_prev_close
             if prev_deviation > 0.20:

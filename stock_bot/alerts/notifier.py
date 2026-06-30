@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 from colorama import Fore, Style
 
 from stock_bot.alerts.alert import Alert
+from stock_bot.data.yf_client import fetch_with_retry
 
 if TYPE_CHECKING:
     from stock_bot.config import StockConfig
@@ -173,8 +174,12 @@ class AlertNotifier:
         try:
             import yfinance as yf
             from stock_bot.indicators.indicators import regime as _regime
-            _spy_raw = yf.download(
-                "SPY", interval="1d", period="1y", auto_adjust=True, actions=False, progress=False
+            _spy_raw = fetch_with_retry(
+                lambda: yf.download(
+                    "SPY", interval="1d", period="1y",
+                    auto_adjust=True, actions=False, progress=False,
+                ),
+                label="SPY:weekly_summary",
             )
             if _spy_raw is not None and not _spy_raw.empty:
                 if hasattr(_spy_raw.columns, "nlevels") and _spy_raw.columns.nlevels > 1:

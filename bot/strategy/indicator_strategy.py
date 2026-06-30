@@ -262,24 +262,30 @@ class IndicatorStrategy:
 
     def _compute_buy_block_gate(
         self,
-        rsi_val:         float,
-        adx_val:         Optional[float],
-        ema_spread_pct:  float,
-        macd_hist:       Optional[float],
+        rsi_val:          float,
+        adx_val:          Optional[float],
+        ema_spread_pct:   float,
+        macd_hist:        Optional[float],
         macd_hist_rising: bool,
-        closes:          list[float],
-        price:           float,
+        closes:           list[float],
+        price:            float,
+        rsi_rising:       bool = False,
     ) -> str:
         """Return the first gate (in priority order) that blocks a BUY.
-        Priority: RSI → ADX → EMA_spread → MACD
+        Priority: RSI → RSI_DIRECTION → ADX → EMA_spread → MACD
         Returns empty string if BUY should fire (should not happen when called from HOLD path)."""
         cfg = self.config
 
-        # RSI: blocks if NEITHER mode's RSI range is satisfied (range check only — direction tracked separately)
+        # RSI range: blocks if NEITHER mode's range is satisfied
         rsi_a_range = not cfg.rsi_filter_enabled or cfg.pullback_rsi_min <= rsi_val <= cfg.pullback_rsi_max
         rsi_b_ok    = not cfg.rsi_filter_enabled or cfg.breakout_rsi_min <= rsi_val <= cfg.breakout_rsi_max
         if not rsi_a_range and not rsi_b_ok:
             return "RSI"
+
+        # RSI direction: Mode A requires rsi_rising; if RSI is in Mode A range but not
+        # rising, and Mode B range is also not satisfied, direction is the blocker.
+        if rsi_a_range and not rsi_rising and not rsi_b_ok:
+            return "RSI_DIRECTION"
 
         # ADX: below Mode A threshold means both modes are blocked at ADX level
         if adx_val is None or adx_val < cfg.adx_threshold:
@@ -293,11 +299,9 @@ class IndicatorStrategy:
         macd_a_ok = not cfg.macd_enabled or macd_hist_rising
         macd_b_ok = not cfg.macd_enabled or (macd_hist is not None and macd_hist > 0)
 
-        # Mode A fires if: RSI in range (rsi_a_range) AND RSI rising AND macd_a_ok
-        # (rsi_rising not available here; treat MACD as the discriminating gate)
-        mode_a_fires = rsi_a_range and macd_a_ok
+        mode_a_fires    = rsi_a_range and rsi_rising and macd_a_ok
         mode_b_breakout = adx_val >= cfg.breakout_adx_threshold and self._is_near_breakout(closes, price)
-        mode_b_fires = rsi_b_ok and mode_b_breakout and macd_b_ok
+        mode_b_fires    = rsi_b_ok and mode_b_breakout and macd_b_ok
 
         if not mode_a_fires and not mode_b_fires:
             return "MACD"   # RSI/ADX/EMA passed → MACD or breakout is the residual blocker
@@ -414,6 +418,7 @@ class IndicatorStrategy:
                     self._last_buy_block_gate = self._compute_buy_block_gate(
                         rsi_val, adx_val, ema_spread_pct,
                         macd_hist, macd_hist_rising, closes, price,
+                        rsi_rising=rsi_rising,
                     ) or "MACD"
                     if not rsi_a_ok and not rsi_b_ok:
                         self.stats["rsi_rejected"] += 1

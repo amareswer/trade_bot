@@ -1115,7 +1115,7 @@ def run():
                     if _corr is not None and _corr > CORRELATION_THRESHOLD:
                         raw_signal = Signal.HOLD
                         if not _buy_block_gate:
-                            _buy_block_gate = "regime"
+                            _buy_block_gate = "correlation"
                         _corr_msg = (
                             f"CORRELATION GATE: BUY blocked — {sym} correlation"
                             f" {_corr:.2f} with open {_peer}"
@@ -1150,6 +1150,47 @@ def run():
                     "CapitalPool: BUY blocked for %s — pool exhausted (%d/%d slots used)",
                     sym, len(capital_pool.allocated_symbols), _max_conc,
                 )
+            # ── 5b. Liquidity gate (DOGE/CAD) ────────────────────────
+            # Block new BUY entries when 24h CAD quote volume is below the
+            # configured minimum. SELL and open positions are unaffected —
+            # state machine already prevents BUY while in a position, but
+            # checking filtered_signal here ensures SELL paths are never touched.
+            if filtered_signal == Signal.BUY and sym == "DOGE/CAD" and live_exchange is not None:
+                _liq_vol_cad: float | None = None
+                try:
+                    _liq_ticker = live_exchange.fetch_ticker(sym)
+                    _qv = _liq_ticker.get("quoteVolume")
+                    if _qv is not None:
+                        _liq_vol_cad = float(_qv)
+                    else:
+                        _bv   = _liq_ticker.get("baseVolume")
+                        _last = _liq_ticker.get("last")
+                        if _bv is not None and _last is not None:
+                            _liq_vol_cad = float(_bv) * float(_last)
+                            logger.warning(
+                                "Liquidity gate [%s]: quoteVolume missing — "
+                                "using baseVolume*last (%.0f CAD)",
+                                sym, _liq_vol_cad,
+                            )
+                except Exception as _liq_exc:
+                    logger.warning("Liquidity gate: fetch_ticker failed for %s: %s", sym, _liq_exc)
+                if _liq_vol_cad is None:
+                    logger.warning(
+                        "Liquidity gate [%s]: volume unavailable — failing open, BUY proceeds",
+                        sym,
+                    )
+                elif _liq_vol_cad < cfg.portfolio.doge_vol_min_cad:
+                    _liq_msg = (
+                        f"LIQUIDITY GATE: DOGE/CAD BUY blocked"
+                        f" — 24h volume ${_liq_vol_cad:,.0f}"
+                        f" < ${cfg.portfolio.doge_vol_min_cad:,.0f} threshold"
+                    )
+                    print(f"  [{sym}] {_liq_msg}", flush=True)
+                    logger.warning(_liq_msg)
+                    filtered_signal = Signal.HOLD
+                    if not _buy_block_gate:
+                        _buy_block_gate = "liquidity"
+
             _max_cash_for_sym = ss['executor'].cash
             if filtered_signal == Signal.SELL:
                 trade_qty = ss['pm'].quantity
@@ -1219,19 +1260,38 @@ def run():
                     approval and final_signal == Signal.BUY
                 )
                 if _buy_was_blocked:
-                    _live_log    = os.path.join(_log_dir, "live_signals.csv")
-                    _write_hdr   = not os.path.exists(_live_log)
+                    _live_log     = os.path.join(_log_dir, "live_signals.csv")
+                    _csv_schema   = [
+                        "timestamp", "symbol", "price", "RSI", "ADX",
+                        "EMA_spread", "trend", "signal_raw",
+                        "blocked_gate", "signal_final",
+                    ]
+                    _write_hdr    = True
+                    if os.path.exists(_live_log):
+                        try:
+                            with open(_live_log, newline="") as _chk:
+                                _existing_hdr = next(csv.reader(_chk), None)
+                            if _existing_hdr == _csv_schema:
+                                _write_hdr = False
+                            else:
+                                _legacy_ts  = datetime.now(_tz.utc).strftime("%Y%m%dT%H%M%SZ")
+                                _legacy_path = os.path.join(
+                                    _log_dir, f"live_signals_legacy_{_legacy_ts}.csv"
+                                )
+                                os.rename(_live_log, _legacy_path)
+                                logger.warning(
+                                    "live_signals.csv header mismatch — renamed to %s",
+                                    _legacy_path,
+                                )
+                        except Exception as _hdr_exc:
+                            logger.warning("live_signals.csv header check failed: %s", _hdr_exc)
                     _signal_final_str = (
                         final_signal.value if (approval and final_signal == Signal.BUY) else "HOLD"
                     )
                     with open(_live_log, "a", newline="") as _f:
                         _w = csv.writer(_f)
                         if _write_hdr:
-                            _w.writerow([
-                                "timestamp", "symbol", "price", "RSI", "ADX",
-                                "EMA_spread", "trend", "signal_raw",
-                                "blocked_gate", "signal_final",
-                            ])
+                            _w.writerow(_csv_schema)
                         _w.writerow([
                             candle.timestamp.strftime("%Y-%m-%d %H:%M"),
                             sym,

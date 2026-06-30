@@ -165,6 +165,14 @@ class StrategyConfig:
             raise ValueError("MAX_EMA_SPREAD_PCT must be >= 0")
         if self.regime_ema_period < 0:
             raise ValueError("REGIME_EMA_PERIOD must be >= 0 (0 = disabled)")
+        if self.pullback_rsi_min >= self.pullback_rsi_max:
+            raise ValueError("PULLBACK_RSI_MIN must be < PULLBACK_RSI_MAX")
+        if self.breakout_rsi_min >= self.breakout_rsi_max:
+            raise ValueError("BREAKOUT_RSI_MIN must be < BREAKOUT_RSI_MAX")
+        if self.max_price_extension_pct <= 0:
+            raise ValueError("MAX_PRICE_EXTENSION_PCT must be > 0")
+        if self.breakout_lookback < 5:
+            raise ValueError("BREAKOUT_LOOKBACK must be >= 5")
 
 
 @dataclass
@@ -208,6 +216,7 @@ class PortfolioConfig:
     sim_volatility:           float = 200.0     # simulated feed volatility per tick
     max_concurrent_positions: int   = 2         # MAX_CONCURRENT_POSITIONS — capital pool slots
     live_dust_value_cad:      float = 10.0      # positions worth < this are dust — skip recovery
+    doge_vol_min_cad:         float = 50_000.0  # DOGE/CAD BUY blocked below this 24h quote volume
 
     def __post_init__(self):
         if self.starting_cash <= 0:
@@ -216,6 +225,8 @@ class PortfolioConfig:
             raise ValueError("MAX_CONCURRENT_POSITIONS must be >= 1")
         if self.live_dust_value_cad < 0:
             raise ValueError("LIVE_DUST_VALUE_CAD must be >= 0")
+        if self.doge_vol_min_cad < 0:
+            raise ValueError("DOGE_VOL_MIN_CAD must be >= 0")
 
 
 @dataclass
@@ -508,6 +519,7 @@ def _load() -> AppConfig:
             sim_volatility           = _float("SIM_VOLATILITY",            200.0),
             max_concurrent_positions = _int  ("MAX_CONCURRENT_POSITIONS",  2),
             live_dust_value_cad      = _float("LIVE_DUST_VALUE_CAD",       10.0),
+            doge_vol_min_cad         = _float("DOGE_VOL_MIN_CAD",         50_000.0),
         ),
         ai=AIConfig(
             enabled        = _bool ("AI_ENABLED",        True),
