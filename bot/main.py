@@ -245,12 +245,20 @@ def build_strategy():
             adx_period               = cfg.strategy.adx_period,
             adx_threshold            = cfg.strategy.adx_threshold,
             adx_max                  = cfg.strategy.adx_max,
+            min_ema_spread_pct       = cfg.strategy.min_ema_spread_pct,
             max_ema_spread_pct       = cfg.strategy.max_ema_spread_pct,
             rsi_filter_enabled       = cfg.strategy.rsi_filter_enabled,
             macd_enabled             = cfg.strategy.macd_enabled,
             regime_ema_period        = cfg.strategy.regime_ema_period,
             regime_ema_slope_filter  = cfg.strategy.regime_ema_slope_filter,
             volume_k                 = cfg.strategy.volume_k,
+            pullback_rsi_min         = cfg.strategy.pullback_rsi_min,
+            pullback_rsi_max         = cfg.strategy.pullback_rsi_max,
+            breakout_rsi_min         = cfg.strategy.breakout_rsi_min,
+            breakout_rsi_max         = cfg.strategy.breakout_rsi_max,
+            breakout_lookback        = cfg.strategy.breakout_lookback,
+            max_price_extension_pct  = cfg.strategy.max_price_extension_pct,
+            breakout_adx_threshold   = cfg.strategy.breakout_adx_threshold,
         ))
     return ThresholdStrategy(
         buy_threshold  = cfg.strategy.buy_threshold,
@@ -354,19 +362,40 @@ def run():
             }
             logger.info("PAPER MODE active — $%.2f virtual cash per symbol", cfg.paper.paper_starting_cash)
         else:
-            executors = {
-                sym: LiveExecutor(
+            _universe_list = list(_universe_symbols)
+            # Pass 1: create first executor to establish account balance.
+            # In dry-run mode _sync_cash() is skipped, so cash comes from the
+            # state file (or starting_cash if no state exists yet).
+            _sym0 = _universe_list[0]
+            _exc0 = LiveExecutor(
+                exchange_id   = cfg.exchange.exchange,
+                symbol        = _sym0,
+                api_key       = cfg.exchange.api_key,
+                api_secret    = cfg.exchange.api_secret,
+                starting_cash = cfg.portfolio.starting_cash,
+                dry_run       = cfg.exchange.dry_run,
+                order_type    = cfg.exchange.order_type,
+                state_path    = f"logs/live_state_{_sym0.replace('/', '_')}.json",
+            )
+            # Derive slot_cash for new symbols from the first executor's balance
+            # so their "ready" log matches the actual pool slot instead of showing
+            # the full cfg.portfolio.starting_cash.
+            _slot_for_new = _exc0.cash / max(1, cfg.portfolio.max_concurrent_positions)
+            # Pass 2: remaining executors — new symbols get slot_for_new, existing
+            # symbols get starting_cash (overridden by _load_state anyway).
+            executors = {_sym0: _exc0}
+            for _s in _universe_list[1:]:
+                _sp = f"logs/live_state_{_s.replace('/', '_')}.json"
+                executors[_s] = LiveExecutor(
                     exchange_id   = cfg.exchange.exchange,
-                    symbol        = sym,
+                    symbol        = _s,
                     api_key       = cfg.exchange.api_key,
                     api_secret    = cfg.exchange.api_secret,
-                    starting_cash = cfg.portfolio.starting_cash,
+                    starting_cash = cfg.portfolio.starting_cash if os.path.exists(_sp) else _slot_for_new,
                     dry_run       = cfg.exchange.dry_run,
                     order_type    = cfg.exchange.order_type,
-                    state_path    = f"logs/live_state_{sym.replace('/', '_')}.json",
+                    state_path    = _sp,
                 )
-                for sym in _universe_symbols
-            }
         executor = executors[_active_symbol]   # alias for pre-loop header/recovery code
         mode_str = "[DRY RUN] " if (cfg.exchange.dry_run or cfg.paper.paper_mode) else ""
         print(
@@ -383,14 +412,6 @@ def run():
             )
         }
         executor = executors[cfg.exchange.symbol]
-    if cfg.exchange.live_trading:
-        for _sym, _exc in executors.items():
-            try:
-                _exc._save_state()
-                logger.info("State saved with symbol: %s", _sym)
-            except Exception as e:
-                logger.warning("State save on startup failed [%s]: %s", _sym, e)
-
     # ── Capital pool — single cash pool shared across all symbols ─────────────
     # For live trading: use actual Kraken balance from the first executor as
     # the pool total (both executors read the same account, so we only count it once).
@@ -403,8 +424,13 @@ def run():
         _pool_total = cfg.portfolio.starting_cash
     capital_pool = CapitalPool(total_capital=_pool_total, max_concurrent=_max_conc)
     _slot = capital_pool.slot_cash
-    for _exc in executors.values():
+    for _sym, _exc in executors.items():
         _exc._portfolio.cash = _slot
+        if cfg.exchange.live_trading:
+            try:
+                _exc._save_state()
+            except Exception as e:
+                logger.warning("State save after pool init failed [%s]: %s", _sym, e)
     print(
         f"\n  Capital pool: ${_pool_total:.2f} total"
         f" / {_max_conc} slots = ${_slot:.2f} per symbol\n",
@@ -414,6 +440,11 @@ def run():
         "CapitalPool init: total=%.2f  slots=%d  slot_cash=%.2f",
         _pool_total, _max_conc, _slot,
     )
+    if cfg.exchange.live_trading:
+        logger.info(
+            "Executor cash after pool correction: %s",
+            {s: f"${e.cash:.2f}" for s, e in executors.items()},
+        )
 
     risk = RiskManager(RiskConfig(
         max_position_pct     = cfg.risk.max_position_pct,
@@ -547,6 +578,28 @@ def run():
     if cfg.exchange.live_trading:
         for _rsym, _rexc in executors.items():
             if _rexc.position > 1e-9:
+                # Dust position guard: skip recovery when position value < threshold
+                try:
+                    _rec_price = float(live_exchange.fetch_ticker(_rsym)['last'])
+                except Exception:
+                    _rec_price = _rexc.avg_entry if _rexc.avg_entry > 0 else 1.0
+                _rec_pos_value = _rexc.position * _rec_price
+                if _rec_pos_value < cfg.portfolio.live_dust_value_cad:
+                    logger.warning(
+                        "Dust position detected [%s]: %.6f × %.2f = %.4f CAD"
+                        " < %.2f threshold — keeping state machine IDLE",
+                        _rsym, _rexc.position, _rec_price,
+                        _rec_pos_value, cfg.portfolio.live_dust_value_cad,
+                    )
+                    print(
+                        f"  DUST POSITION [{_rsym}]: {_rexc.position:.6f}"
+                        f" × {_rec_price:,.2f} = {_rec_pos_value:.4f} CAD"
+                        f" < {cfg.portfolio.live_dust_value_cad:.2f} threshold"
+                        f" — state machine stays IDLE, not recovering",
+                        flush=True,
+                    )
+                    continue
+
                 _rec_ss = symbol_state[_rsym]
                 _rec_ss['pm'].seed(
                     quantity     = _rexc.position,
@@ -927,7 +980,8 @@ def run():
             else:
                 raw_signal = ss['strategy'].evaluate(price)
 
-            # ── 2b. Candle-close diagnostic log ──────────────────────
+            # ── 2b. Candle-close diagnostic log (console) ────────────
+            # CSV write is deferred to after all gates so blocked_gate is complete.
             if is_indicator and live_exchange is not None:
                 _adx_live  = ss['strategy'].last_adx
                 _rsi_live  = ss['strategy'].last_rsi
@@ -937,20 +991,6 @@ def run():
                 _es = _ema_fn(_cl, ss['strategy'].config.slow_ema_period)
                 _spread = abs(_ef - _es) / _es * 100 if (_ef and _es and _es > 0) else 0.0
                 _sig_str = raw_signal.value if hasattr(raw_signal, 'value') else str(raw_signal)
-
-                _reason = ""
-                if _sig_str == "HOLD":
-                    if _adx_live is not None and _adx_live < ss['strategy'].config.adx_threshold:
-                        _reason = f"ADX {_adx_live:.1f} < {ss['strategy'].config.adx_threshold}"
-                    elif _trnd_live == "NEUTRAL":
-                        _reason = "trend NEUTRAL"
-                    elif (_spread > ss['strategy'].config.max_ema_spread_pct * 100
-                          and ss['strategy'].config.max_ema_spread_pct > 0):
-                        _reason = f"EMA spread {_spread:.3f}% > {ss['strategy'].config.max_ema_spread_pct*100:.1f}%"
-                    elif _rsi_live is not None:
-                        _reason = f"RSI {_rsi_live:.1f} filtered"
-                    else:
-                        _reason = "warmup"
 
                 _rsi_str = f"  RSI={_rsi_live:.1f}" if _rsi_live is not None else "  RSI=n/a"
                 _adx_str = f"  ADX={_adx_live:.1f}" if _adx_live is not None else "  ADX=n/a"
@@ -964,37 +1004,33 @@ def run():
                 print(
                     f"  trend={_trnd_live}"
                     f"  EMA_spread={_spread:.3f}%"
-                    f"  signal={_sig_str}"
-                    + (f"  [{_reason}]" if _reason else ""),
+                    f"  signal={_sig_str}",
                     flush=True
                 )
 
-                _live_log = os.path.join(_log_dir, "live_signals.csv")
-                _write_header = not os.path.exists(_live_log)
-                with open(_live_log, "a", newline="") as _f:
-                    _w = csv.writer(_f)
-                    if _write_header:
-                        _w.writerow([
-                            "timestamp", "symbol", "close", "rsi", "adx",
-                            "trend", "ema_spread_pct", "signal", "reason"
-                        ])
-                    _w.writerow([
-                        candle.timestamp.strftime("%Y-%m-%d %H:%M"),
-                        sym,
-                        round(price, 2),
-                        round(_rsi_live, 2) if _rsi_live is not None else "",
-                        round(_adx_live, 2) if _adx_live is not None else "",
-                        _trnd_live,
-                        round(_spread, 4),
-                        _sig_str,
-                        _reason,
-                    ])
+            # ── Blocked-gate tracking (initialise per-candle) ─────────
+            # Records the first gate (in priority order) that blocked a BUY.
+            # Priority: trend → RSI → ADX → EMA_spread → MACD → regime
+            #           → state_machine → risk_manager → capital_pool
+            _signal_raw_for_csv = raw_signal
+            _buy_block_gate: str = ""
+            if is_indicator and live_exchange is not None:
+                # Strategy-internal block (trend, RSI, ADX, EMA_spread, MACD)
+                if _trnd_live == "BULLISH" and raw_signal != Signal.BUY:
+                    _buy_block_gate = ss['strategy'].last_buy_block_gate or "RSI"
+                elif _trnd_live != "BULLISH" and _trnd_live != "BEARISH":
+                    # NEUTRAL trend — BUY was "considered" (regime trending) but trend rejected
+                    if (ss['strategy'].last_regime == "TRENDING"
+                            and raw_signal != Signal.BUY):
+                        _buy_block_gate = "trend"
 
             # ── 2c. MTF gate ──────────────────────────────────────────
             if is_indicator and raw_signal == Signal.BUY and _mtf_1d_closes:
                 _mtf_trend = _trend_fn(_mtf_1d_closes)
                 if _mtf_trend == "BEARISH":
                     raw_signal = Signal.HOLD
+                    if not _buy_block_gate:
+                        _buy_block_gate = "regime"
                     print(f"  [{sym}] MTF gate: 1D trend BEARISH — BUY suppressed", flush=True)
                     logger.info("MTF gate [%s]: BUY suppressed — daily trend BEARISH", sym)
                 if live_exchange and sym == _active_symbol:
@@ -1010,6 +1046,8 @@ def run():
                 _ext_approved, _ext_reason = ext_gate.approve_buy()
                 if not _ext_approved:
                     raw_signal = Signal.HOLD
+                    if not _buy_block_gate:
+                        _buy_block_gate = "regime"
                     print(f"  [{sym}] EXT gate: {_ext_reason}", flush=True)
                     logger.info("External signal gate blocked BUY [%s]: %s", sym, _ext_reason)
 
@@ -1037,6 +1075,8 @@ def run():
 
                     if raw_signal == Signal.BUY:
                         raw_signal = Signal.HOLD
+                        if not _buy_block_gate:
+                            _buy_block_gate = "regime"
                         print(
                             f"  [{sym}] REGIME GATE: BUY overridden → HOLD"
                             f"  ({_rg_status_msg})",
@@ -1074,6 +1114,8 @@ def run():
                     _corr = fetch_correlation(live_exchange, sym, _peer)
                     if _corr is not None and _corr > CORRELATION_THRESHOLD:
                         raw_signal = Signal.HOLD
+                        if not _buy_block_gate:
+                            _buy_block_gate = "regime"
                         _corr_msg = (
                             f"CORRELATION GATE: BUY blocked — {sym} correlation"
                             f" {_corr:.2f} with open {_peer}"
@@ -1093,12 +1135,16 @@ def run():
 
             # ── 4. State machine filter + tick ────────────────────────
             filtered_signal, filter_reason = ss['sm'].filter_signal(raw_signal)
+            if raw_signal == Signal.BUY and filtered_signal != Signal.BUY and not _buy_block_gate:
+                _buy_block_gate = "state_machine"
             ss['sm'].tick()
 
             # ── 5. Dynamic position sizing ────────────────────────────
             # executor.cash is already capped to its pool slot — no division needed.
             # Block BUY when the pool has no slot available for a new position.
             if filtered_signal == Signal.BUY and not capital_pool.can_open_position(sym):
+                if not _buy_block_gate:
+                    _buy_block_gate = "capital_pool"
                 filtered_signal = Signal.HOLD
                 logger.info(
                     "CapitalPool: BUY blocked for %s — pool exhausted (%d/%d slots used)",
@@ -1131,8 +1177,10 @@ def run():
             # ── 7. Risk gate ──────────────────────────────────────────
             approval     = risk.evaluate(final_signal, price, ss['executor'].portfolio, trade_qty)
             block_reason = "" if approval else approval.message
+            if not approval and final_signal == Signal.BUY and not _buy_block_gate:
+                _buy_block_gate = "risk_manager"
 
-            # ── 7b. Candle-close structured log ───────────────────────
+            # ── 7b. Candle-close structured log + blocked-BUY CSV ────
             if is_indicator and live_exchange is not None:
                 _rsi_log = f"{_rsi_live:.1f}" if _rsi_live is not None else "n/a"
                 _adx_log = f"{_adx_live:.1f}" if _adx_live is not None else "n/a"
@@ -1163,8 +1211,40 @@ def run():
                     "spread": round(_spread, 3),
                     "signal": _sig_str,
                     "action": _action,
-                    "reason": _reason,
+                    "reason": _buy_block_gate,
                 })
+
+                # Write to live_signals.csv only when a BUY was considered but blocked
+                _buy_was_blocked = bool(_buy_block_gate) and not (
+                    approval and final_signal == Signal.BUY
+                )
+                if _buy_was_blocked:
+                    _live_log    = os.path.join(_log_dir, "live_signals.csv")
+                    _write_hdr   = not os.path.exists(_live_log)
+                    _signal_final_str = (
+                        final_signal.value if (approval and final_signal == Signal.BUY) else "HOLD"
+                    )
+                    with open(_live_log, "a", newline="") as _f:
+                        _w = csv.writer(_f)
+                        if _write_hdr:
+                            _w.writerow([
+                                "timestamp", "symbol", "price", "RSI", "ADX",
+                                "EMA_spread", "trend", "signal_raw",
+                                "blocked_gate", "signal_final",
+                            ])
+                        _w.writerow([
+                            candle.timestamp.strftime("%Y-%m-%d %H:%M"),
+                            sym,
+                            round(price, 2),
+                            round(_rsi_live, 2) if _rsi_live is not None else "",
+                            round(_adx_live, 2) if _adx_live is not None else "",
+                            round(_spread, 4),
+                            _trnd_live,
+                            _signal_raw_for_csv.value if hasattr(_signal_raw_for_csv, 'value')
+                                else str(_signal_raw_for_csv),
+                            _buy_block_gate,
+                            _signal_final_str,
+                        ])
 
             # ── 8. Display tick (active symbol only) ──────────────────
             if sym == _active_symbol:

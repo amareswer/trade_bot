@@ -1,20 +1,25 @@
 """
-Trend-following indicator strategy with volatility guard.
+Trend-following indicator strategy with dual entry modes.
 
 Regime classification runs first on every candle:
   VOLATILE  — ATR > 1.5× 20-period ATR average      → sit flat (HOLD)
   TRENDING  — ADX ≥ adx_threshold                   → trend-following (EMA/RSI/ADX)
   RANGING   — ADX < adx_threshold, not volatile      → HOLD (no signal)
 
-All signals come from _trend_signal(). The mean-reversion (ranging) branch
-was removed after entry-condition analysis showed it added no alpha over 5000
-candles — 12 ranging entries, 25% win rate, identical to trend entries.
+BUY signals come from two modes (either can fire):
+  Mode A (pullback)    — RSI in [PULLBACK_RSI_MIN, PULLBACK_RSI_MAX], MACD hist rising
+  Mode B (breakout)    — RSI in [BREAKOUT_RSI_MIN, BREAKOUT_RSI_MAX], ADX ≥ breakout_adx_threshold,
+                         MACD hist > 0, price within MAX_PRICE_EXTENSION_PCT of BREAKOUT_LOOKBACK high
+
+Both modes require: trend BULLISH, ADX ≥ adx_threshold, EMA spread ≥ min_ema_spread_pct.
+
+SELL signals are unchanged from the original trend logic.
 """
 from __future__ import annotations
 
 import logging
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
@@ -62,11 +67,19 @@ class IndicatorConfig:
     regime_ema_period:        int   = 200
     regime_ema_slope_filter:  bool  = False
     atr_volatile_multiplier:  float = 1.5    # ATR > multiplier × avg ATR → VOLATILE
+    # ── Entry mode parameters ─────────────────────────────────────────
+    pullback_rsi_min:         float = 38.0   # Mode A: RSI lower bound
+    pullback_rsi_max:         float = 58.0   # Mode A: RSI upper bound
+    breakout_rsi_min:         float = 50.0   # Mode B: RSI lower bound
+    breakout_rsi_max:         float = 72.0   # Mode B: RSI upper bound
+    breakout_lookback:        int   = 20     # Mode B: N-candle high for breakout check
+    max_price_extension_pct:  float = 0.03   # Mode B: max % above N-candle high (anti-chase)
+    breakout_adx_threshold:   float = 22.0   # Mode B: stricter ADX requirement
 
 
 class IndicatorStrategy:
     """
-    Dual-regime indicator strategy.
+    Dual-regime indicator strategy with Mode A (pullback) and Mode B (breakout).
     Interface: evaluate(candle: Candle) -> Signal
     """
 
@@ -86,13 +99,15 @@ class IndicatorStrategy:
         self._volumes:    deque = deque(maxlen=buf)
         self._atr_history: deque = deque(maxlen=20)   # rolling ATR for volatile detection
 
-        self._last_rsi:       Optional[float]  = None
-        self._last_trend:     Optional[str]    = None
-        self._last_adx:       Optional[float]  = None
-        self._last_atr:       Optional[float]  = None
-        self._last_regime:    Optional[Regime] = None
-        self._prev_rsi:       Optional[float]  = None
-        self._last_macd_hist: Optional[float]  = None
+        self._last_rsi:          Optional[float]  = None
+        self._last_trend:        Optional[str]    = None
+        self._last_adx:          Optional[float]  = None
+        self._last_atr:          Optional[float]  = None
+        self._last_regime:       Optional[Regime] = None
+        self._prev_rsi:          Optional[float]  = None
+        self._last_macd_hist:    Optional[float]  = None
+        self._last_buy_block_gate: Optional[str]  = None  # first gate blocking BUY this candle
+        self._last_entry_mode:   Optional[str]    = None  # "A", "B", or None
 
         self.stats: dict = {
             "candles_seen":    0,
@@ -108,18 +123,26 @@ class IndicatorStrategy:
             "buy_signals":     0,
             "sell_signals":    0,
             "hold_signals":    0,
+            "mode_a_signals":  0,
+            "mode_b_signals":  0,
         }
 
         logger.info(
             "IndicatorStrategy | RSI(%d) ob=%.0f os=%.0f"
-            " | EMA(%d/%d) | ADX(%d) thr=%.0f"
-            " | volatile_mult=%.1f | warmup=%d",
+            " | EMA(%d/%d) | ADX(%d) thr=%.0f break_adx=%.0f"
+            " | volatile_mult=%.1f | warmup=%d"
+            " | ModeA RSI[%.0f-%.0f] | ModeB RSI[%.0f-%.0f] lookback=%d ext=%.0f%%",
             self.config.rsi_period,
             self.config.rsi_overbought, self.config.rsi_oversold,
             self.config.fast_ema_period, self.config.slow_ema_period,
             self.config.adx_period, self.config.adx_threshold,
+            self.config.breakout_adx_threshold,
             self.config.atr_volatile_multiplier,
             self._warmup,
+            self.config.pullback_rsi_min, self.config.pullback_rsi_max,
+            self.config.breakout_rsi_min, self.config.breakout_rsi_max,
+            self.config.breakout_lookback,
+            self.config.max_price_extension_pct * 100,
         )
 
     # ── Public interface ──────────────────────────────────────────────
@@ -140,6 +163,8 @@ class IndicatorStrategy:
         closes = list(self._closes)
 
         self.stats["candles_seen"] += 1
+        self._last_buy_block_gate = None
+        self._last_entry_mode     = None
 
         if len(closes) < self._warmup:
             self.stats["warmup_rejected"] += 1
@@ -193,10 +218,12 @@ class IndicatorStrategy:
             regime.value,
         )
 
-        # ── Route by regime ───────────────────────────────────────────
+        # ── Volatile regime: sit flat ─────────────────────────────────
         if regime == Regime.VOLATILE:
             self.stats["volatile_skipped"] += 1
             self.stats["hold_signals"] += 1
+            if trend_val == "BULLISH":
+                self._last_buy_block_gate = "regime"
             return Signal.HOLD
 
         # RANGING → _trend_signal rejects via adx_rejected (ADX < threshold)
@@ -223,6 +250,60 @@ class IndicatorStrategy:
 
         return Regime.TRENDING
 
+    def _is_near_breakout(self, closes: list[float], price: float) -> bool:
+        """True when price is at or within MAX_PRICE_EXTENSION_PCT above the prior
+        BREAKOUT_LOOKBACK-candle high (confirming breakout without chasing)."""
+        lb = self.config.breakout_lookback
+        if len(closes) < lb + 1:
+            return False
+        prior_high = max(closes[-(lb + 1):-1])   # exclude current candle
+        max_ext    = self.config.max_price_extension_pct
+        return prior_high <= price <= prior_high * (1.0 + max_ext)
+
+    def _compute_buy_block_gate(
+        self,
+        rsi_val:         float,
+        adx_val:         Optional[float],
+        ema_spread_pct:  float,
+        macd_hist:       Optional[float],
+        macd_hist_rising: bool,
+        closes:          list[float],
+        price:           float,
+    ) -> str:
+        """Return the first gate (in priority order) that blocks a BUY.
+        Priority: RSI → ADX → EMA_spread → MACD
+        Returns empty string if BUY should fire (should not happen when called from HOLD path)."""
+        cfg = self.config
+
+        # RSI: blocks if NEITHER mode's RSI range is satisfied (range check only — direction tracked separately)
+        rsi_a_range = not cfg.rsi_filter_enabled or cfg.pullback_rsi_min <= rsi_val <= cfg.pullback_rsi_max
+        rsi_b_ok    = not cfg.rsi_filter_enabled or cfg.breakout_rsi_min <= rsi_val <= cfg.breakout_rsi_max
+        if not rsi_a_range and not rsi_b_ok:
+            return "RSI"
+
+        # ADX: below Mode A threshold means both modes are blocked at ADX level
+        if adx_val is None or adx_val < cfg.adx_threshold:
+            return "ADX"
+
+        # EMA_spread: both modes require this
+        if ema_spread_pct < cfg.min_ema_spread_pct:
+            return "EMA_spread"
+
+        # MACD: check if both modes are blocked by MACD conditions
+        macd_a_ok = not cfg.macd_enabled or macd_hist_rising
+        macd_b_ok = not cfg.macd_enabled or (macd_hist is not None and macd_hist > 0)
+
+        # Mode A fires if: RSI in range (rsi_a_range) AND RSI rising AND macd_a_ok
+        # (rsi_rising not available here; treat MACD as the discriminating gate)
+        mode_a_fires = rsi_a_range and macd_a_ok
+        mode_b_breakout = adx_val >= cfg.breakout_adx_threshold and self._is_near_breakout(closes, price)
+        mode_b_fires = rsi_b_ok and mode_b_breakout and macd_b_ok
+
+        if not mode_a_fires and not mode_b_fires:
+            return "MACD"   # RSI/ADX/EMA passed → MACD or breakout is the residual blocker
+
+        return ""  # should not reach here when called from a HOLD outcome
+
     def _trend_signal(
         self,
         price:         float,
@@ -236,11 +317,15 @@ class IndicatorStrategy:
         closes:        list[float],
         adx_val:       Optional[float],
     ) -> Signal:
-        """Original trend-following logic — EMA/RSI/ADX/regime-EMA/volume/MACD."""
-        # ADX threshold (always checked here; when regime_enabled=True this is only
-        # reached for TRENDING candles, so adx_val >= threshold is already guaranteed)
+        """
+        Trend-following logic with Mode A (pullback) and Mode B (breakout).
+        SELL logic is unchanged from the original single-mode implementation.
+        """
+        # ADX threshold (always checked; RANGING → called here, adx_val < threshold fires)
         if adx_val is None or adx_val < self.config.adx_threshold:
             self.stats["adx_rejected"] += 1
+            if trend_val == "BULLISH":
+                self._last_buy_block_gate = "ADX"
             return Signal.HOLD
         if self.config.adx_max > 0 and adx_val > self.config.adx_max:
             self.stats["adx_rejected"] += 1
@@ -251,6 +336,7 @@ class IndicatorStrategy:
             regime_ema = calc_ema(closes, self.config.regime_ema_period)
             if regime_ema is not None and price < regime_ema and trend_val == "BULLISH":
                 self.stats["regime_rejected"] += 1
+                self._last_buy_block_gate = "regime"
                 return Signal.HOLD
             if (self.config.regime_ema_slope_filter
                     and regime_ema is not None
@@ -259,6 +345,7 @@ class IndicatorStrategy:
                 regime_ema_prev = calc_ema(closes[:-6], self.config.regime_ema_period)
                 if regime_ema_prev is not None and regime_ema < regime_ema_prev:
                     self.stats["regime_rejected"] += 1
+                    self._last_buy_block_gate = "regime"
                     return Signal.HOLD
 
         ema_above_min = ema_spread_pct >= self.config.min_ema_spread_pct
@@ -291,18 +378,47 @@ class IndicatorStrategy:
         if trend_val == "BULLISH":
             if not ema_strong:
                 self.stats["ema_rejected"] += 1
-            elif self.config.rsi_filter_enabled and not (
-                    rsi_rising
-                    and rsi_val > self.config.rsi_buy_min
-                    and rsi_val < self.config.rsi_overbought):
-                self.stats["rsi_rejected"] += 1
+                self._last_buy_block_gate = "EMA_spread"
             elif not volume_ok:
                 self.stats["volume_rejected"] += 1
-            elif self.config.macd_enabled and not macd_hist_rising:
-                self.stats["macd_rejected"] += 1
+                self._last_buy_block_gate = "EMA_spread"  # volume treated as EMA_spread tier
             else:
-                self.stats["buy_signals"] += 1
-                return Signal.BUY
+                # ── Mode A: Pullback entry ────────────────────────────
+                # rsi_rising confirms the dip is recovering (not still in descent)
+                rsi_a_ok   = (not self.config.rsi_filter_enabled or
+                              (self.config.pullback_rsi_min <= rsi_val <= self.config.pullback_rsi_max
+                               and rsi_rising))
+                macd_a_ok  = not self.config.macd_enabled or macd_hist_rising
+                mode_a_ok  = rsi_a_ok and macd_a_ok
+
+                # ── Mode B: Breakout continuation ─────────────────────
+                adx_b_ok      = adx_val >= self.config.breakout_adx_threshold
+                rsi_b_ok      = (not self.config.rsi_filter_enabled or
+                                 self.config.breakout_rsi_min <= rsi_val <= self.config.breakout_rsi_max)
+                macd_b_ok     = not self.config.macd_enabled or (macd_hist is not None and macd_hist > 0)
+                breakout_ok   = self._is_near_breakout(closes, price)
+                mode_b_ok     = adx_b_ok and rsi_b_ok and macd_b_ok and breakout_ok
+
+                if mode_a_ok:
+                    self.stats["buy_signals"]    += 1
+                    self.stats["mode_a_signals"] += 1
+                    self._last_entry_mode = "A"
+                    return Signal.BUY
+                elif mode_b_ok:
+                    self.stats["buy_signals"]    += 1
+                    self.stats["mode_b_signals"] += 1
+                    self._last_entry_mode = "B"
+                    return Signal.BUY
+                else:
+                    # Compute first blocking gate in priority order for diagnostics
+                    self._last_buy_block_gate = self._compute_buy_block_gate(
+                        rsi_val, adx_val, ema_spread_pct,
+                        macd_hist, macd_hist_rising, closes, price,
+                    ) or "MACD"
+                    if not rsi_a_ok and not rsi_b_ok:
+                        self.stats["rsi_rejected"] += 1
+                    else:
+                        self.stats["macd_rejected"] += 1
 
         elif trend_val == "BEARISH":
             if not ema_strong:
@@ -320,6 +436,7 @@ class IndicatorStrategy:
 
         else:
             self.stats["trend_rejected"] += 1
+            self._last_buy_block_gate = "trend"
 
         self.stats["hold_signals"] += 1
         return Signal.HOLD
@@ -345,6 +462,14 @@ class IndicatorStrategy:
     @property
     def last_regime(self) -> Optional[str]:
         return self._last_regime.value if self._last_regime else None
+
+    @property
+    def last_buy_block_gate(self) -> Optional[str]:
+        return self._last_buy_block_gate
+
+    @property
+    def last_entry_mode(self) -> Optional[str]:
+        return self._last_entry_mode
 
     @property
     def is_warmed_up(self) -> bool:

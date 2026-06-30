@@ -181,6 +181,9 @@ def _make_cfg() -> IndicatorConfig:
     return IndicatorConfig(
         rsi_period=14, rsi_oversold=30, rsi_overbought=70,
         fast_ema_period=9, slow_ema_period=21,
+        # Set Mode A RSI ceiling to match the test's rsi_overbought so the
+        # oscillating test data (EMA lag + discrete steps) can still emit BUY.
+        pullback_rsi_max=70.0,
     )
 
 

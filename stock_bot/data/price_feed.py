@@ -228,11 +228,22 @@ def fetch_candles(
     # Non-.TO symbols are intentionally excluded — fast_info adds ~2s/symbol overhead.
     if symbol.upper().endswith(".TO"):
         tsx_last_price = None
+        tsx_prev_close = None
         try:
             fi = yf.Ticker(symbol).fast_info
             tsx_last_price = getattr(fi, "last_price", None) or getattr(fi, "lastPrice", None)
+            tsx_prev_close = getattr(fi, "previous_close", None) or getattr(fi, "previousClose", None)
         except Exception:
             pass
+        if tsx_prev_close and tsx_prev_close > 0:
+            prev_deviation = abs(latest - tsx_prev_close) / tsx_prev_close
+            if prev_deviation > 0.20:
+                logger.warning(
+                    "%s — price mismatch: candle close $%.2f vs fast_info.previous_close $%.2f "
+                    "(%.1f%% deviation) — rejecting as corrupted data",
+                    symbol, latest, tsx_prev_close, prev_deviation * 100,
+                )
+                return None
         if tsx_last_price and tsx_last_price > 0:
             tsx_deviation = abs(latest - tsx_last_price) / tsx_last_price
             if tsx_deviation > 0.05:

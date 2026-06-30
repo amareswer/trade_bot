@@ -139,6 +139,14 @@ class StrategyConfig:
     atr_sl_mult:             float = 2.0   # reads ATR_SL_MULT — SL = entry - atr × mult
     atr_tp_mult:             float = 4.0   # reads ATR_TP_MULT — TP = entry + atr × mult
     atr_period:              int   = 14    # reads ATR_PERIOD
+    # ── Entry mode parameters (Mode A = pullback, Mode B = breakout) ──
+    pullback_rsi_min:        float = 38.0  # Mode A: RSI lower bound
+    pullback_rsi_max:        float = 58.0  # Mode A: RSI upper bound
+    breakout_rsi_min:        float = 50.0  # Mode B: RSI lower bound
+    breakout_rsi_max:        float = 72.0  # Mode B: RSI upper bound
+    breakout_lookback:       int   = 20    # Mode B: N-candle high for breakout check
+    max_price_extension_pct: float = 0.03  # Mode B: max % above N-candle high (anti-chase)
+    breakout_adx_threshold:  float = 22.0  # Mode B: stricter ADX requirement
 
     def __post_init__(self):
         if self.mode not in ("indicator", "threshold"):
@@ -195,16 +203,19 @@ class RiskConfig:
 
 @dataclass
 class PortfolioConfig:
-    starting_cash:          float = 10_000.0
-    sim_start_price:        float = 68_500.0  # simulated feed start price
-    sim_volatility:         float = 200.0     # simulated feed volatility per tick
-    max_concurrent_positions: int = 2         # MAX_CONCURRENT_POSITIONS — capital pool slots
+    starting_cash:            float = 10_000.0
+    sim_start_price:          float = 68_500.0  # simulated feed start price
+    sim_volatility:           float = 200.0     # simulated feed volatility per tick
+    max_concurrent_positions: int   = 2         # MAX_CONCURRENT_POSITIONS — capital pool slots
+    live_dust_value_cad:      float = 10.0      # positions worth < this are dust — skip recovery
 
     def __post_init__(self):
         if self.starting_cash <= 0:
             raise ValueError("STARTING_CASH must be > 0")
         if self.max_concurrent_positions < 1:
             raise ValueError("MAX_CONCURRENT_POSITIONS must be >= 1")
+        if self.live_dust_value_cad < 0:
+            raise ValueError("LIVE_DUST_VALUE_CAD must be >= 0")
 
 
 @dataclass
@@ -475,6 +486,13 @@ def _load() -> AppConfig:
             atr_sl_mult             = _float("ATR_SL_MULT",              2.0),
             atr_tp_mult             = _float("ATR_TP_MULT",              4.0),
             atr_period              = _int  ("ATR_PERIOD",               14),
+            pullback_rsi_min        = _float("PULLBACK_RSI_MIN",        38.0),
+            pullback_rsi_max        = _float("PULLBACK_RSI_MAX",        58.0),
+            breakout_rsi_min        = _float("BREAKOUT_RSI_MIN",        50.0),
+            breakout_rsi_max        = _float("BREAKOUT_RSI_MAX",        72.0),
+            breakout_lookback       = _int  ("BREAKOUT_LOOKBACK",       20),
+            max_price_extension_pct = _float("MAX_PRICE_EXTENSION_PCT", 0.03),
+            breakout_adx_threshold  = _float("BREAKOUT_ADX_THRESHOLD",  22.0),
         ),
         risk=RiskConfig(
             risk_per_trade_pct   = _float("RISK_PER_TRADE_PCT",    0.01),
@@ -489,6 +507,7 @@ def _load() -> AppConfig:
             sim_start_price          = _float("SIM_START_PRICE",           68_500.0),
             sim_volatility           = _float("SIM_VOLATILITY",            200.0),
             max_concurrent_positions = _int  ("MAX_CONCURRENT_POSITIONS",  2),
+            live_dust_value_cad      = _float("LIVE_DUST_VALUE_CAD",       10.0),
         ),
         ai=AIConfig(
             enabled        = _bool ("AI_ENABLED",        True),
