@@ -200,7 +200,7 @@ SYMBOL=BTC/CAD
 CANDLE_MINUTES=60
 RISK_PER_TRADE_PCT=0.10   # intentionally high at $100 capital (Kraken min order ~$4.50 CAD)
 STOP_LOSS_PCT=0.015
-TAKE_PROFIT_PCT=0.045
+TAKE_PROFIT_PCT=0.10   # confirmed 2026-07-01: matches backtest and regime monitor (was stale 0.045)
 
 ### How to verify the config is active
 Run: EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py

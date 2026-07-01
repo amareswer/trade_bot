@@ -5,6 +5,29 @@ metadata:
   type: project
 ---
 
+**Status as of 2026-07-01:** Two live symbols (BTC/CAD + XRP/CAD). Capital $77.05/symbol. Bot running on 4h candles. DOGE/CAD blocked. ETH/CAD blocked. Live PF accumulating — no completed round-trips yet on new allocation.
+
+---
+
+## Session 2026-07-01 — Live-Bot Audit + Config Corrections (COMPLETE ✅)
+
+### Fixes applied (no restarts required — config/doc only)
+- **Ambient-balance guard** — `live_executor.py`: bot now reads actual Kraken balances on startup instead of assuming cash = STARTING_CASH; prevents ghost positions after restart
+- **Maker-order fix** — `live_executor.py`: added `postOnly=True` param to limit BUY call; corrected price offset from `price * 1.001` (taker-side) to `price * 0.998` (bid-side passive) — fix was needed to actually achieve maker 0.40% rate
+- **.env corruption fix** — `.env` had duplicate/conflicting EXCHANGE lines; cleaned to single `EXCHANGE=kraken`
+- **BACKTEST_FEE_PCT corrected** — `0.0016` → `0.008` in `.env`; all prior PF numbers under old value were optimistic
+- **DOGE/CAD → BLOCKED** — walk-forward failed at corrected 0.8% fee (5000c PF 0.44); removed from `UNIVERSE_WHITELIST`
+- **MAX_CONCURRENT_POSITIONS / UNIVERSE_SIZE corrected** — both `3` → `2` after DOGE removal; pool is now BTC/CAD + XRP/CAD only
+- **Capital confirmed**: $77.05 available per symbol; position sizing at 10% RISK_PER_TRADE_PCT = $7.70 CAD per BUY (0.000092 BTC at $83,300) — passes Kraken minimums (amt_min=0.00005 BTC, cost_min=$1 CAD)
+- **TP/SL confirmed consistent** — `.env` TP=10% / SL=1.5% confirmed matching across `.env`, `backtest.py`, and `regime_monitor.py`; CLAUDE.md stale reference (TP=0.045) corrected
+
+### Known gaps logged this session (see decisions/known-gaps.md)
+- BUY fills not written to trades.db
+- Regime monitor rolling PF missing MIN_EMA_SPREAD_PCT filter
+- live_state.json (no symbol suffix) is dead code
+
+---
+
 **Status as of 2026-06-25 Late:** Multi-symbol parallel execution live in paper mode. 5 CAD crypto symbols running simultaneously, each with independent strategy/state machine/position manager. Bot at 22:04 UTC, next candle close ~1h 55m.
 
 ---
@@ -414,8 +437,12 @@ PAPER_SLIPPAGE_BPS=15
 
 ## Open Items (Crypto)
 
-1. **Fee path confirmed** — Kraken taker 0.80%, maker 0.40% (confirmed Jun 14 live fill). Limit BUY + market SELL = 1.20% round trip.
-2. **ETH expansion** — deferred until fee path confirmed <0.20%
+1. **Accumulate 15+ live fills per symbol** — then evaluate live PF vs backtest before capital increase
+2. **Capital increase gates** — $100→$250 requires 15 trades + live PF ≥ 1.2 + no single loss >3%; see CLAUDE.md Capital Sizing Rules
+3. **Wire daily P&L Telegram alert** — `TelegramAlerter.daily_pnl()` exists but is never called in bot/main.py midnight loop
+4. **Wire partial TP alert** — partial TP fires but `alerter.fill()` is skipped; real-money exit goes unreported
+5. **live_state.json (no symbol suffix)** — dead code; safe to archive (see decisions/known-gaps.md)
+6. **BUY fills missing from trades.db** — only SELL fills written; see decisions/known-gaps.md for audit path
 
 ---
 

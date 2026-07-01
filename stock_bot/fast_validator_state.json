@@ -8,16 +8,7 @@
       "tp_price": 298.895703,
       "confidence": 70,
       "shares": 1.0
-    },
-    {
-      "symbol": "MRNA",
-      "entry_time": "2026-06-29T19:12:59",
-      "entry_price": 69.19999694824219,
-      "sl_price": 68.161997,
-      "tp_price": 71.275997,
-      "confidence": 70,
-      "shares": 1.0
     }
   ],
-  "last_updated": "2026-07-01T13:33:55Z"
+  "last_updated": "2026-07-01T15:08:30Z"
 }
