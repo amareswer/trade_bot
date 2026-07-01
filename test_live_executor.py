@@ -40,6 +40,7 @@ def _make(
     markets:        dict  = None,
     balance:        dict  = None,
     state_path:     str   = None,
+    order_type:     str   = "market",
 ) -> tuple[LiveExecutor, MagicMock]:
     """
     Build a LiveExecutor with a fully mocked ccxt exchange.
@@ -65,6 +66,7 @@ def _make(
             starting_cash = starting_cash,
             dry_run       = dry_run,
             state_path    = state_path,
+            order_type    = order_type,
         )
     return ex, mock_ex
 
@@ -676,6 +678,85 @@ def test_limit_order_po_rejection_retries_with_tighter_offset(mock_cfg, mock_sle
     # Exactly two limit order placements — no market fallback
     assert mock_ex.create_order.call_count == 2
     assert all(c[0][1] == "limit" for c in mock_ex.create_order.call_args_list)
+
+
+# ---------------------------------------------------------------------------
+# Test: ORDER_TYPE=limit BUY uses post-only and bid-side price (0.2% below)
+# ---------------------------------------------------------------------------
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_order_type_limit_buy_uses_post_only_and_bid_price(mock_cfg, mock_sleep):
+    """BUY with order_type='limit' must use price*0.998 and timeInForce=PO."""
+    mock_cfg.exchange.limit_order_enabled = False  # use simple path, not limit-chase
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, order_type="limit")
+
+    fill_price = round(90_000.0 * 0.998, 2)  # 89_820.0
+    raw = {
+        "id": "lo-001", "status": "closed",
+        "filled": 0.001, "average": fill_price,
+        "fee": {"cost": 0.0, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = raw
+    mock_ex.fetch_order.return_value  = raw
+
+    order = ex.execute(Signal.BUY, 90_000.0, 0.001)
+
+    assert order is not None
+    assert order.status == OrderStatus.FILLED
+
+    call = mock_ex.create_order.call_args
+    # positional: symbol, type, side, amount, price  /  keyword or positional params
+    assert call[1].get("type") == "limit" or call[0][1] == "limit"
+    assert call[1].get("side") == "buy" or call[0][2] == "buy"
+    # price must be bid-side (below market)
+    actual_price = call[1].get("price") or call[0][4]
+    assert actual_price == fill_price, f"expected {fill_price}, got {actual_price}"
+    # post-only param must be present — Kraken uses postOnly=True, not timeInForce=PO
+    params = call[1].get("params") or (call[0][5] if len(call[0]) > 5 else {})
+    assert params == {"postOnly": True}, f"missing post-only: {params}"
+
+
+# ---------------------------------------------------------------------------
+# Test: ORDER_TYPE=limit SELL falls through to market (guaranteed exit)
+# ---------------------------------------------------------------------------
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_order_type_limit_sell_falls_through_to_market(mock_cfg, mock_sleep):
+    """SELL must always be a market order even when order_type='limit'."""
+    mock_cfg.exchange.limit_order_enabled = False
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, order_type="limit")
+
+    # Seed a position
+    buy_raw = {
+        "id": "lo-buy", "status": "closed",
+        "filled": 0.001, "average": round(90_000.0 * 0.998, 2),
+        "fee": {"cost": 0.0, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = buy_raw
+    mock_ex.fetch_order.return_value  = buy_raw
+    ex.execute(Signal.BUY, 90_000.0, 0.001)
+    mock_ex.create_order.reset_mock()
+
+    # Now SELL — must place market, not limit
+    sell_raw = {
+        "id": "lo-sell", "status": "closed",
+        "filled": 0.001, "average": 91_000.0,
+        "fee": {"cost": 0.0, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = sell_raw
+    mock_ex.fetch_order.return_value  = sell_raw
+    order = ex.execute(Signal.SELL, 91_000.0, 0.001)
+
+    assert order is not None
+    assert order.status == OrderStatus.FILLED
+
+    sell_call = mock_ex.create_order.call_args
+    order_type_used = sell_call[1].get("type") or sell_call[0][1]
+    assert order_type_used == "market", (
+        f"SELL should use market order, got '{order_type_used}'"
+    )
 
 
 if __name__ == "__main__":

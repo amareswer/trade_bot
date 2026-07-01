@@ -55,7 +55,8 @@ class LiveExecutor:
         self._portfolio     = Portfolio(cash=starting_cash)
         self._fills:      list[Order] = []
         self._rejects:    list[Order] = []
-        self._fees_paid:  float       = 0.0
+        self._fees_paid:           float = 0.0
+        self._bot_opened_position: bool  = False
 
         exchange_cls = getattr(ccxt, exchange_id.lower())
         self._exchange = exchange_cls({
@@ -203,7 +204,25 @@ class LiveExecutor:
                 )
 
             if prev_position < 1e-9:
-                # Saved position was 0 — reseed cost_basis at current price
+                if not self._bot_opened_position:
+                    # Exchange holds a balance this bot never bought — ambient balance
+                    # from a manual trade, prior session, or external deposit.
+                    # Undo the assignment above and do not adopt: no SELL will be issued.
+                    logger.warning(
+                        "AMBIENT BALANCE IGNORED [%s]: exchange holds %.6f %s"
+                        " but bot_opened_position=False — skipping adoption.",
+                        self.symbol, exchange_total, base,
+                    )
+                    print(
+                        f"  AMBIENT BALANCE IGNORED [{self.symbol}]:"
+                        f" exchange has {exchange_total:.6f} {base}"
+                        f" but this bot did not open it — skipping adoption.",
+                        flush=True,
+                    )
+                    self._portfolio.position    = 0.0
+                    self._portfolio._cost_basis = 0.0
+                    return
+                # Bot opened this position on a prior run — reseed cost_basis at current price
                 try:
                     current_price = float(self._exchange.fetch_ticker(symbol)["last"])
                 except Exception:
@@ -226,15 +245,23 @@ class LiveExecutor:
                     exchange_total, base, exchange_free,
                 )
         else:
-            # total == 0 and free == 0: genuinely no position on exchange
+            # total == 0 and free == 0: genuinely no position on exchange.
             if prev_position > 1e-9:
                 logger.warning(
-                    "Exchange shows 0 %s (total=0 free=0) but saved position=%.6f"
-                    " — clearing position (exchange is source of truth)",
-                    base, prev_position,
+                    "POSITION CLOSED EXTERNALLY [%s]: exchange shows 0 %s"
+                    " but saved position=%.6f — zeroing state."
+                    " No SELL will be placed.",
+                    self.symbol, base, prev_position,
+                )
+                print(
+                    f"  POSITION CLOSED EXTERNALLY [{self.symbol}]:"
+                    f" exchange has 0 {base} but state held {prev_position:.6f}"
+                    f" — state zeroed. No SELL issued.",
+                    flush=True,
                 )
             self._portfolio.position    = 0.0
             self._portfolio._cost_basis = 0.0
+            self._bot_opened_position = False
 
         self._save_state()
 
@@ -249,6 +276,7 @@ class LiveExecutor:
             "cost_basis":   self._portfolio._cost_basis,
             "realized_pnl": self._portfolio.realized_pnl,
             "fees_paid":    self._fees_paid,
+            "bot_opened":   self._bot_opened_position,
             "saved_at":     datetime.now(timezone.utc).isoformat(),
         }
         try:
@@ -298,6 +326,7 @@ class LiveExecutor:
         self._portfolio._cost_basis   = float(state.get("cost_basis",   0.0))
         self._portfolio.realized_pnl  = float(state.get("realized_pnl", 0.0))
         self._fees_paid               = float(state.get("fees_paid",     0.0))
+        self._bot_opened_position     = bool(state.get("bot_opened",    False))
         logger.warning(
             "Accounting restored: cost_basis=%.2f pnl=%.2f fees=%.4f (saved %s)",
             self._portfolio._cost_basis, self._portfolio.realized_pnl,
@@ -528,10 +557,10 @@ class LiveExecutor:
                     last_raw     = raw
                 else:
                     if self._order_type == "limit" and side == OrderSide.BUY:
-                        # Passive bid 0.2% below market — qualifies for Kraken maker rate (0.16%)
+                        # Passive bid 0.2% below market — post-only guarantees maker rate (0.16%)
                         limit_price = round(price * 0.998, 2)
                         logger.warning(
-                            "LIMIT BUY: %.6f %s @ %.2f (0.2%% below %.2f)",
+                            "LIMIT BUY: %.6f %s @ %.2f (0.2%% below %.2f, post-only)",
                             quantity, self.symbol, limit_price, price,
                         )
                         raw = self._exchange.create_order(
@@ -540,20 +569,7 @@ class LiveExecutor:
                             side   = ccxt_side,
                             amount = quantity,
                             price  = limit_price,
-                        )
-                    elif self._order_type == "limit" and side == OrderSide.SELL:
-                        # Passive ask 0.1% above market — qualifies for Kraken maker rate (0.16%)
-                        limit_price = round(price * 1.001, 2)
-                        logger.warning(
-                            "LIMIT SELL: %.6f %s @ %.2f (0.1%% above %.2f)",
-                            quantity, self.symbol, limit_price, price,
-                        )
-                        raw = self._exchange.create_order(
-                            symbol = self.symbol,
-                            type   = "limit",
-                            side   = ccxt_side,
-                            amount = quantity,
-                            price  = limit_price,
+                            params = {"postOnly": True},
                         )
                     else:
                         logger.warning(
@@ -661,13 +677,15 @@ class LiveExecutor:
                 (prev_cost + fill_price * quantity) / self._portfolio.position
                 if self._portfolio.position > 0 else 0.0
             )
+            self._bot_opened_position = True
         else:
             pnl = (fill_price - self._portfolio._cost_basis) * quantity
             self._portfolio.realized_pnl += pnl
             self._portfolio.cash         += total_value
             self._portfolio.position      = max(0.0, self._portfolio.position - quantity)
             if self._portfolio.position == 0:
-                self._portfolio._cost_basis = 0.0
+                self._portfolio._cost_basis   = 0.0
+                self._bot_opened_position     = False
 
         # Deduct exchange fee (live only). If fee is in a non-quote currency
         # (e.g. Kraken fee tokens), skip and log — do not silently mis-account.
