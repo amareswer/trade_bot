@@ -1,6 +1,6 @@
 ---
 name: fee-structure
-description: Real Kraken fee is 0.8% taker; limit BUY saves ~0.64% per round trip; backtest fee corrected
+description: Real Kraken fee is 0.8% taker; maker confirmed 0.40% (Jun 14 real fill); limit BUY saves ~0.40% per round trip; backtest fee corrected
 metadata:
   type: project
 ---
@@ -11,9 +11,9 @@ Final: yes
 
 **Fee facts:**
 - Kraken taker fee: 0.80% per side = 1.60% per round trip
-- Kraken maker fee: ~0.16% per side
-- Limit BUY + market SELL = ~0.96% per round trip (saving 0.64%)
-- At 61 trades / 2 years: saves ~$17–20 on $100 capital (proportional at higher capital)
+- Kraken maker fee: 0.40% per side (confirmed Jun 14 live fill — not the previously assumed 0.16%)
+- Limit BUY + market SELL = ~1.20% per round trip (saving 0.40%)
+- At 61 trades / 2 years: saves ~$11–13 on $100 capital (proportional at higher capital)
 
 **Backtest fee was wrong until 2026-06-22:**
 .env had BACKTEST_FEE_PCT=0.001 (0.1%). All prior PF numbers were optimistic.

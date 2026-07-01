@@ -29,7 +29,7 @@ metadata:
 Everything net-negative at 0.8% fee, regardless of signal quality (even SOL PF 1.33 → net −2.40%). Everything except BTC and LINK net-positive at 0.1%. Fee rate is the binding constraint at $100 CAD capital, not strategy quality.
 
 **Fee levers (Kraken):**
-- Maker orders (limit orders) → 0.16% vs 0.26% taker
+- Maker orders (limit orders) → 0.40% vs 0.80% taker (maker rate confirmed Jun 14 live fill)
 - Volume tier (30-day volume ≥ $50k USD → 0.14%)
 - BTC/USD vs BTC/CAD — CAD pairs may carry FX surcharge; pending raw fee-dict from next fill
 - Do NOT switch to Binance — unavailable in Canada

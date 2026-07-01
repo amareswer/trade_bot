@@ -100,7 +100,7 @@ metadata:
 
 ### Crypto bot — active config changes
 - **SYMBOL changed to ETH/CAD** (not ETH/USD — Kraken balance is CAD)
-- **LIMIT_ORDER_ENABLED=true** — post-only limit orders active (maker 0.16% rate)
+- **LIMIT_ORDER_ENABLED=true** — post-only limit orders active (maker 0.40% rate, confirmed Jun 14 fill)
 - **REGIME_ENABLED=false** — `_ranging_signal()` disabled; unvalidated, not safe to run live
 - **ATR_SL_MULT=0.0** — ATR stops disabled; fixed 1.5% SL active
 - **ZeroDivisionError fixed** in `position_manager.py` `on_buy()` / `on_sell()` — division by zero guard added
@@ -402,11 +402,11 @@ PAPER_SLIPPAGE_BPS=15
 
 **Status:** LIVE on Kraken BTC/CAD
 
-**Known issue:** Actual fee 0.80% vs 0.26% modeled — maker orders (limit) may reduce to 0.16%
+**Fee status:** Taker 0.80%, maker confirmed 0.40% (Jun 14 real fill). Limit BUY + market SELL = 1.20% round trip.
 
 **Next steps:**
 1. Accumulate 30-50 live trades and compare live PF/win rate to backtest
-2. Verify Kraken fee: test limit order to confirm 0.16% maker rate
+2. Maker fee confirmed 0.40% via Jun 14 live fill (was assumed 0.16% — incorrect)
 3. Once fee confirmed <0.20%: consider ETH/CAD expansion
 4. When capital grows to $500+: revisit RISK_PER_TRADE_PCT (lower to 2%)
 
@@ -414,7 +414,7 @@ PAPER_SLIPPAGE_BPS=15
 
 ## Open Items (Crypto)
 
-1. **Verify fee path** — Kraken 0.80% actual vs 0.26% modeled. Test limit order (maker) for 0.16% rate.
+1. **Fee path confirmed** — Kraken taker 0.80%, maker 0.40% (confirmed Jun 14 live fill). Limit BUY + market SELL = 1.20% round trip.
 2. **ETH expansion** — deferred until fee path confirmed <0.20%
 
 ---
@@ -494,7 +494,7 @@ TRAIL_STOP_PCT, PARTIAL_TP_PCT, PARTIAL_TP_SIZE
 
 **Code fixes:**
 - `bot/main.py`: removed dead candle-close SL/TP block (trail stop always fires first)
-- `bot/execution/live_executor.py`: limit BUY at price*0.998 (maker 0.16%), SELL always market, poll 9s
+- `bot/execution/live_executor.py`: limit BUY at price*0.998 (maker 0.40%, confirmed), SELL always market, poll 9s
 - `deploy/deploy.sh`: preserves live_state.json and trades.db on redeploy (was wiping entire logs/)
 - Risk gate bypass: confirmed already fixed — risk_manager.py only gates BUY
 

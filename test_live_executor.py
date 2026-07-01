@@ -543,7 +543,7 @@ def test_limit_order_fills_on_first_attempt(mock_cfg, mock_sleep):
         "status":  "closed",
         "filled":  0.001,
         "average": 90009.0,
-        "fee":     {"cost": 0.0144, "currency": "CAD"},  # maker ~0.16%
+        "fee":     {"cost": 0.360, "currency": "CAD"},  # maker ~0.40% (confirmed Jun 14 fill; 0.001 BTC × 90009 × 0.004)
     }
     mock_ex.create_order.return_value = limit_raw
 
@@ -557,7 +557,7 @@ def test_limit_order_fills_on_first_attempt(mock_cfg, mock_sleep):
     # Post-only flag sent
     assert mock_ex.create_order.call_args[0][5] == {"timeInForce": "PO"}
     # Maker fee deducted
-    assert abs(ex.fees_paid - 0.0144) < 1e-6
+    assert abs(ex.fees_paid - 0.360) < 1e-6
     # No market-order fallback — fetch_order never needed
     mock_ex.fetch_order.assert_not_called()
 

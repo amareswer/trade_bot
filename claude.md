@@ -252,7 +252,7 @@ All critical bugs resolved:
    - Change to: preserve `logs/live_state.json` and `logs/trades.db`, exclude only `logs/trade_bot.log`
 
 #### DAY 2 — Fee savings + silent failures
-5. **Enable limit orders for BUY** — saves 0.64% per round trip (0.80% → 0.16% maker rate)
+5. **Enable limit orders for BUY** — saves 0.40% per round trip (0.80% taker → 0.40% maker rate, confirmed Jun 14 fill)
    - `.env`: `ORDER_TYPE=limit`
    - `live_executor.py:411`: change BUY offset `price * 1.001` → `price * 0.998` (bid-side passive)
    - Leave SELL as market order (guaranteed exit)
@@ -305,13 +305,14 @@ All critical bugs resolved:
 ### Watchlist (not yet tradeable)
 | Symbol | Status | Reason |
 |--------|--------|--------|
-| DOGE/CAD | WATCHLIST | Walk-forward passed (PF 1.43 on 1000c) but Kraken 24h volume only $12,439 CAD — too thin for limit orders; revisit when volume exceeds $50k CAD/day |
+| — | — | No current watchlist entries |
 
 ### Blocked (walk-forward failed)
 | Symbol | Status | Reason |
 |--------|--------|--------|
-| ETH/CAD | BLOCKED | Walk-forward failed on all windows (5000c PF 0.57, deteriorating to 0.44); SL:TP exit ratio 85:7 — strategy has no edge on ETH with this config |
-| SOL/CAD | BLOCKED | Walk-forward failed — marginal on full history (PF 1.15) but collapses on recent windows (1000c PF 0.72) |
+| DOGE/CAD | BLOCKED | Walk-forward failed at corrected 0.8% fee: 5000c PF 0.44, 3000c PF 0.71, 1000c PF 0.44 — all three windows below 1.0. Prior WATCHLIST entry (PF 1.43 on 1000c) was produced at wrong 0.16% fee. Volume gate ($32k vs $50k CAD/day) and wide spread (0.60%) are secondary; walk-forward failure is the deciding factor regardless of volume. |
+| ETH/CAD | BLOCKED | Walk-forward failed on all windows (5000c PF 0.90, 3000c PF 1.44, 1000c PF 1.34 — full-history window fails); strategy has no edge on ETH over the full 2024–2026 period |
+| SOL/CAD | BLOCKED | Walk-forward failed — all three windows below 1.0 (5000c PF 0.88, 3000c PF 0.75, 1000c PF 0.83) |
 
 ### Implementation
 - `.env`: `UNIVERSE_WHITELIST=BTC/CAD,XRP/CAD` — bot uses fixed whitelist, skips dynamic momentum scan

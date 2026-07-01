@@ -557,7 +557,7 @@ class LiveExecutor:
                     last_raw     = raw
                 else:
                     if self._order_type == "limit" and side == OrderSide.BUY:
-                        # Passive bid 0.2% below market — post-only guarantees maker rate (0.16%)
+                        # Passive bid 0.2% below market — post-only guarantees maker rate (0.40%, confirmed Jun 14 fill)
                         limit_price = round(price * 0.998, 2)
                         logger.warning(
                             "LIMIT BUY: %.6f %s @ %.2f (0.2%% below %.2f, post-only)",

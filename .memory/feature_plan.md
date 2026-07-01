@@ -23,7 +23,7 @@ Running log of feature decisions. Most recent first.
 
 ### Limit order post-only chase with PO rejection retry (BUILT ✓)
 Post-only limit BUY placed at bid-side offset; retries on POST_ONLY_REJECT with adjusted price.
-Maker rate (0.16%) vs taker (0.80%) — 0.64% saving per round trip.
+Maker rate (0.40%) vs taker (0.80%) — 0.40% saving per round trip.
 
 ### REGIME_ENABLED flag (BUILT ✓)
 `_ranging_signal()` disabled when `REGIME_ENABLED=false`. Unvalidated signal — safe to disable live.
@@ -547,7 +547,7 @@ The backtest engine checks SL/TP against the candle CLOSE price only (once per 4
 
 **Fee logging added:** `logger.warning("Fee dict from exchange: %s", fee_data)` added in `live_executor.py` at fee extraction point. Next fill will log the raw ccxt fee structure from Kraken for inspection.
 
-**Fee finding:** Actual Kraken fee on first live fill was 0.80% (not 0.26% modelled). Most likely Kraken's BTC/CAD surcharge (CAD settlement adds ~0.54% on top of 0.26% taker). Backtest at 0.80% fee: PF 1.21 (signals intact) but net −4.99% — fees 3× gross profit. Strategy is not viable at 0.80%; maker orders (0.16%) or Binance (0.10%) required.
+**Fee finding:** Actual Kraken fee on first live fill was 0.80% (not 0.26% modelled). Most likely Kraken's BTC/CAD surcharge (CAD settlement adds ~0.54% on top of 0.26% taker). Backtest at 0.80% fee: PF 1.21 (signals intact) but net −4.99% — fees 3× gross profit. Strategy is not viable at 0.80%; maker orders (0.40%) or Binance (0.10%) required.
 
 **Files changed:** `bot/main.py` (intra-candle SL/TP block), `bot/execution/live_executor.py` (fee dict logging)
 

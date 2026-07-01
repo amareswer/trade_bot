@@ -85,7 +85,7 @@ AI_ENABLED=false
 **Why Kraken (not Binance):** Binance unavailable in Canada. BTC/CAD is the native pair.
 **Why 1h candles:** Switched from 4h on 2026-06-14 after bot missed a full $89k→$92k move with zero trades. 1h gives 4× more decision points on a $100 account where missed trades are costly.
 **Backtest note:** Config must be validated with `BACKTEST_TIMEFRAME=1h BACKTEST_LIMIT=5000 EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py` before trusting — not yet done as of 2026-06-14.
-**Fee situation:** Actual Kraken fee 0.80% (vs 0.26% modeled). Strategy net-negative at 0.80%; investigating maker orders (0.16%) as fee lever.
+**Fee situation:** Actual Kraken fee 0.80% taker. Maker rate confirmed 0.40% (Jun 14 live fill). Limit BUY + market SELL = 1.20% round trip vs 1.60% taker-only.
 
 ---
 
