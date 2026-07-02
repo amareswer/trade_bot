@@ -1,14 +1,4 @@
 {
-  "positions": [
-    {
-      "symbol": "RY.TO",
-      "entry_time": "2026-06-29T18:52:30",
-      "entry_price": 290.19000244140625,
-      "sl_price": 285.837152,
-      "tp_price": 298.895703,
-      "confidence": 70,
-      "shares": 1.0
-    }
-  ],
-  "last_updated": "2026-07-01T15:08:30Z"
+  "positions": [],
+  "last_updated": "2026-07-02T00:00:22Z"
 }

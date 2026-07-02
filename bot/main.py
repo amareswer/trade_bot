@@ -866,7 +866,14 @@ def run():
                                         exchange    = cfg.exchange.exchange,
                                     )
 
-                    _ic_sl = _trail_sl_level > 0 and price <= _trail_sl_level
+                    _fixed_sl_level = (
+                        _ic_entry * (1 - cfg.backtest.stop_loss_pct)
+                        if cfg.backtest.stop_loss_pct > 0 else 0.0
+                    )
+                    _ic_sl = (
+                        (_trail_sl_level > 0 and price <= _trail_sl_level)
+                        or (_fixed_sl_level > 0 and price <= _fixed_sl_level)
+                    )
                     _ic_tp = (
                         price >= ss['atr_tp'] if ss['atr_tp'] > 0
                         else (cfg.backtest.take_profit_pct > 0
@@ -874,11 +881,13 @@ def run():
                     )
                     if _ic_sl or _ic_tp:
                         if _ic_sl:
+                            _sl_label = "TRAIL STOP" if _trail_sl_level > 0 else "FIXED SL"
+                            _sl_level = _trail_sl_level if _trail_sl_level > 0 else _fixed_sl_level
                             logger.warning(
-                                "TRAIL STOP [%s]: price=%.2f peak=%.2f trail_sl=%.2f",
-                                sym, price, ss['trail_peak'], _trail_sl_level,
+                                "%s [%s]: price=%.2f entry=%.2f sl=%.2f",
+                                _sl_label, sym, price, _ic_entry, _sl_level,
                             )
-                            print(f"           🛑 TRAIL STOP [{sym}]  price={price:,.2f}  peak={ss['trail_peak']:,.2f}  sl={_trail_sl_level:,.2f}", flush=True)
+                            print(f"           🛑 {_sl_label} [{sym}]  price={price:,.2f}  entry={_ic_entry:,.2f}  sl={_sl_level:,.2f}", flush=True)
                         else:
                             logger.warning(
                                 "TAKE PROFIT [%s]: price=%.2f entry=%.2f tp=%.1f%%",
@@ -897,7 +906,11 @@ def run():
                                 ss['partial_done'] = False
                                 if not ss['pm'].has_position:
                                     capital_pool.release(sym, ss['executor'].cash)
-                                _ic_reason = "trail_stop" if _ic_sl else "take_profit"
+                                _ic_reason = (
+                                    "trail_stop" if (_trail_sl_level > 0 and price <= _trail_sl_level)
+                                    else "stop_loss" if _ic_sl
+                                    else "take_profit"
+                                )
                                 display.fill(
                                     _ic_order.side.value, _ic_order.quantity,
                                     sym, _ic_order.price,
