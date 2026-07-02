@@ -126,7 +126,7 @@ class StrategyConfig:
     buy_threshold:           float = 0.0
     sell_threshold:          float = 0.0
     adx_period:              int   = 14
-    adx_threshold:           float = 25.0  # < this = ranging market → HOLD
+    adx_threshold:           float = 18.0  # < this = ranging market → HOLD (validated live value)
     adx_max:                 float = 0.0   # 0 = disabled; 30.0 = reject ADX > 30
     min_ema_spread_pct:      float = 0.002 # require fast EMA ≥ this % above slow EMA to enter
     max_ema_spread_pct:      float = 0.0   # 0 = disabled; 0.005 = 0.5% ceiling
@@ -177,12 +177,13 @@ class StrategyConfig:
 
 @dataclass
 class RiskConfig:
-    risk_per_trade_pct:   float = 0.005  # 0.5% of cash per trade — conservative dynamic sizing
-    max_position_pct:     float = 0.03   # never more than 3% of portfolio in one position
-    daily_loss_limit_pct: float = 0.01   # halt new BUYs if down 1% today
-    max_drawdown_pct:     float = 0.05   # halt new BUYs if down 5% from all-time peak
-    max_trades_per_day:   int   = 3      # hard cap per calendar day
-    cooldown_ticks:       int   = 10     # candles to wait after each trade
+    risk_per_trade_pct:     float = 0.005  # 0.5% of cash per trade — conservative dynamic sizing
+    max_position_pct:       float = 0.03   # never more than 3% of portfolio in one position
+    daily_loss_limit_pct:   float = 0.01   # halt new BUYs if down 1% today
+    max_drawdown_pct:       float = 0.05   # halt new BUYs if down 5% from all-time peak
+    max_trades_per_day:     int   = 3      # hard cap per calendar day
+    cooldown_ticks:         int   = 10     # candles to wait after each trade
+    risk_halt_blocks_stops: bool  = False  # when True, manual HALT also blocks SL/TP exits
 
     def __post_init__(self):
         errors = []
@@ -484,7 +485,7 @@ def _load() -> AppConfig:
             buy_threshold           = _float("BUY_THRESHOLD",           0.0),
             sell_threshold          = _float("SELL_THRESHOLD",          0.0),
             adx_period              = _int  ("ADX_PERIOD",              14),
-            adx_threshold           = _float("ADX_THRESHOLD",           25.0),  # live .env must set 18
+            adx_threshold           = _float("ADX_THRESHOLD",           18.0),
             adx_max                 = _float("ADX_MAX",                 0.0),
             min_ema_spread_pct      = _float("MIN_EMA_SPREAD_PCT",      0.002),
             max_ema_spread_pct      = _float("MAX_EMA_SPREAD_PCT",      0.0),
@@ -506,12 +507,13 @@ def _load() -> AppConfig:
             breakout_adx_threshold  = _float("BREAKOUT_ADX_THRESHOLD",  22.0),
         ),
         risk=RiskConfig(
-            risk_per_trade_pct   = _float("RISK_PER_TRADE_PCT",    0.01),
-            max_position_pct     = _float("RISK_MAX_POSITION_PCT",  0.05),
-            daily_loss_limit_pct = _float("RISK_DAILY_LOSS_LIMIT",  0.02),
-            max_drawdown_pct     = _float("RISK_MAX_DRAWDOWN",      0.10),
-            max_trades_per_day   = _int  ("RISK_MAX_TRADES_PER_DAY", 5),
-            cooldown_ticks       = _int  ("COOLDOWN_TICKS",          10),
+            risk_per_trade_pct     = _float("RISK_PER_TRADE_PCT",       0.01),
+            max_position_pct       = _float("RISK_MAX_POSITION_PCT",    0.05),
+            daily_loss_limit_pct   = _float("RISK_DAILY_LOSS_LIMIT",    0.02),
+            max_drawdown_pct       = _float("RISK_MAX_DRAWDOWN",        0.10),
+            max_trades_per_day     = _int  ("RISK_MAX_TRADES_PER_DAY",  5),
+            cooldown_ticks         = _int  ("COOLDOWN_TICKS",           10),
+            risk_halt_blocks_stops = _bool ("RISK_HALT_BLOCKS_STOPS",   False),
         ),
         portfolio=PortfolioConfig(
             starting_cash            = _float("STARTING_CASH",            10_000.0),
@@ -576,9 +578,8 @@ def _load() -> AppConfig:
     # Warn loudly when critical strategy values are absent from the environment.
     # These fire at import time so they appear in every run, not buried mid-log.
     if "ADX_THRESHOLD" not in os.environ:
-        logger.warning(
-            "ADX_THRESHOLD not set in .env — falling back to code default %.1f. "
-            "Live-validated strategy uses 18.0. Backtest and live bot WILL diverge.",
+        logger.info(
+            "ADX_THRESHOLD not set in .env — using code default %.1f (validated value).",
             cfg.strategy.adx_threshold,
         )
     if cfg.strategy.volume_k > 0:

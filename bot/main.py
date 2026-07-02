@@ -805,6 +805,9 @@ def run():
                                 _drift_consecutive_failures = 0
 
             # ── 2. Intra-candle SL/TP + Trailing Stop + Partial TP ───
+            # This block is the only SL/TP evaluation path. A second
+            # candle-close SL check that existed in an earlier version of
+            # this file has been removed — all stop/take-profit logic lives here.
             if is_indicator and live_exchange is not None:
                 if ss['pm'].has_position and ss['pm'].avg_entry > 0:
                     _ic_entry       = ss['pm'].avg_entry
@@ -895,8 +898,12 @@ def run():
                             )
                             print(f"           ✅ TAKE PROFIT [{sym}]  price={price:,.2f}  entry={_ic_entry:,.2f}", flush=True)
                         _ic_qty      = ss['pm'].quantity
-                        _ic_approval = risk.evaluate(Signal.SELL, price, ss['executor'].portfolio, _ic_qty)
-                        if _ic_approval.approved:
+                        # SL/TP bypasses the risk gate so stops always fire.
+                        # Only when RISK_HALT_BLOCKS_STOPS=true does a manual halt suppress them.
+                        _sl_tp_halted = (
+                            cfg.risk.risk_halt_blocks_stops and risk.config.halt
+                        )
+                        if not _sl_tp_halted:
                             _ic_order = ss['executor'].execute(Signal.SELL, price, quantity=_ic_qty)
                             if _ic_order and _ic_order.status == OrderStatus.FILLED:
                                 risk.record_fill()
@@ -936,7 +943,7 @@ def run():
                                 )
                         else:
                             logger.warning(
-                                "SL/TP SELL blocked by risk gate [%s]: %s", sym, _ic_approval.message,
+                                "SL/TP SELL halted (RISK_HALT_BLOCKS_STOPS=true) [%s]", sym,
                             )
                         display.position_line(
                             quantity       = ss['pm'].quantity,

@@ -35,8 +35,11 @@ apt-get install -y -qq python3 python3-pip python3-venv git curl
 # ── 2. Copy repo to install dir ───────────────────────────────────────────────
 echo "[2/6] Copying repo to $INSTALL_DIR ..."
 mkdir -p "$INSTALL_DIR"
+# Exclude only regenerable files. DO NOT exclude the whole logs/ directory —
+# live_state_*.json and logs/trades.db must survive redeploys so the bot
+# restarts with the correct position state and trade history.
 rsync -a --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' \
-      --exclude='venv' --exclude='logs/trade_bot.log' \
+      --exclude='venv' --exclude='logs/trade_bot.log' --exclude='logs/*.log' \
       "$REPO_ROOT/" "$INSTALL_DIR/"
 
 # Keep logs directory and persistent state files

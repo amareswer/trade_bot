@@ -24,6 +24,8 @@ from config import cfg
 
 logger = logging.getLogger(__name__)
 
+# Legacy fallback — every caller in bot/main.py passes an explicit per-symbol
+# path (logs/live_state_BTC_CAD.json etc.), so this constant is never reached.
 _DEFAULT_STATE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "logs", "live_state.json",

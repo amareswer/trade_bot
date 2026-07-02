@@ -1,4 +1,14 @@
 {
-  "positions": [],
-  "last_updated": "2026-07-02T00:00:22Z"
+  "positions": [
+    {
+      "symbol": "AMZN",
+      "entry_time": "2026-07-02T16:56:16",
+      "entry_price": 245.6999969482422,
+      "sl_price": 242.014497,
+      "tp_price": 253.070997,
+      "confidence": 70,
+      "shares": 1.0
+    }
+  ],
+  "last_updated": "2026-07-02T20:01:55Z"
 }

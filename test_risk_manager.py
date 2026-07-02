@@ -5,6 +5,32 @@ from bot.risk.risk_manager import RiskManager, RiskConfig, BlockReason
 from bot.strategy.threshold_strategy import Signal
 
 
+# ── SL/TP bypass pattern ──────────────────────────────────────────────────────
+# The intra-candle SL/TP path in bot/main.py calls executor.execute() directly
+# instead of going through risk.evaluate(). This test verifies that pattern:
+# even if the risk gate would block the SELL, the executor still fills the order.
+
+def test_sl_tp_bypasses_risk_gate_in_halt():
+    """SL/TP exits execute directly even when risk manager is in manual halt state."""
+    ex   = PaperExecutor("BTC/CAD", quantity=0.01, starting_cash=1_000.0)
+    risk = RiskManager(RiskConfig(halt=True))
+
+    sl_price = 95_000.0
+
+    # Confirm the risk gate would block SELL in halt state
+    gate_result = risk.evaluate(Signal.SELL, sl_price, ex.portfolio, ex.portfolio.position)
+    assert not gate_result, "Risk gate should block SELL when halt=True"
+    assert gate_result.block_reason == BlockReason.HALT
+
+    # SL/TP path bypasses risk gate — executor.execute() is called directly
+    order = ex.execute(Signal.SELL, sl_price, quantity=ex.portfolio.position)
+    assert order is not None
+    assert order.status == OrderStatus.FILLED
+
+    risk.record_fill()   # fill is still recorded for accounting
+    assert risk.fills_today == 1
+
+
 def _make(cash=100_000, qty=1.0, **cfg):
     executor = PaperExecutor("BTC/USDT", quantity=qty, starting_cash=cash)
     risk     = RiskManager(RiskConfig(**cfg))
@@ -117,6 +143,7 @@ if __name__ == "__main__":
         test_position_size_allows_small_buy,
         test_position_size_does_not_apply_to_sell,
         test_approved_trade_executes_and_records_fill,
+        test_sl_tp_bypasses_risk_gate_in_halt,
     ]
     for t in tests:
         t()

@@ -200,10 +200,12 @@ def compute_rolling_pf(
         if any(v is None for v in [adx_val, rsi_val, fast_val, slow_val]):
             continue
 
+        ema_spread_val = (fast_val - slow_val) / slow_val if slow_val != 0 else 0.0
         is_buy = (
-            adx_val  >= ADX_THRESHOLD
-            and fast_val > slow_val
-            and rsi_val  < RSI_OVERSOLD
+            adx_val        >= ADX_THRESHOLD
+            and fast_val   >  slow_val
+            and rsi_val    <  RSI_OVERSOLD
+            and ema_spread_val >= MIN_EMA_SPREAD_PCT
         )
         if not is_buy:
             continue
@@ -254,13 +256,23 @@ def print_table(
     ema_spread:  float | None,
 ) -> None:
     adx_str    = f"{current_adx:.1f}" if current_adx is not None else "N/A"
-    pf_str     = f"{pf:.2f}" if pf != float("inf") else "inf (no losses)"
     spread_str = f"{ema_spread:+.3f}%" if ema_spread is not None else "N/A"
 
     adx_ok     = current_adx is not None and current_adx >= ADX_THRESHOLD
     adx_pct_ok = adx_pct >= ADX_PCT_MIN
-    pf_ok      = pf >= PF_MIN  # float("inf") >= 1.2 is True — no losses counts as pass
     spread_ok  = ema_spread is not None and ema_spread >= EMA_SPREAD_MIN
+
+    # When the window produced no simulated trades, PF is unmeasurable — exclude
+    # it from pass/fail so the verdict reflects only conditions we can actually evaluate.
+    _pf_measurable = trade_count > 0
+    if _pf_measurable:
+        pf_str    = f"{pf:.2f}" if pf != float("inf") else "inf (no losses)"
+        pf_ok     = pf >= PF_MIN
+        pf_status = "PASS" if pf_ok else "WARN"
+    else:
+        pf_str    = "N/A"
+        pf_ok     = False   # unused in verdict when not measurable
+        pf_status = "N/A (no signals in window)"
 
     def mark(ok: bool) -> str:
         return "PASS" if ok else "WARN"
@@ -278,25 +290,32 @@ def print_table(
     print(f"  {'ADX ≥ 18  (last ' + str(WINDOW) + ' candles)':<{w}}  "
           f"{adx_pct:>11.1f}%  {'≥ ' + str(int(ADX_PCT_MIN)) + '%':>12}  {mark(adx_pct_ok)}")
     print(f"  {'Rolling PF  (last ' + str(WINDOW) + ' candles)':<{w}}  "
-          f"{pf_str:>12}  {'≥ ' + str(PF_MIN):>12}  {mark(pf_ok)}")
+          f"{pf_str:>12}  {'≥ ' + str(PF_MIN):>12}  {pf_status}")
     print(f"  {'EMA spread  (EMA9 − EMA21) / EMA21':<{w}}  "
           f"{spread_str:>12}  {'≥ ' + f'{EMA_SPREAD_MIN:.1f}%':>12}  {mark(spread_ok)}")
     print()
 
-    if trade_count == 0:
-        print(f"  Rolling PF: 0 completed trades — ADX+EMA+RSI conditions not met in window")
-    else:
+    if _pf_measurable:
         print(f"  Rolling PF from {trade_count} completed trade(s)  "
               f"|  SL={STOP_LOSS_PCT * 100:.1f}%  TP={TAKE_PROFIT_PCT * 100:.1f}%")
-    if trade_count < 5:
-        print(f"  Note: PF is unreliable with fewer than 5 trades — use as indicative only")
+        if trade_count < 5:
+            print(f"  Note: PF is unreliable with fewer than 5 trades — use as indicative only")
+    else:
+        print(f"  Rolling PF: 0 completed trades — ADX+EMA+RSI+spread conditions not met in window")
+
+    # Build verdict from measurable conditions only
+    _measurable = [adx_ok, adx_pct_ok, spread_ok]
+    if _pf_measurable:
+        _measurable.append(pf_ok)
+    ok_count    = sum(_measurable)
+    total_count = len(_measurable)
+    _cond_label = "measurable conditions" if total_count < 4 else "conditions"
 
     print()
-    ok_count = sum([adx_ok, adx_pct_ok, pf_ok, spread_ok])
-    if ok_count == 4:
-        verdict = "EDGE PRESENT   — all 4/4 conditions met"
+    if ok_count == total_count:
+        verdict = f"EDGE PRESENT   — all {total_count}/{total_count} {_cond_label} met"
     else:
-        verdict = f"DEGRADED       — {ok_count}/4 conditions met  (review before new entries)"
+        verdict = f"DEGRADED       — {ok_count}/{total_count} {_cond_label} met  (review before new entries)"
     print(f"  Verdict: {verdict}")
     print()
 
@@ -316,14 +335,12 @@ def append_log(
     pf_str     = f"{pf:.3f}" if pf != float("inf") else "inf"
     spread_str = f"{ema_spread:.4f}" if ema_spread is not None else "N/A"
 
-    ok = (
-        current_adx is not None
-        and current_adx >= ADX_THRESHOLD
-        and adx_pct     >= ADX_PCT_MIN
-        and pf          >= PF_MIN
-        and ema_spread  is not None
-        and ema_spread  >= EMA_SPREAD_MIN
-    )
+    adx_ok     = current_adx is not None and current_adx >= ADX_THRESHOLD
+    adx_pct_ok = adx_pct >= ADX_PCT_MIN
+    spread_ok  = ema_spread is not None and ema_spread >= EMA_SPREAD_MIN
+    # Exclude PF from verdict when window produced no signals (same logic as print_table)
+    pf_ok      = (trade_count > 0 and pf >= PF_MIN)
+    ok = adx_ok and adx_pct_ok and spread_ok and (trade_count == 0 or pf_ok)
     verdict = "EDGE" if ok else "DEGRADED"
 
     line = (

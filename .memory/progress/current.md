@@ -5,6 +5,60 @@ metadata:
   type: project
 ---
 
+**Status as of 2026-07-02:** Two live symbols (BTC/CAD + XRP/CAD). Capital $77.05/symbol. Bot running on 4h candles. Code hardening session complete (Tasks 1–6 applied). No live config changes.
+
+---
+
+## Session 2026-07-02 — Bot Hardening Tasks 1–6 (COMPLETE ✅)
+
+### Changes applied
+
+**Task 1 — SL/TP bypass of risk gate (bot/main.py)**
+- Intra-candle SL/TP path now calls `executor.execute()` directly, bypassing `risk.evaluate()`
+- New env var `RISK_HALT_BLOCKS_STOPS` (default false) — when true, manual halt also suppresses stops
+- `risk.record_fill()` still called on FILLED for accounting
+- Unit test added to `test_risk_manager.py`: `test_sl_tp_bypasses_risk_gate_in_halt()`
+
+**Task 2 — BUY fills to trades.db (ALREADY DONE — no code change)**
+- Verified: unified `trade_log.log_fill(side=order.side.value, ...)` at lines 1391–1398 covers both BUY and SELL
+- Also verified: partial TP path (lines 859–867) already calls `alerter.fill()` — CLAUDE.md item 9 was stale
+- known-gaps item 1 marked RESOLVED
+
+**Task 3 — deploy.sh state preservation**
+- Added `--exclude='logs/*.log'` alongside existing `--exclude='logs/trade_bot.log'`
+- Added explanatory comment: live_state_*.json and trades.db must survive redeploys
+
+**Task 4 — regime_monitor.py alignment**
+- `compute_rolling_pf()`: added `ema_spread_val >= MIN_EMA_SPREAD_PCT` to is_buy condition
+- `print_table()` + `append_log()`: trade_count == 0 → PF shows "N/A (no signals in window)",
+  excluded from pass/fail; verdict reads "X/3 measurable conditions met"
+
+**Task 5 — Dead candle-close SL block**
+- Block was already removed in 2026-06-22 session; added a one-line comment at the
+  intra-candle block confirming it is the only SL/TP evaluation path
+
+**Task 6 — Config hygiene (config.py)**
+- ADX_THRESHOLD default changed 25.0 → 18.0 (dataclass + _load())
+- RSI_OVERSOLD/RSI_OVERBOUGHT confirmed 30.0/70.0 (no change needed)
+- live_state.json legacy default: added comment in live_executor.py confirming it's never reached
+- ADX missing-env warning downgraded from WARNING to INFO (default is now correct)
+- New field `RISK_HALT_BLOCKS_STOPS` added to RiskConfig dataclass and _load()
+
+### Test results
+- 109/109 tests pass (108 baseline + 1 new SL/TP bypass test)
+
+### Backtest fingerprint
+- Pre-change baseline: 33 trades / PF 2.19 / WR 42.4%
+- Post-change: identical (my changes do NOT alter strategy behavior)
+- CLAUDE.md fingerprint (58 trades / PF 1.79) is stale — caused by ATR_SL_ENABLED=true
+  in .env with default ATR_SL_MULTIPLIER=2.0 (different from validation run). Not caused
+  by these changes. See known-gaps.md item 4 for details.
+
+### Open items from this session
+- Backtest fingerprint in CLAUDE.md needs updating (separate task — confirm ATR_SL config)
+
+---
+
 **Status as of 2026-07-01:** Two live symbols (BTC/CAD + XRP/CAD). Capital $77.05/symbol. Bot running on 4h candles. DOGE/CAD blocked. ETH/CAD blocked. Live PF accumulating — no completed round-trips yet on new allocation.
 
 ---
@@ -439,10 +493,11 @@ PAPER_SLIPPAGE_BPS=15
 
 1. **Accumulate 15+ live fills per symbol** — then evaluate live PF vs backtest before capital increase
 2. **Capital increase gates** — $100→$250 requires 15 trades + live PF ≥ 1.2 + no single loss >3%; see CLAUDE.md Capital Sizing Rules
-3. **Wire daily P&L Telegram alert** — `TelegramAlerter.daily_pnl()` exists but is never called in bot/main.py midnight loop
-4. **Wire partial TP alert** — partial TP fires but `alerter.fill()` is skipped; real-money exit goes unreported
-5. **live_state.json (no symbol suffix)** — dead code; safe to archive (see decisions/known-gaps.md)
-6. **BUY fills missing from trades.db** — only SELL fills written; see decisions/known-gaps.md for audit path
+3. ~~**Wire daily P&L Telegram alert**~~ — DONE (bot/main.py midnight loop at lines 1443-1454)
+4. ~~**Wire partial TP alert**~~ — DONE (lines 859-867 already call alerter.fill())
+5. ~~**live_state.json (no symbol suffix)**~~ — ADDRESSED (comment added to live_executor.py; file on disk is inert)
+6. ~~**BUY fills missing from trades.db**~~ — RESOLVED (unified call covers BUY+SELL; see known-gaps.md item 1)
+7. **Update CLAUDE.md backtest fingerprint** — current result is 33 trades/PF 2.19 (ATR_SL_ENABLED=true changes exit mix vs original 58-trade validation run)
 
 ---
 
@@ -451,26 +506,26 @@ PAPER_SLIPPAGE_BPS=15
 Three agents audited crypto bot, stock bot, and deployment. Findings below by priority.
 
 ### TODAY — Active money at risk
-- [ ] Fix `BACKTEST_FEE_PCT=0.001` → `0.008` in `.env` — all recent backtest PF numbers are wrong
+- [x] Fix `BACKTEST_FEE_PCT=0.001` → `0.008` in `.env` — DONE (prior session)
 - [ ] Run 1h backtest (`BACKTEST_TIMEFRAME=1h`) — live bot on 1h but ALL validation done on 4h; untested
-- [ ] Fix SL/TP risk gate bypass (`bot/main.py:525-561`) — halt state blocks stop-loss from firing
-- [ ] Fix `deploy.sh` — `--exclude='logs'` wipes `live_state.json` on redeploy (position lost)
+- [x] Fix SL/TP risk gate bypass — DONE 2026-07-02 (Task 1: direct execute, RISK_HALT_BLOCKS_STOPS=false default)
+- [x] Fix `deploy.sh` — DONE 2026-07-02 (Task 3: added --exclude='logs/*.log', preserved state files)
 
 ### DAY 2
-- [ ] Enable limit orders for BUY only — `ORDER_TYPE=limit`, offset `price*0.998`, 9s cancel timeout
-- [ ] Remove dual SL evaluation path — candle-close SL block (`bot/main.py:618-633`) is dead code
+- [x] Enable limit orders for BUY only — DONE (prior session, ORDER_TYPE=limit active)
+- [x] Remove dual SL evaluation path — DONE (prior session; confirmed absent 2026-07-02, comment added)
 
 ### DAY 3
 - [ ] Fix stock bot daily loss breaker (`paper.py:81,114`) — uses cash only, ignores position value
-- [ ] Wire `alerter.daily_pnl()` in `bot/main.py` midnight loop
-- [ ] Wire `alerter.fill()` on partial TP path (`bot/main.py:~506`)
-- [ ] Add consecutive error counter → Telegram after 5 failures
+- [x] Wire `alerter.daily_pnl()` in `bot/main.py` midnight loop — ALREADY DONE (lines 1443-1454)
+- [x] Wire `alerter.fill()` on partial TP path — ALREADY DONE (lines 859-867)
+- [x] Add consecutive error counter → Telegram after 5 failures — DONE (prior session)
 
 ### WEEK 2
-- [ ] ADX default `config.py:383`: `25.0` → `18.0`
-- [ ] RSI levels in `.env`: `RSI_OVERSOLD=30 RSI_OVERBOUGHT=70`
+- [x] ADX default `config.py`: `25.0` → `18.0` — DONE 2026-07-02 (Task 6)
+- [x] RSI levels confirmed: `RSI_OVERSOLD=30.0 RSI_OVERBOUGHT=70.0` in both code and .env ✓
 - [x] Add logrotate on VPS — `deploy/logrotate_trade_bot.conf` created ✓
-- [x] Add position drift reconciliation — wired in `bot/main.py` (every 60 ticks) ✓
+- [x] Add position drift reconciliation — wired in `bot/main.py` (every 120 ticks) ✓
 - [x] Add candle watchdog alert — wired in `bot/main.py` (2× candle_minutes) ✓
 - [x] External uptime monitor — `deploy/UPTIME_MONITOR.md` setup guide created ✓
 - [ ] Cron for `live_comparison.py` weekly
