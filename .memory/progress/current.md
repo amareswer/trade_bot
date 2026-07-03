@@ -5,7 +5,55 @@ metadata:
   type: project
 ---
 
-**Status as of 2026-07-02:** Two live symbols (BTC/CAD + XRP/CAD). Capital $77.05/symbol. Bot running on 4h candles. Code hardening session complete (Tasks 1–6 applied). No live config changes.
+**Status as of 2026-07-03 (Session 6 complete):**
+
+## Session 2026-07-03 — Uptime + Ledger Reconciliation (COMPLETE ✅)
+
+### Workstream 1 — Uptime (58% downtime diagnosed and mitigated)
+
+**Root cause:** Bot was running on local Mac (caffeinate), not VPS. Mac sleep + manual stops = all downtime.
+No systemd on Mac → no automatic restart. 42 distinct gaps > 30 min across 34.9-day log window.
+
+**Fixes applied:**
+- `deploy/trade_bot.service`: `Restart=on-failure` → `Restart=always`; `StartLimitIntervalSec=300`+`StartLimitBurst=5` → `StartLimitIntervalSec=0` (never give up)
+- `bot/main.py`: `_record_startup_and_check_crash_loop()` added — writes `logs/startup_timestamps.txt`, fires `alerter.error()` on 3+ restarts in 5 min
+- Candle watchdog extracted to `_check_candle_watchdog()` module-level function (unit-testable)
+- `test_candle_watchdog.py`: 5 tests with mocked clock — all PASS
+- `deploy/UPTIME.md`: Operational guide (how to check, what each alert means, systemd commands)
+
+### Workstream 2 — Ledger Reconciliation + Fee Capture
+
+**Fee capture:**
+- `executor.py` Order: added `fee_cost: float = 0.0` + `fee_currency: str = ""`
+- `live_executor.py`: fills Order with actual fee from Kraken exchange response
+- `trade_log.py`: added `fee_cost`/`fee_currency` columns + in-place migration; `log_fill()` takes fee args; `source` kwarg prepends to notes
+- All 3 `log_fill()` call sites in `bot/main.py` now pass fee data from order
+- `shadow_signal.py`: shows `actual_fee=X.XX%` when fee_cost populated (fallback to `assumed_fee`)
+
+**Reconciliation (reconcile_ledger.py):**
+- Fetched 7 Kraken BTC/CAD trades (full history), 0 XRP/CAD
+- True Kraken balance: **154.11 CAD** (matches 2 × 77.05 from live_state files)
+- True realized P&L: **-2.20 CAD** (including all fees); DB had only recorded -0.02
+- 2 phantom rows marked (qty=0 SELLs with no position): id=2, id=3
+- 6 Kraken trades backfilled into trades.db with fee data (source='kraken_backfill')
+- 1 unexplained SELL (Jun 27, 0.000378 BTC) — no matching BUY in Kraken API window
+- Report: `logs/reconciliation_20260703.md`
+
+### Test results
+- **114/114 tests pass** (was 109; +5 candle watchdog tests)
+
+---
+
+**Status as of 2026-07-02 (Sessions 3–5 complete):**
+- ATR SL drift resolved (Session 3). Walk-forward re-confirmed with BACKTEST_SINCE/UNTIL pinning (Session 4).
+- XRP/CAD removed from live trading (Session 5): walk-forward fails on Mode A/B strategy. Moved to watchlist.
+  `.env`: UNIVERSE_WHITELIST=BTC/CAD, MAX_CONCURRENT_POSITIONS=1, UNIVERSE_SIZE=1, STARTING_CASH=100.
+- Strategy fingerprint guard added (Session 5): SHA-256 over bot/strategy/*.py logged at startup and in backtest header.
+  `logs/validated_strategy_hash` stamped with hash `d3c7c383d91d5ef9`.
+  Startup warns loudly if code drifts from stamped version.
+- `regime_monitor.py`: XRP/CAD moved to MONITOR_WATCHLIST (health metrics, NOT TRADED label).
+- CLAUDE.md: XRP→WATCHLIST, canonical fingerprint section added, Validation Discipline section added.
+- 109/109 tests pass. Pinned backtest: 39 trades, PF 1.77 (within expected variance range 1.77–1.79).
 
 ---
 
@@ -56,6 +104,56 @@ metadata:
 
 ### Open items from this session
 - Backtest fingerprint in CLAUDE.md needs updating (separate task — confirm ATR_SL config)
+  → RESOLVED in Session 2 — see below
+
+---
+
+## Session 2026-07-02 (Session 2) — ATR SL Config Drift Fix (COMPLETE ✅)
+
+### Root cause
+Two independent ATR SL config systems in config.py:
+- `StrategyConfig` (live bot): reads `ATR_SL_MULT` — .env `ATR_SL_MULT=0.0` → live was CORRECT
+- `BacktestConfig` (redundant): reads `ATR_SL_ENABLED` + `ATR_SL_MULTIPLIER` — .env `ATR_SL_ENABLED=true` → backtest used ATR SL at 2× → 33 trades / PF 2.19 (not validated 58 / 1.79)
+
+### Changes applied
+
+**config.py:**
+- `StrategyConfig.atr_sl_mult` default: 2.0 → 0.0 (disabled; convention: 0 = disabled)
+- `BacktestConfig`: removed `atr_sl_enabled`/`atr_sl_multiplier`; added `atr_sl_mult` (reads `ATR_SL_MULT`, default 0.0)
+- `calc_trade_qty_atr`: updated ref from `backtest.atr_sl_multiplier` → `backtest.atr_sl_mult`
+- `_load()`: removed `ATR_SL_ENABLED`/`ATR_SL_MULTIPLIER` reads; `BacktestConfig.atr_sl_mult` reads same key as `StrategyConfig`
+- Added `_STRATEGY_CRITICAL_PREFIXES` and `_KNOWN_STRATEGY_ENV_KEYS` constants before `_load()`
+- Added startup strategy fingerprint log (SL type, SL%, TP%, ADX, RSI, EMA spread, whitelist)
+- Added drift guard: WARN if .env contains unknown key matching ATR_/RSI_/ADX_/STOP_/TAKE_/RISK_/EMA_ prefixes
+
+**bot/backtest/engine.py:**
+- Replaced `atr_sl_enabled: bool, atr_sl_multiplier: float` params with `atr_sl_mult: float = 0.0`
+- Check changed: `atr_sl_enabled and _entry_atr > 0` → `atr_sl_mult > 0 and _entry_atr > 0`
+
+**backtest.py:**
+- Replaced `atr_sl_enabled = cfg.backtest.atr_sl_enabled, atr_sl_multiplier = cfg.backtest.atr_sl_multiplier` with `atr_sl_mult = cfg.backtest.atr_sl_mult`
+
+**swing_backtest.py + swing_walkforward.py:**
+- Replaced `atr_sl_enabled=False, atr_sl_multiplier=2.0` with `atr_sl_mult=0.0`
+
+**.env:**
+- Removed `ATR_SL_ENABLED=true` (stale key that caused drift)
+- `ATR_SL_MULT=0.0` retained
+
+**CLAUDE.md:**
+- Updated fingerprint: now ~39 trades / PF 1.79 (count lower due to EMA spread filter added 2026-06-27)
+- Added ATR drift incident note with timeline
+
+### Live impact
+- 1 fill under ATR config: 2026-06-22 16:36 UTC, SELL BTC/CAD 0.00055556 @ 91433.5, pnl=-0.02, reason='trail_stop'
+- Live on fixed SL=1.5% from 2026-06-22 21:24 UTC onwards
+
+### Test results
+- 12/12 tests pass
+
+### Backtest verification
+- `EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py` → 39 trades / PF 1.79 / exit SL=27 TP=7 / max DD -4.41%
+- PF 1.79 confirmed ✓ (trade count different from original 58 due to EMA spread filter added 2026-06-27)
 
 ---
 
@@ -497,7 +595,7 @@ PAPER_SLIPPAGE_BPS=15
 4. ~~**Wire partial TP alert**~~ — DONE (lines 859-867 already call alerter.fill())
 5. ~~**live_state.json (no symbol suffix)**~~ — ADDRESSED (comment added to live_executor.py; file on disk is inert)
 6. ~~**BUY fills missing from trades.db**~~ — RESOLVED (unified call covers BUY+SELL; see known-gaps.md item 1)
-7. **Update CLAUDE.md backtest fingerprint** — current result is 33 trades/PF 2.19 (ATR_SL_ENABLED=true changes exit mix vs original 58-trade validation run)
+7. ~~**Update CLAUDE.md backtest fingerprint**~~ — RESOLVED 2026-07-02 (ATR SL drift fixed; now ~39 trades/PF 1.79 confirmed; drift guard added to config.py)
 
 ---
 

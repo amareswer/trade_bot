@@ -125,15 +125,19 @@ def fetch_candles_paginated(
     symbol:       str,
     timeframe:    str = "4h",
     total_limit:  int = 5000,
+    since_ms:     int | None = None,  # pin window start (unix ms); overrides rolling-N logic
+    until_ms:     int | None = None,  # trim candles at/after this timestamp (unix ms)
 ) -> list[Candle]:
     """
     Fetch up to *total_limit* candles using multiple API calls.
 
-    Makes ceil(total_limit / 1000) requests, each fetching 1000 candles
-    via the 'since' parameter, then deduplicates and returns the full
-    list ordered oldest → newest.
+    Rolling mode (default): fetches the most-recent *total_limit* candles.
+    Pinned mode (since_ms set): fetches from *since_ms* forward, computing
+    the required page count from (until_ms or now) - since_ms.  Candles
+    at or after *until_ms* are trimmed from the result.
 
-    A 0.5s sleep between pages keeps us inside Binance's rate limits.
+    Makes ceil(n_candles / 1000) requests, deduplicates, and returns
+    oldest → newest.  A 0.5s sleep between pages respects Binance rate limits.
     """
     exchange_id = exchange_id.lower()
     if not hasattr(ccxt, exchange_id):
@@ -156,15 +160,34 @@ def fetch_candles_paginated(
     if candle_ms is None:
         raise ValueError(f"Unknown timeframe '{timeframe}' — cannot compute page offsets.")
 
-    pages      = math.ceil(total_limit / _PAGE_SIZE)
-    now_ms     = exchange.milliseconds()
-    start_ms   = now_ms - total_limit * candle_ms
+    now_ms = exchange.milliseconds()
 
-    logger.info(
-        "Paginated fetch: %d candles × %s from %s | %d pages",
-        total_limit, timeframe, exchange_id, pages,
-    )
-    print(f"  Fetching {total_limit} × {timeframe} candles ({pages} pages) …", flush=True)
+    if since_ms is not None:
+        # Pinned-window mode: fetch from since_ms to until_ms (or now)
+        end_ms     = until_ms if until_ms is not None else now_ms
+        n_candles  = math.ceil((end_ms - since_ms) / candle_ms)
+        pages      = math.ceil(n_candles / _PAGE_SIZE)
+        start_ms   = since_ms
+        logger.info(
+            "Pinned fetch: since=%s until=%s → ~%d candles × %s from %s | %d pages",
+            datetime.fromtimestamp(since_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d"),
+            datetime.fromtimestamp(end_ms   / 1000, tz=timezone.utc).strftime("%Y-%m-%d"),
+            n_candles, timeframe, exchange_id, pages,
+        )
+        print(
+            f"  Fetching pinned window {datetime.fromtimestamp(since_ms/1000,tz=timezone.utc).strftime('%Y-%m-%d')}"
+            f" → {datetime.fromtimestamp(end_ms/1000,tz=timezone.utc).strftime('%Y-%m-%d')}"
+            f" (~{n_candles} × {timeframe}, {pages} pages) …", flush=True,
+        )
+    else:
+        # Rolling mode: most-recent total_limit candles
+        pages    = math.ceil(total_limit / _PAGE_SIZE)
+        start_ms = now_ms - total_limit * candle_ms
+        logger.info(
+            "Paginated fetch: %d candles × %s from %s | %d pages",
+            total_limit, timeframe, exchange_id, pages,
+        )
+        print(f"  Fetching {total_limit} × {timeframe} candles ({pages} pages) …", flush=True)
 
     raw_by_ts: dict[int, list] = {}   # deduplicate by timestamp
 
@@ -192,6 +215,15 @@ def fetch_candles_paginated(
         raise ValueError(f"No OHLCV data returned for {symbol} on {exchange_id}.")
 
     sorted_rows = sorted(raw_by_ts.values(), key=lambda r: r[0])
+
+    # Trim rows at or after until_ms (pinned-window upper bound)
+    if until_ms is not None:
+        sorted_rows = [r for r in sorted_rows if r[0] < until_ms]
+
+    if not sorted_rows:
+        raise ValueError(
+            f"No candles remain after until_ms trim for {symbol} on {exchange_id}."
+        )
 
     candles = [
         Candle(

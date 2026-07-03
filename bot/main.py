@@ -309,6 +309,59 @@ def _regime_monitor_loop(symbols: list, exchange_id: str, interval_seconds: int 
 
 
 # ---------------------------------------------------------------------------
+# Crash-loop detection helper
+# ---------------------------------------------------------------------------
+_STARTUP_LOG = os.path.join(_log_dir, "startup_timestamps.txt")
+_CRASH_LOOP_WINDOW_S  = 300   # 5 minutes
+_CRASH_LOOP_THRESHOLD = 3     # 3+ restarts in window = crash-loop
+
+
+def _record_startup_and_check_crash_loop(alerter: "TelegramAlerter") -> None:
+    """Append current timestamp to startup log; fire an error alert if crash-loop detected."""
+    now = datetime.now(_tz.utc)
+    try:
+        with open(_STARTUP_LOG, "a") as fh:
+            fh.write(now.isoformat() + "\n")
+        with open(_STARTUP_LOG) as fh:
+            lines = [l.strip() for l in fh if l.strip()]
+        cutoff = now.timestamp() - _CRASH_LOOP_WINDOW_S
+        recent = [l for l in lines if datetime.fromisoformat(l).timestamp() > cutoff]
+        # Trim file to last 50 entries
+        if len(lines) > 50:
+            with open(_STARTUP_LOG, "w") as fh:
+                fh.write("\n".join(lines[-50:]) + "\n")
+        if len(recent) >= _CRASH_LOOP_THRESHOLD:
+            alerter.error(
+                f"Crash-loop: {len(recent)} restarts in {_CRASH_LOOP_WINDOW_S // 60} min "
+                f"— check logs/trade_bot.log for root cause"
+            )
+            logger.warning("CRASH-LOOP detected: %d restarts in %ds", len(recent), _CRASH_LOOP_WINDOW_S)
+    except Exception as exc:
+        logger.warning("Could not check crash-loop state: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Candle watchdog helper (extracted for unit-testability)
+# ---------------------------------------------------------------------------
+
+def _check_candle_watchdog(
+    last_candle_time: float,
+    candle_minutes: int,
+    now: float,
+    alerter: "TelegramAlerter",
+) -> float:
+    """Return updated last_candle_time. Fires alerter.error() if feed is stale."""
+    stale_s = candle_minutes * 60 * 2
+    if now - last_candle_time > stale_s:
+        alerter.error(
+            f"Candle watchdog: no new {candle_minutes}min candle "
+            f"for {int((now - last_candle_time) / 60)} minutes — feed may be stale"
+        )
+        return now  # reset so we don't spam every tick
+    return last_candle_time
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
@@ -349,14 +402,15 @@ def run():
         if cfg.paper.paper_mode:
             executors = {
                 sym: LiveExecutor(
-                    exchange_id   = cfg.exchange.exchange,
-                    symbol        = sym,
-                    api_key       = cfg.exchange.api_key,
-                    api_secret    = cfg.exchange.api_secret,
-                    starting_cash = cfg.paper.paper_starting_cash,
-                    dry_run       = True,
-                    order_type    = cfg.exchange.order_type,
-                    state_path    = f"logs/live_state_{sym.replace('/', '_')}.json",
+                    exchange_id              = cfg.exchange.exchange,
+                    symbol                   = sym,
+                    api_key                  = cfg.exchange.api_key,
+                    api_secret               = cfg.exchange.api_secret,
+                    starting_cash            = cfg.paper.paper_starting_cash,
+                    dry_run                  = True,
+                    order_type               = cfg.exchange.order_type,
+                    state_path               = f"logs/live_state_{sym.replace('/', '_')}.json",
+                    adopt_external_holdings  = cfg.exchange.adopt_external_holdings,
                 )
                 for sym in _universe_symbols
             }
@@ -368,14 +422,15 @@ def run():
             # state file (or starting_cash if no state exists yet).
             _sym0 = _universe_list[0]
             _exc0 = LiveExecutor(
-                exchange_id   = cfg.exchange.exchange,
-                symbol        = _sym0,
-                api_key       = cfg.exchange.api_key,
-                api_secret    = cfg.exchange.api_secret,
-                starting_cash = cfg.portfolio.starting_cash,
-                dry_run       = cfg.exchange.dry_run,
-                order_type    = cfg.exchange.order_type,
-                state_path    = f"logs/live_state_{_sym0.replace('/', '_')}.json",
+                exchange_id              = cfg.exchange.exchange,
+                symbol                   = _sym0,
+                api_key                  = cfg.exchange.api_key,
+                api_secret               = cfg.exchange.api_secret,
+                starting_cash            = cfg.portfolio.starting_cash,
+                dry_run                  = cfg.exchange.dry_run,
+                order_type               = cfg.exchange.order_type,
+                state_path               = f"logs/live_state_{_sym0.replace('/', '_')}.json",
+                adopt_external_holdings  = cfg.exchange.adopt_external_holdings,
             )
             # Derive slot_cash for new symbols from the first executor's balance
             # so their "ready" log matches the actual pool slot instead of showing
@@ -387,14 +442,15 @@ def run():
             for _s in _universe_list[1:]:
                 _sp = f"logs/live_state_{_s.replace('/', '_')}.json"
                 executors[_s] = LiveExecutor(
-                    exchange_id   = cfg.exchange.exchange,
-                    symbol        = _s,
-                    api_key       = cfg.exchange.api_key,
-                    api_secret    = cfg.exchange.api_secret,
-                    starting_cash = cfg.portfolio.starting_cash if os.path.exists(_sp) else _slot_for_new,
-                    dry_run       = cfg.exchange.dry_run,
-                    order_type    = cfg.exchange.order_type,
-                    state_path    = _sp,
+                    exchange_id              = cfg.exchange.exchange,
+                    symbol                   = _s,
+                    api_key                  = cfg.exchange.api_key,
+                    api_secret               = cfg.exchange.api_secret,
+                    starting_cash            = cfg.portfolio.starting_cash if os.path.exists(_sp) else _slot_for_new,
+                    dry_run                  = cfg.exchange.dry_run,
+                    order_type               = cfg.exchange.order_type,
+                    state_path               = _sp,
+                    adopt_external_holdings  = cfg.exchange.adopt_external_holdings,
                 )
         executor = executors[_active_symbol]   # alias for pre-loop header/recovery code
         mode_str = "[DRY RUN] " if (cfg.exchange.dry_run or cfg.paper.paper_mode) else ""
@@ -422,8 +478,12 @@ def run():
         _pool_total = _first_exec.cash   # real Kraken CAD balance
     else:
         _pool_total = cfg.portfolio.starting_cash
-    capital_pool = CapitalPool(total_capital=_pool_total, max_concurrent=_max_conc)
+    _slot_cap = cfg.portfolio.max_slot_cash_cad
+    capital_pool = CapitalPool(
+        total_capital=_pool_total, max_concurrent=_max_conc, slot_cap=_slot_cap
+    )
     _slot = capital_pool.slot_cash
+    _uncapped_slot = _pool_total / _max_conc
     for _sym, _exc in executors.items():
         _exc._portfolio.cash = _slot
         if cfg.exchange.live_trading:
@@ -431,14 +491,19 @@ def run():
                 _exc._save_state()
             except Exception as e:
                 logger.warning("State save after pool init failed [%s]: %s", _sym, e)
+    _cap_note = (
+        f" (capped from ${_uncapped_slot:.2f})"
+        if _slot_cap > 0 and _uncapped_slot > _slot_cap
+        else " (uncapped)"
+    )
     print(
         f"\n  Capital pool: ${_pool_total:.2f} total"
-        f" / {_max_conc} slots = ${_slot:.2f} per symbol\n",
+        f" / {_max_conc} slots = ${_slot:.2f} per symbol{_cap_note}\n",
         flush=True,
     )
     logger.info(
-        "CapitalPool init: total=%.2f  slots=%d  slot_cash=%.2f",
-        _pool_total, _max_conc, _slot,
+        "CapitalPool init: total=%.2f  slots=%d  slot_cash=%.2f  slot_cap=%.2f",
+        _pool_total, _max_conc, _slot, _slot_cap,
     )
     if cfg.exchange.live_trading:
         logger.info(
@@ -508,6 +573,7 @@ def run():
 
     _mode_label = "LIVE" if cfg.exchange.live_trading else ("DRY RUN" if cfg.exchange.dry_run else "PAPER")
     alerter.startup(cfg.exchange.exchange, cfg.exchange.symbol, _mode_label)
+    _record_startup_and_check_crash_loop(alerter)
 
     # ── Derive live candle timeframe from CANDLE_MINUTES ─────────────────────
     # This is the timeframe used for ALL live candle operations:
@@ -628,6 +694,7 @@ def run():
     tick_log:   deque[dict] = deque(maxlen=200)
     _consecutive_errors = 0
     _drift_consecutive_failures = 0
+    _drift_consecutive_count    = 0   # consecutive ticks where position drift was detected
     candle_log: deque[dict] = deque(maxlen=50)
     _last_candle_time = time.time()
 
@@ -760,13 +827,9 @@ def run():
 
             # ── 1b. Candle watchdog (active symbol, live only) ────────
             if cfg.exchange.feed_mode == "live" and sym == _active_symbol:
-                _candle_stale_s = cfg.exchange.candle_minutes * 60 * 2
-                if time.time() - _last_candle_time > _candle_stale_s:
-                    alerter.error(
-                        f"Candle watchdog: no new {cfg.exchange.candle_minutes}min candle "
-                        f"for {int((time.time()-_last_candle_time)/60)} minutes — feed may be stale"
-                    )
-                    _last_candle_time = time.time()
+                _last_candle_time = _check_candle_watchdog(
+                    _last_candle_time, cfg.exchange.candle_minutes, time.time(), alerter
+                )
 
             # ── 1c. Position drift reconciliation (every 120 ticks, live) ──
             if cfg.exchange.live_trading and not cfg.exchange.dry_run and sym == _active_symbol and tick % 120 == 0:
@@ -779,15 +842,32 @@ def run():
                         exchange_pos = float(balance.get("free", {}).get(base, 0))
                         bot_pos = ss['executor'].position
                         drift = abs(exchange_pos - bot_pos)
+                        _drift_threshold = cfg.exchange.drift_alert_threshold
                         if drift > 0.000010:
+                            _drift_consecutive_count += 1
                             logger.warning(
-                                "POSITION DRIFT: exchange=%.6f bot=%.6f drift=%.6f %s",
+                                "POSITION DRIFT [%d/%d]: exchange=%.6f bot=%.6f"
+                                " drift=%.6f %s",
+                                _drift_consecutive_count, _drift_threshold,
                                 exchange_pos, bot_pos, drift, base,
                             )
-                            alerter.error(
-                                f"Position drift detected: exchange={exchange_pos:.6f} "
-                                f"bot={bot_pos:.6f} {base} — check logs/live_state.json"
-                            )
+                            if _drift_consecutive_count >= _drift_threshold:
+                                alerter.error(
+                                    f"PERSISTENT position drift after"
+                                    f" {_drift_consecutive_count} consecutive checks:"
+                                    f" exchange={exchange_pos:.6f}"
+                                    f" bot={bot_pos:.6f} {base}"
+                                    f" — check logs/live_state.json"
+                                )
+                                _drift_consecutive_count = 0
+                        else:
+                            if _drift_consecutive_count > 0:
+                                logger.info(
+                                    "Position drift resolved: exchange=%.6f"
+                                    " bot=%.6f %s",
+                                    exchange_pos, bot_pos, base,
+                                )
+                            _drift_consecutive_count = 0
                         _drift_succeeded = True
                         _drift_consecutive_failures = 0
                         break
@@ -858,6 +938,8 @@ def run():
                                         pnl           = _p_pnl,
                                         exchange      = cfg.exchange.exchange,
                                         signal_reason = "partial_tp",
+                                        fee_cost      = _p_order.fee_cost,
+                                        fee_currency  = _p_order.fee_currency,
                                     )
                                     alerter.fill(
                                         side        = "SELL",
@@ -931,6 +1013,8 @@ def run():
                                     pnl           = _ic_pnl,
                                     exchange      = cfg.exchange.exchange,
                                     signal_reason = _ic_reason,
+                                    fee_cost      = _ic_order.fee_cost,
+                                    fee_currency  = _ic_order.fee_currency,
                                 )
                                 alerter.fill(
                                     side        = "SELL",
@@ -1403,6 +1487,8 @@ def run():
                             pnl           = pnl,
                             exchange      = cfg.exchange.exchange,
                             signal_reason = filter_reason or raw_signal.value,
+                            fee_cost      = order.fee_cost,
+                            fee_currency  = order.fee_currency,
                         )
                         alerter.fill(
                             side        = order.side.value,

@@ -19,16 +19,38 @@ Date filtering (for regime testing):
 import argparse
 import logging
 import os
+from datetime import datetime, timezone
 logging.basicConfig(level=logging.WARNING)
 
 from config import cfg
 from bot.data.historical_feed import fetch_candles_paginated
 from bot.backtest import engine, metrics as metrics_mod, report
 from bot.backtest.attribution import compute_attribution, print_attribution, save_attribution_csv
+from bot.strategy.fingerprint import compute_strategy_hash
 
-# ── Date filter for regime testing ────────────────────────────────────────────
-# Set to "YYYY-MM-DD" to slice candles, or None to use full dataset.
+# ── Pinned-window reproducibility (ISO dates) ─────────────────────────────────
+# When set, fetches exactly that calendar window instead of rolling most-recent-N.
+# Use these to reproduce a specific historical validation run.
+#
+#   BACKTEST_SINCE="2024-03-07" BACKTEST_UNTIL="2026-06-20"
+#     → reproduces the 2026-06-19 validation window (~5000 × 4h candles)
+#
+# BACKTEST_SINCE changes the FETCH start; BACKTEST_UNTIL trims at the end.
+# Both must be "YYYY-MM-DD" UTC dates.  Either may be omitted independently.
+_SINCE_STR = os.environ.get("BACKTEST_SINCE") or None
+_UNTIL_STR = os.environ.get("BACKTEST_UNTIL") or None
+
+def _date_to_ms(date_str: str) -> int:
+    """Convert "YYYY-MM-DD" UTC date string to Unix milliseconds."""
+    return int(datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+BACKTEST_SINCE_MS = _date_to_ms(_SINCE_STR) if _SINCE_STR else None
+BACKTEST_UNTIL_MS = _date_to_ms(_UNTIL_STR) if _UNTIL_STR else None
+
+# ── Regime-slice filter for half-period testing (post-fetch) ──────────────────
+# Set to "YYYY-MM-DD" to slice the already-fetched candles by date.
 # Override via env: BACKTEST_START (lower bound) / BACKTEST_END (upper bound).
+# These narrow a window AFTER fetching; they cannot reach before BACKTEST_SINCE.
 BEFORE_DATE = os.environ.get("BACKTEST_END")   or None  # keep candles BEFORE this date
 AFTER_DATE  = os.environ.get("BACKTEST_START") or None  # keep candles FROM this date onward
 # ─────────────────────────────────────────────────────────────────────────────
@@ -43,7 +65,8 @@ def main():
     parser.add_argument("--max_drawdown", type=float, default=0.25)
     args = parser.parse_args()
 
-    print(f"\n  Exchange: {cfg.exchange.exchange.capitalize()}  |  Symbol: {cfg.exchange.symbol}  |  Timeframe: {cfg.backtest.timeframe}")
+    _strategy_hash = compute_strategy_hash()
+    print(f"\n  Exchange: {cfg.exchange.exchange.capitalize()}  |  Symbol: {cfg.exchange.symbol}  |  Timeframe: {cfg.backtest.timeframe}  |  Strategy hash: {_strategy_hash}")
 
     try:
         candles = fetch_candles_paginated(
@@ -51,6 +74,8 @@ def main():
             symbol      = cfg.exchange.symbol,
             timeframe   = cfg.backtest.timeframe,
             total_limit = args.limit,
+            since_ms    = BACKTEST_SINCE_MS,
+            until_ms    = BACKTEST_UNTIL_MS,
         )
     except Exception as exc:
         print(f"\n  ERROR fetching data: {exc}\n")
@@ -116,8 +141,7 @@ def main():
         regime_ema_slope_filter = cfg.strategy.regime_ema_slope_filter,
         volume_k                = cfg.strategy.volume_k,
         atr_volatile_multiplier = cfg.strategy.atr_volatile_multiplier,
-        atr_sl_enabled          = cfg.backtest.atr_sl_enabled,
-        atr_sl_multiplier       = cfg.backtest.atr_sl_multiplier,
+        atr_sl_mult             = cfg.backtest.atr_sl_mult,
     )
 
     m = metrics_mod.compute(result)

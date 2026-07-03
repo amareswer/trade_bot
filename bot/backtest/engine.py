@@ -104,9 +104,8 @@ def run(
     # Volume filter
     volume_k:                 float = 1.2,
     atr_volatile_multiplier:  float = 1.5,
-    # ATR-based SL
-    atr_sl_enabled:           bool  = False,
-    atr_sl_multiplier:        float = 2.0,
+    # ATR-based SL (0.0 = disabled, uses fixed stop_loss_pct instead)
+    atr_sl_mult:              float = 0.0,
 ) -> BacktestResult:
     """Run a full backtest and return the result."""
 
@@ -230,8 +229,8 @@ def run(
                     exit_reason = "trail_stop"
                     exit_price  = _trail_sl
                     forced_exit = True
-            elif atr_sl_enabled and _entry_atr > 0:
-                sl_level = entry_price - _entry_atr * atr_sl_multiplier
+            elif atr_sl_mult > 0 and _entry_atr > 0:
+                sl_level = entry_price - _entry_atr * atr_sl_mult
                 if candle.low <= sl_level:
                     raw_signal  = Signal.SELL
                     exit_reason = "stop_loss"

@@ -55,6 +55,10 @@ class Order:
     filled_at:    Optional[datetime] = None
     reject_reason: Optional[str]    = None
 
+    # Fee data from exchange (live only; zero for paper/simulation)
+    fee_cost:     float = field(default=0.0)
+    fee_currency: str   = field(default="")
+
     # Computed on fill
     total_value:  float = field(default=0.0, init=False)
 

@@ -57,8 +57,7 @@ FIXED = dict(
     trail_stop_pct          = 0.0,
     partial_tp_pct          = 0.0,
     partial_tp_size         = 0.5,
-    atr_sl_enabled          = False,
-    atr_sl_multiplier       = 2.0,
+    atr_sl_mult             = 0.0,
 )
 
 # ── SL/TP sweep combinations ─────────────────────────────────────────────────

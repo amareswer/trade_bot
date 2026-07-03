@@ -101,3 +101,32 @@ def test_available_cash_decreases_on_allocate():
     assert pool.available_cash == pytest.approx(100.0)
     pool.allocate("XRP/CAD")
     assert pool.available_cash == pytest.approx(0.0)
+
+
+# ── Slot cap tests ─────────────────────────────────────────────────────────
+
+def test_slot_cap_limits_allocation():
+    """pool=154, max_concurrent=1, cap=77 → slot=77 (not 154)."""
+    pool = CapitalPool(total_capital=154.0, max_concurrent=1, slot_cap=77.0)
+    assert pool.slot_cash == pytest.approx(77.0)
+
+
+def test_slot_cap_zero_means_uncapped():
+    pool = CapitalPool(total_capital=200.0, max_concurrent=2, slot_cap=0.0)
+    assert pool.slot_cash == pytest.approx(100.0)
+
+
+def test_slot_cap_larger_than_base_has_no_effect():
+    """Cap higher than natural slot: natural slot wins."""
+    pool = CapitalPool(total_capital=200.0, max_concurrent=2, slot_cap=200.0)
+    assert pool.slot_cash == pytest.approx(100.0)
+
+
+def test_slot_cap_property_readable():
+    pool = CapitalPool(total_capital=200.0, max_concurrent=2, slot_cap=50.0)
+    assert pool.slot_cap == pytest.approx(50.0)
+
+
+def test_slot_cap_invalid_negative():
+    with pytest.raises(ValueError):
+        CapitalPool(total_capital=100.0, max_concurrent=1, slot_cap=-1.0)

@@ -32,7 +32,9 @@ CREATE TABLE IF NOT EXISTS fills (
     exchange      TEXT,
     signal_reason TEXT,
     risk_decision TEXT,
-    notes         TEXT
+    notes         TEXT,
+    fee_cost      REAL    DEFAULT 0.0,
+    fee_currency  TEXT    DEFAULT ''
 )
 """
 
@@ -61,21 +63,35 @@ class TradeLog:
         signal_reason: str             = "",
         risk_decision: str             = "approved",
         notes:         str             = "",
+        fee_cost:      float           = 0.0,
+        fee_currency:  str             = "",
+        source:        str             = "",
     ) -> None:
+        if quantity <= 0:
+            raise ValueError(
+                f"log_fill called with quantity={quantity} for {side.upper()} {symbol}"
+                f" — would write a phantom row. Caller must provide a real fill quantity."
+            )
         value = quantity * price
         ts    = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Prepend source tag to notes if provided
+        if source:
+            notes = f"[{source}] {notes}".strip()
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO fills
                     (timestamp, side, symbol, quantity, price, value,
-                     pnl, exchange, signal_reason, risk_decision, notes)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                     pnl, exchange, signal_reason, risk_decision, notes,
+                     fee_cost, fee_currency)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (ts, side.upper(), symbol, quantity, price, value,
-                 pnl, exchange, signal_reason, risk_decision, notes),
+                 pnl, exchange, signal_reason, risk_decision, notes,
+                 fee_cost, fee_currency),
             )
-        logger.debug("TradeLog: %s %s qty=%.6f @ %.2f pnl=%s", side, symbol, quantity, price, pnl)
+        logger.debug("TradeLog: %s %s qty=%.6f @ %.2f pnl=%s fee=%.6f %s",
+                     side, symbol, quantity, price, pnl, fee_cost, fee_currency)
 
     def recent(self, limit: int = 20) -> list[dict]:
         """Return the most recent fills as a list of dicts."""
@@ -116,6 +132,14 @@ class TradeLog:
     def _init_db(self) -> None:
         with self._connect() as conn:
             conn.execute(_CREATE)
+            # Migrate: add fee columns if this is a pre-existing DB
+            existing = {r[1] for r in conn.execute("PRAGMA table_info(fills)")}
+            if "fee_cost" not in existing:
+                conn.execute("ALTER TABLE fills ADD COLUMN fee_cost REAL DEFAULT 0.0")
+                logger.info("TradeLog: migrated — added fee_cost column")
+            if "fee_currency" not in existing:
+                conn.execute("ALTER TABLE fills ADD COLUMN fee_currency TEXT DEFAULT ''")
+                logger.info("TradeLog: migrated — added fee_currency column")
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self._db_path, timeout=10)

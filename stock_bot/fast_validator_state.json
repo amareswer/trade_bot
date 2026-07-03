@@ -8,7 +8,16 @@
       "tp_price": 253.070997,
       "confidence": 70,
       "shares": 1.0
+    },
+    {
+      "symbol": "HOOD",
+      "entry_time": "2026-07-02T23:44:23",
+      "entry_price": 112.69999694824219,
+      "sl_price": 111.009497,
+      "tp_price": 116.080997,
+      "confidence": 70,
+      "shares": 1.0
     }
   ],
-  "last_updated": "2026-07-02T20:01:55Z"
+  "last_updated": "2026-07-03T12:23:24Z"
 }

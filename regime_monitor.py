@@ -1,5 +1,5 @@
 """
-regime_monitor.py — BTC/CAD and XRP/CAD live strategy regime health check.
+regime_monitor.py — BTC/CAD live strategy regime health check (XRP/CAD on watchlist).
 
 Fetches the last 200 × 1h Kraken candles per symbol and reports four metrics:
 
@@ -36,11 +36,14 @@ from pathlib import Path
 
 # ── Settings ——————————————————————————————————————————————————————————————————
 # Defaults match live Kraken config (CLAUDE.md). Override with env vars if needed.
-# MONITOR_SYMBOLS: comma-separated list; falls back to MONITOR_SYMBOL for compatibility.
-EXCHANGE_ID     = os.getenv("MONITOR_EXCHANGE",   "kraken")
-_sym_env        = os.getenv("MONITOR_SYMBOLS", os.getenv("MONITOR_SYMBOL", "BTC/CAD,XRP/CAD"))
-SYMBOLS         = [s.strip() for s in _sym_env.split(",") if s.strip()]
-SYMBOL          = SYMBOLS[0]   # kept for backward-compat references in helpers
+# MONITOR_SYMBOLS: comma-separated traded symbols; falls back to MONITOR_SYMBOL for compatibility.
+# MONITOR_WATCHLIST: comma-separated symbols monitored for health/re-validation but NOT traded.
+EXCHANGE_ID       = os.getenv("MONITOR_EXCHANGE",   "kraken")
+_sym_env          = os.getenv("MONITOR_SYMBOLS", os.getenv("MONITOR_SYMBOL", "BTC/CAD"))
+SYMBOLS           = [s.strip() for s in _sym_env.split(",") if s.strip()]
+SYMBOL            = SYMBOLS[0]   # kept for backward-compat references in helpers
+_wl_env           = os.getenv("MONITOR_WATCHLIST", "XRP/CAD")
+WATCHLIST_SYMBOLS = [s.strip() for s in _wl_env.split(",") if s.strip()]
 TIMEFRAME       = os.getenv("MONITOR_TIMEFRAME",  "1h")
 FETCH_LIMIT     = int(os.getenv("MONITOR_LIMIT",  "200"))
 WINDOW          = int(os.getenv("MONITOR_WINDOW", "50"))
@@ -475,6 +478,14 @@ def main() -> None:
             any_ok = True
 
     _check_doge_liquidity(exchange, now_str)
+
+    # ── Watchlist — health metrics only, NOT TRADED ──────────────────────────
+    for wl_sym in WATCHLIST_SYMBOLS:
+        print()
+        print(f"  ── Watchlist  [{now_str}] ──")
+        print(f"  {EXCHANGE_ID.capitalize()}  {wl_sym}  |  NOT TRADED — walk-forward failed on current strategy")
+        print(f"  Monitoring for re-validation. Re-entry gate: full 3-window walk-forward pass.")
+        _check_symbol(exchange, wl_sym, now_str)
 
     if any_ok:
         print(f"  Logged → {LOG_FILE}\n")

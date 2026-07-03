@@ -38,25 +38,32 @@ class LiveExecutor:
     Interface identical to PaperExecutor.
     """
 
+    # Exchange balance must exceed state-file position by at least this much
+    # before the external-holdings guard fires (avoids false positives from
+    # sub-satoshi rounding differences between Kraken and state files).
+    _EXTERNAL_THRESHOLD = 1e-5  # 10 satoshis / 10 DOGE / etc.
+
     def __init__(
         self,
-        exchange_id:   str,
-        symbol:        str,
-        api_key:       str,
-        api_secret:    str,
-        starting_cash: float = 10_000.0,
-        dry_run:       bool  = False,
-        state_path:    str   = _DEFAULT_STATE_PATH,
-        order_type:    str   = "market",
+        exchange_id:              str,
+        symbol:                   str,
+        api_key:                  str,
+        api_secret:               str,
+        starting_cash:            float = 10_000.0,
+        dry_run:                  bool  = False,
+        state_path:               str   = _DEFAULT_STATE_PATH,
+        order_type:               str   = "market",
+        adopt_external_holdings:  bool  = False,
     ):
-        self.symbol         = symbol
-        self.dry_run        = dry_run
-        self._order_type    = order_type
-        self._starting_cash = starting_cash
-        self._state_path    = state_path
-        self._portfolio     = Portfolio(cash=starting_cash)
-        self._fills:      list[Order] = []
-        self._rejects:    list[Order] = []
+        self.symbol                    = symbol
+        self.dry_run                   = dry_run
+        self._order_type               = order_type
+        self._starting_cash            = starting_cash
+        self._state_path               = state_path
+        self._adopt_external_holdings  = adopt_external_holdings
+        self._portfolio                = Portfolio(cash=starting_cash)
+        self._fills:      list[Order]  = []
+        self._rejects:    list[Order]  = []
         self._fees_paid:           float = 0.0
         self._bot_opened_position: bool  = False
 
@@ -167,16 +174,18 @@ class LiveExecutor:
 
     def _sync_position(self, symbol: str) -> None:
         """
-        Exchange is the single source of truth for position.
+        Reconcile managed position against exchange balance on startup.
 
-        Uses total balance (not free) so Kraken's settlement window — where a
-        recent fill shows BTC in total but not yet in free — never causes a
-        spurious zero-out of a real open position.
+        The state file is the primary source of truth for what the BOT manages.
+        The exchange balance may exceed the state file (deposits, manual trades,
+        or positions opened by a different session) — that excess is "external
+        holdings" and is NOT traded unless ADOPT_EXTERNAL_HOLDINGS=true.
 
         Outcomes:
-          total > 0              → position = total (authoritative)
-          total > 0, free == 0  → settlement window; log WARNING, still use total
-          total == 0, free == 0 → genuinely no position; clear it
+          exchange > state + threshold, adopt=False  → warn + keep state qty
+          exchange > state + threshold, adopt=True   → adopt all (old behaviour)
+          exchange == state (within threshold)        → confirm from exchange
+          exchange == 0, state > 0                   → externally closed; zero state
         """
         base = symbol.split("/")[0]
         try:
@@ -187,17 +196,44 @@ class LiveExecutor:
             logger.warning("_sync_position: fetch_balance failed — %s", exc)
             return
 
+        # prev_position is what _load_state() set from the on-disk state file.
+        # This is the quantity the bot "owns" from its own trading records.
         prev_position = self._portfolio.position
 
         if exchange_total > 1e-9:
+            # ── External holdings guard ───────────────────────────────────────
+            # If exchange holds more than the state file recorded, the surplus
+            # is not under bot management: deposits, manual buys, or stale
+            # _bot_opened_position flags from a different session.
+            _excess = exchange_total - prev_position
+            if _excess > self._EXTERNAL_THRESHOLD and not self._adopt_external_holdings:
+                logger.warning(
+                    "EXTERNAL HOLDINGS DETECTED [%s]: exchange %.6f %s"
+                    " > state-file %.6f — %.6f %s not under bot management"
+                    " and will not be traded"
+                    " (set ADOPT_EXTERNAL_HOLDINGS=true to opt in)",
+                    symbol, exchange_total, base, prev_position, _excess, base,
+                )
+                print(
+                    f"  EXTERNAL HOLDINGS [{symbol}]:"
+                    f" exchange {exchange_total:.6f} {base}  "
+                    f"  state-file {prev_position:.6f} {base}  "
+                    f"  {_excess:.6f} {base} NOT under bot management — will not be traded.",
+                    flush=True,
+                )
+                # Do not adopt the excess — managed position stays at prev_position.
+                self._save_state()
+                return
+
+            # ── Normal adoption ───────────────────────────────────────────────
             self._portfolio.position = exchange_total
 
             if exchange_free < 1e-9:
-                # Kraken settlement window: fill landed in total, not yet free
+                # Kraken settlement window: fill landed in total, not yet free.
                 logger.warning(
                     "%s settling on exchange: total=%.6f free=0"
                     " — using total as position, will become free shortly",
-                    self.symbol.split("/")[0], exchange_total,
+                    base, exchange_total,
                 )
                 print(
                     f"  SETTLEMENT: {base} total={exchange_total:.6f} free=0"
@@ -207,9 +243,8 @@ class LiveExecutor:
 
             if prev_position < 1e-9:
                 if not self._bot_opened_position:
-                    # Exchange holds a balance this bot never bought — ambient balance
-                    # from a manual trade, prior session, or external deposit.
-                    # Undo the assignment above and do not adopt: no SELL will be issued.
+                    # adopt_external_holdings=True and bot didn't open this:
+                    # treat it as unmanaged even with adopt flag (safety net).
                     logger.warning(
                         "AMBIENT BALANCE IGNORED [%s]: exchange holds %.6f %s"
                         " but bot_opened_position=False — skipping adoption.",
@@ -224,7 +259,7 @@ class LiveExecutor:
                     self._portfolio.position    = 0.0
                     self._portfolio._cost_basis = 0.0
                     return
-                # Bot opened this position on a prior run — reseed cost_basis at current price
+                # Bot opened this position on a prior run — reseed cost_basis.
                 try:
                     current_price = float(self._exchange.fetch_ticker(symbol)["last"])
                 except Exception:
@@ -247,7 +282,7 @@ class LiveExecutor:
                     exchange_total, base, exchange_free,
                 )
         else:
-            # total == 0 and free == 0: genuinely no position on exchange.
+            # exchange_total == 0: genuinely no position on exchange.
             if prev_position > 1e-9:
                 logger.warning(
                     "POSITION CLOSED EXTERNALLY [%s]: exchange shows 0 %s"
@@ -263,7 +298,7 @@ class LiveExecutor:
                 )
             self._portfolio.position    = 0.0
             self._portfolio._cost_basis = 0.0
-            self._bot_opened_position = False
+            self._bot_opened_position   = False
 
         self._save_state()
 
@@ -633,6 +668,56 @@ class LiveExecutor:
 
                     quantity = filled_qty
 
+                # Recovery: SELL quantity is 0 after polling — try to recover the true fill.
+                # Priority:
+                #   1. last_raw["filled"] if non-zero — authoritative (exchange confirms it)
+                #   2. last_raw["amount"] ONLY for market orders that closed — safe inference
+                #      (closed market SELL = fully executed; amount = what was requested)
+                #      Never use amount for limit orders — they may partially fill or cancel.
+                #   3. If neither recovers a positive qty → refuse to write a phantom row.
+                if side == OrderSide.SELL and quantity <= 0:
+                    _last_filled = float(last_raw.get("filled") or 0.0)
+                    _last_status = last_raw.get("status")
+                    _is_market   = (self._order_type != "limit")
+
+                    if _last_filled > 0:
+                        # `filled` is now non-zero — initial create_order response was stale.
+                        quantity   = _last_filled
+                        filled_qty = _last_filled
+                        logger.warning(
+                            "SELL filled settled to %.6f after polling (order %s)"
+                            " — initial response had filled=0",
+                            _last_filled, order_id_str,
+                        )
+                    elif _last_status in ("closed", "filled") and _is_market:
+                        # Market SELL closed with filled still=0 — infer from amount.
+                        _req_amt = float(last_raw.get("amount") or 0.0)
+                        if _req_amt > 0:
+                            quantity   = _req_amt
+                            filled_qty = _req_amt
+                            logger.warning(
+                                "SELL market order %s closed with filled=0"
+                                " — inferring fill qty from amount=%.6f."
+                                " Verify on exchange if P&L looks wrong.",
+                                order_id_str, _req_amt,
+                            )
+                        else:
+                            logger.error(
+                                "SELL qty=0 GUARD: order %s closed but amount=0 too"
+                                " — skipping fill record. Manual verification required.",
+                                order_id_str,
+                            )
+                            return None
+                    else:
+                        # Limit order with filled=0, or order not yet closed — do not infer.
+                        logger.error(
+                            "SELL qty=0 GUARD: order %s status=%s order_type=%s filled=0"
+                            " — skipping fill record to prevent phantom row."
+                            " Manual verification required.",
+                            order_id_str, _last_status, self._order_type,
+                        )
+                        return None
+
                 # Shared fee extraction — works for both limit-chase and market paths.
                 # Log the raw dict so the true fee structure is auditable.
                 fee_data     = last_raw.get("fee") or {}
@@ -704,14 +789,16 @@ class LiveExecutor:
                 logger.warning("Fee deducted: %.6f %s", fee_cost, quote)
 
         order = Order(
-            order_id   = order_id_str,
-            symbol     = self.symbol,
-            side       = side,
-            quantity   = quantity,
-            price      = fill_price,
-            status     = OrderStatus.FILLED,
-            created_at = ts,
-            filled_at  = datetime.now(timezone.utc),
+            order_id     = order_id_str,
+            symbol       = self.symbol,
+            side         = side,
+            quantity     = quantity,
+            price        = fill_price,
+            status       = OrderStatus.FILLED,
+            created_at   = ts,
+            filled_at    = datetime.now(timezone.utc),
+            fee_cost     = fee_cost,
+            fee_currency = fee_currency,
         )
         self._fills.append(order)
         self._save_state()

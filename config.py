@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -91,6 +92,8 @@ class ExchangeConfig:
     limit_chase_timeout_s:   int   = 120      # reads LIMIT_CHASE_TIMEOUT_S
     limit_chase_max_retries: int   = 3        # reads LIMIT_CHASE_MAX_RETRIES
     limit_chase_tick_pct:    float = 0.0001   # reads LIMIT_CHASE_TICK_PCT — offset as % of price (0.0001 = 0.01%)
+    adopt_external_holdings: bool  = False    # ADOPT_EXTERNAL_HOLDINGS — if True, bot manages all exchange balance incl. deposits
+    drift_alert_threshold:   int   = 3       # DRIFT_ALERT_THRESHOLD — escalate to alerter.error() after this many consecutive drift detections
 
     def __post_init__(self):
         if self.feed_mode not in ("live", "simulated"):
@@ -136,7 +139,7 @@ class StrategyConfig:
     volume_k:                float = 0.0   # volume filter multiplier (0 = disabled)
     macd_enabled:            bool  = True  # BUY only when MACD histogram is rising
     atr_volatile_multiplier: float = 1.5   # ATR > mult × avg ATR → sit flat (VOLATILE)
-    atr_sl_mult:             float = 2.0   # reads ATR_SL_MULT — SL = entry - atr × mult
+    atr_sl_mult:             float = 0.0   # reads ATR_SL_MULT — SL = entry - atr × mult; 0 = disabled (use fixed SL)
     atr_tp_mult:             float = 4.0   # reads ATR_TP_MULT — TP = entry + atr × mult
     atr_period:              int   = 14    # reads ATR_PERIOD
     # ── Entry mode parameters (Mode A = pullback, Mode B = breakout) ──
@@ -216,6 +219,7 @@ class PortfolioConfig:
     sim_start_price:          float = 68_500.0  # simulated feed start price
     sim_volatility:           float = 200.0     # simulated feed volatility per tick
     max_concurrent_positions: int   = 2         # MAX_CONCURRENT_POSITIONS — capital pool slots
+    max_slot_cash_cad:        float = 0.0       # MAX_SLOT_CASH_CAD — per-slot hard cap (0 = uncapped)
     live_dust_value_cad:      float = 10.0      # positions worth < this are dust — skip recovery
     doge_vol_min_cad:         float = 50_000.0  # DOGE/CAD BUY blocked below this 24h quote volume
 
@@ -224,6 +228,8 @@ class PortfolioConfig:
             raise ValueError("STARTING_CASH must be > 0")
         if self.max_concurrent_positions < 1:
             raise ValueError("MAX_CONCURRENT_POSITIONS must be >= 1")
+        if self.max_slot_cash_cad < 0:
+            raise ValueError("MAX_SLOT_CASH_CAD must be >= 0")
         if self.live_dust_value_cad < 0:
             raise ValueError("LIVE_DUST_VALUE_CAD must be >= 0")
         if self.doge_vol_min_cad < 0:
@@ -265,8 +271,7 @@ class BacktestConfig:
     trail_stop_activation_pct:  float = 0.03 # min profit before trail activates (0 = immediate)
     partial_tp_pct:      float = 0.0     # sell partial_tp_size at this gain (0 = disabled)
     partial_tp_size:     float = 0.5     # fraction of position to sell at partial TP
-    atr_sl_enabled:      bool  = False   # True = ATR-based SL; False = fixed % SL
-    atr_sl_multiplier:   float = 2.0     # SL = entry_price - ATR × multiplier
+    atr_sl_mult:         float = 0.0     # ATR SL multiplier; 0 = disabled (uses fixed stop_loss_pct)
 
     _VALID_TIMEFRAMES = {"1m","5m","15m","30m","1h","2h","4h","6h","12h","1d","1w"}
 
@@ -368,7 +373,7 @@ class AppConfig:
         Risks exactly risk_per_trade_pct of cash if the ATR stop is hit.
         Falls back to calc_trade_qty() when ATR is 0 or unavailable.
         """
-        mult = atr_multiplier if atr_multiplier is not None else self.backtest.atr_sl_multiplier
+        mult = atr_multiplier if atr_multiplier is not None else self.backtest.atr_sl_mult
         if price <= 0 or cash <= 0 or atr_value <= 0 or mult <= 0:
             return self.calc_trade_qty(cash, price)
         sl_distance = atr_value * mult
@@ -438,6 +443,22 @@ class AppConfig:
                 self.risk.risk_per_trade_pct * 1.05 * 100,
             )
 
+        # ── Strategy hash + drift guard ───────────────────────────────────────
+        from bot.strategy.fingerprint import compute_strategy_hash  # local import — avoids circular at module init
+        _shash = compute_strategy_hash()
+        logger.info("CONFIG  strategy_hash=%s", _shash)
+        _hash_file = Path(os.getenv("STRATEGY_HASH_FILE", "logs/validated_strategy_hash"))
+        if _hash_file.exists():
+            _saved = _hash_file.read_text().strip()
+            if _saved != _shash:
+                logger.warning(
+                    "STRATEGY CODE DIFFERS FROM LAST VALIDATED VERSION  "
+                    "saved=%s  current=%s  "
+                    "Walk-forward results are STALE — re-run walkforward.py then stamp with: "
+                    "python stamp_strategy.py",
+                    _saved, _shash,
+                )
+
         logger.info("─" * 60)
 
 
@@ -452,6 +473,31 @@ def per_symbol_max_pct(universe_size: int, max_position_pct: float) -> float:
         return 0.0
     return max_position_pct / universe_size
 
+
+# ---------------------------------------------------------------------------
+# Drift guard — env keys that are KNOWN to config.py for strategy-critical
+# prefixes.  Any env key matching a prefix that is NOT in this set triggers
+# a startup WARNING (typo, renamed key, or stale legacy setting).
+# Convention: mult=0.0 means disabled — no separate _ENABLED keys.
+# ---------------------------------------------------------------------------
+_STRATEGY_CRITICAL_PREFIXES: tuple[str, ...] = (
+    "ATR_", "RSI_", "ADX_", "STOP_", "TAKE_", "RISK_", "EMA_",
+)
+_KNOWN_STRATEGY_ENV_KEYS: frozenset[str] = frozenset({
+    # ATR
+    "ATR_SL_MULT", "ATR_TP_MULT", "ATR_PERIOD", "ATR_VOLATILE_MULTIPLIER",
+    # RSI
+    "RSI_PERIOD", "RSI_OVERSOLD", "RSI_OVERBOUGHT", "RSI_FILTER_ENABLED",
+    # ADX
+    "ADX_PERIOD", "ADX_THRESHOLD", "ADX_MAX",
+    # STOP / TAKE
+    "STOP_LOSS_PCT", "TAKE_PROFIT_PCT",
+    # RISK
+    "RISK_PER_TRADE_PCT", "RISK_MAX_POSITION_PCT", "RISK_DAILY_LOSS_LIMIT",
+    "RISK_MAX_DRAWDOWN", "RISK_MAX_TRADES_PER_DAY", "RISK_HALT_BLOCKS_STOPS",
+    # EMA — none of the recognised keys start with EMA_ (they use MIN_/MAX_/FAST_/SLOW_/REGIME_)
+    # so any EMA_* key in .env is unrecognised and will be flagged correctly.
+})
 
 # ---------------------------------------------------------------------------
 # Load — reads env vars, validates, returns singleton
@@ -472,8 +518,10 @@ def _load() -> AppConfig:
             order_type              = _str  ("ORDER_TYPE",             "market"),
             limit_order_enabled     = _bool ("LIMIT_ORDER_ENABLED",      False),
             limit_chase_timeout_s   = _int  ("LIMIT_CHASE_TIMEOUT_S",    120),
-            limit_chase_max_retries = _int  ("LIMIT_CHASE_MAX_RETRIES",  3),
-            limit_chase_tick_pct    = _float("LIMIT_CHASE_TICK_PCT",     0.0001),
+            limit_chase_max_retries  = _int  ("LIMIT_CHASE_MAX_RETRIES",  3),
+            limit_chase_tick_pct     = _float("LIMIT_CHASE_TICK_PCT",     0.0001),
+            adopt_external_holdings  = _bool ("ADOPT_EXTERNAL_HOLDINGS",  False),
+            drift_alert_threshold    = _int  ("DRIFT_ALERT_THRESHOLD",    3),
         ),
         strategy=StrategyConfig(
             mode                    = _str  ("STRATEGY_MODE",           "indicator"),
@@ -495,7 +543,7 @@ def _load() -> AppConfig:
             volume_k                = _float("VOLUME_K",                0.0),
             macd_enabled            = _bool ("MACD_ENABLED",            True),
             atr_volatile_multiplier = _float("ATR_VOLATILE_MULTIPLIER", 1.5),
-            atr_sl_mult             = _float("ATR_SL_MULT",              2.0),
+            atr_sl_mult             = _float("ATR_SL_MULT",              0.0),
             atr_tp_mult             = _float("ATR_TP_MULT",              4.0),
             atr_period              = _int  ("ATR_PERIOD",               14),
             pullback_rsi_min        = _float("PULLBACK_RSI_MIN",        38.0),
@@ -520,6 +568,7 @@ def _load() -> AppConfig:
             sim_start_price          = _float("SIM_START_PRICE",           68_500.0),
             sim_volatility           = _float("SIM_VOLATILITY",            200.0),
             max_concurrent_positions = _int  ("MAX_CONCURRENT_POSITIONS",  2),
+            max_slot_cash_cad        = _float("MAX_SLOT_CASH_CAD",         0.0),
             live_dust_value_cad      = _float("LIVE_DUST_VALUE_CAD",       10.0),
             doge_vol_min_cad         = _float("DOGE_VOL_MIN_CAD",         50_000.0),
         ),
@@ -543,8 +592,7 @@ def _load() -> AppConfig:
             trail_stop_activation_pct   = _float("TRAILING_STOP_ACTIVATION_PCT", 0.03),
             partial_tp_pct   = _float("PARTIAL_TP_PCT",       0.0),
             partial_tp_size  = _float("PARTIAL_TP_SIZE",      0.5),
-            atr_sl_enabled   = _bool ("ATR_SL_ENABLED",       False),
-            atr_sl_multiplier= _float("ATR_SL_MULTIPLIER",    2.0),
+            atr_sl_mult      = _float("ATR_SL_MULT",           0.0),
         ),
         signals=ExternalSignalsConfig(
             fng_enabled            = _bool ("EXT_FNG_ENABLED",       True),
@@ -588,6 +636,32 @@ def _load() -> AppConfig:
             "Live-validated strategy uses VOLUME_K=0 (disabled). "
             "Set VOLUME_K=0 in .env unless you have re-validated with volume filter on.",
             cfg.strategy.volume_k,
+        )
+
+    # ── Startup strategy fingerprint ──────────────────────────────────────
+    sl_type = "ATR" if cfg.strategy.atr_sl_mult > 0 else "fixed"
+    logger.info(
+        "STRATEGY FINGERPRINT  SL=%s(%.3f%%)  ATR_SL_MULT=%.2f  TP=%.2f%%  "
+        "ADX=%.1f  RSI=%g/%g  MIN_EMA_SPREAD=%.4f  whitelist=%s",
+        sl_type, cfg.backtest.stop_loss_pct * 100, cfg.strategy.atr_sl_mult,
+        cfg.backtest.take_profit_pct * 100,
+        cfg.strategy.adx_threshold,
+        cfg.strategy.rsi_oversold, cfg.strategy.rsi_overbought,
+        cfg.strategy.min_ema_spread_pct,
+        cfg.universe.universe_whitelist or "(dynamic)",
+    )
+
+    # ── Drift guard: warn on unrecognised strategy-critical env keys ──────
+    _unrecognised = [
+        k for k in os.environ
+        if any(k.startswith(p) for p in _STRATEGY_CRITICAL_PREFIXES)
+        and k not in _KNOWN_STRATEGY_ENV_KEYS
+    ]
+    if _unrecognised:
+        logger.warning(
+            "CONFIG DRIFT: .env contains unrecognised strategy keys: %s — "
+            "these are ignored by config.py. Check for typos or stale legacy settings.",
+            ", ".join(sorted(_unrecognised)),
         )
 
     return cfg

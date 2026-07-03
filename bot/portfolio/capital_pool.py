@@ -35,21 +35,31 @@ class CapitalPool:
     pools grow and losing pools shrink — consistent with fixed-fractional sizing.
     """
 
-    def __init__(self, total_capital: float, max_concurrent: int = 2) -> None:
+    def __init__(self, total_capital: float, max_concurrent: int = 2, slot_cap: float = 0.0) -> None:
         if total_capital <= 0:
             raise ValueError("total_capital must be > 0")
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be >= 1")
+        if slot_cap < 0:
+            raise ValueError("slot_cap must be >= 0")
         self._total    = total_capital
         self._max_conc = max_concurrent
+        self._slot_cap = slot_cap   # 0 = uncapped
         self._slots: dict[str, float] = {}  # symbol → cash allocated to this slot
 
     # ── Properties ───────────────────────────────────────────────────────────
 
     @property
     def slot_cash(self) -> float:
-        """Cash budget per position slot (= total / max_concurrent)."""
-        return self._total / self._max_conc
+        """Cash budget per position slot (total / max_concurrent, capped at slot_cap if > 0)."""
+        base = self._total / self._max_conc
+        if self._slot_cap > 0:
+            return min(base, self._slot_cap)
+        return base
+
+    @property
+    def slot_cap(self) -> float:
+        return self._slot_cap
 
     @property
     def total_capital(self) -> float:

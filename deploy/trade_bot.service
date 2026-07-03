@@ -2,8 +2,10 @@
 Description=Crypto Trading Bot
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=300
-StartLimitBurst=5
+# Never give up restarting — crash-loop detection is handled in-process via
+# startup_timestamps.txt + Telegram alert. systemd stops restarting if
+# StartLimitIntervalSec > 0 and burst is exceeded; set to 0 to disable.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -12,7 +14,7 @@ WorkingDirectory=/opt/trade_bot
 EnvironmentFile=/opt/trade_bot/.env
 
 ExecStart=/opt/trade_bot/venv/bin/python main.py
-Restart=on-failure
+Restart=always
 RestartSec=30
 
 # Send stdout+stderr to the system journal (view with: journalctl -u trade_bot -f)

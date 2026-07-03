@@ -153,12 +153,38 @@ A robust crypto trading system that:
 
 ---
 
+## Test Suite Manifest (as of 2026-07-03)
+
+Expected total: **139 tests**. If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result.
+
+| File | Tests | What it covers |
+|------|-------|----------------|
+| `test_indicators.py` | 28 | RSI, EMA, ADX, MACD, ATR calculations |
+| `test_live_executor.py` | 21 | LiveExecutor: dry-run, market/limit orders, fee deduction, state save/load |
+| `test_capital_pool.py` | 19 | CapitalPool: slot allocation, slot cap, release, edge cases |
+| `test_correlation.py` | 17 | Pearson correlation, pct_returns, fetch_correlation |
+| `test_risk_manager.py` | 12 | RiskManager: halt gate, daily loss, position size, SL/TP bypass |
+| `test_fill_recording.py` | 8 | BUG 1: qty=0 fill — filled priority, amount fallback, guard, TradeLog guard |
+| `test_external_holdings.py` | 6 | External-holdings guard in _sync_position (adopt=false/true) |
+| `test_executor.py` | 6 | PaperExecutor: BUY/SELL, insufficient cash, history |
+| `test_drift_escalation.py` | 6 | BUG 2: consecutive drift counter, escalation threshold, resolution reset |
+| `test_tsx_validation.py` | 5 | Stock-bot TSX price sanity check |
+| `test_candle_watchdog.py` | 5 | Candle watchdog: timing, alert, no double-fire |
+| `test_universe.py` | 4 | Universe screener: scoring, momentum filter, fallback |
+| `test_main_strategy.py` | 2 | Strategy builder: full config wiring |
+
+Run: `python -m pytest --tb=short -q` — must show **139 passed**.
+
+---
+
 ## VALIDATED TRADING CONFIG
 
 As of 2026-06-19, the following configuration has passed:
 - 5000-candle backtest (BTC/USDT 4h, Mar 2024–Jun 2026): PF 1.79, 58 trades, win rate 32.8%, max DD -5.12%, return -4.70% (at 0.8% fee)
+  NOTE: This fingerprint was produced on an older strategy (simple RSI < 30 BUY gate).
+  The current code uses Mode A/B (pullback RSI 38–58 + breakout); see "trade count evolution" below.
 - SL/TP sweep: SL=1.5% / TP=10% validated 2026-06-19 (was TP=4.5%)
-- Walk-forward (5 windows, TP=10%, fee=0.8%):
+- Walk-forward as of 2026-06-19 (OLD strategy — RSI < 30 BUY gate, no EMA spread filter):
 
   | Window | Candles | PF   | Return  |
   |--------|---------|------|---------|
@@ -169,6 +195,20 @@ As of 2026-06-19, the following configuration has passed:
   | 1000   | Jan26   | 1.25 | -1.32%  |
 
   All 5 windows PF > 1.0 — walk-forward passed.
+
+- Walk-forward re-run 2026-07-02 (CURRENT code — Mode A/B + EMA spread filter + MACD):
+
+  | Window | Candles | Period        | Trades | PF   | Return  |
+  |--------|---------|---------------|--------|------|---------|
+  | Full   | 5000    | Mar24–Jul26   | 39     | 1.79 | -3.00%  |
+  | 4000   | Sep24   | Sep24–Jul26   | 30     | 2.00 | -1.75%  |
+  | 3000   | Feb25   | Feb25–Jul26   | 20     | 2.99 | +0.17%  |
+  | 2000   | Aug25   | Aug25–Jul26   | 8      | 3.12 | +0.08%  |
+  | 1000   | Jan26   | Jan26–Jul26   | 4      | 3.38 | +0.08%  |
+
+  All 5 windows PF > 1.0. 2000c and 1000c have very few trades (8/4) — PF is directionally
+  valid but not statistically reliable at these sample sizes. The 5000c (39 trades) and
+  4000c (30 trades) windows are the most meaningful and both show PF ≥ 1.79.
 - ADX sweep (18 / 25 / 30 / 35): ADX=18 is best on both full history and recent window
 - RSI filter confirmed ON: RSI_FILTER_ENABLED=false drops PF from 1.38 → 1.19 and return from +1.51% → -0.10%
 - Volume filter tested (VOLUME_K=1.2) and disabled: hurt PF (1.38→1.00), added noise not quality
@@ -204,8 +244,45 @@ TAKE_PROFIT_PCT=0.10   # confirmed 2026-07-01: matches backtest and regime monit
 
 ### How to verify the config is active
 Run: EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py
-Expected: ~58 trades, PF ~1.79, return ~-4.70%, max DD ~-5.12%
-If RSI_FILTER_ENABLED=false accidentally: trade count jumps to ~107, PF drops to 1.19
+Expected: ~39 trades, PF ~1.79 (see note below on trade count evolution)
+If RSI_FILTER_ENABLED=false accidentally: trade count jumps significantly, PF drops below 1.2
+
+Reproducible pinned-window verification (identical result to rolling run):
+  EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-06-20 python backtest.py
+  Expected: 39 trades, PF 1.79 (confirmed 2026-07-02 — matches rolling window exactly)
+  BACKTEST_SINCE/BACKTEST_UNTIL change the FETCH start, not just post-fetch filtering.
+
+Note — trade count evolution:
+- 2026-06-19 fingerprint (TP=10% validated):      ~58 trades, PF 1.79
+  Strategy at this point: simple RSI < 30 oversold BUY gate, no EMA spread filter
+- 2026-06-27 (MIN_EMA_SPREAD_PCT=0.004 added):    change reduced trade count further
+- Post-commit c94d297 (Mode A/B dual entry):       strategy redesigned — pullback RSI 38–58
+  and breakout mode replace simple RSI < 30. This is the primary cause of 58→39.
+- 2026-07-02 current expected fingerprint:         39 trades, PF 1.79
+  Proven: pinned window (2024-03-07→2026-06-19) gives IDENTICAL result to rolling window.
+  Window drift is NOT a factor. Trade count difference is entirely from strategy redesign.
+  PF 1.79 is the stable invariant across both old and new strategy versions.
+
+### Canonical strategy fingerprint (BTC/USDT, 2026-07-03)
+- **Strategy hash:** `659d1c03987b72fd`
+- **Hashed files (behavior-defining only):**
+  - `bot/strategy/indicator_strategy.py`
+  - `bot/strategy/threshold_strategy.py`
+  - `bot/indicators/indicators.py`
+  - *(fingerprint.py and __init__.py excluded — non-behavioral)*
+- **Window:** BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-06-20 (pinned) or rolling 5000 × 4h (same trade count)
+- **Result:** 39 trades, PF 1.77 (range 1.77–1.79 depending on rolling-window end date; all > 1.0)
+- **Stamped:** run `python stamp_strategy.py` after each passing walk-forward to write `logs/validated_strategy_hash`
+- If the bot or backtest prints `STRATEGY CODE DIFFERS`, re-run walk-forward before trusting any PF numbers
+- Prior hash `d3c7c383d91d5ef9` (2026-07-02) was computed over all `bot/strategy/*.py` including fingerprint.py — that scope was wrong. Hash value changed when scope was corrected to behavior-only files. No strategy logic changed.
+
+ATR SL drift incident (resolved 2026-07-02):
+- Root cause: .env contained ATR_SL_ENABLED=true (a stale key from a second config system in BacktestConfig)
+  while live bot correctly used ATR_SL_MULT=0.0. Backtest was running ATR SL at 2× multiplier
+  → 33 trades / PF 2.19 (vs expected 58/1.79). Now resolved: BacktestConfig uses ATR_SL_MULT
+  (same key as StrategyConfig), convention mult=0.0 means disabled. No separate _ENABLED key.
+- 1 live fill occurred under unvalidated ATR config (2026-06-22 16:36 UTC, pnl=-0.02 CAD, reason='trail_stop')
+- Live bot was on validated fixed SL=1.5% from 2026-06-22 21:24 UTC onwards.
 
 ### Config change log (2026-06-19)
 Previous validated config: TP=4.5% (PF 1.38 at zero fee)
@@ -240,7 +317,7 @@ All critical bugs resolved:
 #### TODAY — Active money at risk
 1. **Fix backtest fee** — `.env`: change `BACKTEST_FEE_PCT=0.001` → `BACKTEST_FEE_PCT=0.008`
    - Every backtest run since deploy has reported false PF numbers at 0.1% fee
-   - After fix, re-run: `EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py` → expect ~58 trades, PF ~1.79
+   - After fix, re-run: `EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py` → expect ~39 trades, PF ~1.79 (count lower than original 58 due to EMA spread filter added 2026-06-27)
 2. **Run 1h backtest** — live bot uses `CANDLE_MINUTES=60` but ALL validation was done on 4h candles
    - `EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_TIMEFRAME=1h BACKTEST_LIMIT=5000 python backtest.py`
    - If PF < 1.0: stop live trading until re-validated; if PF > 1.0: confirm and document
@@ -294,18 +371,17 @@ All critical bugs resolved:
 | Add oversold recovery to universe pre_filter | After paper validated | AI rejects overbought momentum leaders |
 
 - Can evolve into a professional-grade trading platform
-## Live Symbol Universe (updated 2026-06-27)
+## Live Symbol Universe (updated 2026-07-02)
 
 ### Approved for live trading
 | Symbol | Status | Basis |
 |--------|--------|-------|
-| BTC/CAD | ACTIVE | Original validated pair |
-| XRP/CAD | ACTIVE | Walk-forward passed (Binance USDT proxy, all 3 windows PF > 1.0, 1000c PF 1.54); Kraken liquidity confirmed at $228,592 CAD/24h; min order 1.65 XRP (~$2.46 CAD) |
+| BTC/CAD | ACTIVE | Walk-forward re-confirmed 2026-07-02 on current code: all 5 windows PF > 1.0 (1.79→2.00→2.99→3.12→3.38). Original validated pair. |
 
-### Watchlist (not yet tradeable)
+### Watchlist (not yet tradeable — monitored for re-validation)
 | Symbol | Status | Reason |
 |--------|--------|--------|
-| — | — | No current watchlist entries |
+| XRP/CAD | WATCHLIST | Walk-forward failed on current Mode A/B strategy (2026-07-02): 5000c PF 0.99, 3000c PF 0.98, win rate 12.9%, 87% SL-exit rate. Prior ACTIVE status was validated on the retired pre-c94d297 RSI<30 strategy. Re-entry condition: full 3-window walk-forward pass on current strategy code. |
 
 ### Blocked (walk-forward failed)
 | Symbol | Status | Reason |
@@ -314,16 +390,25 @@ All critical bugs resolved:
 | ETH/CAD | BLOCKED | Walk-forward failed on all windows (5000c PF 0.90, 3000c PF 1.44, 1000c PF 1.34 — full-history window fails); strategy has no edge on ETH over the full 2024–2026 period |
 | SOL/CAD | BLOCKED | Walk-forward failed — all three windows below 1.0 (5000c PF 0.88, 3000c PF 0.75, 1000c PF 0.83) |
 
+### Screened out — liquidity gate (checked 2026-07-02)
+| Symbol | 24h Vol (CAD) | Gate | Reason |
+|--------|--------------|------|--------|
+| PEPE/CAD | $1,659 | $50,000 | Failed liquidity gate — walk-forward not run |
+| XDC/CAD | $10,288 | $50,000 | Failed liquidity gate — walk-forward not run |
+
+These are the only remaining Kraken CAD spot pairs not already decided. Re-screen when volume grows.
+Screen run: `python screen_universe.py` — report at `logs/screen_results_20260702.md`.
+
 ### Implementation
-- `.env`: `UNIVERSE_WHITELIST=BTC/CAD,XRP/CAD` — bot uses fixed whitelist, skips dynamic momentum scan
-- `regime_monitor.py`: tracks both BTC/CAD and XRP/CAD
+- `.env`: `UNIVERSE_WHITELIST=BTC/CAD` — bot uses fixed whitelist (XRP/CAD removed 2026-07-02)
+- `regime_monitor.py`: `MONITOR_SYMBOLS=BTC/CAD` (traded), `MONITOR_WATCHLIST=XRP/CAD` (health metrics only, labeled NOT TRADED)
 
 ---
 
 ## Capital Sizing Rules
 
 ### Starting capital
-$100 CAD per symbol. BTC/CAD and XRP/CAD trade independently — each symbol has its own capital allocation, trade counter, and sizing tier.
+$100 CAD per symbol. Each live symbol trades independently with its own capital allocation, trade counter, and sizing tier. Currently: BTC/CAD only ($100 CAD).
 
 ### First increase — $100 → $250 CAD per symbol
 Requires ALL of the following on live fills (not backtest):
@@ -342,15 +427,128 @@ Requires ALL of the following:
 - **Never increase capital after a winning streak** — only increase after the trade count threshold is met
 - **Never increase capital on both symbols simultaneously** — increase one, wait 10 trades, then evaluate the second
 - **If live PF drops below 1.0 over any 10-trade window**, reduce back to previous capital tier immediately regardless of overall account performance
+- **Symbol removal must never implicitly increase surviving symbol allocation.** Use `MAX_SLOT_CASH_CAD` in `.env` to hard-cap per-slot cash. Current value: `MAX_SLOT_CASH_CAD=77`. Implemented via `CapitalPool(slot_cap=...)` in `bot/portfolio/capital_pool.py`. When a new symbol is added to the whitelist, update this value deliberately — not as a side effect of adding a slot.
+- **Personal holdings in the same Kraken account are invisible to the bot by default.** `ADOPT_EXTERNAL_HOLDINGS=false` (default) ensures `LiveExecutor` only manages positions it opened itself. If Kraken balance exceeds the state-file recorded position, the excess is logged as "EXTERNAL HOLDINGS DETECTED" and is never traded. Incident: Jun 27 2026 — bot adopted and sold 0.000378 BTC deposit + 218 DOGE deposit because state file had stale `bot_opened=True` flag and no guard existed. Fixed in `live_executor._sync_position()`. Never set `ADOPT_EXTERNAL_HOLDINGS=true` unless you explicitly want the bot to trade all assets in the account.
 
 ---
 
 ## Exchange Setup
 - Backtesting: EXCHANGE=binance, SYMBOL=BTC/USDT
-- Live trading: EXCHANGE=kraken, SYMBOL=BTC/CAD (primary), XRP/CAD (secondary via UNIVERSE_WHITELIST)
+- Live trading: EXCHANGE=kraken, SYMBOL=BTC/CAD (XRP/CAD removed from UNIVERSE_WHITELIST 2026-07-02 — walk-forward failed)
 - Reason: Kraken OHLCV history limited to ~720 candles, Binance has 5000+
 - Price diff confirmed: 0.048% — negligible
 - Kraken API key: generate at Security → API once KYC clears
   - Enable: Query Funds, Query Orders, Create Orders, Cancel Orders
   - Disable: Withdrawals (never enable on bot key)
   - Restrict to your IP address
+
+---
+
+## Validation Discipline
+
+**Any commit that touches strategy-logic files invalidates all fingerprints and symbol ACTIVE statuses until walk-forward is re-run and the hash re-stamped.**
+
+Strategy-logic files = anything in `bot/strategy/`. Changes to config, execution, risk, data, or tests do NOT invalidate the hash.
+
+### Workflow after a strategy change
+1. Edit `bot/strategy/*.py`
+2. Run full backtest: `EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py` — confirm PF ≥ 1.79
+3. Run walk-forward: `python walkforward.py` — confirm all windows PF > 1.0
+4. Stamp the hash: `python stamp_strategy.py`
+5. Update CLAUDE.md "Canonical strategy fingerprint" with the new hash + result
+6. For any symbol in UNIVERSE_WHITELIST: re-run walk-forward on that symbol too before assuming ACTIVE status still holds
+   - A symbol validated on strategy version X is NOT automatically valid on version Y
+
+### Re-entry gate for watchlisted / blocked symbols
+Full 3-window walk-forward pass (all windows PF > 1.0) on the CURRENT strategy code.
+A passing result on an older strategy version does not count.
+
+### Capital gate evaluation (15-fill threshold)
+
+The 15-fill capital gate ($100 → $250) requires **ALL THREE**, not just PF:
+
+1. **Live PF ≥ 1.2** over ≥15 completed round-trips
+2. **Shadow match rate ≥ 95%** — run `python shadow_signal.py` to verify the live bot's
+   candle-close decisions match a fresh strategy replay. Confirms the live execution is
+   faithfully running the validated backtest strategy, not a diverged state.
+3. **Fee and slippage within assumptions** — fill prices within 0.5% of signal-candle close;
+   round-trip cost consistent with 0.40% maker BUY + 0.80% taker SELL = 1.20%.
+
+**PF alone is insufficient at 15-trade sample sizes:**
+- A **failing PF with clean fidelity** (≥95% match, slippage on-spec) means **variance, not
+  strategy failure**. Extend the window to 25–30 trades rather than demoting or scaling back.
+- A **passing PF with poor fidelity** (<95% match or large slippage) means the live bot may not
+  be executing the validated strategy — investigate before promoting capital.
+- A **failing PF with poor fidelity** requires investigation of execution problems before any
+  capital decision.
+
+**Shadow signal tool:** `python shadow_signal.py`
+- Run daily (see cron note below) or before any capital gate evaluation.
+- Report: `logs/shadow_report_<date>.md`. Includes strategy hash, match rate, fill slippage.
+- First run (2026-07-03): 97.6% match (41/42 comparable candles), 1 MACD-state boundary
+  mismatch (identical RSI/ADX on both sides — expected fresh-init vs live-accumulated difference).
+
+**Cron invocation (suggested daily):**
+```
+# Shadow signal fidelity — run daily at 06:00 UTC
+0 6 * * *  cd /path/to/trade_bot && python shadow_signal.py >> logs/shadow_signal.log 2>&1
+```
+Override env for non-standard paths:
+```
+SHADOW_LOOKBACK=100 SHADOW_LOG=logs/trade_bot.log SHADOW_DB=logs/trades.db python shadow_signal.py
+```
+
+### Why this matters (incident log)
+- XRP/CAD: validated on old RSI < 30 strategy (pre-commit c94d297). Mode A/B entry logic
+  (pullback RSI 38–58) was added without re-running XRP walk-forward. XRP traded live with real
+  money for weeks on a stale, passing-but-now-failed validation. 2026-07-02: 5000c PF 0.99,
+  3000c PF 0.98 — removed from live trading.
+
+---
+
+## USD Expansion (contingent)
+
+**Status: no qualifying symbols as of 2026-07-03.** Screen run with strategy hash `659d1c03987b72fd`.
+
+### Screen results (2026-07-03)
+603 Kraken USD spot pairs → 178 cleared $50,000/day liquidity gate → top 15 by volume walk-forwarded.
+
+| Symbol | Vol (USD/day) | 5000c PF | 3000c PF | 1000c PF | SL rate | Verdict |
+|--------|-------------|--------|--------|--------|---------|---------|
+| HYPE/USD | $13,411,669 | — | — | — | N/A | SKIP (no Binance proxy) |
+| ZEC/USD | $6,964,638 | 0.99 | 1.43 | 2.65 | 87% | FAIL — full PF < 1.0 + SL 87% |
+| ADA/USD | $6,669,035 | 0.60 | 0.53 | 0.00 | 90% | FAIL — PF + SL |
+| SUI/USD | $5,784,470 | 1.32 | 0.98 | 2.50 | 82% | FAIL — 3000c PF 0.98 + SL 82% |
+| TAO/USD | $4,137,799 | 0.93 | 1.38 | 1.64 | 86% | FAIL — full PF + SL |
+| M/USD | $3,942,638 | — | — | — | N/A | SKIP (no Binance proxy) |
+| SYN/USD | $3,546,542 | 1.80 | 2.56 | 2.39 | 79% | FAIL — SL 79% > 70% cap |
+| XLM/USD | $2,970,677 | 0.96 | 1.14 | 0.66 | 87% | FAIL — full PF + SL |
+| UNI/USD | $2,879,284 | 0.91 | 0.95 | 0.59 | 88% | FAIL — PF + SL |
+| NEAR/USD | $2,573,455 | 1.05 | 1.30 | 1.18 | 86% | FAIL — full PF + SL |
+| LINK/USD | $2,261,609 | 1.54 | 2.19 | 1.28 | 79% | FAIL — SL 79% > 70% cap |
+| LTC/USD | $2,194,392 | 0.90 | 0.92 | 0.00 | 88% | FAIL — PF + SL |
+| AAVE/USD | $1,962,514 | 0.89 | 0.79 | 1.32 | 88% | FAIL — PF + SL |
+| XMR/USD | $1,891,217 | — | — | — | N/A | SKIP (Binance delisted) |
+| BASED/USD | $1,879,930 | — | — | — | N/A | SKIP (no Binance proxy) |
+
+**Dominant failure mode:** SL-exit rate 79–90% on every alt tested. The Mode A/B pullback entry
+(RSI 38–58) has no edge on these assets — same pathology as XRP/CAD (87% SL rate).
+
+**Closest near-misses on PF alone** (would still fail SL gate):
+- SYN/USD: PF 1.80/2.56/2.39 but SL rate 79%
+- LINK/USD: PF 1.54/2.19/1.28 but SL rate 79%
+
+### Preconditions for any USD pair promotion
+All of the following must be met before adding any USD pair to UNIVERSE_WHITELIST:
+1. A future screen run produces a 3-window PASS (PF ≥ 1.2 all windows + trades ≥ 10 + SL ≤ 70%)
+2. BTC/CAD live gates met: ≥ 15 fills + live PF ≥ 1.2
+3. Capital ≥ $500 CAD available for the new symbol slot
+4. Documented decision on CAD→USD conversion cost and ongoing FX exposure (Kraken charges
+   ~0.20% conversion; USD P&L requires separate tracking from CAD base)
+5. Full 3-window walk-forward pass on the CURRENT strategy code at promotion time (a pass on
+   an older hash does not count)
+
+### Re-screen triggers
+- Strategy code change (new hash after walk-forward) — re-screen all alts before assuming new results
+- New high-volume symbol appears on Kraken USD (run `SCREEN_QUOTE=USD python screen_universe.py`)
+- SL-exit rate cap relaxed (would require separate validation that high-SL symbols are genuinely profitable)
