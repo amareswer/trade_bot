@@ -5,7 +5,29 @@ metadata:
   type: project
 ---
 
-**Status as of 2026-07-03 (Session 7 complete):**
+**Status as of 2026-07-04 (Session 8 complete):**
+
+## Session 2026-07-04 (Session 8) — Stock Bot Breaker Fix + Unified Dashboard Rewrite (COMPLETE ✅)
+
+### Stock bot
+- **Daily-loss breaker baseline fixed** (`stock_bot/execution/paper.py`): session baseline now
+  includes avg_cost marks of restored positions; `_open_position_value` seeded at restore.
+  Restart-with-positions previously disabled the breaker entirely. `test_stock_breaker.py` (3 tests).
+
+### Unified dashboard (unified_dashboard.py + .html)
+- Was reading legacy `logs/live_state.json` — stale since Jun 27, still showing the phantom
+  0.000378 BTC external-deposit position and pre-slot cash. Now reads per-symbol
+  `live_state_*.json`, splits active (whitelist) vs retired slots, STALE badge > 48h.
+- Added ops strip: HALT kill-switch status, per-symbol fills today + breaker peak from
+  `logs/risk_state.json`. Stock positions get live price/market value/unrealized P&L via
+  stock bot's `latest_price()` (graceful fallback on yfinance rate limit).
+- **Gotcha found:** a `--watch` watcher from Jun 26 (PID 2649) held old code in memory and
+  kept overwriting the new HTML every 30s. Killed + relaunched via
+  `nohup python unified_dashboard.py --watch >> logs/unified_dashboard.log 2>&1 &`.
+  ALWAYS restart the watcher after editing unified_dashboard.py.
+- Tests: 155 total (152 + 3 stock breaker). CLAUDE.md manifest + roadmap item 7 updated.
+
+---
 
 ## Session 2026-07-03 (Session 7) — Full Audit + Crypto Hardening + Multi-Coin Readiness (COMPLETE ✅)
 

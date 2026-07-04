@@ -14,17 +14,23 @@ Tab selection is saved in localStorage — auto-refresh does not lose your spot.
 """
 from __future__ import annotations
 
+import glob
 import json
+import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
-CRYPTO_STATE_PATH   = "logs/live_state.json"
-STOCK_STATE_PATH    = "stock_bot/paper_state.json"
+CRYPTO_STATE_GLOB    = "logs/live_state_*.json"   # per-symbol files (current bot)
+CRYPTO_STATE_LEGACY  = "logs/live_state.json"     # pre-multi-symbol — fallback only
+STOCK_STATE_PATH     = "stock_bot/paper_state.json"
 KRAKEN_HOLDINGS_PATH = "logs/kraken_holdings.json"
-OUTPUT_PATH         = "unified_dashboard.html"
-REFRESH_S           = 30
+RISK_STATE_PATH      = "logs/risk_state.json"
+HALT_FLAG_PATH       = "logs/HALT"
+OUTPUT_PATH          = "unified_dashboard.html"
+REFRESH_S            = 30
+STALE_AFTER_H        = 48   # state older than this is flagged STALE
 
 
 # ── State helpers ─────────────────────────────────────────────────────────────
@@ -33,6 +39,47 @@ def _load_json(path: str) -> dict | None:
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
+    except Exception:
+        return None
+
+
+def _whitelist() -> list[str]:
+    """Active symbols from .env UNIVERSE_WHITELIST (comma-separated)."""
+    try:
+        from dotenv import dotenv_values
+        raw = dotenv_values(".env").get("UNIVERSE_WHITELIST", "") or ""
+    except Exception:
+        raw = os.getenv("UNIVERSE_WHITELIST", "")
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
+def _load_crypto_states() -> tuple[dict[str, dict], dict[str, dict]]:
+    """Read per-symbol live state files. Returns (active, retired) keyed by
+    symbol — active = in UNIVERSE_WHITELIST, retired = leftover slot files.
+    Falls back to the legacy single-file path if no per-symbol files exist."""
+    states: dict[str, dict] = {}
+    for path in sorted(glob.glob(CRYPTO_STATE_GLOB)):
+        data = _load_json(path)
+        if data and data.get("symbol"):
+            states[data["symbol"]] = data
+    if not states:
+        legacy = _load_json(CRYPTO_STATE_LEGACY)
+        if legacy and legacy.get("symbol"):
+            states[legacy["symbol"]] = legacy
+    wl = _whitelist()
+    active  = {s: d for s, d in states.items() if not wl or s in wl}
+    retired = {s: d for s, d in states.items() if s not in active}
+    return active, retired
+
+
+def _hours_old(ts: str | None) -> float | None:
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
     except Exception:
         return None
 
@@ -93,22 +140,23 @@ def _stat_block(label: str, val: str, sub: str = "") -> str:
 
 # ── Portfolio tab sections ────────────────────────────────────────────────────
 
-def _combined_stats(crypto: dict | None, stock: dict | None) -> str:
-    crypto_cash  = float(crypto.get("cash", 0))          if crypto else 0.0
-    crypto_basis = float(crypto.get("cost_basis", 0))    if crypto else 0.0
-    crypto_pos   = float(crypto.get("position", 0))      if crypto else 0.0
-    crypto_rpnl  = float(crypto.get("realized_pnl", 0))  if crypto else 0.0
-    crypto_fees  = float(crypto.get("fees_paid", 0))     if crypto else 0.0
+def _combined_stats(active: dict[str, dict], stock: dict | None) -> str:
+    crypto_cash = sum(float(d.get("cash", 0)) for d in active.values())
+    crypto_pv   = sum(
+        float(d.get("cost_basis", 0))
+        for d in active.values() if float(d.get("position", 0)) > 0
+    )
+    crypto_rpnl = sum(float(d.get("realized_pnl", 0)) for d in active.values())
+    crypto_fees = sum(float(d.get("fees_paid", 0)) for d in active.values())
 
-    stock_cash   = float(stock.get("cash", 0))           if stock else 0.0
-    stock_rpnl   = float(stock.get("realized_pnl", 0))   if stock else 0.0
-    stock_pos    = stock.get("positions", {})             if stock else {}
-    stock_pv     = sum(
+    stock_cash  = float(stock.get("cash", 0))          if stock else 0.0
+    stock_rpnl  = float(stock.get("realized_pnl", 0))  if stock else 0.0
+    stock_pos   = stock.get("positions", {})            if stock else {}
+    stock_pv    = sum(
         float(p.get("shares", 0)) * float(p.get("avg_cost", 0))
         for p in stock_pos.values()
     )
 
-    crypto_pv  = crypto_basis if crypto_pos > 0 else 0.0
     total      = crypto_cash + crypto_pv + stock_cash + stock_pv
     total_rpnl = crypto_rpnl + stock_rpnl
 
@@ -119,8 +167,8 @@ def _combined_stats(crypto: dict | None, stock: dict | None) -> str:
         f'<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));'
         f'gap:12px;margin-bottom:24px">'
         + _stat_block(
-            "Combined Capital", f"${total:,.2f}",
-            "crypto + stock · crypto uses cost basis as proxy"
+            "Bot-Managed Capital", f"${total:,.2f}",
+            "active crypto slots + stock paper · crypto positions at cost basis"
         )
         + _stat_block(
             "Realized P&L",
@@ -129,8 +177,44 @@ def _combined_stats(crypto: dict | None, stock: dict | None) -> str:
         )
         + _stat_block(
             "Crypto Fees Paid", f"${crypto_fees:.4f}",
-            "Kraken taker + CAD pair surcharge"
+            "active slots · Kraken maker/taker"
         )
+        + "</div>"
+    )
+
+
+def _ops_status_section() -> str:
+    """Kill-switch + risk-breaker state strip (files written by the live bot)."""
+    halted = os.path.exists(HALT_FLAG_PATH)
+    halt_val = (
+        '<span style="color:#f85149">🛑 HALTED</span>' if halted
+        else '<span style="color:#3fb950">● trading enabled</span>'
+    )
+    halt_sub = "rm logs/HALT to resume" if halted else "touch logs/HALT to kill-switch"
+
+    risk = _load_json(RISK_STATE_PATH)
+    if risk:
+        fills_by_sym = risk.get("fills_by_symbol") or {}
+        fills = int(risk.get("fills_today", 0))
+        fills_sub = (
+            " · ".join(f"{s} {n}" for s, n in fills_by_sym.items())
+            if fills_by_sym else f"UTC day {risk.get('today', '—')}"
+        )
+        peak = float(risk.get("peak_value") or 0.0)
+        dov  = risk.get("day_open_value")
+        peak_sub = f"day open ${float(dov):,.2f}" if dov else "day open unset"
+        fills_val = str(fills)
+        peak_val  = f"${peak:,.2f}"
+    else:
+        fills_val, fills_sub = "—", "logs/risk_state.json not written yet"
+        peak_val,  peak_sub  = "—", "restart-safe since 2026-07-03"
+
+    return (
+        '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));'
+        'gap:12px;margin-bottom:24px">'
+        + _stat_block("Kill-Switch", halt_val, halt_sub)
+        + _stat_block("Fills Today", fills_val, fills_sub)
+        + _stat_block("All-Time Peak (breaker)", peak_val, peak_sub)
         + "</div>"
     )
 
@@ -322,17 +406,8 @@ def _kraken_holdings_card(bot_cash: float) -> str:
     )
 
 
-def _crypto_card(state: dict | None) -> str:
-    if state is None:
-        return (
-            '<div class="pf-card offline">'
-            '<div>⚡ Crypto bot offline</div>'
-            '<div style="font-size:11px;color:#8b949e;margin-top:4px">'
-            'logs/live_state.json not found</div>'
-            '</div>'
-        )
-
-    symbol   = state.get("symbol", "—")
+def _crypto_card(symbol: str, state: dict) -> str:
+    """One card per active crypto slot."""
     cash     = float(state.get("cash", 0))
     position = float(state.get("position", 0))
     basis    = float(state.get("cost_basis", 0))
@@ -345,26 +420,66 @@ def _crypto_card(state: dict | None) -> str:
     total      = cash + pos_val
     live_price = _fetch_crypto_price(symbol)
 
+    age = _hours_old(state.get("saved_at"))
+    if age is not None and age > STALE_AFTER_H:
+        badge = (
+            f'<span class="pf-card-badge" style="background:#f8514922;color:#f85149;'
+            f'border-color:#f8514955">STALE · {age/24:.0f}d old</span>'
+        )
+    else:
+        badge = (
+            f'<span class="pf-card-badge" style="background:#1f6feb22;color:#58a6ff;'
+            f'border-color:#1f6feb55">LIVE · {symbol}</span>'
+        )
+
     holding_row = _kv("Position", f"{position:.6f} {base}") if position > 0 else _kv("Position", "Flat")
     basis_row   = _kv("Cost basis", f"${basis:,.2f}") if position > 0 else ""
 
     return (
         '<div class="pf-card">'
         '<div class="pf-card-header">'
-        '<span class="pf-card-title">⚡ Crypto Bot</span>'
-        f'<span class="pf-card-badge" style="background:#1f6feb22;color:#58a6ff;border-color:#1f6feb55">LIVE · {symbol}</span>'
+        f'<span class="pf-card-title">⚡ {symbol}</span>'
+        f'{badge}'
         '</div>'
         + _kv("Live Price", f"<strong>{live_price}</strong>")
-        + _signals_section(read_live_signals())
-        + _kraken_holdings_card(cash)
-        + _kv("Cash", f"${cash:,.2f} CAD")
+        + _kv("Slot cash", f"${cash:,.2f} CAD")
         + holding_row
         + basis_row
         + _kv("Realized P&L", _pnl(rpnl))
         + _kv("Fees paid", f"${fees:.4f}")
-        + _kv("Total value", f"${total:,.2f}")
+        + _kv("Slot value", f"${total:,.2f}")
         + _kv("Last saved", saved)
         + "</div>"
+    )
+
+
+def _crypto_offline_card() -> str:
+    return (
+        '<div class="pf-card offline">'
+        '<div>⚡ Crypto bot offline</div>'
+        '<div style="font-size:11px;color:#8b949e;margin-top:4px">'
+        'no logs/live_state_*.json found</div>'
+        '</div>'
+    )
+
+
+def _retired_slots_note(retired: dict[str, dict]) -> str:
+    """Leftover state files for symbols no longer in UNIVERSE_WHITELIST.
+    Their cash sits in the shared Kraken account — shown but not counted
+    as bot-managed capital."""
+    if not retired:
+        return ""
+    items = " · ".join(
+        f"{sym} (${float(d.get('cash', 0)):,.2f}, "
+        f"saved {_fmt_ts(d.get('saved_at')).split(' ')[0]})"
+        for sym, d in retired.items()
+    )
+    return (
+        '<div style="margin:0 0 24px;padding:10px 14px;background:#0d1117;'
+        'border:1px solid #30363d;border-radius:6px;font-size:11px;color:#8b949e">'
+        f'<strong style="color:#c9d1d9">Retired slots</strong> (not in whitelist, '
+        f'not counted — cash remains in the Kraken account): {items}'
+        '</div>'
     )
 
 
@@ -413,6 +528,26 @@ def _stock_card(state: dict | None) -> str:
     )
 
 
+def _fetch_stock_prices(symbols: list[str]) -> dict[str, float]:
+    """Live prices via the stock bot's own guarded feed (yf.download path).
+    Returns {} on any failure — the table falls back to avg-cost marks."""
+    prices: dict[str, float] = {}
+    if not symbols:
+        return prices
+    try:
+        from stock_bot.data.price_feed import latest_price
+    except Exception:
+        return prices
+    for sym in symbols:
+        try:
+            p = latest_price(sym)
+            if p and p > 0:
+                prices[sym] = float(p)
+        except Exception:
+            continue
+    return prices
+
+
 def _stock_positions_table(state: dict | None) -> str:
     if state is None:
         return ""
@@ -433,17 +568,50 @@ def _stock_positions_table(state: dict | None) -> str:
         'font-size:12px;color:#c9d1d9;white-space:nowrap"'
     )
 
+    live = _fetch_stock_prices(list(positions.keys()))
+
     rows = ""
+    total_upnl = 0.0
+    have_any_live = False
     for sym, pos in positions.items():
         shares   = float(pos.get("shares", 0))
         avg_cost = float(pos.get("avg_cost", 0))
+        cur      = live.get(sym)
+        if cur is not None and avg_cost > 0:
+            have_any_live = True
+            mkt_val  = shares * cur
+            upnl     = mkt_val - shares * avg_cost
+            upnl_pct = (cur - avg_cost) / avg_cost * 100
+            total_upnl += upnl
+            col   = "#3fb950" if upnl >= 0 else "#f85149"
+            s     = "+" if upnl >= 0 else ""
+            cur_s = f"${cur:,.2f}"
+            val_s = f"${mkt_val:,.2f}"
+            pnl_s = f'<span style="color:{col}">{s}${upnl:,.2f} ({s}{upnl_pct:.1f}%)</span>'
+        else:
+            cur_s = "—"
+            val_s = f"${shares * avg_cost:,.2f} (cost)"
+            pnl_s = '<span style="color:#8b949e">—</span>'
         rows += (
             f"<tr>"
             f"<td {td}><strong>{sym}</strong></td>"
             f"<td {td}>{shares:,.0f}</td>"
             f"<td {td}>${avg_cost:,.2f}</td>"
-            f'<td {td} style="color:#8b949e">—</td>'
+            f"<td {td}>{cur_s}</td>"
+            f"<td {td}>{val_s}</td>"
+            f"<td {td}>{pnl_s}</td>"
             f"</tr>"
+        )
+
+    footer = ""
+    if have_any_live:
+        col = "#3fb950" if total_upnl >= 0 else "#f85149"
+        s   = "+" if total_upnl >= 0 else ""
+        footer = (
+            '<div style="padding:10px 12px;border-top:1px solid #30363d;'
+            'font-size:12px;color:#8b949e">'
+            f'Unrealized P&amp;L: <strong style="color:{col}">{s}${total_upnl:,.2f}</strong>'
+            '</div>'
         )
 
     return (
@@ -458,15 +626,26 @@ def _stock_positions_table(state: dict | None) -> str:
         f"<th {th}>Symbol</th>"
         f"<th {th}>Shares</th>"
         f"<th {th}>Avg Cost</th>"
-        f"<th {th}>Live P&L</th>"
+        f"<th {th}>Live</th>"
+        f"<th {th}>Value</th>"
+        f"<th {th}>Unrealized P&L</th>"
         f"</tr></thead>"
         f"<tbody>{rows}</tbody>"
         "</table>"
+        f"{footer}"
         "</div>"
     )
 
 
-def _portfolio_tab_html(crypto: dict | None, stock: dict | None) -> str:
+def _portfolio_tab_html(
+    active: dict[str, dict], retired: dict[str, dict], stock: dict | None
+) -> str:
+    crypto_cards = (
+        "".join(_crypto_card(sym, st) for sym, st in active.items())
+        if active else _crypto_offline_card()
+    )
+    active_cash = sum(float(d.get("cash", 0)) for d in active.values())
+
     return (
         '<div style="padding:24px 20px;max-width:1000px;margin:0 auto">'
         '<div style="margin-bottom:24px">'
@@ -477,11 +656,15 @@ def _portfolio_tab_html(crypto: dict | None, stock: dict | None) -> str:
         "Crypto live (Kraken) · Stocks paper ($1,000 account)"
         "</div>"
         "</div>"
-        + _combined_stats(crypto, stock)
+        + _combined_stats(active, stock)
+        + _ops_status_section()
         + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px">'
-        + _crypto_card(crypto)
+        + crypto_cards
         + _stock_card(stock)
         + "</div>"
+        + _retired_slots_note(retired)
+        + _signals_section(read_live_signals())
+        + _kraken_holdings_card(active_cash)
         + _stock_positions_table(stock)
         + "</div>"
     )
@@ -581,9 +764,11 @@ _JS = """
 
 # ── HTML assembler ────────────────────────────────────────────────────────────
 
-def _build_html(crypto: dict | None, stock: dict | None) -> str:
+def _build_html(
+    active: dict[str, dict], retired: dict[str, dict], stock: dict | None
+) -> str:
     now       = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    portfolio = _portfolio_tab_html(crypto, stock)
+    portfolio = _portfolio_tab_html(active, retired, stock)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -624,12 +809,13 @@ def _build_html(crypto: dict | None, stock: dict | None) -> str:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def generate() -> None:
-    crypto = _load_json(CRYPTO_STATE_PATH)
-    stock  = _load_json(STOCK_STATE_PATH)
-    html   = _build_html(crypto, stock)
+    active, retired = _load_crypto_states()
+    stock = _load_json(STOCK_STATE_PATH)
+    html  = _build_html(active, retired, stock)
     Path(OUTPUT_PATH).write_text(html, encoding="utf-8")
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] unified_dashboard.html written")
+    print(f"[{ts}] unified_dashboard.html written "
+          f"({len(active)} active crypto slot(s), {len(retired)} retired)")
 
 
 def main() -> None:

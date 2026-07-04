@@ -155,7 +155,7 @@ A robust crypto trading system that:
 
 ## Test Suite Manifest (as of 2026-07-03)
 
-Expected total: **152 tests**. If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result.
+Expected total: **155 tests**. If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result.
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -169,12 +169,13 @@ Expected total: **152 tests**. If `pytest --collect-only -q` reports a lower num
 | `test_executor.py` | 6 | PaperExecutor: BUY/SELL, insufficient cash, history |
 | `test_drift_escalation.py` | 6 | BUG 2: consecutive drift counter, escalation threshold, resolution reset |
 | `test_tsx_validation.py` | 5 | Stock-bot TSX price sanity check |
+| `test_stock_breaker.py` | 3 | Stock-bot daily-loss breaker: restart baseline includes position marks |
 | `test_candle_watchdog.py` | 5 | Candle watchdog: timing, alert, no double-fire |
 | `test_halt_flag.py` | 5 | Manual halt kill-switch: logs/HALT flag file engage/lift, ownership guard |
 | `test_universe.py` | 4 | Universe screener: scoring, momentum filter, fallback |
 | `test_main_strategy.py` | 2 | Strategy builder: full config wiring |
 
-Run: `python -m pytest --tb=short -q` — must show **152 passed**.
+Run: `python -m pytest --tb=short -q` — must show **155 passed**.
 
 ---
 
@@ -311,6 +312,22 @@ SELL signals do meaningful work, reducing fee sensitivity.
 - **Daily P&L Telegram alert fires exactly once per UTC day** — date-change trigger replaced
   the `hour==0 and minute==0` window, which double-fired on a 30s loop and could skip entirely.
 
+### Stock bot + unified dashboard (2026-07-04)
+- **Stock daily-loss breaker fixed** (roadmap item 7 closed — see strikethrough above).
+- **`unified_dashboard.py` rewritten for the multi-symbol bot:**
+  - Reads `logs/live_state_*.json` per-symbol files (was reading the legacy
+    `logs/live_state.json`, stale since Jun 27 — it still showed the phantom external
+    0.000378 BTC position). Legacy path is fallback-only now.
+  - Symbols split by UNIVERSE_WHITELIST: active slots get cards (with STALE badge if
+    state > 48h old); retired slots (XRP/DOGE leftovers) listed but not counted.
+  - New ops strip: kill-switch status (`logs/HALT`), fills today per symbol and breaker
+    peak/day-open from `logs/risk_state.json`.
+  - Stock positions table shows live price / market value / unrealized P&L via the stock
+    bot's own guarded `latest_price()` (falls back to cost marks when yfinance rate-limits).
+  - NOTE: `--watch` keeps the module in memory — **restart the watcher after editing
+    unified_dashboard.py** or it keeps regenerating with old code (bit us 2026-07-04:
+    a watcher from Jun 26 was overwriting the new output every 30s).
+
 ### Multi-coin readiness (2026-07-03)
 The live loop is now safe to run with >1 symbol in UNIVERSE_WHITELIST. Single-symbol behavior
 is numerically identical; strategy files untouched (hash `659d1c03987b72fd` still valid).
@@ -369,9 +386,10 @@ All critical bugs resolved:
    - Remove the candle-close SL block to eliminate double-exit confusion
 
 #### DAY 3 — Stock bot circuit breaker + alerting
-7. **Fix stock bot daily loss breaker** — `stock_bot/execution/paper.py:81,114-115`
-   - `session_start_value = self._cash` ignores open positions — breaker can fire when portfolio is flat
-   - Fix: use `cash + sum(position mark values)` as baseline in both session init and drawdown calc
+7. ~~**Fix stock bot daily loss breaker**~~ — DONE 2026-07-04: session baseline now includes
+   restored position marks (avg_cost) and `_open_position_value` is seeded consistently at
+   restore. Previously a restart with open positions silently disabled the breaker
+   (cash-only baseline vs cash+positions current). Tests: `test_stock_breaker.py` (3).
 8. **Wire daily P&L Telegram alert** — `bot/main.py`
    - `TelegramAlerter.daily_pnl()` exists but is never called
    - Add midnight UTC trigger inside main loop: `if now.hour == 0 and now.minute < 1: alerter.daily_pnl(...)`

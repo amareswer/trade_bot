@@ -73,6 +73,12 @@ PROTECTED=BMO.TO,CM.TO,SPCX              # display only, never paper-sell
 - State validation in _load_state(): rejects cash > $1M or |realized_pnl| > $1M (corrupted state guard)
 - Screener price filter: $5–$200 only (universe symbols only; watchlist bypasses)
 - **Earnings blackout (added 2026-06-28):** BUY blocked when next_earnings_date ≤ EARNINGS_BLACKOUT_DAYS away
+- **Daily-loss breaker baseline fixed 2026-07-04:** `paper.py` session baseline now =
+  cash + avg_cost marks of restored positions, with `_open_position_value` seeded at
+  restore (`_update_position_value({})`). Before: cash-only baseline meant a restart with
+  open positions could never trip the breaker (current total always >> baseline).
+  Tests: `test_stock_breaker.py` (paths monkeypatched to tmp — never touches real
+  paper_state.json). Self-test `python stock_bot/execution/paper.py` still passes.
 
 ## Earnings blackout (added 2026-06-28)
 

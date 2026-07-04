@@ -82,10 +82,13 @@ class StockPaperExecutor(StockExecutorBase):
         else:
             if not self._load_state():
                 logger.info("StockPaperExecutor starting fresh | cash=$%.2f", starting_cash)
-        # Session start value reflects the actual cash after any state restore,
-        # so the daily loss circuit breaker measures drawdown from this session's
-        # opening balance, not the original starting_cash constructor arg.
-        self._session_start_value = self._cash
+        # Session baseline = cash + mark value of any restored positions
+        # (avg_cost until live prices arrive). Seeding _open_position_value with
+        # the same marks keeps baseline and current total consistent — a
+        # cash-only baseline disabled the breaker whenever a session started
+        # with open positions (current total always far above baseline).
+        self._update_position_value({})
+        self._session_start_value = self._cash + self._open_position_value
 
         self._ensure_csv_header()
         print("  Paper trading: whole shares only (no fractions)")
