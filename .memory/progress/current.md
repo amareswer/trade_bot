@@ -5,9 +5,50 @@ metadata:
   type: project
 ---
 
-**Status as of 2026-07-03 (Session 6 complete):**
+**Status as of 2026-07-03 (Session 7 complete):**
 
-## Session 2026-07-03 — Uptime + Ledger Reconciliation (COMPLETE ✅)
+## Session 2026-07-03 (Session 7) — Full Audit + Crypto Hardening + Multi-Coin Readiness (COMPLETE ✅)
+
+### Full-codebase audit (crypto expert review)
+- 139/139 tests passed pre-change; strategy hash verified live == stamped (`659d1c03987b72fd`)
+- Most CLAUDE.md roadmap items confirmed already done (fee 0.008, SL/TP bypass, deploy.sh state
+  preservation, limit BUY 0.998, alerts, drift check, watchdog, min-order validation)
+- Found: stock-bot daily-loss breaker baseline still cash-only after restart (paper.py:88 —
+  NOT yet fixed, crypto prioritized); no runtime kill-switch; risk state not persisted;
+  daily P&L double-fire; local-time daily reset; unpinned requirements; no CI; Python 3.9
+  actually running the suite despite 3.10+ target
+
+### Crypto fixes shipped (all in risk/execution/main — strategy hash UNCHANGED)
+- `logs/HALT` flag-file kill-switch (`_check_halt_flag()` in bot/main.py, Telegram on engage/lift)
+- RiskManager state persistence → `logs/risk_state.json` (live only; peak/day-open/fill counts)
+- RiskManager daily reset now UTC (`_utc_today()`)
+- Daily P&L alert: fires exactly once per UTC day (date-change trigger)
+
+### Multi-coin readiness (single-symbol behavior numerically identical)
+- `risk.evaluate(..., account_value=, symbol=)`: daily-loss/drawdown measure aggregate account;
+  position-size stays per-slot; per-symbol daily trade caps via `record_fill(symbol)`
+- Drift check, candle watchdog, price-feed error counter, daily P&L now per-symbol (was active-symbol only)
+- Universe refresh guard: cannot switch to a symbol with no executor (would trade cold)
+- Gates to actually add a coin: walk-forward pass on current code + capital ≥ $250
+
+### Tests: 139 → **152 passed** (halt flag 5, risk persistence 4, multi-symbol 4). CLAUDE.md manifest updated.
+
+### ATR stop-loss experiment — COMPLETE ✅ (2026-07-04, report: logs/atr_sl_experiment_20260704.md)
+Tool: `atr_sl_experiment.py` (repo root; reproduces screen_universe config, sweeps ATR_SL_MULT).
+Baseline reproduced screen exactly (SYN 1.80/2.56/2.39, SL 79%) — harness validated.
+- **Mechanism confirmed:** ATR×2.0–2.5 stops cut SL-exit rate 76–87% → 9–43% everywhere
+  (in-sample + OOS), win rate ~triples, net return improves in every OOS case (less fee bleed).
+- **But PF gains do NOT replicate OOS** (parity ±0.1) → ATR SL = variance/fee improvement,
+  NOT proven alpha. In-sample lifts (SYN 1.80→1.93, BTC 1.77→2.20) partly window-specific.
+- XRP still fails all variants (entries dead — not an overfit rescue). SYN + LINK now clear
+  the screen gate in-sample at ATR×2.0–2.5 (fixed SL never did).
+- **Decision: BTC/CAD live unchanged** (validated fixed SL; no OOS PF gain; don't reset the
+  15-fill comparison). SYN/LINK = conditional candidates via USD-expansion preconditions
+  (capital ≥ $500 + BTC gates + per-symbol walk-forward at chosen mult + SL-distance sizing).
+
+---
+
+## Session 2026-07-03 (Session 6) — Uptime + Ledger Reconciliation (COMPLETE ✅)
 
 ### Workstream 1 — Uptime (58% downtime diagnosed and mitigated)
 

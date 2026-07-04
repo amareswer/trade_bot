@@ -59,3 +59,22 @@ else:
     if order and order.status == OrderStatus.FILLED:
         risk.record_fill()
 ```
+
+## 2026-07-03 hardening + multi-coin support
+
+- **State persistence:** pass `state_path` (live mode uses `logs/risk_state.json`) — peak value,
+  day-open, and daily fill counts survive restarts. Daily counters restore only if saved on the
+  same UTC day; peak always restores. Backtests pass no path → stateless, unchanged.
+- **UTC daily reset:** `_utc_today()` replaced local `date.today()` — counters reset at UTC
+  midnight, matching candles and the daily P&L alert.
+- **Manual kill-switch:** `touch logs/HALT` engages halt via `_check_halt_flag()` in bot/main.py
+  (checked every tick); `rm logs/HALT` resumes. Telegram alert on engage/lift. SL/TP exits still
+  fire during halt unless `RISK_HALT_BLOCKS_STOPS=true`.
+- **Multi-coin (keyword-only, defaults preserve old behavior):**
+  `evaluate(..., account_value=X, symbol=s)` — daily-loss/drawdown/peak use the aggregate
+  account value (`_account_value()` in bot/main.py sums all slots); position-size check stays
+  per-slot. `record_fill(symbol)` + `fills_today_for(symbol)` give each symbol its own daily
+  trade cap. Backtest engine uses the old positional signature — numerically identical.
+- **Halt semantics correction:** manual halt blocks BUY + strategy SELL (not "SELL always allowed"
+  as older notes said); the SL/TP path in bot/main.py bypasses the risk gate entirely, so stops
+  always fire. Tested in test_risk_manager.py + test_halt_flag.py.

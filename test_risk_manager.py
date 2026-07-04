@@ -1,7 +1,12 @@
 """Unit tests for RiskManager — all checks, no network."""
 
+import json
+import os
+import tempfile
+from datetime import date, timedelta
+
 from bot.execution.executor import PaperExecutor, OrderStatus
-from bot.risk.risk_manager import RiskManager, RiskConfig, BlockReason
+from bot.risk.risk_manager import RiskManager, RiskConfig, BlockReason, _utc_today
 from bot.strategy.threshold_strategy import Signal
 
 
@@ -118,6 +123,111 @@ def test_position_size_does_not_apply_to_sell():
     result = risk.evaluate(Signal.SELL, 74_000, ex.portfolio, 1.0)
     assert result.approved
 
+# ── Multi-symbol: per-symbol trade cap + aggregate account breakers ───────
+
+def test_per_symbol_trade_cap_is_isolated():
+    ex, risk = _make(max_trades_per_day=2)
+    risk.record_fill("BTC/CAD")
+    risk.record_fill("BTC/CAD")
+    blocked = risk.evaluate(Signal.BUY, 100, ex.portfolio, 0.001, symbol="BTC/CAD")
+    assert not blocked
+    assert blocked.block_reason == BlockReason.DAILY_TRADE_CAP
+    # A different symbol still has its full daily budget
+    allowed = risk.evaluate(Signal.BUY, 100, ex.portfolio, 0.001, symbol="XRP/CAD")
+    assert allowed.approved
+
+
+def test_account_value_drives_daily_loss_breaker():
+    # Slot portfolio is flat, but the aggregate account is down 10% — the
+    # daily-loss breaker must fire on the account, not the slot.
+    ex, risk = _make(cash=10_000, daily_loss_limit_pct=0.05, max_drawdown_pct=0.50)
+    risk.evaluate(Signal.HOLD, 100, ex.portfolio, 1.0, account_value=10_000.0)
+    result = risk.evaluate(Signal.BUY, 100, ex.portfolio, 0.001, account_value=9_000.0)
+    assert not result
+    assert result.block_reason == BlockReason.DAILY_LOSS
+
+
+def test_position_size_check_stays_per_slot():
+    # Position sizing is per-slot even when a large aggregate account value is
+    # supplied — a $77 slot must not size positions off a $10k account.
+    ex, risk = _make(cash=100, max_position_pct=0.20, daily_loss_limit_pct=0.50)
+    result = risk.evaluate(
+        Signal.BUY, 100, ex.portfolio, 0.5,   # $50 = 50% of the $100 slot
+        account_value=10_000.0,
+    )
+    assert not result
+    assert result.block_reason == BlockReason.POSITION_SIZE
+
+
+def test_per_symbol_fills_persist_across_restart():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "risk_state.json")
+        risk = RiskManager(RiskConfig(), state_path=path)
+        risk.record_fill("BTC/CAD")
+        risk.record_fill("BTC/CAD")
+        risk.record_fill("XRP/CAD")
+
+        restarted = RiskManager(RiskConfig(), state_path=path)
+        assert restarted.fills_today == 3
+        assert restarted.fills_today_for("BTC/CAD") == 2
+        assert restarted.fills_today_for("XRP/CAD") == 1
+        assert restarted.fills_today_for("ETH/CAD") == 0
+
+
+# ── State persistence: breakers survive restarts ──────────────────────────
+
+def test_state_persists_across_restart():
+    ex = PaperExecutor("BTC/USDT", quantity=1.0, starting_cash=10_000)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "risk_state.json")
+
+        risk = RiskManager(RiskConfig(), state_path=path)
+        risk.evaluate(Signal.HOLD, 100, ex.portfolio, 1.0)   # seeds day_open + peak
+        risk.record_fill()
+        risk.record_fill()
+
+        restarted = RiskManager(RiskConfig(), state_path=path)
+        assert restarted.fills_today == 2
+        assert restarted.peak_value == risk.peak_value
+        assert restarted.day_open_value == risk.day_open_value
+
+
+def test_stale_day_counters_reset_but_peak_survives():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "risk_state.json")
+        yesterday = _utc_today() - timedelta(days=1)
+        with open(path, "w") as fh:
+            json.dump({
+                "today":          yesterday.isoformat(),
+                "fills_today":    5,
+                "day_open_value": 9_999.0,
+                "peak_value":     12_345.0,
+            }, fh)
+
+        risk = RiskManager(RiskConfig(), state_path=path)
+        assert risk.fills_today == 0            # daily counters reset on a new day
+        assert risk.day_open_value is None      # re-seeded on first evaluate()
+        assert risk.peak_value == 12_345.0      # all-time peak never resets
+
+
+def test_corrupt_state_file_starts_fresh():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "risk_state.json")
+        with open(path, "w") as fh:
+            fh.write("{not json")
+
+        risk = RiskManager(RiskConfig(), state_path=path)
+        assert risk.fills_today == 0
+        assert risk.peak_value == 0.0
+
+
+def test_no_state_path_never_writes():
+    with tempfile.TemporaryDirectory() as tmp:
+        risk = RiskManager(RiskConfig())
+        risk.record_fill()
+        assert os.listdir(tmp) == []   # stateless mode leaves no files
+
+
 # ── Integration: approved trade flows through to executor ─────────────────
 
 def test_approved_trade_executes_and_records_fill():
@@ -144,6 +254,14 @@ if __name__ == "__main__":
         test_position_size_does_not_apply_to_sell,
         test_approved_trade_executes_and_records_fill,
         test_sl_tp_bypasses_risk_gate_in_halt,
+        test_state_persists_across_restart,
+        test_stale_day_counters_reset_but_peak_survives,
+        test_corrupt_state_file_starts_fresh,
+        test_no_state_path_never_writes,
+        test_per_symbol_trade_cap_is_isolated,
+        test_account_value_drives_daily_loss_breaker,
+        test_position_size_check_stays_per_slot,
+        test_per_symbol_fills_persist_across_restart,
     ]
     for t in tests:
         t()

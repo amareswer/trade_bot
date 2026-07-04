@@ -12,9 +12,11 @@ Checks (in order):
   5. Max position size  — BUY may not push position above Y% of portfolio
 """
 
+import json
 import logging
+import os
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Optional
 
@@ -66,6 +68,12 @@ class ApprovalResult:
 APPROVED = ApprovalResult(approved=True, message="All checks passed")
 
 
+def _utc_today() -> date:
+    """Calendar date in UTC — all daily counters reset at UTC midnight,
+    matching candle timestamps and the daily P&L alert."""
+    return datetime.now(timezone.utc).date()
+
+
 # ---------------------------------------------------------------------------
 # Risk manager
 # ---------------------------------------------------------------------------
@@ -76,12 +84,22 @@ class RiskManager:
     after every confirmed fill so daily counters stay accurate.
     """
 
-    def __init__(self, config: Optional[RiskConfig] = None):
+    def __init__(self, config: Optional[RiskConfig] = None, state_path: Optional[str] = None):
+        """
+        state_path: optional JSON file for breaker state (peak value, day-open
+        value, daily fill count). Pass a path in live mode so circuit breakers
+        survive restarts; leave None for backtests and unit tests.
+        """
         self.config             = config or RiskConfig()
-        self._today:            date           = date.today()
+        self._state_path        = state_path
+        self._today:            date           = _utc_today()
         self._fills_today:      int            = 0
+        self._fills_by_symbol:  dict           = {}    # per-symbol daily fill counts
         self._day_open_value:   Optional[float] = None
         self._peak_value:       float           = 0.0   # all-time portfolio peak
+
+        if state_path:
+            self._load_state()
 
         logger.info(
             "RiskManager ready | max_pos=%.0f%% | daily_loss=%.0f%% | "
@@ -104,14 +122,25 @@ class RiskManager:
         portfolio:   Portfolio,
         trade_qty:   float,
         candle_date: Optional[date] = None,
+        *,
+        account_value: Optional[float] = None,
+        symbol:        Optional[str]   = None,
     ) -> ApprovalResult:
         """
         Run all risk checks for *signal* at *price*.
         Returns ApprovalResult — truthy if safe to trade.
         Pass candle_date in backtests so daily counters reset on historical dates
         instead of the real wall-clock date.
+
+        Multi-symbol mode (both optional, single-symbol behavior unchanged when omitted):
+          account_value — aggregate value across ALL symbol slots. Used for the
+            daily-loss and max-drawdown breakers so they measure the whole account,
+            not whichever slot happens to be evaluating this tick. The position-size
+            check always uses the slot portfolio (per-slot sizing semantics).
+          symbol — enables the per-symbol daily trade cap instead of the global one.
         """
-        current_value = portfolio.total_value(price)
+        slot_value    = portfolio.total_value(price)
+        current_value = account_value if account_value is not None else slot_value
         self._maybe_reset_day(current_value, candle_date)
         self._update_peak(current_value)
 
@@ -141,11 +170,18 @@ class RiskManager:
                 )
 
         # ── Check 3: daily trade cap (BUY only — SELL must always be allowed) ──
-        if signal == Signal.BUY and self._fills_today >= self.config.max_trades_per_day:
+        # Per-symbol when symbol is passed (each symbol gets its own budget);
+        # global count otherwise.
+        _cap_fills = (
+            self._fills_by_symbol.get(symbol, 0) if symbol is not None
+            else self._fills_today
+        )
+        if signal == Signal.BUY and _cap_fills >= self.config.max_trades_per_day:
+            _cap_label = f" [{symbol}]" if symbol is not None else ""
             return ApprovalResult(
                 approved=False,
                 message=(
-                    f"Daily trade cap reached: {self._fills_today}/"
+                    f"Daily trade cap reached{_cap_label}: {_cap_fills}/"
                     f"{self.config.max_trades_per_day} fills today"
                 ),
                 block_reason=BlockReason.DAILY_TRADE_CAP,
@@ -165,10 +201,10 @@ class RiskManager:
                     block_reason=BlockReason.DAILY_LOSS,
                 )
 
-        # ── Check 5: max position size (BUY only) ─────────────────────
+        # ── Check 5: max position size (BUY only, always per-slot) ────
         if signal == Signal.BUY:
             new_position_value = (portfolio.position + trade_qty) * price
-            new_position_pct   = new_position_value / current_value if current_value else 1.0
+            new_position_pct   = new_position_value / slot_value if slot_value else 1.0
             if new_position_pct > self.config.max_position_pct:
                 return ApprovalResult(
                     approved=False,
@@ -182,10 +218,18 @@ class RiskManager:
 
         return APPROVED
 
-    def record_fill(self) -> None:
-        """Call after every confirmed FILLED order."""
+    def record_fill(self, symbol: Optional[str] = None) -> None:
+        """Call after every confirmed FILLED order. Pass symbol in multi-symbol
+        mode so the per-symbol daily trade cap stays accurate."""
         self._fills_today += 1
+        if symbol is not None:
+            self._fills_by_symbol[symbol] = self._fills_by_symbol.get(symbol, 0) + 1
         logger.debug("Daily fills: %d/%d", self._fills_today, self.config.max_trades_per_day)
+        self._save_state()
+
+    def fills_today_for(self, symbol: str) -> int:
+        """Daily fill count for one symbol (0 if none recorded)."""
+        return self._fills_by_symbol.get(symbol, 0)
 
     def halt(self) -> None:
         self.config.halt = True
@@ -214,14 +258,64 @@ class RiskManager:
     def _update_peak(self, current_value: float) -> None:
         if current_value > self._peak_value:
             self._peak_value = current_value
+            self._save_state()
 
     def _maybe_reset_day(self, current_value: float, candle_date: Optional[date] = None) -> None:
-        today = candle_date if candle_date is not None else date.today()
+        today = candle_date if candle_date is not None else _utc_today()
         if today != self._today:
-            self._today          = today
-            self._fills_today    = 0
-            self._day_open_value = current_value
+            self._today           = today
+            self._fills_today     = 0
+            self._fills_by_symbol = {}
+            self._day_open_value  = current_value
             logger.info("New trading day — counters reset | day_open=$%.2f", current_value)
+            self._save_state()
         elif self._day_open_value is None:
             self._day_open_value = current_value
             logger.info("Day-open value set | $%.2f", current_value)
+            self._save_state()
+
+    # ------------------------------------------------------------------
+    # State persistence — circuit breakers must survive restarts.
+    # systemd auto-restarts the bot on crash; without this, a crash loop
+    # would silently reset the max-drawdown peak and the daily trade cap.
+    # ------------------------------------------------------------------
+
+    def _load_state(self) -> None:
+        try:
+            with open(self._state_path) as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            logger.warning("RiskManager state load failed (%s) — starting fresh", exc)
+            return
+
+        self._peak_value = float(data.get("peak_value", 0.0))
+        # Daily counters only apply if the saved state is from the same UTC day
+        if data.get("today") == self._today.isoformat():
+            self._fills_today = int(data.get("fills_today", 0))
+            self._fills_by_symbol = dict(data.get("fills_by_symbol") or {})
+            _dov = data.get("day_open_value")
+            self._day_open_value = float(_dov) if _dov is not None else None
+        logger.info(
+            "RiskManager state restored | peak=$%.2f fills_today=%d day_open=%s",
+            self._peak_value, self._fills_today,
+            f"${self._day_open_value:.2f}" if self._day_open_value else "unset",
+        )
+
+    def _save_state(self) -> None:
+        if not self._state_path:
+            return
+        try:
+            tmp_path = self._state_path + ".tmp"
+            with open(tmp_path, "w") as fh:
+                json.dump({
+                    "today":           self._today.isoformat(),
+                    "fills_today":     self._fills_today,
+                    "fills_by_symbol": self._fills_by_symbol,
+                    "day_open_value":  self._day_open_value,
+                    "peak_value":      self._peak_value,
+                }, fh)
+            os.replace(tmp_path, self._state_path)
+        except Exception as exc:
+            logger.warning("RiskManager state save failed: %s", exc)

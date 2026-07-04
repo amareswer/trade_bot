@@ -155,7 +155,7 @@ A robust crypto trading system that:
 
 ## Test Suite Manifest (as of 2026-07-03)
 
-Expected total: **139 tests**. If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result.
+Expected total: **152 tests**. If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result.
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -163,17 +163,18 @@ Expected total: **139 tests**. If `pytest --collect-only -q` reports a lower num
 | `test_live_executor.py` | 21 | LiveExecutor: dry-run, market/limit orders, fee deduction, state save/load |
 | `test_capital_pool.py` | 19 | CapitalPool: slot allocation, slot cap, release, edge cases |
 | `test_correlation.py` | 17 | Pearson correlation, pct_returns, fetch_correlation |
-| `test_risk_manager.py` | 12 | RiskManager: halt gate, daily loss, position size, SL/TP bypass |
+| `test_risk_manager.py` | 20 | RiskManager: halt gate, daily loss, position size, SL/TP bypass, state persistence, per-symbol caps, aggregate account breakers |
 | `test_fill_recording.py` | 8 | BUG 1: qty=0 fill — filled priority, amount fallback, guard, TradeLog guard |
 | `test_external_holdings.py` | 6 | External-holdings guard in _sync_position (adopt=false/true) |
 | `test_executor.py` | 6 | PaperExecutor: BUY/SELL, insufficient cash, history |
 | `test_drift_escalation.py` | 6 | BUG 2: consecutive drift counter, escalation threshold, resolution reset |
 | `test_tsx_validation.py` | 5 | Stock-bot TSX price sanity check |
 | `test_candle_watchdog.py` | 5 | Candle watchdog: timing, alert, no double-fire |
+| `test_halt_flag.py` | 5 | Manual halt kill-switch: logs/HALT flag file engage/lift, ownership guard |
 | `test_universe.py` | 4 | Universe screener: scoring, momentum filter, fallback |
 | `test_main_strategy.py` | 2 | Strategy builder: full config wiring |
 
-Run: `python -m pytest --tb=short -q` — must show **139 passed**.
+Run: `python -m pytest --tb=short -q` — must show **152 passed**.
 
 ---
 
@@ -297,11 +298,40 @@ SELL signals do meaningful work, reducing fee sensitivity.
 - `volume_k` field wired through IndicatorConfig → StrategyConfig → AppConfig → engine.py → backtest.py → main.py
   (set VOLUME_K=0 to disable; VOLUME_K=1.2 requires current candle volume ≥ 1.2× avg of prior 3)
 
+### Crypto bot hardening (2026-07-03)
+- **Manual kill-switch:** `touch logs/HALT` engages the risk manager's manual halt without a
+  restart (blocks BUY + strategy SELL; SL/TP exits still fire). `rm logs/HALT` resumes.
+  Telegram alert on engage/lift. Helper: `_check_halt_flag()` in `bot/main.py`.
+- **Risk breaker state persists across restarts:** `logs/risk_state.json` stores the all-time
+  drawdown peak, day-open value, and daily fill count (live mode only — backtests stay
+  stateless). Previously a crash/restart silently reset the max-drawdown breaker and the
+  daily trade cap. Daily counters only restore if saved on the same UTC day; peak always restores.
+- **RiskManager daily reset now uses UTC** (`_utc_today()`), matching candle timestamps and
+  the daily P&L alert — was local `date.today()`, resetting counters at local midnight.
+- **Daily P&L Telegram alert fires exactly once per UTC day** — date-change trigger replaced
+  the `hour==0 and minute==0` window, which double-fired on a 30s loop and could skip entirely.
+
+### Multi-coin readiness (2026-07-03)
+The live loop is now safe to run with >1 symbol in UNIVERSE_WHITELIST. Single-symbol behavior
+is numerically identical; strategy files untouched (hash `659d1c03987b72fd` still valid).
+- **Aggregate account breakers:** `risk.evaluate(..., account_value=..., symbol=...)` — daily-loss
+  and max-drawdown now measure the whole account (sum of all slots), not whichever slot happens
+  to evaluate that tick. Position-size check stays per-slot. Backtests use the old positional
+  signature and are unchanged.
+- **Per-symbol daily trade cap:** `record_fill(symbol)` + `fills_today_for(symbol)` — each symbol
+  gets its own RISK_MAX_TRADES_PER_DAY budget, persisted in `logs/risk_state.json`.
+- **Monitoring covers every symbol** (was active-symbol only): drift reconciliation, candle
+  watchdog, price-feed error counter, and daily P&L alert all run per symbol.
+- **Universe refresh guard:** the 24h refresh can no longer switch to a symbol that was not
+  initialized at startup (no executor / cold strategy) — it logs and keeps the current symbol.
+- Adding a second coin still requires: walk-forward pass on current strategy code, capital
+  ≥ $250, and the capital sizing rules above. The code is ready; the edge and capital are the gates.
+
 ### Bug fixes applied 2026-06-20
 All critical bugs resolved:
 
 **Crypto bot (bot/):**
-- `bot/risk/risk_manager.py`: HALT gate now only blocks BUY — SELL always allowed (positions can close during halt)
+- `bot/risk/risk_manager.py`: daily-loss, max-drawdown, and trade-cap checks block BUY only — SELL always allowed. Manual HALT blocks BUY and strategy SELL, but SL/TP exits bypass the risk gate entirely (unless `RISK_HALT_BLOCKS_STOPS=true`), so stops always fire during a halt.
 - `bot/backtest/engine.py`: Added `forced_exit` flag — SL/TP triggers bypass cooldown state machine (stop-losses were being suppressed)
 - `walkforward.py` + `montecarlo.py`: ADX threshold corrected 15.0 → 18.0 (was testing wrong strategy vs live)
 - `config.py`: Defaults corrected — fee 0.001→0.008, SL 0.02→0.015, TP 0.04→0.10 (both dataclass and _load())
@@ -547,6 +577,16 @@ All of the following must be met before adding any USD pair to UNIVERSE_WHITELIS
    ~0.20% conversion; USD P&L requires separate tracking from CAD base)
 5. Full 3-window walk-forward pass on the CURRENT strategy code at promotion time (a pass on
    an older hash does not count)
+
+### ATR stop-loss experiment (2026-07-04) — near-miss follow-up
+`atr_sl_experiment.py` tested ATR-scaled stops (1.5–3.0 × ATR14) vs the fixed 1.5% SL on
+SYN, LINK, XRP, BTC. Report: `logs/atr_sl_experiment_20260704.md`.
+- SL-exit rates drop 76–87% → 9–43% everywhere; SYN and LINK clear the full screen gate
+  in-sample at ATR×2.0–2.5 (PF ≥ 1.2 all windows). XRP still fails (entries have no edge).
+- **OOS shows PF parity, not improvement** — ATR SL is a variance/fee improvement, not alpha.
+- BTC/CAD live stays on validated fixed SL. SYN/LINK are conditional candidates: all USD
+  preconditions above + fresh per-symbol walk-forward at the chosen mult + SL-distance-based
+  position sizing (wider stop must not raise dollar risk per trade).
 
 ### Re-screen triggers
 - Strategy code change (new hash after walk-forward) — re-screen all alts before assuming new results

@@ -349,16 +349,54 @@ def _check_candle_watchdog(
     candle_minutes: int,
     now: float,
     alerter: "TelegramAlerter",
+    symbol: str = "",
 ) -> float:
     """Return updated last_candle_time. Fires alerter.error() if feed is stale."""
     stale_s = candle_minutes * 60 * 2
     if now - last_candle_time > stale_s:
+        _sym_label = f" [{symbol}]" if symbol else ""
         alerter.error(
-            f"Candle watchdog: no new {candle_minutes}min candle "
+            f"Candle watchdog{_sym_label}: no new {candle_minutes}min candle "
             f"for {int((now - last_candle_time) / 60)} minutes — feed may be stale"
         )
         return now  # reset so we don't spam every tick
     return last_candle_time
+
+
+# ---------------------------------------------------------------------------
+# Manual halt flag file (extracted for unit-testability)
+# ---------------------------------------------------------------------------
+_HALT_FLAG_PATH = os.path.join(_log_dir, "HALT")
+
+
+def _check_halt_flag(
+    risk: "RiskManager",
+    flag_path: str,
+    halt_file_active: bool,
+    alerter: "TelegramAlerter",
+) -> bool:
+    """Engage/lift the manual halt based on presence of the HALT flag file.
+
+    Operational kill-switch: `touch logs/HALT` halts new trades without a
+    restart; `rm logs/HALT` resumes. Returns the updated halt_file_active
+    so a halt engaged elsewhere (e.g. a future Telegram command) is never
+    lifted by this helper.
+    """
+    exists = os.path.exists(flag_path)
+    if exists and not risk.config.halt:
+        risk.halt()
+        alerter.error(
+            f"Manual HALT engaged — {flag_path} detected. "
+            f"BUY and strategy SELL blocked; SL/TP exits still fire. "
+            f"Remove the file to resume."
+        )
+        return True
+    if not exists and halt_file_active:
+        if risk.config.halt:
+            risk.resume()
+        alerter.error(f"Manual HALT lifted — {flag_path} removed. Trading resumed.")
+        return False
+    return halt_file_active
 
 
 # ---------------------------------------------------------------------------
@@ -511,12 +549,18 @@ def run():
             {s: f"${e.cash:.2f}" for s, e in executors.items()},
         )
 
-    risk = RiskManager(RiskConfig(
-        max_position_pct     = cfg.risk.max_position_pct,
-        daily_loss_limit_pct = cfg.risk.daily_loss_limit_pct,
-        max_drawdown_pct     = cfg.risk.max_drawdown_pct,
-        max_trades_per_day   = cfg.risk.max_trades_per_day,
-    ))
+    risk = RiskManager(
+        RiskConfig(
+            max_position_pct     = cfg.risk.max_position_pct,
+            daily_loss_limit_pct = cfg.risk.daily_loss_limit_pct,
+            max_drawdown_pct     = cfg.risk.max_drawdown_pct,
+            max_trades_per_day   = cfg.risk.max_trades_per_day,
+        ),
+        # Persist breaker state (drawdown peak, daily counters) across restarts
+        # in live mode only — backtests/paper runs stay stateless.
+        state_path = os.path.join(_log_dir, "risk_state.json")
+                     if cfg.exchange.live_trading else None,
+    )
     ai = AIEngine(
         model          = cfg.ai.model,
         min_confidence = cfg.ai.min_confidence,
@@ -594,16 +638,19 @@ def run():
             last_ts = _warmup_strategy(strat, live_exchange, _LIVE_TF, symbol=sym)
 
             symbol_state[sym] = {
-                'strategy':     strat,
-                'sm':           sm,
-                'pm':           pm,
-                'executor':     executors[sym],
-                'last_ts_ms':   last_ts,
-                'trail_peak':   0.0,
-                'partial_done': False,
-                'atr_sl':       0.0,
-                'atr_tp':       0.0,
-                'last_price':   0.0,
+                'strategy':         strat,
+                'sm':               sm,
+                'pm':               pm,
+                'executor':         executors[sym],
+                'last_ts_ms':       last_ts,
+                'trail_peak':       0.0,
+                'partial_done':     False,
+                'atr_sl':           0.0,
+                'atr_tp':           0.0,
+                'last_price':       0.0,
+                'err_count':        0,            # consecutive price-fetch failures
+                'drift_count':      0,            # consecutive drift detections
+                'last_candle_time': time.time(),  # candle watchdog timer
             }
             logger.info("Symbol ready: %s", sym)
 
@@ -628,16 +675,19 @@ def run():
             print(f"  MTF: daily candle fetch failed ({_mtf_exc}) — MTF disabled this session.", flush=True)
     else:
         symbol_state[_active_symbol] = {
-            'strategy':     strategy,
-            'sm':           TradingStateMachine(cooldown_ticks=cfg.risk.cooldown_ticks),
-            'pm':           PositionManager(),
-            'executor':     executor,
-            'last_ts_ms':   None,
-            'trail_peak':   0.0,
-            'partial_done': False,
-            'atr_sl':       0.0,
-            'atr_tp':       0.0,
-            'last_price':   0.0,
+            'strategy':         strategy,
+            'sm':               TradingStateMachine(cooldown_ticks=cfg.risk.cooldown_ticks),
+            'pm':               PositionManager(),
+            'executor':         executor,
+            'last_ts_ms':       None,
+            'trail_peak':       0.0,
+            'partial_done':     False,
+            'atr_sl':           0.0,
+            'atr_tp':           0.0,
+            'last_price':       0.0,
+            'err_count':        0,
+            'drift_count':      0,
+            'last_candle_time': time.time(),
         }
 
     # ── Restart recovery ──────────────────────────────────────────────────────
@@ -692,11 +742,21 @@ def run():
 
     tick        = 0
     tick_log:   deque[dict] = deque(maxlen=200)
-    _consecutive_errors = 0
     _drift_consecutive_failures = 0
-    _drift_consecutive_count    = 0   # consecutive ticks where position drift was detected
     candle_log: deque[dict] = deque(maxlen=50)
-    _last_candle_time = time.time()
+
+    def _account_value() -> float:
+        """Aggregate account value across ALL symbol slots (cash + marked positions).
+        Fed to the risk gate so daily-loss/drawdown breakers measure the whole
+        account, not just the slot being evaluated. With one symbol this equals
+        that slot's portfolio value — behavior unchanged."""
+        total = 0.0
+        for _s, _e in executors.items():
+            _px = symbol_state[_s]['last_price'] if _s in symbol_state else 0.0
+            if not _px:
+                _px = getattr(_e, "avg_entry", 0.0) or 0.0
+            total += _e.cash + _e.position * _px
+        return total
 
     # Trailing stop and partial TP state — reset on each new trade
     _trail_peak:      float = 0.0
@@ -766,8 +826,16 @@ def run():
         except Exception as exc:
             logger.warning("Dashboard render failed: %s", exc)
 
+    _halt_file_active = False
+    _last_daily_pnl_date = datetime.now(_tz.utc).date()
+
     while _running:
         tick += 1
+
+        # ── 0a. Manual halt flag file (touch logs/HALT to kill-switch) ──
+        _halt_file_active = _check_halt_flag(
+            risk, _HALT_FLAG_PATH, _halt_file_active, alerter
+        )
 
         # ── 0. Universe refresh (every 24h) ──────────────────────────
         if (cfg.universe.enabled and
@@ -779,12 +847,22 @@ def run():
                 )
                 new_symbol = _universe_symbols[0]
                 if new_symbol != _active_symbol:
-                    logger.info(
-                        "Universe refresh: switching %s → %s",
-                        _active_symbol, new_symbol,
-                    )
-                    _active_symbol = new_symbol
-                    cfg.exchange.symbol = new_symbol
+                    # Only switch to symbols initialized at startup — they have an
+                    # executor, warmed strategy, and state machine. A brand-new
+                    # symbol would trade cold with no executor: skip until restart.
+                    if new_symbol in symbol_state:
+                        logger.info(
+                            "Universe refresh: switching %s → %s",
+                            _active_symbol, new_symbol,
+                        )
+                        _active_symbol = new_symbol
+                        cfg.exchange.symbol = new_symbol
+                    else:
+                        logger.warning(
+                            "Universe refresh: %s not initialized at startup"
+                            " — keeping %s (restart to trade new symbols)",
+                            new_symbol, _active_symbol,
+                        )
                 _universe_last_refresh = time.time()
             except Exception as _univ_exc:
                 logger.warning(
@@ -800,12 +878,12 @@ def run():
                 try:
                     price = float(live_exchange.fetch_ticker(sym)['last'])
                     ss['last_price'] = price
-                    _consecutive_errors = 0
+                    ss['err_count'] = 0
                 except Exception as exc:
-                    _consecutive_errors += 1
-                    if _consecutive_errors >= 5:
+                    ss['err_count'] += 1
+                    if ss['err_count'] >= 5:
                         alerter.error(
-                            f"Price feed down {_consecutive_errors} consecutive ticks — {exc}"
+                            f"Price feed down [{sym}] {ss['err_count']} consecutive ticks — {exc}"
                         )
                     logger.warning("price fetch failed for %s: %s", sym, exc)
                     price = ss['last_price']
@@ -815,24 +893,25 @@ def run():
                 try:
                     price = feed.get_price()
                     ss['last_price'] = price
-                    _consecutive_errors = 0
+                    ss['err_count'] = 0
                 except Exception as exc:
-                    _consecutive_errors += 1
-                    if _consecutive_errors >= 5:
+                    ss['err_count'] += 1
+                    if ss['err_count'] >= 5:
                         alerter.error(
-                            f"Price feed down {_consecutive_errors} consecutive ticks — {exc}"
+                            f"Price feed down [{sym}] {ss['err_count']} consecutive ticks — {exc}"
                         )
                     print(f"  TICK {tick:04d} | price fetch failed: {exc}")
                     continue
 
-            # ── 1b. Candle watchdog (active symbol, live only) ────────
-            if cfg.exchange.feed_mode == "live" and sym == _active_symbol:
-                _last_candle_time = _check_candle_watchdog(
-                    _last_candle_time, cfg.exchange.candle_minutes, time.time(), alerter
+            # ── 1b. Candle watchdog (every symbol, live only) ─────────
+            if cfg.exchange.feed_mode == "live":
+                ss['last_candle_time'] = _check_candle_watchdog(
+                    ss['last_candle_time'], cfg.exchange.candle_minutes,
+                    time.time(), alerter, symbol=sym,
                 )
 
-            # ── 1c. Position drift reconciliation (every 120 ticks, live) ──
-            if cfg.exchange.live_trading and not cfg.exchange.dry_run and sym == _active_symbol and tick % 120 == 0:
+            # ── 1c. Position drift reconciliation (every symbol, every 120 ticks, live) ──
+            if cfg.exchange.live_trading and not cfg.exchange.dry_run and tick % 120 == 0:
                 _drift_delays = [5, 15, 30]
                 _drift_succeeded = False
                 for _attempt, _delay in enumerate(_drift_delays):
@@ -844,30 +923,30 @@ def run():
                         drift = abs(exchange_pos - bot_pos)
                         _drift_threshold = cfg.exchange.drift_alert_threshold
                         if drift > 0.000010:
-                            _drift_consecutive_count += 1
+                            ss['drift_count'] += 1
                             logger.warning(
-                                "POSITION DRIFT [%d/%d]: exchange=%.6f bot=%.6f"
+                                "POSITION DRIFT [%s] [%d/%d]: exchange=%.6f bot=%.6f"
                                 " drift=%.6f %s",
-                                _drift_consecutive_count, _drift_threshold,
+                                sym, ss['drift_count'], _drift_threshold,
                                 exchange_pos, bot_pos, drift, base,
                             )
-                            if _drift_consecutive_count >= _drift_threshold:
+                            if ss['drift_count'] >= _drift_threshold:
                                 alerter.error(
-                                    f"PERSISTENT position drift after"
-                                    f" {_drift_consecutive_count} consecutive checks:"
+                                    f"PERSISTENT position drift [{sym}] after"
+                                    f" {ss['drift_count']} consecutive checks:"
                                     f" exchange={exchange_pos:.6f}"
                                     f" bot={bot_pos:.6f} {base}"
-                                    f" — check logs/live_state.json"
+                                    f" — check logs/live_state_{sym.replace('/', '_')}.json"
                                 )
-                                _drift_consecutive_count = 0
+                                ss['drift_count'] = 0
                         else:
-                            if _drift_consecutive_count > 0:
+                            if ss['drift_count'] > 0:
                                 logger.info(
-                                    "Position drift resolved: exchange=%.6f"
+                                    "Position drift resolved [%s]: exchange=%.6f"
                                     " bot=%.6f %s",
-                                    exchange_pos, bot_pos, base,
+                                    sym, exchange_pos, bot_pos, base,
                                 )
-                            _drift_consecutive_count = 0
+                            ss['drift_count'] = 0
                         _drift_succeeded = True
                         _drift_consecutive_failures = 0
                         break
@@ -919,11 +998,14 @@ def run():
                     ):
                         _p_qty = round(ss['pm'].quantity * cfg.backtest.partial_tp_size, 6)
                         if _p_qty > 0:
-                            _p_approval = risk.evaluate(Signal.SELL, price, ss['executor'].portfolio, _p_qty)
+                            _p_approval = risk.evaluate(
+                                Signal.SELL, price, ss['executor'].portfolio, _p_qty,
+                                account_value=_account_value(), symbol=sym,
+                            )
                             if _p_approval.approved:
                                 _p_order = ss['executor'].execute(Signal.SELL, price, quantity=_p_qty)
                                 if _p_order and _p_order.status == OrderStatus.FILLED:
-                                    risk.record_fill()
+                                    risk.record_fill(sym)
                                     ss['sm'].on_fill(Signal.SELL, _p_order.price)
                                     _p_pnl = ss['pm'].on_sell(_p_order.price, _p_order.quantity)
                                     ss['partial_done'] = True
@@ -988,7 +1070,7 @@ def run():
                         if not _sl_tp_halted:
                             _ic_order = ss['executor'].execute(Signal.SELL, price, quantity=_ic_qty)
                             if _ic_order and _ic_order.status == OrderStatus.FILLED:
-                                risk.record_fill()
+                                risk.record_fill(sym)
                                 ss['sm'].on_fill(Signal.SELL, _ic_order.price)
                                 _ic_pnl = ss['pm'].on_sell(_ic_order.price, _ic_order.quantity)
                                 ss['trail_peak'] = 0.0
@@ -1071,8 +1153,7 @@ def run():
                         _render_dashboard(_dash_signal, _dash_rsi, _dash_trend)
                     continue  # no new candle for this symbol
                 ss['last_ts_ms'] = new_ts
-                if sym == _active_symbol:
-                    _last_candle_time = time.time()
+                ss['last_candle_time'] = time.time()
                 raw_signal = ss['strategy'].evaluate(candle)
             elif is_indicator:
                 # Simulated mode: flat fake candle per tick
@@ -1320,7 +1401,10 @@ def run():
                 final_signal = merge_signals(filtered_signal, advice)
 
             # ── 7. Risk gate ──────────────────────────────────────────
-            approval     = risk.evaluate(final_signal, price, ss['executor'].portfolio, trade_qty)
+            approval     = risk.evaluate(
+                final_signal, price, ss['executor'].portfolio, trade_qty,
+                account_value=_account_value(), symbol=sym,
+            )
             block_reason = "" if approval else approval.message
             if not approval and final_signal == Signal.BUY and not _buy_block_gate:
                 _buy_block_gate = "risk_manager"
@@ -1439,7 +1523,7 @@ def run():
                 order = ss['executor'].execute(final_signal, price, quantity=trade_qty)
                 if order:
                     if order.status == OrderStatus.FILLED:
-                        risk.record_fill()
+                        risk.record_fill(sym)
                         ss['sm'].on_fill(final_signal, order.price)
 
                         pnl = None
@@ -1534,17 +1618,23 @@ def run():
         # ── End of per-symbol loop ────────────────────────────────────
         time.sleep(cfg.exchange.loop_interval)
         _now_utc = datetime.now(_tz.utc)
-        if _now_utc.hour == 0 and _now_utc.minute == 0:
-            _act_ss = symbol_state.get(_active_symbol, next(iter(symbol_state.values())))
-            _act_ex = executors.get(_active_symbol, next(iter(executors.values())))
-            alerter.daily_pnl(
-                symbol       = _active_symbol,
-                realized_pnl = _act_ss['pm'].realized_pnl,
-                total_value  = _act_ex.portfolio.total_value(
-                    _act_ss.get('last_price') or 0
-                ),
-                trade_count  = risk._fills_today,
-            )
+        # Fire exactly once per UTC day — date-change check instead of a
+        # minute-0 window, which double-fired on a 30s loop interval and
+        # skipped entirely when a tick ran past the minute.
+        if _now_utc.date() != _last_daily_pnl_date:
+            _last_daily_pnl_date = _now_utc.date()
+            for _dp_sym, _dp_ss in symbol_state.items():
+                _dp_ex = executors.get(_dp_sym)
+                if _dp_ex is None:
+                    continue
+                alerter.daily_pnl(
+                    symbol       = _dp_sym,
+                    realized_pnl = _dp_ss['pm'].realized_pnl,
+                    total_value  = _dp_ex.portfolio.total_value(
+                        _dp_ss.get('last_price') or 0
+                    ),
+                    trade_count  = risk.fills_today_for(_dp_sym),
+                )
 
     display.stopped(
         ticks        = tick,
