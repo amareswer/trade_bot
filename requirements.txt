@@ -4,7 +4,7 @@ openai>=1.0          # OpenRouter-compatible client (crypto AI advisory)
 
 # Stock bot
 ollama>=0.4.0        # official Ollama Python client (ollama_cloud provider)
-yfinance>=0.2        # US + TSX market data (NYSE, NASDAQ, TSX via .TO suffix)
+yfinance>=1.2,<2     # US + TSX market data (.TO suffix). 1.x uses curl_cffi impersonation — fixes Yahoo rate-limit blocks (upgraded 2026-07-04 from 0.2.54). 1.2.0 = newest on Python 3.9; 1.5+ needs 3.10.
 pandas>=2.0          # DataFrame handling for yfinance output
 requests>=2.28       # HTTP client for Fear & Greed + StockTwits + future APIs
 pytrends>=4.0        # Google Trends interest score — no API key required
