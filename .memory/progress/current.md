@@ -27,6 +27,17 @@ metadata:
   ALWAYS restart the watcher after editing unified_dashboard.py.
 - Tests: 155 total (152 + 3 stock breaker). CLAUDE.md manifest + roadmap item 7 updated.
 
+### yfinance weekend spiral + upgrade (late session)
+- SL/TP watcher (30s) + FastValidator (300s) threads had NO market-hours gate — polled Yahoo
+  all weekend, perpetually re-tripping the rate limiter. Both now gated on
+  `_get_market_status()["any_open"]` (sleep 300s when closed).
+- yfinance upgraded 0.2.54 → **1.2.0** (+ curl_cffi 0.13 browser impersonation).
+  Proof it works: AC.TO — blocked all night on 0.2.54 — fetched instantly on 1.2.0.
+  1.2.0 is the NEWEST version that runs on Python 3.9 (1.5+ needs curl_cffi≥0.15 → Python 3.10).
+  requirements.txt pinned `yfinance>=1.2,<2`. 155/155 tests pass on the new version.
+- Escape hatch if limits ever return: hybrid provider (Alpaca free API for US symbols,
+  yfinance only for .TO) — price_feed.py is the seam. Moving to Python 3.10+ unlocks yfinance 1.5+.
+
 ### Dashboard integrated into crypto bot (late session)
 - `bot/main.py` `_unified_dashboard_loop()` daemon thread regenerates unified_dashboard.html
   every 60s via subprocess (regime-monitor isolation pattern; `UNIFIED_DASHBOARD_INTERVAL=0`
