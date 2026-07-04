@@ -324,9 +324,14 @@ SELL signals do meaningful work, reducing fee sensitivity.
     peak/day-open from `logs/risk_state.json`.
   - Stock positions table shows live price / market value / unrealized P&L via the stock
     bot's own guarded `latest_price()` (falls back to cost marks when yfinance rate-limits).
-  - NOTE: `--watch` keeps the module in memory — **restart the watcher after editing
-    unified_dashboard.py** or it keeps regenerating with old code (bit us 2026-07-04:
-    a watcher from Jun 26 was overwriting the new output every 30s).
+  - **Now auto-refreshed by the crypto bot** (2026-07-04): `bot/main.py` runs
+    `_unified_dashboard_loop()` as a daemon thread — regenerates every 60s via subprocess
+    (same isolation pattern as the regime monitor). `UNIFIED_DASHBOARD_INTERVAL=0` disables.
+    No separate `--watch` terminal needed. Because each refresh is a fresh subprocess, it
+    always runs current code (a long-lived `--watch` from Jun 26 once held stale code in
+    memory and overwrote new output every 30s — that failure mode is gone).
+  - Stock prices are TTL-cached 15 min in `logs/stock_price_cache.json` (cross-process) —
+    without it, per-cycle yfinance calls got rate-limited within minutes.
 
 ### Multi-coin readiness (2026-07-03)
 The live loop is now safe to run with >1 symbol in UNIVERSE_WHITELIST. Single-symbol behavior

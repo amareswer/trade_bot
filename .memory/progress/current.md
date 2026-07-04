@@ -27,6 +27,16 @@ metadata:
   ALWAYS restart the watcher after editing unified_dashboard.py.
 - Tests: 155 total (152 + 3 stock breaker). CLAUDE.md manifest + roadmap item 7 updated.
 
+### Dashboard integrated into crypto bot (late session)
+- `bot/main.py` `_unified_dashboard_loop()` daemon thread regenerates unified_dashboard.html
+  every 60s via subprocess (regime-monitor isolation pattern; `UNIFIED_DASHBOARD_INTERVAL=0`
+  disables). No separate `--watch` terminal anymore; stale-module failure mode eliminated.
+- Stock prices TTL-cached 15 min to `logs/stock_price_cache.json` (cross-process) — per-cycle
+  yfinance calls were getting rate-limited within minutes.
+- Verified live: bot restart 2026-07-04 00:51, thread refreshing the HTML, no stray watchers.
+- Operator setup is now exactly 2 terminals: `python -m bot.main` (crypto + dashboard) and
+  `python -m stock_bot.main` (stocks).
+
 ---
 
 ## Session 2026-07-03 (Session 7) — Full Audit + Crypto Hardening + Multi-Coin Readiness (COMPLETE ✅)
