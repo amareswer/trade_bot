@@ -309,6 +309,37 @@ def _regime_monitor_loop(symbols: list, exchange_id: str, interval_seconds: int 
 
 
 # ---------------------------------------------------------------------------
+# Unified dashboard background thread
+# ---------------------------------------------------------------------------
+
+def _unified_dashboard_loop(interval_s: int = 60) -> None:
+    """Daemon thread: regenerate unified_dashboard.html every interval_s.
+
+    Runs the generator as a subprocess for the same reasons as the regime
+    monitor: its Kraken/yfinance calls stay isolated from the bot's own
+    connections, and every run loads fresh code — no long-lived --watch
+    process holding a stale module in memory."""
+    import subprocess
+    import sys as _sys
+
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script = os.path.join(project_root, "unified_dashboard.py")
+
+    while True:
+        try:
+            subprocess.run(
+                [_sys.executable, script],
+                cwd=project_root,
+                timeout=90,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            logger.warning("Unified dashboard refresh failed: %s", exc)
+        time.sleep(interval_s)
+
+
+# ---------------------------------------------------------------------------
 # Crash-loop detection helper
 # ---------------------------------------------------------------------------
 _STARTUP_LOG = os.path.join(_log_dir, "startup_timestamps.txt")
@@ -825,6 +856,22 @@ def run():
             )
         except Exception as exc:
             logger.warning("Dashboard render failed: %s", exc)
+
+    # ── Unified dashboard background thread ───────────────────────────────
+    # UNIFIED_DASHBOARD_INTERVAL=0 disables (e.g. when running
+    # `python unified_dashboard.py --watch` manually instead).
+    _ud_interval = int(os.getenv("UNIFIED_DASHBOARD_INTERVAL", "60"))
+    if cfg.dashboard.enabled and _ud_interval > 0:
+        _ud_thread = threading.Thread(
+            target=_unified_dashboard_loop,
+            args=(_ud_interval,),
+            daemon=True,
+            name="unified-dashboard",
+        )
+        _ud_thread.start()
+        logger.info("Unified dashboard thread started (interval=%ds)", _ud_interval)
+        print(f"  Unified dashboard → file://{os.path.join(os.path.dirname(_DASHBOARD_PATH), 'unified_dashboard.html')}"
+              f"  (refreshes every {_ud_interval}s)\n", flush=True)
 
     _halt_file_active = False
     _last_daily_pnl_date = datetime.now(_tz.utc).date()
