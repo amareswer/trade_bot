@@ -528,9 +528,18 @@ def _stock_card(state: dict | None) -> str:
     )
 
 
+# Price cache: {symbol: (price_or_None, fetched_at_epoch)}. The watcher
+# regenerates every 30s — without a TTL that means a yfinance call per symbol
+# per cycle, which Yahoo rate-limits within minutes. Failures are cached too
+# so a rate-limited symbol isn't retried every cycle.
+_stock_price_cache: dict[str, tuple[float | None, float]] = {}
+STOCK_PRICE_TTL_S = 900   # 15 min — plenty fresh for a paper dashboard
+
+
 def _fetch_stock_prices(symbols: list[str]) -> dict[str, float]:
-    """Live prices via the stock bot's own guarded feed (yf.download path).
-    Returns {} on any failure — the table falls back to avg-cost marks."""
+    """Live prices via the stock bot's own guarded feed, TTL-cached.
+    Returns only symbols with a known price — the table falls back to
+    avg-cost marks for the rest."""
     prices: dict[str, float] = {}
     if not symbols:
         return prices
@@ -538,13 +547,23 @@ def _fetch_stock_prices(symbols: list[str]) -> dict[str, float]:
         from stock_bot.data.price_feed import latest_price
     except Exception:
         return prices
+    now = time.time()
     for sym in symbols:
+        cached = _stock_price_cache.get(sym)
+        if cached is not None and now - cached[1] < STOCK_PRICE_TTL_S:
+            if cached[0] is not None:
+                prices[sym] = cached[0]
+            continue
+        price: float | None = None
         try:
             p = latest_price(sym)
             if p and p > 0:
-                prices[sym] = float(p)
+                price = float(p)
         except Exception:
-            continue
+            price = None
+        _stock_price_cache[sym] = (price, now)
+        if price is not None:
+            prices[sym] = price
     return prices
 
 
