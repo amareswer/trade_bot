@@ -633,13 +633,20 @@ def run() -> None:
     print()
 
     # ── Background SL/TP watcher (every 30s, independent of main scan loop) ──
+    # Market-hours gated: prices cannot move while markets are closed, and
+    # unguarded weekend polling kept the IP permanently yfinance-rate-limited
+    # (each 30s retry cycle re-tripped the limiter — observed 2026-07-04).
     def _sl_tp_watcher() -> None:
         while True:
             try:
-                _check_open_positions_sl_tp(executor, cfg)
+                if _get_market_status()["any_open"]:
+                    _check_open_positions_sl_tp(executor, cfg)
+                    time.sleep(30)
+                else:
+                    time.sleep(300)   # closed — check the clock, not Yahoo
             except Exception as _exc:
                 logger.warning("SL/TP watcher error: %s", _exc)
-            time.sleep(30)
+                time.sleep(30)
 
     if executor:
         _watcher = threading.Thread(target=_sl_tp_watcher, daemon=True)
@@ -649,15 +656,21 @@ def run() -> None:
     notifier.start_weekly_summary()
 
     def _fast_validator_worker() -> None:
+        # Market-hours gated for the same reason as the SL/TP watcher — its
+        # candle fetches for exit checks were part of the weekend rate-limit spiral.
         while True:
             try:
-                result  = fast_validator.run_cycle(watchlist_symbols, ai_engine)
-                open_c  = result["open_count"]
-                exits_c = len(result["exits"])
-                logger.info("FastValidator: %d open, %d completed today", open_c, exits_c)
+                if _get_market_status()["any_open"]:
+                    result  = fast_validator.run_cycle(watchlist_symbols, ai_engine)
+                    open_c  = result["open_count"]
+                    exits_c = len(result["exits"])
+                    logger.info("FastValidator: %d open, %d completed today", open_c, exits_c)
+                    time.sleep(_fast_loop_interval)
+                else:
+                    time.sleep(max(_fast_loop_interval, 300))
             except Exception as _exc:
                 logger.warning("FastValidator error: %s", _exc)
-            time.sleep(_fast_loop_interval)
+                time.sleep(_fast_loop_interval)
 
     if fast_validator:
         _fv_thread = threading.Thread(target=_fast_validator_worker, daemon=True)

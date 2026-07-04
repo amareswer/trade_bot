@@ -80,6 +80,16 @@ PROTECTED=BMO.TO,CM.TO,SPCX              # display only, never paper-sell
   Tests: `test_stock_breaker.py` (paths monkeypatched to tmp — never touches real
   paper_state.json). Self-test `python stock_bot/execution/paper.py` still passes.
 
+## Weekend rate-limit spiral (fixed 2026-07-04)
+The SL/TP watcher (30s) and FastValidator (300s) background threads in `stock_bot/main.py`
+ran 24/7 with no market-hours gate — all weekend they polled yfinance (positions +
+full watchlist entry scan), each retry cycle re-tripping the rate limiter so the IP
+stayed blocked continuously. Main loop was gated; the threads were not. Both now check
+`_get_market_status()["any_open"]` and sleep 300s when closed. Symptom to recognize:
+endless `YFRateLimitError` + `circuit breaker tripped` every ~2.5 min on a weekend.
+Note: FastValidator holds its OWN paper book (`fast_validator_state.json`, e.g. AMZN/HOOD)
+separate from paper_state.json (AC.TO/DLTR) — different positions there are by design.
+
 ## Earnings blackout (added 2026-06-28)
 
 File: `stock_bot/main.py` — `_is_earnings_blackout(symbol, research, cfg) -> bool`
