@@ -29,22 +29,32 @@ load_dotenv()
 # ── Logging setup ────────────────────────────────────────────────────────────
 _log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
 os.makedirs(_log_dir, exist_ok=True)
-_file_handler = logging.handlers.RotatingFileHandler(
-    os.path.join(_log_dir, "trade_bot.log"),
-    maxBytes=10_000_000,
-    backupCount=5,
-)
-_file_handler.setLevel(logging.INFO)
-_file_handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
-_console_handler = logging.StreamHandler()
-_console_handler.setLevel(logging.WARNING)
-_root_logger = logging.getLogger()
-_root_logger.handlers.clear()
-_root_logger.setLevel(logging.INFO)
-_root_logger.addHandler(_console_handler)
-_root_logger.addHandler(_file_handler)
 
 logger = logging.getLogger(__name__)
+
+
+def _setup_logging() -> None:
+    """Install root handlers — called from run(), NOT at import time.
+
+    Import-time installation meant every test run that imported bot.main
+    wrote into the production logs/trade_bot.log: it polluted forensics,
+    faked the dashboard heartbeat (log mtime = "bot alive"), and a pytest
+    run even rotated the live log at 10MB out from under the running bot
+    (2026-07-05). Only the actual bot process may touch this file."""
+    _file_handler = logging.handlers.RotatingFileHandler(
+        os.path.join(_log_dir, "trade_bot.log"),
+        maxBytes=10_000_000,
+        backupCount=5,
+    )
+    _file_handler.setLevel(logging.INFO)
+    _file_handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+    _console_handler = logging.StreamHandler()
+    _console_handler.setLevel(logging.WARNING)
+    _root_logger = logging.getLogger()
+    _root_logger.handlers.clear()
+    _root_logger.setLevel(logging.INFO)
+    _root_logger.addHandler(_console_handler)
+    _root_logger.addHandler(_file_handler)
 
 # ── Imports ───────────────────────────────────────────────────────────────────
 from config import cfg
@@ -435,6 +445,7 @@ def _check_halt_flag(
 # ---------------------------------------------------------------------------
 
 def run():
+    _setup_logging()
     cfg.log_startup()
 
     strategy = build_strategy()

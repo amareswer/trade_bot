@@ -200,3 +200,8 @@ python test_indicators.py     # 21 tests
 # .env file in project root
 OPENROUTER_API_KEY=sk-or-...
 ```
+
+## 2026-07-05 — Python/venv + yfinance upgrade (both bots affected)
+Runtime = .venv (3.11.15), launch: `.venv/bin/python -m bot.main` / `caffeinate -i .venv/bin/python -m stock_bot.main`.
+yfinance 1.5.1 validated; pandas held at 2.3.3 deliberately. Suite = 168 tests ~3s via .venv/bin/python -m pytest.
+Full detail: CLAUDE.md "Ops changes (2026-07-05)" + "Stock bot Phase A" sections.

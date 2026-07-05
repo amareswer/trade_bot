@@ -138,3 +138,50 @@ Only reopen if ONE of these occurs:
 1. Live regime flips to BULL and first 5 trades show PF < 0.8 (strategy not working live)
 2. Live trades accumulate to 20+ and metrics diverge materially from backtest
 3. BTC market structure changes fundamentally (e.g. new regulatory regime)
+---
+
+## Session-Edge Experiment (2026-07-05)
+
+Question: is the edge concentrated in specific entry sessions?
+Two pre-registered hypotheses, coarse buckets, in-sample (2024-03-07→2026-06-20,
+pinned canonical window) + OOS (2019–2021). Post-hoc trade removal.
+Harness validated: baseline reproduced the fingerprint exactly (39 trades, PF 1.77).
+Full report: logs/session_edge_experiment_20260705.md
+
+| Hypothesis | In-sample (39 trades) | OOS (110 trades) | Verdict |
+|---|---|---|---|
+| H1 weekend entries underperform | blocked n=7 PF 0.03 vs kept PF 2.18 | blocked n=36 PF 1.47 vs kept PF 1.85 | **INSUFFICIENT DATA** — 7 < 8-trade floor; OOS weekend still profitable (PF 1.47), so the "block weekends" strength did not replicate |
+| H2 overnight (00/04 UTC) entries underperform | blocked PF 1.96 vs kept 1.66 | blocked PF 2.14 vs kept 1.55 | **NOT SUPPORTED** — direction reversed: overnight entries are fine, even better. Hypothesis killed. |
+
+Notes:
+- The in-sample weekend number (PF 0.03 on 7 trades) is exactly the seductive
+  small-sample mirage the pre-registered floor exists to catch. Both periods DO
+  agree weekend < weekday directionally — logged as a watch item, below action
+  threshold. Revisit only when the sample grows (live fills or a longer window);
+  do NOT tune toward it.
+- No live change. No strategy-file change. Hash 659d1c03987b72fd untouched.
+- Next queued hypothesis (not yet run): volatility-regime conditioning —
+  do winners concentrate in a measurable ATR/ADX band at entry?
+
+---
+
+## Volatility-Regime Experiment (2026-07-05)
+
+Question: do winners concentrate in an ADX / ATR band at entry?
+Pre-registered: H1 weak-trend (ADX 18–25 entries underperform), H2 excess-vol
+(ATR% > 1.5% stop distance entries underperform). Same windows and criteria as
+the session experiment. Baseline again reproduced the fingerprint (39 / PF 1.77).
+Full report: logs/vol_regime_experiment_20260705.md
+
+| Hypothesis | In-sample | OOS | Verdict |
+|---|---|---|---|
+| H1 weak-trend (ADX<25) | blocked n=18 PF 1.02 vs kept PF 2.48 — suggestive | REVERSED: blocked 1.86 vs kept 1.62 | **NOT SUPPORTED** — in-sample pattern did not survive OOS (ATR-alpha failure mode, caught again) |
+| H2 excess-vol (ATR%>1.5%) | REVERSED in-sample: blocked 2.19 vs kept 1.62 | blocked 1.64 vs kept 2.17 | **NOT SUPPORTED** — high-ATR entries are fine on BTC |
+
+Meta-conclusion after 3 experiments / 4 hypotheses (session ×2, regime ×2):
+**BTC edge appears uniform** — it does not hide in a session or volatility
+pocket. Good for robustness (no fragile conditioning), bad for free PF gains:
+filter-hunting on BTC looks exhausted with current sample sizes. Remaining
+levers, in order: live fill accumulation (capital gates), fee optimization
+(already maximized), capital. Next research should target the actual failure
+(alt entry quality), not further BTC conditioning.

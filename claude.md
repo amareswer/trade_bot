@@ -136,7 +136,17 @@ Logs must be readable and persistent.
 ---
 
 ## 🧠 CODING STYLE
-- Python 3.10+
+- Python 3.10+ — run everything through `.venv` (Python 3.11, created 2026-07-05).
+  The system python3 is 3.9 and must not be used: `X | Y` annotations only survive
+  there via `from __future__ import annotations`, and yfinance ≥1.5 needs 3.10+.
+  Launch: `caffeinate -i .venv/bin/python -m stock_bot.main` / `.venv/bin/python -m bot.main`
+  Test:   `.venv/bin/python -m pytest --tb=short -q`
+  Library versions were pinned to match the pre-venv environment (pandas 2.3.3,
+  ccxt 4.5.56) so the interpreter was the only variable at switch time. yfinance was
+  then upgraded 1.2.0 → 1.5.1 as its own change (2026-07-05): 168 tests green and all
+  four live data paths smoke-tested (daily US/TSX candles, guarded live price,
+  FastValidator 1h fetch, multi-ticker batch). pandas stays 2.3.3 — pip wanted 3.0.x
+  on 3.11; upgrade it deliberately, not as a side effect.
 - Modular design
 - Simple before complex
 - Clean separation of concerns
@@ -383,10 +393,12 @@ expectancy is unmeasured until trades complete. The report's expectancy number i
   MAX_HOLD now falls back to the guarded `get_live_price()`; SL/TP still wait for real candles.
 - **Price-corruption guard on the fast book:** candle close deviating > FAST_PRICE_SANITY_PCT
   (20%) from the prior close is rejected for entries AND exits. Incident: 2026-06-29 META
-  $564.87 entry → phantom "SL" exit at $163.51 (−71% in 20 min, data corruption not market).
-  That row still poisons fast_trades.csv stats (PF 0.07 / −16.85% per signal vs the 3 sane
-  trades: +4.0% TP, +1.2% MAX_HOLD, −1.5% SL). Consider resetting the fast book (only 4
-  closed signals — cheap now) so post-guard stats start clean. User decision.
+  $564.87 entry → phantom "SL" exit at $163.51 (−71% in 20 min, data corruption not market),
+  which dragged the signal book to PF 0.07 / −16.85% per signal vs the 3 sane trades
+  (+4.0% TP, +1.2% MAX_HOLD, −1.5% SL).
+  **Fast book RESET 2026-07-05:** pre-guard history archived to
+  `stock_bot/archive/fast_trades_pre_guard_20260705.csv` + `..._state_...json`.
+  Every signal from Monday 2026-07-06 onward is post-guard — stats clean from trade one.
 - **FastValidator scope widened:** scans watchlist + top FAST_MOVERS_COUNT (5) universe
   movers per cycle (was watchlist-only). Cap bounds yfinance fetch volume — raise carefully,
   rate-limit spirals are a known failure mode.
@@ -396,6 +408,35 @@ expectancy is unmeasured until trades complete. The report's expectancy number i
   added there: the paper executor already applies PAPER_SLIPPAGE_BPS to every fill. The fast
   book is reported separately as a unit-sized signal book (% stats only — never $ expectancy).
 - Phase A gate stays: 30 completed trades, PF ≥ 1.2, win rate ≥ 30% before any IBKR live step.
+
+### Ops changes (2026-07-05)
+- **Runtime interpreter is the `.venv` (Python 3.11.15)** — see CODING STYLE for launch/test
+  commands and the pandas-2.3.3 hold. System python3 (3.9) must not run the bots.
+- **yfinance upgraded 1.2.0 → 1.5.1** (own change, after the venv switch): 168 tests green,
+  all four live data paths smoke-tested (daily US/TSX candles, guarded live price,
+  FastValidator 1h fetch, multi-ticker batch). Better rate-limit resilience via curl_cffi.
+- **Runtime data untracked from git:** `stock_bot/fast_trades.csv` was accidentally tracked —
+  removed from the index (`git rm --cached`). Root `.gitignore` now covers all stock-bot
+  runtime files (`fast_trades.csv`, `paper_state.json`, `universe_cache.json`, `archive/`).
+  Rule: code and config templates go in git; anything the bots write at runtime does not.
+- **Startup banner shows the executor's restored cash**, not `.env` PAPER_STARTING_CASH
+  (banner printed $1,000.00 while the restored book held $520.71).
+- **Dashboard stock-bot heartbeat amber window 65h → 80h** — TSX holiday Mondays no longer
+  show a false "down?" on Tuesday morning.
+- ~~Pending: restart stock bot under venv~~ — DONE 2026-07-05 10:42 (verified via ps: running
+  on 3.11 with caffeinate).
+- **Crypto bot log pollution fixed:** `bot/main.py` installed the root RotatingFileHandler at
+  IMPORT time, so every pytest run wrote test noise into `logs/trade_bot.log` — it faked the
+  dashboard heartbeat (log mtime = "alive"), buried real forensics, and one pytest run rotated
+  the live log at 10MB. Handler setup now lives in `_setup_logging()`, called only from
+  `run()`. Verified: importing bot.main installs zero handlers; pytest no longer touches the
+  log. (`stock_bot/main.py` has the same import-time pattern — harmless today since no test
+  imports it; fix opportunistically on a future stock-bot change.)
+- **Crypto bot found DOWN during this session** (no process; last real log 09:23 ET after
+  ~3 min of Kraken network errors, no traceback — consistent with closed terminal or Mac
+  sleep; it was launched WITHOUT caffeinate). Position was 0 — no exposure while down.
+  It picked up the 2026-07-04 execution fixes at its 22:09 ET restart.
+  **Launch it like the stock bot from now on:** `caffeinate -i .venv/bin/python -m bot.main`
 
 ### Multi-coin readiness (2026-07-03)
 The live loop is now safe to run with >1 symbol in UNIVERSE_WHITELIST. Single-symbol behavior

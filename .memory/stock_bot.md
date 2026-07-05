@@ -495,3 +495,16 @@ Phase A measures expectancy from 30 completed paper trades. Full notes in CLAUDE
       trades/week pace, projected $/week; fast book reported as % only
 - Tests: test_fast_validator_exits.py (6) + test_paper_report.py (6); suite = 168 in ~5s
 - Weekly check: python -c "from stock_bot.analysis.paper_report import generate_report; print(generate_report())"
+
+## Ops session (2026-07-05)
+
+- [x] Fast book RESET — pre-guard history archived to stock_bot/archive/*_pre_guard_20260705.*
+      Stats clean from Monday 2026-07-06; corruption guard active on all new signals
+- [x] Runtime interpreter = .venv (Python 3.11.15); system 3.9 banned for bots
+- [x] yfinance 1.2.0 → 1.5.1 (own change): 168 tests + 4 live data paths validated
+      pandas HELD at 2.3.3 — pip wants 3.0.x on 3.11; upgrade deliberately, never as side effect
+- [x] fast_trades.csv untracked from git; all runtime data gitignored
+- [x] Banner shows restored cash (was .env starting cash); dashboard heartbeat amber 65h→80h
+- [ ] PENDING: restart stock bot under venv (caffeinate -i .venv/bin/python -m stock_bot.main)
+      — running process predates fast-book reset, holds AMZN/HOOD in memory
+- Docker decision: NOT now — venv + existing systemd deploy path; revisit at VPS move

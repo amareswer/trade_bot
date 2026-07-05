@@ -206,7 +206,7 @@ def _heartbeat_blocks() -> str:
 
     return (
         block("Crypto Bot", "logs/trade_bot.log", 2, 8, "normal between candles")
-        + block("Stock Bot", "logs/stock_bot.log", 2, 65, "normal on weekends")
+        + block("Stock Bot", "logs/stock_bot.log", 2, 80, "normal on weekends/holidays")
     )
 
 
