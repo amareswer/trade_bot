@@ -183,6 +183,257 @@ def _combined_stats(active: dict[str, dict], stock: dict | None) -> str:
     )
 
 
+def _file_age_h(path: str) -> float | None:
+    try:
+        return (time.time() - os.path.getmtime(path)) / 3600
+    except Exception:
+        return None
+
+
+def _heartbeat_blocks() -> str:
+    """Green/amber/red bot-alive indicators based on log freshness."""
+    def block(label: str, path: str, green_h: float, amber_h: float, idle_note: str) -> str:
+        age = _file_age_h(path)
+        if age is None:
+            return _stat_block(label, '<span style="color:#f85149">● no log</span>', path)
+        if age < green_h:
+            val, sub = '<span style="color:#3fb950">● alive</span>', f"last activity {age*60:.0f} min ago"
+        elif age < amber_h:
+            val, sub = '<span style="color:#d29922">● quiet</span>', f"last activity {age:.1f}h ago — {idle_note}"
+        else:
+            val, sub = '<span style="color:#f85149">● down?</span>', f"no activity for {age:.0f}h — check the bot"
+        return _stat_block(label, val, sub)
+
+    return (
+        block("Crypto Bot", "logs/trade_bot.log", 2, 8, "normal between candles")
+        + block("Stock Bot", "logs/stock_bot.log", 2, 65, "normal on weekends")
+    )
+
+
+# Gate window opens when the live bot went back on the validated fixed-SL
+# config (2026-06-22 21:24 UTC — see CLAUDE.md, ATR SL drift incident).
+# Earlier fills (older configs, kraken_backfill reconstructions, the Jun 27
+# external-holdings incident) are not evidence about the current strategy.
+_GATE_START = "2026-06-22T21:24"
+
+
+def _read_gate_stats() -> dict:
+    """Capital-gate inputs: completed round trips, NET-of-fee live PF, shadow match.
+
+    PF gross of fees is misleading at this capital level — fees dwarf gross
+    P&L (backtest PF 1.79 coexists with a negative net return for the same
+    reason). Each SELL's pnl is reduced by its own fee plus an equal share of
+    the window's BUY fees.
+    """
+    out = {"sells": 0, "pf": None, "wins": 0, "losses": 0, "shadow": None, "realized": 0.0}
+    try:
+        import sqlite3
+        con = sqlite3.connect("logs/trades.db")
+        sell_rows = con.execute(
+            "SELECT pnl, COALESCE(fee_cost, 0), COALESCE(signal_reason, '')"
+            " FROM fills WHERE side='SELL' AND quantity > 0 AND pnl IS NOT NULL"
+            " AND timestamp >= ?"
+            " AND (notes IS NULL OR (notes NOT LIKE '%phantom%'"
+            "                        AND notes NOT LIKE '%backfill%'))",
+            (_GATE_START,),
+        ).fetchall()
+        buy_fees = con.execute(
+            "SELECT COALESCE(SUM(fee_cost), 0) FROM fills"
+            " WHERE side='BUY' AND timestamp >= ?"
+            " AND (notes IS NULL OR notes NOT LIKE '%backfill%')",
+            (_GATE_START,),
+        ).fetchone()[0]
+        con.close()
+
+        # Partial TPs realize P&L (counted in PF) but are not completed
+        # round trips (excluded from the 15-fill gate count).
+        out["sells"] = sum(1 for _, _, reason in sell_rows if reason != "partial_tp")
+        buy_fee_share = (buy_fees or 0.0) / len(sell_rows) if sell_rows else 0.0
+        net_pnls = [pnl - fee - buy_fee_share for pnl, fee, _ in sell_rows]
+        gross_p = sum(p for p in net_pnls if p > 0)
+        gross_l = -sum(p for p in net_pnls if p < 0)
+        out["wins"]     = sum(1 for p in net_pnls if p > 0)
+        out["losses"]   = sum(1 for p in net_pnls if p < 0)
+        out["realized"] = sum(net_pnls)
+        if gross_l > 0:
+            out["pf"] = gross_p / gross_l
+        elif gross_p > 0:
+            out["pf"] = float("inf")
+    except Exception:
+        pass
+    try:
+        import re
+        reports = sorted(glob.glob("logs/shadow_report_*.md"))
+        if reports:
+            text = open(reports[-1], encoding="utf-8").read()
+            m = re.search(r"Match rate[^0-9]*([0-9]+(?:\.[0-9]+)?)\s*%", text)
+            if m:
+                out["shadow"] = float(m.group(1))
+    except Exception:
+        pass
+    return out
+
+
+def _gate_tracker_section() -> str:
+    """Scoreboard for the $100 → $250 capital gate: 15 fills + PF ≥ 1.2 + shadow ≥ 95%."""
+    g = _read_gate_stats()
+    fills_needed = 15
+
+    pct = min(100, int(g["sells"] / fills_needed * 100))
+    bar = (
+        f'<div style="background:#21262d;border-radius:4px;height:8px;margin-top:8px">'
+        f'<div style="background:#1f6feb;height:8px;border-radius:4px;width:{pct}%"></div></div>'
+    )
+    fills_block = _stat_block(
+        "Gate 1 · Round Trips",
+        f'{g["sells"]} / {fills_needed}' + bar,
+        f'{g["wins"]}W / {g["losses"]}L · realized ${g["realized"]:+.2f} net of fees'
+        f' · since {_GATE_START[:10]} (validated config)',
+    )
+
+    if g["pf"] is None:
+        pf_val, pf_sub = "—", "needs closed trades with recorded P&L"
+    else:
+        pf_s   = "∞" if g["pf"] == float("inf") else f'{g["pf"]:.2f}'
+        pf_col = "#3fb950" if (g["pf"] >= 1.2) else "#d29922"
+        pf_val = f'<span style="color:{pf_col}">{pf_s}</span>'
+        pf_sub = "target ≥ 1.2 over ≥15 fills — NET of fees (small sample — direction only)"
+    pf_block = _stat_block("Gate 2 · Live PF (net)", pf_val, pf_sub)
+
+    if g["shadow"] is None:
+        sh_val, sh_sub = "—", "run python shadow_signal.py"
+    else:
+        sh_col = "#3fb950" if g["shadow"] >= 95 else "#f85149"
+        sh_val = f'<span style="color:{sh_col}">{g["shadow"]:.1f}%</span>'
+        sh_sub = "target ≥ 95% — strategy fidelity (latest report)"
+    sh_block = _stat_block("Gate 3 · Shadow Match", sh_val, sh_sub)
+
+    return (
+        '<div style="margin-bottom:8px;font-size:11px;color:#8b949e;'
+        'text-transform:uppercase;letter-spacing:.05em;font-weight:600">'
+        'Capital Gate — $100 → $250 requires all three</div>'
+        '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));'
+        'gap:12px;margin-bottom:24px">'
+        + fills_block + pf_block + sh_block
+        + "</div>"
+    )
+
+
+def _pnl_trend_section() -> str:
+    """Daily realized P&L bars from trades.db (crypto — stock has no closed trades yet)."""
+    daily: dict[str, float] = {}
+    try:
+        import sqlite3
+        con = sqlite3.connect("logs/trades.db")
+        rows = con.execute(
+            "SELECT substr(timestamp, 1, 10), SUM(pnl) FROM fills"
+            " WHERE side='SELL' AND pnl IS NOT NULL AND quantity > 0"
+            " GROUP BY substr(timestamp, 1, 10) ORDER BY 1"
+        ).fetchall()
+        con.close()
+        daily = {d: (p or 0.0) for d, p in rows}
+    except Exception:
+        pass
+    if not daily:
+        return ""
+
+    max_abs = max(abs(v) for v in daily.values()) or 1.0
+    bars = ""
+    for day, v in list(daily.items())[-14:]:
+        h   = max(4, int(abs(v) / max_abs * 48))
+        col = "#3fb950" if v >= 0 else "#f85149"
+        bars += (
+            f'<div style="display:flex;flex-direction:column;align-items:center;gap:4px">'
+            f'<div style="font-size:9px;color:{col}">{v:+.2f}</div>'
+            f'<div style="width:26px;height:{h}px;background:{col};border-radius:3px;'
+            f'align-self:center;margin-top:{48-h}px"></div>'
+            f'<div style="font-size:9px;color:#8b949e">{day[5:]}</div>'
+            f'</div>'
+        )
+    return (
+        '<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;'
+        'padding:14px 16px;margin-bottom:24px">'
+        '<div style="font-size:11px;color:#8b949e;text-transform:uppercase;'
+        'letter-spacing:.05em;font-weight:600;margin-bottom:10px">'
+        'Realized P&L by Day (crypto live · stock has no closed trades yet)</div>'
+        f'<div style="display:flex;gap:10px;align-items:flex-end">{bars}</div>'
+        '</div>'
+    )
+
+
+def _fast_validator_card() -> str:
+    """FastValidator's separate paper book (independent of the main paper trader)."""
+    data = _load_json("stock_bot/fast_validator_state.json")
+    if not data:
+        return ""
+    positions = data.get("positions", [])
+    rows = "".join(
+        _kv(
+            f'{p.get("symbol", "?")} × {p.get("shares", 0):g}',
+            f'in @ ${float(p.get("entry_price", 0)):,.2f} · '
+            f'SL ${float(p.get("sl_price", 0)):,.2f} · TP ${float(p.get("tp_price", 0)):,.2f}',
+        )
+        for p in positions
+    ) or _kv("Positions", "none open")
+    return (
+        '<div class="pf-card" style="margin-bottom:24px">'
+        '<div class="pf-card-header">'
+        '<span class="pf-card-title">⚡ FastValidator (separate paper book)</span>'
+        f'<span class="pf-card-badge" style="background:#d2992222;color:#d29922;'
+        f'border-color:#d2992255">{len(positions)} open</span>'
+        '</div>'
+        + rows
+        + _kv("Last updated", _fmt_ts(data.get("last_updated")))
+        + "</div>"
+    )
+
+
+def _regime_card() -> str:
+    """Latest regime-monitor verdict per symbol from logs/regime_health.log."""
+    import re
+    try:
+        lines = open("logs/regime_health.log", encoding="utf-8").read().splitlines()
+    except Exception:
+        return ""
+    latest: dict[str, str] = {}
+    for ln in lines:
+        m = re.match(r"([\d-]+ [\d:]+ UTC)\s+(\S+)\s+(.*)", ln)
+        if m:
+            latest[m.group(2)] = ln
+    if not latest:
+        return ""
+
+    rows = ""
+    for sym in sorted(latest):
+        ln = latest[sym]
+        ts = ln[:16]
+        verdict = (re.search(r"verdict=(\S+)", ln) or [None, "?"])[1]
+        col = {"EDGE": "#3fb950", "WARN": "#d29922", "DEGRADED": "#d29922"}.get(verdict, "#f85149")
+        adx    = re.search(r"ADX=\s*([\d.]+)", ln)
+        spread = re.search(r"spread=\s*([\d.]+)%", ln)
+        vol    = re.search(r"vol_cad=([\d,]+)", ln)
+        if adx and spread:
+            detail = f"ADX {adx.group(1)} · spread {spread.group(1)}%"
+        elif vol:
+            detail = f"24h vol ${vol.group(1)} CAD (liquidity watch)"
+        else:
+            detail = ""
+        rows += _kv(
+            sym,
+            f'<span style="color:{col};font-weight:600">{verdict}</span>'
+            f' <span style="color:#8b949e;font-weight:400;font-size:11px">'
+            f'{detail} · {ts}</span>',
+        )
+    return (
+        '<div class="pf-card" style="margin-bottom:24px">'
+        '<div class="pf-card-header">'
+        '<span class="pf-card-title">📡 Regime Monitor (latest reading)</span>'
+        '</div>'
+        + rows
+        + "</div>"
+    )
+
+
 def _ops_status_section() -> str:
     """Kill-switch + risk-breaker state strip (files written by the live bot)."""
     halted = os.path.exists(HALT_FLAG_PATH)
@@ -212,6 +463,7 @@ def _ops_status_section() -> str:
     return (
         '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));'
         'gap:12px;margin-bottom:24px">'
+        + _heartbeat_blocks()
         + _stat_block("Kill-Switch", halt_val, halt_sub)
         + _stat_block("Fills Today", fills_val, fills_sub)
         + _stat_block("All-Time Peak (breaker)", peak_val, peak_sub)
@@ -702,10 +954,14 @@ def _portfolio_tab_html(
         "</div>"
         + _combined_stats(active, stock)
         + _ops_status_section()
+        + _gate_tracker_section()
+        + _pnl_trend_section()
         + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px">'
         + crypto_cards
         + _stock_card(stock)
         + "</div>"
+        + _regime_card()
+        + _fast_validator_card()
         + _retired_slots_note(retired)
         + _signals_section(read_live_signals())
         + _kraken_holdings_card(active_cash)

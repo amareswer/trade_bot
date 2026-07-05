@@ -682,6 +682,7 @@ def run():
                 'err_count':        0,            # consecutive price-fetch failures
                 'drift_count':      0,            # consecutive drift detections
                 'last_candle_time': time.time(),  # candle watchdog timer
+                'mtf_1d_closes':    [],           # daily closes cache — refreshed at gate 2c
             }
             logger.info("Symbol ready: %s", sym)
 
@@ -698,12 +699,9 @@ def run():
         _monitor_thread.start()
         logger.info("Regime monitor thread started (interval=%ds)", _rm_interval)
 
-        try:
-            _raw_1d = live_exchange.fetch_ohlcv(_active_symbol, timeframe="1d", limit=30)
-            _mtf_1d_closes = [float(r[4]) for r in _raw_1d[:-1]]
-            print(f"  MTF: loaded {len(_mtf_1d_closes)} daily candles for regime check.", flush=True)
-        except Exception as _mtf_exc:
-            print(f"  MTF: daily candle fetch failed ({_mtf_exc}) — MTF disabled this session.", flush=True)
+        # MTF daily closes are fetched per symbol at decision time (gate 2c) —
+        # no startup prefetch: it added to the Kraken connection burst and the
+        # data went stale between BUY signals anyway.
     else:
         symbol_state[_active_symbol] = {
             'strategy':         strategy,
@@ -719,6 +717,7 @@ def run():
             'err_count':        0,
             'drift_count':      0,
             'last_candle_time': time.time(),
+            'mtf_1d_closes':    [],
         }
 
     # ── Restart recovery ──────────────────────────────────────────────────────
@@ -794,8 +793,6 @@ def run():
     _partial_tp_done: bool  = False
     _atr_sl_price:    float = 0.0
     _atr_tp_price:    float = 0.0
-    # MTF 1D closes for regime check — loaded once at startup
-    _mtf_1d_closes: list[float] = []
 
     # Sticky indicator values — updated each candle close, displayed between closes
     _dash_signal = "HOLD"
@@ -965,7 +962,10 @@ def run():
                     try:
                         balance = ss['executor']._exchange.fetch_balance()
                         base = sym.split("/")[0]
-                        exchange_pos = float(balance.get("free", {}).get(base, 0))
+                        # Compare against `total`, matching _sync_position: during
+                        # Kraken's settlement window a fresh fill sits in total but
+                        # not yet in free, and `free` here caused false drift alerts.
+                        exchange_pos = float(balance.get("total", {}).get(base, 0))
                         bot_pos = ss['executor'].position
                         drift = abs(exchange_pos - bot_pos)
                         _drift_threshold = cfg.exchange.drift_alert_threshold
@@ -1045,11 +1045,15 @@ def run():
                     ):
                         _p_qty = round(ss['pm'].quantity * cfg.backtest.partial_tp_size, 6)
                         if _p_qty > 0:
-                            _p_approval = risk.evaluate(
-                                Signal.SELL, price, ss['executor'].portfolio, _p_qty,
-                                account_value=_account_value(), symbol=sym,
+                            # Partial TP is an exit — classified with SL/TP, not with
+                            # strategy SELLs: it bypasses the risk gate (only the halt
+                            # check can block a SELL there, and a manual HALT must not
+                            # freeze profit-taking exits). RISK_HALT_BLOCKS_STOPS=true
+                            # suppresses it, same as the SL/TP block below.
+                            _p_halted = (
+                                cfg.risk.risk_halt_blocks_stops and risk.config.halt
                             )
-                            if _p_approval.approved:
+                            if not _p_halted:
                                 _p_order = ss['executor'].execute(Signal.SELL, price, quantity=_p_qty)
                                 if _p_order and _p_order.status == OrderStatus.FILLED:
                                     risk.record_fill(sym)
@@ -1115,7 +1119,11 @@ def run():
                             cfg.risk.risk_halt_blocks_stops and risk.config.halt
                         )
                         if not _sl_tp_halted:
-                            _ic_order = ss['executor'].execute(Signal.SELL, price, quantity=_ic_qty)
+                            # urgent=True → always a market order. A stop exit must
+                            # never sit in the limit-chase while price runs away.
+                            _ic_order = ss['executor'].execute(
+                                Signal.SELL, price, quantity=_ic_qty, urgent=True,
+                            )
                             if _ic_order and _ic_order.status == OrderStatus.FILLED:
                                 risk.record_fill(sym)
                                 ss['sm'].on_fill(Signal.SELL, _ic_order.price)
@@ -1257,21 +1265,34 @@ def run():
                         _buy_block_gate = "trend"
 
             # ── 2c. MTF gate ──────────────────────────────────────────
-            if is_indicator and raw_signal == Signal.BUY and _mtf_1d_closes:
-                _mtf_trend = _trend_fn(_mtf_1d_closes)
-                if _mtf_trend == "BEARISH":
-                    raw_signal = Signal.HOLD
-                    if not _buy_block_gate:
-                        _buy_block_gate = "regime"
-                    print(f"  [{sym}] MTF gate: 1D trend BEARISH — BUY suppressed", flush=True)
-                    logger.info("MTF gate [%s]: BUY suppressed — daily trend BEARISH", sym)
-                if live_exchange and sym == _active_symbol:
-                    try:
-                        _raw_1d_refresh = live_exchange.fetch_ohlcv(sym, timeframe="1d", limit=30)
-                        if _raw_1d_refresh:
-                            _mtf_1d_closes = [float(r[4]) for r in _raw_1d_refresh[:-1]]
-                    except Exception:
-                        pass
+            # Daily closes are fetched per symbol at decision time so the veto
+            # never runs on stale data. (Previously: loaded once at startup and
+            # only refreshed AFTER a BUY had already been judged — the gate
+            # could veto on daily candles that were weeks old, and it applied
+            # the active symbol's daily trend to every symbol.)
+            # BUY signals are rare, so this is at most one extra API call per
+            # BUY-signal candle. On fetch failure fall back to the cached
+            # closes; with no cache the gate fails open (same as before).
+            if is_indicator and raw_signal == Signal.BUY and live_exchange is not None:
+                try:
+                    _raw_1d = live_exchange.fetch_ohlcv(sym, timeframe="1d", limit=30)
+                    if _raw_1d:
+                        ss['mtf_1d_closes'] = [float(r[4]) for r in _raw_1d[:-1]]
+                except Exception as _mtf_exc:
+                    logger.warning(
+                        "MTF gate [%s]: daily fetch failed (%s) — %s",
+                        sym, _mtf_exc,
+                        "using cached closes" if ss['mtf_1d_closes']
+                        else "no cache, gate skipped",
+                    )
+                if ss['mtf_1d_closes']:
+                    _mtf_trend = _trend_fn(ss['mtf_1d_closes'])
+                    if _mtf_trend == "BEARISH":
+                        raw_signal = Signal.HOLD
+                        if not _buy_block_gate:
+                            _buy_block_gate = "regime"
+                        print(f"  [{sym}] MTF gate: 1D trend BEARISH — BUY suppressed", flush=True)
+                        logger.info("MTF gate [%s]: BUY suppressed — daily trend BEARISH", sym)
 
             # ── 2d. External signal gate ──────────────────────────────
             if raw_signal == Signal.BUY and ext_gate is not None:
@@ -1577,7 +1598,15 @@ def run():
                         if order.side == OrderSide.BUY:
                             ss['pm'].on_buy(order.price, order.quantity)
                             capital_pool.allocate(sym)
-                            ss['trail_peak'] = order.price
+                            # Seed the trail peak only when there is no activation
+                            # threshold — otherwise the intra-candle block arms it
+                            # once price reaches entry × (1 + activation_pct).
+                            # Seeding unconditionally here bypassed that gate.
+                            ss['trail_peak'] = (
+                                order.price
+                                if cfg.backtest.trail_stop_activation_pct <= 0
+                                else 0.0
+                            )
                             ss['partial_done'] = False
                             ss['atr_sl'] = 0.0
                             ss['atr_tp'] = 0.0

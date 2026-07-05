@@ -477,3 +477,21 @@ stock_analysis.py     ← CLI: accuracy + paper report (project root)
       `_is_earnings_blackout()` in main.py — 7/7 tests pass
       Blocks BUY within 7 days of earnings — fail-open on any error
       AC.TO blackout Jul 20 | DLTR blackout Aug 13
+
+## Phase A — expectancy measurement (2026-07-04)
+
+Context: user asked for "$200/day minimum" — reframed as expectancy × capital × frequency;
+Phase A measures expectancy from 30 completed paper trades. Full notes in CLAUDE.md
+"Stock bot Phase A" section.
+
+- [x] Exit audit: SL/TP watcher healthy; AC.TO (+1.3%) / DLTR (+4.9%) correctly held in band
+- [x] FastValidator MAX_HOLD starvation fix: feed gaps no longer skip force-exits
+      (falls back to get_live_price; SL/TP still wait for real candles)
+- [x] Corruption guard FAST_PRICE_SANITY_PCT=20 on fast-book entries AND exits
+      Incident: META $564.87 → phantom SL $163.51 (2026-06-29) — row still poisons
+      fast_trades.csv stats; recommend resetting the fast book (user decision pending)
+- [x] FastValidator scans watchlist + top FAST_MOVERS_COUNT=5 universe movers
+- [x] paper_report.py: expectancy net of IBKR commissions (env-driven model),
+      trades/week pace, projected $/week; fast book reported as % only
+- Tests: test_fast_validator_exits.py (6) + test_paper_report.py (6); suite = 168 in ~5s
+- Weekly check: python -c "from stock_bot.analysis.paper_report import generate_report; print(generate_report())"

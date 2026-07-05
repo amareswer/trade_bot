@@ -35,6 +35,16 @@ from bot.strategy.threshold_strategy import Signal
 from bot.data.trade_log import TradeLog
 
 
+@pytest.fixture(autouse=True)
+def _force_market_path(monkeypatch):
+    """These tests exercise the market-order fill-recording path. Make them
+    hermetic: LIMIT_ORDER_ENABLED=true in the developer's .env must not
+    reroute execute() into the limit-chase — with time.sleep mocked, the
+    chase's 120s wall-clock poll deadline becomes a CPU busy-spin
+    (~8 minutes for the never-closing-order test)."""
+    monkeypatch.setattr(le_mod.cfg.exchange, "limit_order_enabled", False)
+
+
 _DEFAULT_MARKETS = {
     "BTC/CAD": {
         "limits": {

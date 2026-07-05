@@ -155,12 +155,12 @@ A robust crypto trading system that:
 
 ## Test Suite Manifest (as of 2026-07-03)
 
-Expected total: **155 tests**. If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result.
+Expected total: **168 tests** (as of 2026-07-04). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
 
 | File | Tests | What it covers |
 |------|-------|----------------|
 | `test_indicators.py` | 28 | RSI, EMA, ADX, MACD, ATR calculations |
-| `test_live_executor.py` | 21 | LiveExecutor: dry-run, market/limit orders, fee deduction, state save/load |
+| `test_live_executor.py` | 22 | LiveExecutor: dry-run, market/limit orders, urgent-exit bypass, fee deduction, state save/load |
 | `test_capital_pool.py` | 19 | CapitalPool: slot allocation, slot cap, release, edge cases |
 | `test_correlation.py` | 17 | Pearson correlation, pct_returns, fetch_correlation |
 | `test_risk_manager.py` | 20 | RiskManager: halt gate, daily loss, position size, SL/TP bypass, state persistence, per-symbol caps, aggregate account breakers |
@@ -174,8 +174,10 @@ Expected total: **155 tests**. If `pytest --collect-only -q` reports a lower num
 | `test_halt_flag.py` | 5 | Manual halt kill-switch: logs/HALT flag file engage/lift, ownership guard |
 | `test_universe.py` | 4 | Universe screener: scoring, momentum filter, fallback |
 | `test_main_strategy.py` | 2 | Strategy builder: full config wiring |
+| `test_fast_validator_exits.py` | 6 | FastValidator exits: MAX_HOLD live-price fallback, corruption guard, SL regression |
+| `test_paper_report.py` | 6 | Expectancy math: IBKR commission model, net-of-cost flip, report rendering |
 
-Run: `python -m pytest --tb=short -q` — must show **155 passed**.
+Run: `python -m pytest --tb=short -q` — must show **168 passed**.
 
 ---
 
@@ -239,10 +241,11 @@ SYMBOL=BTC/USDT
 ### Live trading settings (Kraken — separate from backtest)
 EXCHANGE=kraken
 SYMBOL=BTC/CAD
-CANDLE_MINUTES=60
+CANDLE_MINUTES=240   # 4h — now matches the validation timeframe (was 60; the 1h config was never backtested — roadmap item 2 closed by this change)
 RISK_PER_TRADE_PCT=0.10   # intentionally high at $100 capital (Kraken min order ~$4.50 CAD)
 STOP_LOSS_PCT=0.015
 TAKE_PROFIT_PCT=0.10   # confirmed 2026-07-01: matches backtest and regime monitor (was stale 0.045)
+ORDER_TYPE=limit / LIMIT_ORDER_ENABLED=true   # BUY entries limit-chase for maker rate; ALL SL/TP exits forced to market via urgent=True (2026-07-04)
 
 ### How to verify the config is active
 Run: EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py
@@ -333,6 +336,67 @@ SELL signals do meaningful work, reducing fee sensitivity.
   - Stock prices are TTL-cached 15 min in `logs/stock_price_cache.json` (cross-process) —
     without it, per-cycle yfinance calls got rate-limited within minutes.
 
+### Execution hardening (2026-07-04) — audit fixes, strategy files untouched (hash `659d1c03987b72fd` still valid)
+- **SL/TP exits are always market orders.** `LiveExecutor.execute(..., urgent=True)` bypasses
+  the limit-chase and the ORDER_TYPE=limit path entirely; the SL/TP block in `bot/main.py`
+  passes it. Before this, a stop exit could sit in the post-only chase (placed ABOVE the ask,
+  up to 4 × LIMIT_CHASE_TIMEOUT_S=120s repricing) while price ran away — with SL=1.5% and
+  stops being the majority exit, chase slippage was directly eating the validated edge.
+  BUY entries keep the limit-chase (0.40% maker saving, confirmed Jun 14 fill).
+  Test: `test_urgent_sell_bypasses_limit_chase`.
+- **Partial TP reclassified as an exit** — bypasses the risk gate like SL/TP (a manual HALT
+  no longer freezes profit-taking; `RISK_HALT_BLOCKS_STOPS=true` still suppresses it).
+- **MTF gate no longer runs on stale data.** Daily closes are fetched per symbol at decision
+  time (gate 2c) with a per-symbol cache fallback. Previously loaded once at startup and only
+  refreshed AFTER a BUY had been judged — the veto could run on weeks-old daily candles, and
+  multi-symbol mode applied the active symbol's daily trend to every symbol.
+- **Trailing-stop peak seeding respects TRAILING_STOP_ACTIVATION_PCT** — on BUY the peak is
+  seeded only when activation is 0; otherwise the intra-candle block arms it at
+  entry × (1 + activation). (Latent — trailing disabled in .env.)
+- **Drift reconciliation compares Kraken `total`** (matching `_sync_position`) — `free`
+  produced false drift alerts during the settlement window after a fill.
+- **Dashboard capital-gate PF is NET of fees and window-scoped.** `unified_dashboard.py`
+  `_read_gate_stats`: each SELL's pnl minus its fee minus an equal share of window BUY fees;
+  only fills since 2026-06-22 21:24 UTC (validated-config go-live) count; `kraken_backfill`
+  and phantom rows excluded; `partial_tp` fills count toward PF but not the 15-round-trip
+  gate. Rationale: trades.db `pnl` is gross — at $77 capital, fees dwarf gross P&L (book was
+  gross −$0.02 but net −$1.13 when this was fixed). A gross-PF gate could promote capital on
+  a losing book.
+- **Test suite hermeticity:** `test_fill_recording.py` now forces `limit_order_enabled=False`
+  (autouse fixture). Since LIMIT_ORDER_ENABLED=true landed in `.env`, its never-closing-order
+  test was rerouted into the limit-chase and busy-spun ~8 minutes at 100% CPU (time.sleep
+  mocked + 120s wall-clock poll deadline). Suite runtime is back to ~5s; if it ever takes
+  minutes again, suspect a test reading live `.env` config.
+- **Known-inert leftover:** the DOGE/CAD liquidity gate in `bot/main.py` is dead code (DOGE
+  is BLOCKED) and hardcodes a symbol — generalize to config or delete when next touched.
+- `.env` chmod 600 (was world-readable). A bare un-named secret sits as a comment under
+  "── Secrets ──" in `.env` — identify the service, move to a named var, and rotate it.
+
+### Stock bot Phase A — expectancy measurement (2026-07-04)
+Goal: get to 30 completed paper round-trips and measure per-trade expectancy net of costs.
+Income targets ($/day) are NOT a bot setting — income = expectancy × capital × frequency, and
+expectancy is unmeasured until trades complete. The report's expectancy number is the product.
+- **Exit audit result:** main paper book SL/TP watcher healthy (30s cadence, market-hours
+  gated); AC.TO/DLTR correctly held inside the −5%/+15% band. No missed exits.
+- **FastValidator MAX_HOLD starvation fixed:** feed gaps (rate limit / holiday) skipped ALL
+  exit checks, so positions could outlive the 48h design (observed AMZN/HOOD 2026-07-04).
+  MAX_HOLD now falls back to the guarded `get_live_price()`; SL/TP still wait for real candles.
+- **Price-corruption guard on the fast book:** candle close deviating > FAST_PRICE_SANITY_PCT
+  (20%) from the prior close is rejected for entries AND exits. Incident: 2026-06-29 META
+  $564.87 entry → phantom "SL" exit at $163.51 (−71% in 20 min, data corruption not market).
+  That row still poisons fast_trades.csv stats (PF 0.07 / −16.85% per signal vs the 3 sane
+  trades: +4.0% TP, +1.2% MAX_HOLD, −1.5% SL). Consider resetting the fast book (only 4
+  closed signals — cheap now) so post-guard stats start clean. User decision.
+- **FastValidator scope widened:** scans watchlist + top FAST_MOVERS_COUNT (5) universe
+  movers per cycle (was watchlist-only). Cap bounds yfinance fetch volume — raise carefully,
+  rate-limit spirals are a known failure mode.
+- **Expectancy report:** `stock_bot/analysis/paper_report.py` now prints per-trade net $ / net %,
+  net PF, trades/week pace, and projected $/week — net of the IBKR Pro fixed commission model
+  (COMMISSION_PER_SHARE_USD/CAD + COMMISSION_MIN_USD/CAD in stock_bot/.env). Slippage is NOT
+  added there: the paper executor already applies PAPER_SLIPPAGE_BPS to every fill. The fast
+  book is reported separately as a unit-sized signal book (% stats only — never $ expectancy).
+- Phase A gate stays: 30 completed trades, PF ≥ 1.2, win rate ≥ 30% before any IBKR live step.
+
 ### Multi-coin readiness (2026-07-03)
 The live loop is now safe to run with >1 symbol in UNIVERSE_WHITELIST. Single-symbol behavior
 is numerically identical; strategy files untouched (hash `659d1c03987b72fd` still valid).
@@ -366,49 +430,38 @@ All critical bugs resolved:
 
 ### Next steps — prioritized roadmap (audited 2026-06-21)
 
-#### TODAY — Active money at risk
-1. **Fix backtest fee** — `.env`: change `BACKTEST_FEE_PCT=0.001` → `BACKTEST_FEE_PCT=0.008`
-   - Every backtest run since deploy has reported false PF numbers at 0.1% fee
-   - After fix, re-run: `EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py` → expect ~39 trades, PF ~1.79 (count lower than original 58 due to EMA spread filter added 2026-06-27)
-2. **Run 1h backtest** — live bot uses `CANDLE_MINUTES=60` but ALL validation was done on 4h candles
-   - `EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_TIMEFRAME=1h BACKTEST_LIMIT=5000 python backtest.py`
-   - If PF < 1.0: stop live trading until re-validated; if PF > 1.0: confirm and document
-3. **Fix SL/TP risk gate bypass** — `bot/main.py` lines 525–561
-   - Intra-candle SL/TP path routes through `risk.evaluate()` — a daily-loss halt silently blocks the stop-loss
-   - SL/TP triggers must bypass the risk gate entirely (same fix as `risk_manager.py` SELL bypass)
-4. **Fix `deploy.sh` before any VPS push** — `deploy/deploy.sh` line 39
-   - `--exclude='logs'` wipes `live_state.json` on redeploy → bot restarts thinking it holds nothing
-   - Change to: preserve `logs/live_state.json` and `logs/trades.db`, exclude only `logs/trade_bot.log`
+#### TODAY — Active money at risk (ALL DONE — verified in code 2026-07-04)
+1. ~~**Fix backtest fee**~~ — DONE: `.env` has `BACKTEST_FEE_PCT=0.008`
+2. ~~**Run 1h backtest**~~ — CLOSED by moving live to `CANDLE_MINUTES=240` (4h), which is the
+   validated timeframe. No 1h validation exists; do not move back to 60 without running it.
+3. ~~**Fix SL/TP risk gate bypass**~~ — DONE: SL/TP exits bypass `risk.evaluate()` entirely
+   (only `RISK_HALT_BLOCKS_STOPS=true` suppresses them). Tests in `test_risk_manager.py`.
+4. ~~**Fix `deploy.sh` before any VPS push**~~ — DONE: rsync preserves `live_state_*.json` and
+   `trades.db`, excludes only `*.log`.
 
-#### DAY 2 — Fee savings + silent failures
-5. **Enable limit orders for BUY** — saves 0.40% per round trip (0.80% taker → 0.40% maker rate, confirmed Jun 14 fill)
-   - `.env`: `ORDER_TYPE=limit`
-   - `live_executor.py:411`: change BUY offset `price * 1.001` → `price * 0.998` (bid-side passive)
-   - Leave SELL as market order (guaranteed exit)
-   - Increase cancel timeout `range(1, 4)` → `range(1, 10)` (9s resting time on 60min candle bot)
-6. **Fix dual SL evaluation paths** — `bot/main.py:618-633`
-   - Intra-tick SL/TP (lines 474–582) always fires first; candle-close SL block (lines 618–633) is dead code
-   - Remove the candle-close SL block to eliminate double-exit confusion
+#### DAY 2 — Fee savings + silent failures (ALL DONE)
+5. ~~**Enable limit orders for BUY**~~ — DONE: `LIMIT_ORDER_ENABLED=true` with limit-chase;
+   2026-07-04: SL/TP exits forced to market via `urgent=True` (the chase must never hold a stop).
+6. ~~**Fix dual SL evaluation paths**~~ — DONE: candle-close SL block removed; the intra-candle
+   block is the only SL/TP path (comment at `bot/main.py` section 2).
 
-#### DAY 3 — Stock bot circuit breaker + alerting
+#### DAY 3 — Stock bot circuit breaker + alerting (ALL DONE)
 7. ~~**Fix stock bot daily loss breaker**~~ — DONE 2026-07-04: session baseline now includes
    restored position marks (avg_cost) and `_open_position_value` is seeded consistently at
    restore. Previously a restart with open positions silently disabled the breaker
    (cash-only baseline vs cash+positions current). Tests: `test_stock_breaker.py` (3).
-8. **Wire daily P&L Telegram alert** — `bot/main.py`
-   - `TelegramAlerter.daily_pnl()` exists but is never called
-   - Add midnight UTC trigger inside main loop: `if now.hour == 0 and now.minute < 1: alerter.daily_pnl(...)`
-9. **Wire partial TP Telegram alert** — `bot/main.py` ~line 506
-   - Partial TP calls `trade_log.log_fill()` but skips `alerter.fill()` — real-money exit goes unreported
-10. **Add consecutive error counter** — `bot/main.py` price fetch block
-    - After 5 consecutive fetch failures: call `alerter.error("Price feed down 5+ ticks")` and back off
+8. ~~**Wire daily P&L Telegram alert**~~ — DONE: fires once per UTC day via date-change check.
+9. ~~**Wire partial TP Telegram alert**~~ — DONE: partial TP calls `alerter.fill()`.
+10. ~~**Add consecutive error counter**~~ — DONE: per-symbol `err_count`, alert at 5 consecutive failures.
 
 #### WEEK 2 — Hardening
 11. Correct ADX default: `config.py:383` change `25.0` → `18.0` (safe only while `.env` exists)
-12. Correct RSI levels: `.env` set `RSI_OVERSOLD=30` `RSI_OVERBOUGHT=70` (validated values, not current 32/68)
+12. ~~Correct RSI levels~~ — DONE: `.env` has `RSI_OVERSOLD=30.0` / `RSI_OVERBOUGHT=70.0`
 13. Add logrotate on VPS: `/etc/logrotate.d/trade_bot` — weekly, 4 rotations, compress (log grows unbounded)
-14. Add position drift reconciliation: periodic `fetch_balance()` vs `live_state.json` to detect divergence
-15. Add candle watchdog: if `2 × candle_minutes` pass with no new candle, call `alerter.error()`
+    (local log uses RotatingFileHandler 10MB × 5 — VPS journald/logrotate still unconfigured)
+14. ~~Add position drift reconciliation~~ — DONE: every 120 ticks per symbol, retry ladder,
+    escalation after DRIFT_ALERT_THRESHOLD consecutive detections; compares `total` (2026-07-04)
+15. ~~Add candle watchdog~~ — DONE: `_check_candle_watchdog`, per symbol, alert at 2× candle_minutes
 16. Set up external uptime monitor (UptimeRobot free tier) — systemd stops after 5 crashes with no external alert
 17. Schedule weekly `live_comparison.py`: `0 9 * * 1 python live_comparison.py >> logs/weekly.log`
 
@@ -519,6 +572,10 @@ A passing result on an older strategy version does not count.
 ### Capital gate evaluation (15-fill threshold)
 
 The 15-fill capital gate ($100 → $250) requires **ALL THREE**, not just PF:
+
+The unified dashboard tracks all three live ("Capital Gate" strip). Its PF is **net of fees**
+and only counts fills after 2026-06-22 21:24 UTC (validated-config go-live) — `trades.db`
+`pnl` is gross, and at $100 capital fees dwarf gross P&L. Live PF below always means net PF.
 
 1. **Live PF ≥ 1.2** over ≥15 completed round-trips
 2. **Shadow match rate ≥ 95%** — run `python shadow_signal.py` to verify the live bot's

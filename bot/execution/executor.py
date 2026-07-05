@@ -136,10 +136,13 @@ class PaperExecutor:
         signal:   Signal,
         price:    float,
         quantity: Optional[float] = None,
+        urgent:   bool = False,
     ) -> Optional[Order]:
         """
         Create, validate, and fill (or reject) an order for *signal*.
         *quantity* overrides the default self.quantity — pass it for dynamic sizing.
+        *urgent* is accepted for interface parity with LiveExecutor (where it
+        forces a market order for SL/TP exits); paper fills are instant anyway.
         """
         if signal == Signal.HOLD:
             logger.info("HOLD — no order created | price=%.2f", price)

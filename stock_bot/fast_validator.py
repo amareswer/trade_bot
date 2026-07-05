@@ -29,6 +29,7 @@ import yfinance as yf
 from dotenv import load_dotenv
 
 from stock_bot.data.yf_client import fetch_with_retry
+from stock_bot.data.intraday_price import get_live_price
 from stock_bot.indicators.indicators import (
     adx   as calc_adx,
     atr   as calc_atr,
@@ -95,6 +96,7 @@ class FastValidatorConfig:
     max_hold_hours:    int    # force-exit if position held longer than this
     max_positions:     int    # max simultaneous open positions
     min_confidence:    int    # minimum AI confidence to enter a trade
+    price_sanity_pct:  float = 20.0  # reject candle close deviating > this % from prior close
 
 
 def load_fast_config() -> FastValidatorConfig:
@@ -106,7 +108,25 @@ def load_fast_config() -> FastValidatorConfig:
         max_hold_hours  = _env_int  ("FAST_MAX_HOLD_HOURS",   48),
         max_positions   = _env_int  ("FAST_MAX_POSITIONS",    2),
         min_confidence  = _env_int  ("FAST_MIN_CONFIDENCE",   70),
+        price_sanity_pct = _env_float("FAST_PRICE_SANITY_PCT", 20.0),
     )
+
+
+def _last_close_sane(candles: list, sanity_pct: float) -> bool:
+    """
+    Corruption guard on the close used for entries/exits — same 20% deviation
+    principle as get_live_price()'s previous-close check. Incident: 2026-06-29
+    META candle printed $163.51 against a $564.87 entry (−71% in 20 min, price
+    corruption not market) and wrote a phantom SL exit into the stats book.
+    A single candle is trusted (nothing to compare against).
+    """
+    if len(candles) < 2:
+        return True
+    prev = candles[-2].close
+    if prev <= 0:
+        return True
+    deviation = abs(candles[-1].close - prev) / prev * 100
+    return deviation <= sanity_pct
 
 
 # ---------------------------------------------------------------------------
@@ -374,13 +394,35 @@ class FastValidator:
         now = datetime.utcnow()
 
         for pos in list(state.positions):
+            hold_hours = (now - pos.entry_time).total_seconds() / 3600.0
             candles = current_candles.get(pos.symbol.upper())
             if not candles:
-                logger.warning("FastValidator: no candles for open position %s — skipping exit check", pos.symbol)
+                # No candles this cycle (rate limit / market holiday). SL/TP and
+                # signal-reversal need a fresh price and can wait — but MAX_HOLD
+                # is the trade-completion guarantee for the stats book and must
+                # not be starved by feed gaps: fall back to the guarded
+                # live-price helper (same one the main book's SL/TP watcher uses).
+                if hold_hours >= self.cfg.max_hold_hours:
+                    live = get_live_price(pos.symbol)
+                    if live is not None:
+                        to_close.append((pos, "MAX_HOLD", live))
+                        continue
+                logger.warning(
+                    "FastValidator: no candles for open position %s — skipping"
+                    " exit check (held %.1fh / max %dh)",
+                    pos.symbol, hold_hours, self.cfg.max_hold_hours,
+                )
+                continue
+
+            if not _last_close_sane(candles, self.cfg.price_sanity_pct):
+                logger.warning(
+                    "FastValidator: %s close $%.4f deviates > %.0f%% from prior"
+                    " candle — suspected corruption, skipping exit check this cycle",
+                    pos.symbol, candles[-1].close, self.cfg.price_sanity_pct,
+                )
                 continue
 
             latest = candles[-1].close
-            hold_hours = (now - pos.entry_time).total_seconds() / 3600.0
             sig = signals.get(pos.symbol.upper(), {})
 
             # Priority 1: stop-loss
@@ -453,6 +495,14 @@ class FastValidator:
         if verdict.confidence < self.cfg.min_confidence:
             return False
         if sig.get("trend") == "BEARISH":
+            return False
+
+        if not _last_close_sane(candles, self.cfg.price_sanity_pct):
+            logger.warning(
+                "FastValidator: %s entry rejected — close $%.4f deviates > %.0f%%"
+                " from prior candle (suspected corruption)",
+                symbol, candles[-1].close, self.cfg.price_sanity_pct,
+            )
             return False
 
         entry_price = candles[-1].close

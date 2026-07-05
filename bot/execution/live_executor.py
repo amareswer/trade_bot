@@ -524,7 +524,14 @@ class LiveExecutor:
         signal,
         price:    float,
         quantity: float,
+        urgent:   bool = False,
     ) -> Order | None:
+        """
+        urgent=True forces a plain market order regardless of
+        LIMIT_ORDER_ENABLED / ORDER_TYPE. SL/TP exits must never sit in a
+        limit-chase: a post-only sell above the ask in a falling market can
+        spend minutes repricing while the stop level runs away.
+        """
         from bot.strategy.threshold_strategy import Signal
 
         if signal not in (Signal.BUY, Signal.SELL):
@@ -583,7 +590,7 @@ class LiveExecutor:
             try:
                 ccxt_side = "buy" if side == OrderSide.BUY else "sell"
 
-                if cfg.exchange.limit_order_enabled:
+                if cfg.exchange.limit_order_enabled and not urgent:
                     # Limit-chase path: _place_limit_order handles all polling and
                     # retries internally and always returns a resolved order dict.
                     raw          = self._place_limit_order(ccxt_side, quantity, price)
@@ -593,7 +600,7 @@ class LiveExecutor:
                     quantity     = filled_qty
                     last_raw     = raw
                 else:
-                    if self._order_type == "limit" and side == OrderSide.BUY:
+                    if self._order_type == "limit" and side == OrderSide.BUY and not urgent:
                         # Passive bid 0.2% below market — post-only guarantees maker rate (0.40%, confirmed Jun 14 fill)
                         limit_price = round(price * 0.998, 2)
                         logger.warning(

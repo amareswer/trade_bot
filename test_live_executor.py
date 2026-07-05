@@ -759,6 +759,44 @@ def test_order_type_limit_sell_falls_through_to_market(mock_cfg, mock_sleep):
     )
 
 
+# ---------------------------------------------------------------------------
+# Test: urgent=True bypasses the limit-chase — SL/TP exits are always market
+# ---------------------------------------------------------------------------
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_urgent_sell_bypasses_limit_chase(mock_cfg, mock_sleep):
+    """SL/TP exit path passes urgent=True: even with LIMIT_ORDER_ENABLED=true
+    the order must be a plain market order — a stop must never sit in the
+    chase repricing while price runs away."""
+    _limit_cfg(mock_cfg, enabled=True, timeout_s=30)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0)
+
+    # Seed a bot-owned position directly
+    ex._portfolio.position    = 0.001
+    ex._portfolio._cost_basis = 90_000.0
+
+    sell_raw = {
+        "id": "urgent-001", "status": "closed",
+        "filled": 0.001, "average": 88_650.0,   # −1.5% stop level
+        "fee": {"cost": 0.709, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = sell_raw
+    mock_ex.fetch_order.return_value  = sell_raw
+
+    order = ex.execute(Signal.SELL, 88_650.0, 0.001, urgent=True)
+
+    assert order is not None
+    assert order.status == OrderStatus.FILLED
+    # Market order placed, limit-chase never touched
+    call = mock_ex.create_order.call_args
+    order_type_used = call[1].get("type") or call[0][1]
+    assert order_type_used == "market", (
+        f"urgent SELL should use market order, got '{order_type_used}'"
+    )
+    mock_ex.fetch_order_book.assert_not_called()
+
+
 if __name__ == "__main__":
     import sys
     import traceback

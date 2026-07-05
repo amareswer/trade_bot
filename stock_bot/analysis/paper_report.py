@@ -14,6 +14,7 @@ from datetime import datetime
 _STOCK_BOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _TRADES_CSV    = os.path.join(_STOCK_BOT_DIR, "paper_trades.csv")
 _STATE_JSON    = os.path.join(_STOCK_BOT_DIR, "paper_state.json")
+_FAST_CSV      = os.path.join(_STOCK_BOT_DIR, "fast_trades.csv")
 
 _COLS = [
     "timestamp", "symbol", "side", "shares",
@@ -129,7 +130,70 @@ def _pair_trades(trades: list[dict]) -> tuple[list[dict], dict[str, dict]]:
     return pairs, open_positions
 
 
-def generate_report(csv_path: str = _TRADES_CSV, state_path: str = _STATE_JSON) -> str:
+def _round_trip_commission(symbol: str, shares: float) -> float:
+    """
+    IBKR Pro fixed-rate commission for a full round trip (entry + exit).
+    Rates come from stock_bot/.env — never hardcode thresholds in code paths.
+    Slippage is NOT modelled here: the paper executor already applies
+    PAPER_SLIPPAGE_BPS to every fill price, so recorded fills include it.
+    """
+    if symbol.upper().endswith(".TO"):
+        per_share = float(os.getenv("COMMISSION_PER_SHARE_CAD", "0.01"))
+        minimum   = float(os.getenv("COMMISSION_MIN_CAD",       "1.00"))
+    else:
+        per_share = float(os.getenv("COMMISSION_PER_SHARE_USD", "0.005"))
+        minimum   = float(os.getenv("COMMISSION_MIN_USD",       "1.00"))
+    return 2 * max(minimum, shares * per_share)
+
+
+def _expectancy_stats(pairs: list[dict]) -> dict | None:
+    """
+    Net-of-commission expectancy over completed pairs.
+    Returns None when there are no completed pairs.
+    """
+    if not pairs:
+        return None
+    net_pnls: list[float] = []
+    net_pcts: list[float] = []
+    for p in pairs:
+        commission = _round_trip_commission(p["symbol"], p["shares"])
+        net        = p["pnl"] - commission
+        pos_value  = p["entry_price"] * p["shares"]
+        net_pnls.append(net)
+        net_pcts.append(net / pos_value * 100 if pos_value > 0 else 0.0)
+
+    n        = len(net_pnls)
+    wins     = [x for x in net_pnls if x > 0]
+    losses   = [x for x in net_pnls if x < 0]
+    gross_w  = sum(wins)
+    gross_l  = abs(sum(losses))
+
+    # Trades-per-week pace from the exit-date span
+    try:
+        exit_dates = sorted(
+            datetime.strptime(p["exit_date"], "%Y-%m-%d") for p in pairs
+        )
+        span_days = max(1, (exit_dates[-1] - exit_dates[0]).days)
+        per_week  = n / span_days * 7
+    except (ValueError, KeyError):
+        per_week = None
+
+    return {
+        "n":              n,
+        "expectancy_usd": sum(net_pnls) / n,
+        "expectancy_pct": sum(net_pcts) / n,
+        "net_pf":         (gross_w / gross_l) if gross_l > 0
+                          else (float("inf") if gross_w > 0 else None),
+        "net_win_rate":   len(wins) / n * 100,
+        "trades_per_week": per_week,
+    }
+
+
+def generate_report(
+    csv_path:      str = _TRADES_CSV,
+    state_path:    str = _STATE_JSON,
+    fast_csv_path: str = _FAST_CSV,
+) -> str:
     """
     Build and return the full paper trading report as a string.
     No network calls. No yfinance. Pure file reads.
@@ -264,6 +328,61 @@ def generate_report(csv_path: str = _TRADES_CSV, state_path: str = _STATE_JSON) 
         lines.append(f"  Completed trades:  0")
         lines.append(f"  Win rate:          —")
         lines.append(f"  Profit factor:     —")
+
+    lines.append("")
+
+    # ── Expectancy (net of costs) ─────────────────────────────────────────────
+    # THE number that converts this paper book into an income projection:
+    # expectancy $/trade × trades/week = weekly income at current sizing.
+    lines += [
+        "  EXPECTANCY — NET OF COMMISSIONS",
+        f"  {sep}",
+    ]
+    exp = _expectancy_stats(pairs)
+    if exp:
+        lines.append(f"  Per-trade net $:   ${exp['expectancy_usd']:>+8,.2f}  (IBKR Pro fixed rates; slippage already in fills)")
+        lines.append(f"  Per-trade net %:   {exp['expectancy_pct']:>+8.2f}%  of position value")
+        if exp["net_pf"] is None:
+            lines.append("  Net profit factor: —")
+        elif exp["net_pf"] == float("inf"):
+            lines.append("  Net profit factor: ∞ (no net losses)")
+        else:
+            lines.append(f"  Net profit factor: {exp['net_pf']:>8.2f}")
+        lines.append(f"  Net win rate:      {exp['net_win_rate']:>8.1f}%")
+        if exp["trades_per_week"] is not None:
+            weekly = exp["expectancy_usd"] * exp["trades_per_week"]
+            lines.append(f"  Pace:              {exp['trades_per_week']:>8.1f} trades/week")
+            lines.append(f"  Projected income:  ${weekly:>+8,.2f}/week at current sizing")
+        if exp["n"] < 30:
+            lines.append(f"  ⚠ {exp['n']} trades — direction only, not statistically reliable (need 30)")
+    else:
+        lines.append("  No completed round-trips — expectancy unknown.")
+        lines.append("  This number IS the product of the paper phase; nothing")
+        lines.append("  can be projected until trades complete.")
+
+    lines.append("")
+
+    # ── Fast validator signal book (unit-sized — % stats only) ────────────────
+    fast_pairs, fast_open = _pair_trades(_read_trades(fast_csv_path))
+    lines += [
+        "  FAST VALIDATOR — SIGNAL BOOK (unit-sized, % stats only)",
+        f"  {sep}",
+    ]
+    if fast_pairs:
+        f_n     = len(fast_pairs)
+        f_wins  = [p for p in fast_pairs if p["pnl_pct"] > 0]
+        f_loss  = [p for p in fast_pairs if p["pnl_pct"] < 0]
+        f_wr    = len(f_wins) / f_n * 100
+        f_gw    = sum(p["pnl_pct"] for p in f_wins)
+        f_gl    = abs(sum(p["pnl_pct"] for p in f_loss))
+        f_pf    = (f_gw / f_gl) if f_gl > 0 else float("inf")
+        f_exp   = sum(p["pnl_pct"] for p in fast_pairs) / f_n
+        lines.append(f"  Completed:         {f_n}   open: {len(fast_open)}")
+        lines.append(f"  Win rate:          {f_wr:.1f}%")
+        lines.append(f"  Profit factor:     {'∞' if f_pf == float('inf') else f'{f_pf:.2f}'} (gross % — signals, not sized trades)")
+        lines.append(f"  Expectancy:        {f_exp:+.2f}% per signal")
+    else:
+        lines.append(f"  Completed: 0   open: {len(fast_open)} — no closed signals yet.")
 
     lines.append(f"  {sep}")
     if n_complete < 15:

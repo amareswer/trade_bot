@@ -601,6 +601,9 @@ def run() -> None:
 
     _fast_enabled       = _os.getenv("FAST_ENABLED", "false").strip().lower() in ("1", "true", "yes")
     _fast_loop_interval = int(_os.getenv("FAST_LOOP_INTERVAL", "300").strip() or "300")
+    # How many universe top movers the fast validator scans in addition to the
+    # watchlist. Capped to bound yfinance fetch volume per cycle (rate limits).
+    _fast_movers_count  = int(_os.getenv("FAST_MOVERS_COUNT", "5").strip() or "5")
     fast_validator      = FastValidator() if _fast_enabled else None
 
     print()
@@ -661,7 +664,13 @@ def run() -> None:
         while True:
             try:
                 if _get_market_status()["any_open"]:
-                    result  = fast_validator.run_cycle(watchlist_symbols, ai_engine)
+                    # Read top_movers live from the enclosing scope — the main
+                    # loop rebinds it on each universe refresh, and the closure
+                    # sees the updated binding. Cap keeps fetch volume bounded.
+                    _fv_symbols = list(dict.fromkeys(
+                        watchlist_symbols + top_movers[:_fast_movers_count]
+                    ))
+                    result  = fast_validator.run_cycle(_fv_symbols, ai_engine)
                     open_c  = result["open_count"]
                     exits_c = len(result["exits"])
                     logger.info("FastValidator: %d open, %d completed today", open_c, exits_c)
