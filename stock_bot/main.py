@@ -628,7 +628,9 @@ def run() -> None:
     else:
         print(f"  AI engine  : disabled")
     if executor:
-        print(f"  Paper trading: ON  cash=${cfg.paper_starting_cash:,.2f}  risk={cfg.paper_risk_pct*100:.0f}%/trade  min_conf={cfg.paper_min_confidence}%")
+        # Show the executor's actual (restored) cash, not the .env starting
+        # value — the banner said $1,000.00 while the restored book held $520.71.
+        print(f"  Paper trading: ON  cash=${executor.cash:,.2f}  risk={cfg.paper_risk_pct*100:.0f}%/trade  min_conf={cfg.paper_min_confidence}%")
     if fast_validator:
         print(f"  Fast validator: ON  interval={_fast_loop_interval}s  state=fast_validator_state.json")
     print(f"  Dashboard : file://{_os.path.abspath('stock_dashboard.html')}")
