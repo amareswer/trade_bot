@@ -452,6 +452,66 @@ expectancy is unmeasured until trades complete. The report's expectancy number i
 - **`.env` secret rotation deferred by user** (2026-07-06, "will do it later") — still the
   only open security item.
 
+### Dual-strategy formalization (2026-07-06)
+Stock bot now has two formally separated, named strategy books. 168 tests pass.
+
+**Strategy architecture:**
+| Book | Label | Candle | Max hold | Capital | Stats |
+|------|-------|--------|----------|---------|-------|
+| Main paper executor | **Position book** | `1d` daily | Days–weeks (no forced exit) | Real $ tracked | $ expectancy, net PF |
+| FastValidator | **Swing book** | `1h` hourly | 48h forced exit | Unit-sized (1.0 share) | % stats only |
+
+**Bidirectional symbol conflict guard (no more silent double exposure):**
+- `fast_validator.py`: `FastValidator.__init__()` accepts `blocked_symbols_fn: Callable[[], set[str]] | None`. In `_try_enter()`, calls it and skips if the symbol is held in the position book.
+- `main.py`: FastValidator created with `blocked_symbols_fn=lambda: set(executor.positions_snapshot().keys())`. Before position book BUY, checks `fast_validator.state.open_symbols()` — skips with log + print if swing book holds it.
+- Both directions enforced; neither book can silently build double exposure.
+
+**Label change in `paper_report.py`:**
+- "ACCOUNT" section → "POSITION BOOK (daily candles · multi-day holds · sized in $)"
+- "FAST VALIDATOR — SIGNAL BOOK" → "SWING BOOK (1h candles · 48h max hold · % stats only)"
+
+### Broker platform research (2026-07-06)
+**Decision: Interactive Brokers (IBKR) is the target live broker for the stock bot.**
+
+Alpaca ruled out — no Canadian TSX support (SHOP.TO, RY.TO etc.), which would require splitting into two brokers and violates modularity.
+
+**IBKR facts:**
+- Python: `ib_insync` library (clean async wrapper over TWS API)
+- Paper trading: built-in (TWS paper port 7497, live port 7496)
+- Supports: US stocks (SMART routing) + TSX stocks (TSX exchange contract)
+- Commission: US $0/trade, TSX CAD $1/trade minimum
+- Monthly: $10/month small account (waived at >$125k monthly volume)
+- Account minimum: $1 live; PDT rule ($25k) applies for >3 day-trades in 5 days
+
+**Integration point:** `StockExecutorBase` in `stock_bot/execution/base.py` is the abstraction. A future `IBKRExecutor(StockExecutorBase)` in `stock_bot/execution/ibkr.py` implements all abstract methods (buy, sell, cash, position, avg_cost, positions_snapshot, etc.). No signal or strategy code changes.
+
+**Gate before live IBKR:** same as current Phase A — 30 completed paper trades, PF ≥ 1.2, win rate ≥ 30%.
+
+### Next feature roadmap (2026-07-06)
+
+#### Stock bot — near term
+| # | Feature | Why | Effort |
+|---|---------|-----|--------|
+| A | **Swing book cash tracking** | Add `FAST_STARTING_CASH` + real cash in `FastValidatorState` — unlocks $ expectancy for swing book, same Phase A gate as position book | Medium |
+| B | **Swing book Phase A gate** | Separate 30-trade / PF ≥ 1.2 counter for swing book, independent of position book | Small |
+| C | **Combined dashboard section** | Total capital across both books, per-book PF side by side, combined exposure | Medium |
+| D | **IBKR paper executor** | `IBKRExecutor(StockExecutorBase)` in `stock_bot/execution/ibkr.py` — paper mode first (port 7497), then live gate | Large (~10h) |
+| E | **5-day earnings blackout** | Block BUY within 5 days of next earnings — avoid pre-earnings gap risk | Small |
+
+#### Crypto bot — near term
+| # | Feature | Why | Effort |
+|---|---------|-----|--------|
+| F | **VPS logrotate** | `/etc/logrotate.d/trade_bot` — local log uses RotatingFileHandler, VPS has no rotation yet | Small |
+| G | **UptimeRobot monitor** | External uptime check — systemd stops after 5 crashes with no alert | Trivial |
+| H | **`.env` secret rotation** | Bare unnamed secret in `.env` — identify service, name it, rotate | Small |
+
+#### Both bots — longer term
+| # | Feature | Why | Effort |
+|---|---------|-----|--------|
+| I | **IBKR live go-live** | After 30 paper trades + PF ≥ 1.2 on stock bot | Gate-blocked |
+| J | **USD symbol re-screen** | Re-run `screen_universe.py` after any strategy hash change | ~2h |
+| K | **ATR SL experiment for SYN/LINK** | ATR×2.0–2.5 cleared in-sample — needs OOS + per-symbol walk-forward before adding | Large |
+
 ### Multi-coin readiness (2026-07-03)
 The live loop is now safe to run with >1 symbol in UNIVERSE_WHITELIST. Single-symbol behavior
 is numerically identical; strategy files untouched (hash `659d1c03987b72fd` still valid).
@@ -533,6 +593,8 @@ All critical bugs resolved:
 | 30–50 live trades accumulated | ~2–3 months | Compare live PF vs backtest |
 | Kraken maker fee confirmed <0.20% | Test one limit order | Validates limit-order cost model for XRP/CAD |
 | Stock bot: 30 paper trades, PF ≥ 1.2, win rate ≥ 30% | ~4–6 weeks | Gate for Phase 7 IBKR live |
+| Swing book: 30 paper signals, PF ≥ 1.2 (separate gate) | ~4–6 weeks | Gate for swing book cash tracking + sizing |
+| IBKR paper executor implemented + tested | After paper gate | Enables live go-live without code rewrite |
 | Capital grows to $500+ | Organic | Lower RISK_PER_TRADE_PCT from 10% → 2% |
 | Add 5-day earnings blackout to stock_bot BUY | After paper validated | Avoid pre-earnings gap risk |
 | Add oversold recovery to universe pre_filter | After paper validated | AI rejects overbought momentum leaders |

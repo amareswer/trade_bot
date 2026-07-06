@@ -96,19 +96,23 @@ class FastValidatorConfig:
     max_hold_hours:    int    # force-exit if position held longer than this
     max_positions:     int    # max simultaneous open positions
     min_confidence:    int    # minimum AI confidence to enter a trade
-    price_sanity_pct:  float = 20.0  # reject candle close deviating > this % from prior close
+    price_sanity_pct:  float = 20.0    # reject candle close deviating > this % from prior close
+    starting_cash:     float = 1000.0  # virtual cash for the swing book
+    risk_pct:          float = 0.25    # fraction of cash to allocate per trade (max 2 positions = 50% max deployed)
 
 
 def load_fast_config() -> FastValidatorConfig:
     return FastValidatorConfig(
-        candle_interval = _env_str  ("FAST_CANDLE_INTERVAL",  "1h"),
-        lookback_hours  = _env_int  ("FAST_LOOKBACK_HOURS",   168),
-        sl_pct          = _env_float("FAST_SL_PCT",           1.5),
-        tp_pct          = _env_float("FAST_TP_PCT",           3.0),
-        max_hold_hours  = _env_int  ("FAST_MAX_HOLD_HOURS",   48),
-        max_positions   = _env_int  ("FAST_MAX_POSITIONS",    2),
-        min_confidence  = _env_int  ("FAST_MIN_CONFIDENCE",   70),
+        candle_interval  = _env_str  ("FAST_CANDLE_INTERVAL",  "1h"),
+        lookback_hours   = _env_int  ("FAST_LOOKBACK_HOURS",   168),
+        sl_pct           = _env_float("FAST_SL_PCT",           1.5),
+        tp_pct           = _env_float("FAST_TP_PCT",           3.0),
+        max_hold_hours   = _env_int  ("FAST_MAX_HOLD_HOURS",   48),
+        max_positions    = _env_int  ("FAST_MAX_POSITIONS",    2),
+        min_confidence   = _env_int  ("FAST_MIN_CONFIDENCE",   70),
         price_sanity_pct = _env_float("FAST_PRICE_SANITY_PCT", 20.0),
+        starting_cash    = _env_float("FAST_STARTING_CASH",    1000.0),
+        risk_pct         = _env_float("FAST_RISK_PCT",         0.25),
     )
 
 
@@ -146,7 +150,10 @@ class FastPosition:
 
 @dataclass
 class FastValidatorState:
-    positions: list[FastPosition] = field(default_factory=list)
+    positions:     list[FastPosition] = field(default_factory=list)
+    cash:          float = 0.0   # seeded from FAST_STARTING_CASH on first run
+    starting_cash: float = 0.0
+    realized_pnl:  float = 0.0
 
     def open_symbols(self) -> set[str]:
         return {p.symbol.upper() for p in self.positions}
@@ -184,7 +191,10 @@ class FastValidatorState:
                 }
                 for p in self.positions
             ],
-            "last_updated": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "cash":          round(self.cash, 4),
+            "starting_cash": round(self.starting_cash, 4),
+            "realized_pnl":  round(self.realized_pnl, 4),
+            "last_updated":  datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -210,7 +220,12 @@ class FastValidatorState:
                     confidence  = int(d["confidence"]),
                     shares      = float(d.get("shares", 1.0)),
                 ))
-            return cls(positions=positions)
+            return cls(
+                positions     = positions,
+                cash          = float(data.get("cash",          0.0)),
+                starting_cash = float(data.get("starting_cash", 0.0)),
+                realized_pnl  = float(data.get("realized_pnl",  0.0)),
+            )
         except (KeyError, ValueError, json.JSONDecodeError, OSError) as exc:
             logger.warning("Could not load fast_validator_state.json (%s) — starting fresh", exc)
             return cls()
@@ -254,6 +269,10 @@ class FastValidator:
         # Callable that returns symbols currently held in the position book.
         # Used to prevent double exposure (swing + position on same symbol).
         self._blocked_symbols_fn = blocked_symbols_fn
+        # Seed cash from config on first run (state file has no cash yet).
+        if self.state.starting_cash == 0.0 and self.cfg.starting_cash > 0:
+            self.state.cash          = self.cfg.starting_cash
+            self.state.starting_cash = self.cfg.starting_cash
         self._ensure_csv_header()
 
     # ── Data fetch ─────────────────────────────────────────────────────────
@@ -454,6 +473,11 @@ class FastValidator:
             pnl_pct    = (exit_price - pos.entry_price) / pos.entry_price * 100
             hold_hours = (now - pos.entry_time).total_seconds() / 3600.0
 
+            proceeds = round(exit_price * pos.shares, 4)
+            pnl_usd  = round((exit_price - pos.entry_price) * pos.shares, 4)
+            self.state.cash         = round(self.state.cash + proceeds, 4)
+            self.state.realized_pnl = round(self.state.realized_pnl + pnl_usd, 4)
+
             exit_rec = {
                 "symbol":      pos.symbol,
                 "reason":      reason,
@@ -465,17 +489,18 @@ class FastValidator:
             exits.append(exit_rec)
 
             self._write_trade(
-                symbol      = pos.symbol,
-                side        = "SELL",
-                shares      = pos.shares,
-                price       = exit_price,
-                reason      = reason,
-                confidence  = pos.confidence,
+                symbol         = pos.symbol,
+                side           = "SELL",
+                shares         = pos.shares,
+                price          = exit_price,
+                reason         = reason,
+                confidence     = pos.confidence,
+                cash_remaining = self.state.cash,
             )
             state.remove(pos.symbol)
             logger.info(
-                "FastValidator EXIT  %s  reason=%-14s  exit=$%.4f  pnl=%+.2f%%  hold=%.1fh",
-                pos.symbol, reason, exit_price, pnl_pct, hold_hours,
+                "FastValidator EXIT  %s  reason=%-14s  exit=$%.4f  pnl=%+.2f%% ($%+.2f)  hold=%.1fh  cash=$%.2f",
+                pos.symbol, reason, exit_price, pnl_pct, pnl_usd, hold_hours, self.state.cash,
             )
 
         return exits
@@ -519,8 +544,20 @@ class FastValidator:
             return False
 
         entry_price = candles[-1].close
-        sl_price    = round(entry_price * (1.0 - self.cfg.sl_pct  / 100.0), 6)
-        tp_price    = round(entry_price * (1.0 + self.cfg.tp_pct  / 100.0), 6)
+        sl_price    = round(entry_price * (1.0 - self.cfg.sl_pct / 100.0), 6)
+        tp_price    = round(entry_price * (1.0 + self.cfg.tp_pct / 100.0), 6)
+
+        alloc  = self.state.cash * self.cfg.risk_pct
+        shares = int(alloc / entry_price) if entry_price > 0 else 0
+        if shares <= 0:
+            logger.info(
+                "FastValidator: %s skipped — cash $%.2f × %.0f%% = $%.2f < $%.2f/share",
+                symbol, self.state.cash, self.cfg.risk_pct * 100, alloc, entry_price,
+            )
+            return False
+
+        cost = round(shares * entry_price, 4)
+        self.state.cash = round(self.state.cash - cost, 4)
 
         pos = FastPosition(
             symbol      = symbol.upper(),
@@ -529,20 +566,21 @@ class FastValidator:
             sl_price    = sl_price,
             tp_price    = tp_price,
             confidence  = verdict.confidence,
-            shares      = 1.0,
+            shares      = float(shares),
         )
         self.state.add(pos)
         self._write_trade(
-            symbol     = symbol.upper(),
-            side       = "BUY",
-            shares     = pos.shares,
-            price      = entry_price,
-            reason     = f"AI:{verdict.signal} conf={verdict.confidence}",
-            confidence = verdict.confidence,
+            symbol         = symbol.upper(),
+            side           = "BUY",
+            shares         = pos.shares,
+            price          = entry_price,
+            reason         = f"AI:{verdict.signal} conf={verdict.confidence}",
+            confidence     = verdict.confidence,
+            cash_remaining = self.state.cash,
         )
         logger.info(
-            "FastValidator ENTRY %s  price=$%.4f  SL=$%.4f  TP=$%.4f  conf=%d",
-            symbol, entry_price, sl_price, tp_price, verdict.confidence,
+            "FastValidator ENTRY %s  price=$%.4f  SL=$%.4f  TP=$%.4f  conf=%d  shares=%d  cash=$%.2f",
+            symbol, entry_price, sl_price, tp_price, verdict.confidence, shares, self.state.cash,
         )
         return True
 
@@ -645,12 +683,13 @@ class FastValidator:
 
     def _write_trade(
         self,
-        symbol:     str,
-        side:       str,
-        shares:     float,
-        price:      float,
-        reason:     str = "",
-        confidence: int = 0,
+        symbol:         str,
+        side:           str,
+        shares:         float,
+        price:          float,
+        reason:         str = "",
+        confidence:     int = 0,
+        cash_remaining: float | None = None,
     ) -> None:
         row = [
             datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
@@ -658,8 +697,8 @@ class FastValidator:
             side,
             f"{shares:.4f}",
             f"{price:.4f}",
-            f"{shares * price:.2f}",  # total_value
-            "0.00",                   # cash_remaining — not tracked in fast validator
+            f"{shares * price:.2f}",
+            f"{cash_remaining:.2f}" if cash_remaining is not None else "0.00",
             reason,
             confidence,
         ]

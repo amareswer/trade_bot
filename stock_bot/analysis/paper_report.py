@@ -11,10 +11,11 @@ import json
 import os
 from datetime import datetime
 
-_STOCK_BOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_TRADES_CSV    = os.path.join(_STOCK_BOT_DIR, "paper_trades.csv")
-_STATE_JSON    = os.path.join(_STOCK_BOT_DIR, "paper_state.json")
-_FAST_CSV      = os.path.join(_STOCK_BOT_DIR, "fast_trades.csv")
+_STOCK_BOT_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_TRADES_CSV      = os.path.join(_STOCK_BOT_DIR, "paper_trades.csv")
+_STATE_JSON      = os.path.join(_STOCK_BOT_DIR, "paper_state.json")
+_FAST_CSV        = os.path.join(_STOCK_BOT_DIR, "fast_trades.csv")
+_FAST_STATE_JSON = os.path.join(_STOCK_BOT_DIR, "fast_validator_state.json")
 
 _COLS = [
     "timestamp", "symbol", "side", "shares",
@@ -362,27 +363,55 @@ def generate_report(
 
     lines.append("")
 
-    # ── Swing book signal validator (unit-sized — % stats only) ──────────────
+    # ── Swing book (1h candles, 48h max hold, cash-tracked) ──────────────────
     fast_pairs, fast_open = _pair_trades(_read_trades(fast_csv_path))
+    fast_state = _read_state(_FAST_STATE_JSON)
+    f_cash          = fast_state.get("cash",          None)
+    f_starting_cash = fast_state.get("starting_cash", None)
+    f_realized_pnl  = fast_state.get("realized_pnl",  None)
+
     lines += [
-        "  SWING BOOK  (1h candles · 48h max hold · % stats only)",
+        "  SWING BOOK  (1h candles · 48h max hold · sized in $)",
         f"  {sep}",
     ]
+
+    if f_starting_cash:
+        lines.append(f"  Starting cash:    ${f_starting_cash:>10,.2f}")
+    if f_cash is not None:
+        lines.append(f"  Current cash:     ${f_cash:>10,.2f}")
+    if f_realized_pnl is not None and f_starting_cash:
+        pct = f_realized_pnl / f_starting_cash * 100
+        lines.append(f"  Realized P&L:     ${f_realized_pnl:>+10,.2f}  ({pct:+.1f}%)")
+
     if fast_pairs:
-        f_n     = len(fast_pairs)
-        f_wins  = [p for p in fast_pairs if p["pnl_pct"] > 0]
-        f_loss  = [p for p in fast_pairs if p["pnl_pct"] < 0]
-        f_wr    = len(f_wins) / f_n * 100
-        f_gw    = sum(p["pnl_pct"] for p in f_wins)
-        f_gl    = abs(sum(p["pnl_pct"] for p in f_loss))
-        f_pf    = (f_gw / f_gl) if f_gl > 0 else float("inf")
-        f_exp   = sum(p["pnl_pct"] for p in fast_pairs) / f_n
+        f_n    = len(fast_pairs)
+        f_wins = [p for p in fast_pairs if p["pnl"] > 0]
+        f_loss = [p for p in fast_pairs if p["pnl"] < 0]
+        f_wr   = len(f_wins) / f_n * 100
+        f_gw_usd = sum(p["pnl"] for p in f_wins)
+        f_gl_usd = abs(sum(p["pnl"] for p in f_loss))
+        f_pf_usd = (f_gw_usd / f_gl_usd) if f_gl_usd > 0 else float("inf")
+        f_gw_pct = sum(p["pnl_pct"] for p in f_wins)
+        f_gl_pct = abs(sum(p["pnl_pct"] for p in f_loss))
+        f_pf_pct = (f_gw_pct / f_gl_pct) if f_gl_pct > 0 else float("inf")
+        f_exp_pct = sum(p["pnl_pct"] for p in fast_pairs) / f_n
+
+        f_exp_stats = _expectancy_stats(fast_pairs)
+
         lines.append(f"  Completed:         {f_n}   open: {len(fast_open)}")
         lines.append(f"  Win rate:          {f_wr:.1f}%")
-        lines.append(f"  Profit factor:     {'∞' if f_pf == float('inf') else f'{f_pf:.2f}'} (gross % — signals, not sized trades)")
-        lines.append(f"  Expectancy:        {f_exp:+.2f}% per signal")
+        lines.append(f"  Profit factor:     {'∞' if f_pf_usd == float('inf') else f'{f_pf_usd:.2f}'} (gross $) · "
+                     f"{'∞' if f_pf_pct == float('inf') else f'{f_pf_pct:.2f}'} (gross %)")
+        lines.append(f"  Expectancy:        {f_exp_pct:+.2f}% per trade")
+        if f_exp_stats:
+            lines.append(f"  Net expectancy:    ${f_exp_stats['expectancy_usd']:>+8,.2f}/trade · "
+                         f"{f_exp_stats['expectancy_pct']:>+6.2f}%  (net of IBKR commissions)")
+            lines.append(f"  Net PF:            {f_exp_stats['net_pf']:.2f}")
+            lines.append(f"  Pace:              {f_exp_stats['trades_per_week']:.1f} trades/week")
+            if f_n < 30:
+                lines.append(f"  ⚠ {f_n} trades — direction only, not statistically reliable (need 30)")
     else:
-        lines.append(f"  Completed: 0   open: {len(fast_open)} — no closed signals yet.")
+        lines.append(f"  Completed: 0   open: {len(fast_open)} — no closed trades yet.")
 
     lines.append(f"  {sep}")
     if n_complete < 15:

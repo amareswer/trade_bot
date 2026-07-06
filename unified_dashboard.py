@@ -14,6 +14,7 @@ Tab selection is saved in localStorage — auto-refresh does not lose your spot.
 """
 from __future__ import annotations
 
+import csv
 import glob
 import json
 import os
@@ -157,8 +158,16 @@ def _combined_stats(active: dict[str, dict], stock: dict | None) -> str:
         for p in stock_pos.values()
     )
 
-    total      = crypto_cash + crypto_pv + stock_cash + stock_pv
-    total_rpnl = crypto_rpnl + stock_rpnl
+    swing_data  = _load_json("stock_bot/fast_validator_state.json") or {}
+    swing_cash  = float(swing_data.get("cash",         0))
+    swing_rpnl  = float(swing_data.get("realized_pnl", 0))
+    swing_pv    = sum(
+        float(p.get("shares", 0)) * float(p.get("entry_price", 0))
+        for p in swing_data.get("positions", [])
+    )
+
+    total      = crypto_cash + crypto_pv + stock_cash + stock_pv + swing_cash + swing_pv
+    total_rpnl = crypto_rpnl + stock_rpnl + swing_rpnl
 
     rpnl_col = "#3fb950" if total_rpnl >= 0 else "#f85149"
     rpnl_s   = "+" if total_rpnl >= 0 else ""
@@ -168,12 +177,12 @@ def _combined_stats(active: dict[str, dict], stock: dict | None) -> str:
         f'gap:12px;margin-bottom:24px">'
         + _stat_block(
             "Bot-Managed Capital", f"${total:,.2f}",
-            "active crypto slots + stock paper · crypto positions at cost basis"
+            "crypto slots + position book + swing book · positions at cost/entry"
         )
         + _stat_block(
             "Realized P&L",
             f'<span style="color:{rpnl_col}">{rpnl_s}${total_rpnl:,.2f}</span>',
-            "crypto (live) + stock (paper)"
+            "crypto (live) + position book (paper) + swing book (paper)"
         )
         + _stat_block(
             "Crypto Fees Paid", f"${crypto_fees:.4f}",
@@ -361,28 +370,70 @@ def _pnl_trend_section() -> str:
     )
 
 
+def _count_swing_completed() -> int:
+    """Count completed round-trips (SELL rows) in fast_trades.csv."""
+    try:
+        path = "stock_bot/fast_trades.csv"
+        if not os.path.exists(path):
+            return 0
+        with open(path, encoding="utf-8", newline="") as f:
+            return sum(1 for row in csv.reader(f) if len(row) > 2 and row[2].upper() == "SELL")
+    except Exception:
+        return 0
+
+
 def _fast_validator_card() -> str:
-    """FastValidator's separate paper book (independent of the main paper trader)."""
+    """Swing book — 1h candles, 48h max hold, cash-tracked (separate from position book)."""
     data = _load_json("stock_bot/fast_validator_state.json")
     if not data:
         return ""
-    positions = data.get("positions", [])
-    rows = "".join(
+
+    positions    = data.get("positions", [])
+    cash         = float(data.get("cash",          0))
+    starting     = float(data.get("starting_cash", 0))
+    realized_pnl = float(data.get("realized_pnl",  0))
+    completed    = _count_swing_completed()
+
+    ret_pct  = (cash - starting + realized_pnl) / starting * 100 if starting else 0.0
+    ret_col  = "#3fb950" if ret_pct >= 0 else "#f85149"
+    ret_s    = "+" if ret_pct >= 0 else ""
+
+    gate_pct = min(100, int(completed / 30 * 100))
+    gate_bar = (
+        f'<div style="background:#21262d;border-radius:4px;height:6px;margin-top:6px">'
+        f'<div style="background:#d29922;height:6px;border-radius:4px;width:{gate_pct}%"></div></div>'
+    )
+
+    pos_rows = "".join(
         _kv(
-            f'{p.get("symbol", "?")} × {p.get("shares", 0):g}',
+            f'{p.get("symbol", "?")} × {float(p.get("shares", 0)):g}sh',
             f'in @ ${float(p.get("entry_price", 0)):,.2f} · '
             f'SL ${float(p.get("sl_price", 0)):,.2f} · TP ${float(p.get("tp_price", 0)):,.2f}',
         )
         for p in positions
-    ) or _kv("Positions", "none open")
+    ) or _kv("Open positions", "none")
+
     return (
         '<div class="pf-card" style="margin-bottom:24px">'
         '<div class="pf-card-header">'
-        '<span class="pf-card-title">⚡ FastValidator (separate paper book)</span>'
-        f'<span class="pf-card-badge" style="background:#d2992222;color:#d29922;'
-        f'border-color:#d2992255">{len(positions)} open</span>'
+        '<span class="pf-card-title">⚡ Swing Book</span>'
+        '<span class="pf-card-badge" style="background:#d2992222;color:#d29922;'
+        f'border-color:#d2992255">1h · 48h max · {len(positions)} open</span>'
         '</div>'
-        + rows
+        + (
+            _kv("Cash", f"${cash:,.2f}  (started ${starting:,.2f})")
+            if starting else _kv("Cash", f"${cash:,.2f}")
+        )
+        + _kv("Realized P&L", _pnl(realized_pnl))
+        + _kv(
+            "Return",
+            f'<span style="color:{ret_col}">{ret_s}{ret_pct:.1f}%</span>'
+        )
+        + _kv(
+            "Phase A progress",
+            f'{completed} / 30 completed trades{gate_bar}',
+        )
+        + pos_rows
         + _kv("Last updated", _fmt_ts(data.get("last_updated")))
         + "</div>"
     )
