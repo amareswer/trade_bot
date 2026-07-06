@@ -438,6 +438,20 @@ expectancy is unmeasured until trades complete. The report's expectancy number i
   It picked up the 2026-07-04 execution fixes at its 22:09 ET restart.
   **Launch it like the stock bot from now on:** `caffeinate -i .venv/bin/python -m bot.main`
 
+### Ops changes (2026-07-06)
+- **Scheduling is now repo-tracked:** `ops/crontab.txt` is the source of truth for cron on any
+  machine — install with `crontab ops/crontab.txt`, never edit the live crontab by hand.
+  Installed locally 2026-07-06: daily `shadow_signal.py` (02:00 local ≈ 06:00 UTC) and weekly
+  Monday `live_comparison.py` (roadmap item 17 closed). VPS migration note in the file:
+  convert to systemd timers (`Persistent=true`) via deploy.sh.
+- **Shadow signal 2026-07-06 run: 100% match rate (PASS ≥95%).** Report:
+  `logs/shadow_report_20260706.md`.
+- **pytest log-pollution fix verified:** full suite (168 passed, 3.6s) leaves
+  `logs/trade_bot.log` mtime/size untouched. The test noise stamped 2026-07-05 10:42 in the
+  log predates the fix — historical, not a regression.
+- **`.env` secret rotation deferred by user** (2026-07-06, "will do it later") — still the
+  only open security item.
+
 ### Multi-coin readiness (2026-07-03)
 The live loop is now safe to run with >1 symbol in UNIVERSE_WHITELIST. Single-symbol behavior
 is numerically identical; strategy files untouched (hash `659d1c03987b72fd` still valid).
@@ -496,7 +510,12 @@ All critical bugs resolved:
 10. ~~**Add consecutive error counter**~~ — DONE: per-symbol `err_count`, alert at 5 consecutive failures.
 
 #### WEEK 2 — Hardening
-11. Correct ADX default: `config.py:383` change `25.0` → `18.0` (safe only while `.env` exists)
+11. ~~Correct ADX default~~ — RESOLVED 2026-07-06: `config.py` already defaults 18.0 (dataclass
+    + `_load()`). The remaining `25.0` in `bot/strategy/indicator_strategy.py:59` is dead at
+    runtime (both `bot/main.py` and `backtest.py` always pass `cfg.strategy.adx_threshold`)
+    and was deliberately left: editing that file invalidates strategy hash `659d1c03987b72fd`
+    and forces a full walk-forward for zero behavior change. Fix it inside the next real
+    strategy change.
 12. ~~Correct RSI levels~~ — DONE: `.env` has `RSI_OVERSOLD=30.0` / `RSI_OVERBOUGHT=70.0`
 13. Add logrotate on VPS: `/etc/logrotate.d/trade_bot` — weekly, 4 rotations, compress (log grows unbounded)
     (local log uses RotatingFileHandler 10MB × 5 — VPS journald/logrotate still unconfigured)
@@ -504,7 +523,8 @@ All critical bugs resolved:
     escalation after DRIFT_ALERT_THRESHOLD consecutive detections; compares `total` (2026-07-04)
 15. ~~Add candle watchdog~~ — DONE: `_check_candle_watchdog`, per symbol, alert at 2× candle_minutes
 16. Set up external uptime monitor (UptimeRobot free tier) — systemd stops after 5 crashes with no external alert
-17. Schedule weekly `live_comparison.py`: `0 9 * * 1 python live_comparison.py >> logs/weekly.log`
+17. ~~Schedule weekly `live_comparison.py`~~ — DONE 2026-07-06: installed via `ops/crontab.txt`
+    (see Ops changes 2026-07-06)
 
 #### MONTH+ — Revenue unlock gates
 | Milestone | Gate | Impact |
