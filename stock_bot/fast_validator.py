@@ -23,7 +23,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Callable, Optional
 
 import yfinance as yf
 from dotenv import load_dotenv
@@ -245,11 +245,15 @@ class FastValidator:
 
     def __init__(
         self,
-        cfg:   FastValidatorConfig | None = None,
-        state: FastValidatorState  | None = None,
+        cfg:                 FastValidatorConfig | None = None,
+        state:               FastValidatorState  | None = None,
+        blocked_symbols_fn:  Callable[[], set[str]] | None = None,
     ) -> None:
         self.cfg   = cfg   or load_fast_config()
         self.state = state or FastValidatorState.load()
+        # Callable that returns symbols currently held in the position book.
+        # Used to prevent double exposure (swing + position on same symbol).
+        self._blocked_symbols_fn = blocked_symbols_fn
         self._ensure_csv_header()
 
     # ── Data fetch ─────────────────────────────────────────────────────────
@@ -496,6 +500,15 @@ class FastValidator:
             return False
         if sig.get("trend") == "BEARISH":
             return False
+
+        if self._blocked_symbols_fn is not None:
+            blocked = self._blocked_symbols_fn()
+            if symbol.upper() in blocked:
+                logger.info(
+                    "FastValidator: skip %s — already held in position book (dual-exposure guard)",
+                    symbol,
+                )
+                return False
 
         if not _last_close_sane(candles, self.cfg.price_sanity_pct):
             logger.warning(

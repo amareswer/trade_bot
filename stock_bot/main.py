@@ -604,7 +604,11 @@ def run() -> None:
     # How many universe top movers the fast validator scans in addition to the
     # watchlist. Capped to bound yfinance fetch volume per cycle (rate limits).
     _fast_movers_count  = int(_os.getenv("FAST_MOVERS_COUNT", "5").strip() or "5")
-    fast_validator      = FastValidator() if _fast_enabled else None
+    fast_validator      = FastValidator(
+        blocked_symbols_fn=(
+            (lambda: set(executor.positions_snapshot().keys())) if executor else None
+        ),
+    ) if _fast_enabled else None
 
     print()
     print("  Stock Bot — Running 24/7")
@@ -966,7 +970,14 @@ def run() -> None:
                             logger.info("REGIME_SKIP: %s — market is %s", symbol, _cycle_regime)
                             print(f"  📛 REGIME_SKIP: {symbol} — market is {_cycle_regime}")
                             _regime_ok = False
-                        if _regime_ok and executor.position(symbol) == 0:
+                        _fv_occupied = fast_validator.state.open_symbols() if fast_validator else set()
+                        if symbol.upper() in _fv_occupied:
+                            logger.info(
+                                "POSITION_SKIP: %s — already held in swing book (dual-exposure guard)",
+                                symbol,
+                            )
+                            print(f"  📄 SKIP: {symbol} — held in swing book (no double exposure)")
+                        elif _regime_ok and executor.position(symbol) == 0:
                             _price_map_now = {r.symbol: r.price for r in scan_results}
                             if not executor.check_exposure(_price_map_now):
                                 print(f"  📄 SKIP: {symbol} — max exposure ({cfg.paper_max_exposure_pct*100:.0f}%) reached")

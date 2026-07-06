@@ -237,7 +237,7 @@ def generate_report(
         f"  Generated: {now_str}",
         "═" * width,
         "",
-        "  ACCOUNT",
+        "  POSITION BOOK  (daily candles · multi-day holds · sized in $)",
         f"  {sep}",
     ]
 
@@ -362,10 +362,10 @@ def generate_report(
 
     lines.append("")
 
-    # ── Fast validator signal book (unit-sized — % stats only) ────────────────
+    # ── Swing book signal validator (unit-sized — % stats only) ──────────────
     fast_pairs, fast_open = _pair_trades(_read_trades(fast_csv_path))
     lines += [
-        "  FAST VALIDATOR — SIGNAL BOOK (unit-sized, % stats only)",
+        "  SWING BOOK  (1h candles · 48h max hold · % stats only)",
         f"  {sep}",
     ]
     if fast_pairs:

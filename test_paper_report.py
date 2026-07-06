@@ -82,7 +82,7 @@ def test_generate_report_renders_expectancy_section():
     assert "EXPECTANCY — NET OF COMMISSIONS" in report
     # $20 gross − $2 commission = $18 net on one trade
     assert "+18.00" in report
-    assert "FAST VALIDATOR" in report
+    assert "SWING BOOK" in report
 
 
 if __name__ == "__main__":
