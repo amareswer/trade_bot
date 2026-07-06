@@ -308,6 +308,8 @@ def generate_report(
         f"  {sep}",
     ]
     n_complete = len(pairs)
+    win_rate   = 0.0
+    pf         = 0.0
     if n_complete > 0:
         wins      = [p for p in pairs if p["pnl_pct"] > 0]
         losses    = [p for p in pairs if p["pnl_pct"] < 0]
@@ -413,14 +415,55 @@ def generate_report(
     else:
         lines.append(f"  Completed: 0   open: {len(fast_open)} — no closed trades yet.")
 
+    # ── Phase A gates ─────────────────────────────────────────────────────────
     lines.append(f"  {sep}")
-    if n_complete < 15:
-        status = f"NEED MORE DATA (< 15 trades, have {n_complete})"
-    elif n_complete < 30:
-        status = "TRACKING"
+    lines.append("  PHASE A GATE STATUS")
+    lines.append(f"  {sep}")
+
+    # Position book gate (30 trades, PF ≥ 1.2, WR ≥ 30%)
+    pos_pf = pf if n_complete > 0 else 0.0
+    pos_wr = win_rate if n_complete > 0 else 0.0
+    if n_complete >= 30 and pos_pf >= 1.2 and pos_wr >= 30.0:
+        pos_gate = "✓ PASS"
+    elif n_complete == 0:
+        pos_gate = f"NEED DATA (0 / 30 trades)"
     else:
-        status = "VALIDATED"
-    lines.append(f"  Status: {status}")
+        reasons = []
+        if n_complete < 30:
+            reasons.append(f"{n_complete}/30 trades")
+        if pos_pf < 1.2:
+            reasons.append(f"PF {pos_pf:.2f} < 1.2")
+        if pos_wr < 30.0:
+            reasons.append(f"WR {pos_wr:.1f}% < 30%")
+        pos_gate = "TRACKING  (" + " · ".join(reasons) + ")"
+    lines.append(f"  Position book:  {pos_gate}")
+
+    # Swing book gate (30 trades, PF ≥ 1.2, WR ≥ 30%)
+    if fast_pairs:
+        swing_pf = f_pf_usd
+        swing_wr = f_wr
+        swing_n  = f_n
+    else:
+        swing_pf = 0.0
+        swing_wr = 0.0
+        swing_n  = 0
+
+    if swing_n >= 30 and swing_pf >= 1.2 and swing_wr >= 30.0:
+        sw_gate = "✓ PASS"
+    elif swing_n == 0:
+        sw_gate = "NEED DATA (0 / 30 trades)"
+    else:
+        sw_reasons = []
+        if swing_n < 30:
+            sw_reasons.append(f"{swing_n}/30 trades")
+        if swing_pf < 1.2:
+            sw_reasons.append(f"PF {swing_pf:.2f} < 1.2" if swing_pf != float("inf") else "")
+        if swing_wr < 30.0:
+            sw_reasons.append(f"WR {swing_wr:.1f}% < 30%")
+        sw_reasons = [r for r in sw_reasons if r]
+        sw_gate = "TRACKING  (" + " · ".join(sw_reasons) + ")"
+    lines.append(f"  Swing book:     {sw_gate}")
+
     lines.append("═" * width)
     lines.append("")
 

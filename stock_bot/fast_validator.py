@@ -96,9 +96,10 @@ class FastValidatorConfig:
     max_hold_hours:    int    # force-exit if position held longer than this
     max_positions:     int    # max simultaneous open positions
     min_confidence:    int    # minimum AI confidence to enter a trade
-    price_sanity_pct:  float = 20.0    # reject candle close deviating > this % from prior close
-    starting_cash:     float = 1000.0  # virtual cash for the swing book
-    risk_pct:          float = 0.25    # fraction of cash to allocate per trade (max 2 positions = 50% max deployed)
+    price_sanity_pct:       float = 20.0    # reject candle close deviating > this % from prior close
+    starting_cash:          float = 1000.0  # virtual cash for the swing book
+    risk_pct:               float = 0.25    # fraction of cash to allocate per trade (max 2 positions = 50% max deployed)
+    earnings_blackout_days: int   = 7       # block BUY within N days of next earnings
 
 
 def load_fast_config() -> FastValidatorConfig:
@@ -110,9 +111,10 @@ def load_fast_config() -> FastValidatorConfig:
         max_hold_hours   = _env_int  ("FAST_MAX_HOLD_HOURS",   48),
         max_positions    = _env_int  ("FAST_MAX_POSITIONS",    2),
         min_confidence   = _env_int  ("FAST_MIN_CONFIDENCE",   70),
-        price_sanity_pct = _env_float("FAST_PRICE_SANITY_PCT", 20.0),
-        starting_cash    = _env_float("FAST_STARTING_CASH",    1000.0),
-        risk_pct         = _env_float("FAST_RISK_PCT",         0.25),
+        price_sanity_pct       = _env_float("FAST_PRICE_SANITY_PCT",        20.0),
+        starting_cash          = _env_float("FAST_STARTING_CASH",           1000.0),
+        risk_pct               = _env_float("FAST_RISK_PCT",                0.25),
+        earnings_blackout_days = _env_int  ("FAST_EARNINGS_BLACKOUT_DAYS",  7),
     )
 
 
@@ -260,15 +262,18 @@ class FastValidator:
 
     def __init__(
         self,
-        cfg:                 FastValidatorConfig | None = None,
-        state:               FastValidatorState  | None = None,
-        blocked_symbols_fn:  Callable[[], set[str]] | None = None,
+        cfg:                  FastValidatorConfig | None = None,
+        state:                FastValidatorState  | None = None,
+        blocked_symbols_fn:   Callable[[], set[str]] | None = None,
+        earnings_blocked_fn:  Callable[[], set[str]] | None = None,
     ) -> None:
         self.cfg   = cfg   or load_fast_config()
         self.state = state or FastValidatorState.load()
         # Callable that returns symbols currently held in the position book.
         # Used to prevent double exposure (swing + position on same symbol).
-        self._blocked_symbols_fn = blocked_symbols_fn
+        self._blocked_symbols_fn  = blocked_symbols_fn
+        # Callable that returns symbols in earnings blackout (within N days of earnings).
+        self._earnings_blocked_fn = earnings_blocked_fn
         # Seed cash from config on first run (state file has no cash yet).
         if self.state.starting_cash == 0.0 and self.cfg.starting_cash > 0:
             self.state.cash          = self.cfg.starting_cash
@@ -532,6 +537,15 @@ class FastValidator:
                 logger.info(
                     "FastValidator: skip %s — already held in position book (dual-exposure guard)",
                     symbol,
+                )
+                return False
+
+        if self._earnings_blocked_fn is not None:
+            earnings_blocked = self._earnings_blocked_fn()
+            if symbol.upper() in earnings_blocked:
+                logger.info(
+                    "FastValidator: skip %s — earnings blackout (%d-day window)",
+                    symbol, self.cfg.earnings_blackout_days,
                 )
                 return False
 

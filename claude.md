@@ -487,16 +487,40 @@ Alpaca ruled out — no Canadian TSX support (SHOP.TO, RY.TO etc.), which would 
 
 **Gate before live IBKR:** same as current Phase A — 30 completed paper trades, PF ≥ 1.2, win rate ≥ 30%.
 
+### Swing book hardening (2026-07-06 continued)
+Features A, B, E from the roadmap completed. 168 tests pass.
+
+**A — Swing book cash tracking:**
+- `FastValidatorConfig` gains `starting_cash` (env: `FAST_STARTING_CASH=1000.00`) and `risk_pct` (env: `FAST_RISK_PCT=0.25`).
+- `FastValidatorState` gains `cash`, `starting_cash`, `realized_pnl` — persisted in `fast_validator_state.json` and restored on restart.
+- First run seeds cash from config (state file has no cash yet — `starting_cash == 0.0` guard).
+- `_try_enter()` sizes real share count: `int(cash × risk_pct / entry_price)`; skips if result is 0 (not enough cash). Deducts cost on entry, adds proceeds on exit.
+- `check_exits()` updates `state.cash` and `state.realized_pnl` on each close; `_write_trade()` writes real `cash_remaining` to CSV (frozen 9-column schema unchanged).
+- `paper_report.py` swing book section now shows: starting cash, current cash, realized P&L + %, and net expectancy in $.
+- `unified_dashboard.py`: `_fast_validator_card()` rewritten with cash stats + Phase A progress bar; `_combined_stats()` includes swing cash + open position value in total.
+
+**B — Swing book Phase A gate (formal status):**
+- Bottom of `paper_report.py` replaced: two independent `Phase A Gate Status` lines replace the single confusing `Status:` line that used position-book counts but appeared after the swing-book section.
+- Format: `Position book: TRACKING (8/30 trades · PF 0.95 < 1.2)` and `Swing book: NEED DATA (0 / 30 trades)` — each uses its own count/PF/win-rate against the 30-trade / PF ≥ 1.2 / WR ≥ 30% gate. Shows `✓ PASS` when all three criteria are met independently.
+- `win_rate` and `pf` initialized to `0.0` before the `if n_complete > 0:` block so the gate check has values when the book is empty.
+
+**E — Earnings blackout for swing book:**
+- `FastValidatorConfig` gains `earnings_blackout_days: int = 7` (env: `FAST_EARNINGS_BLACKOUT_DAYS=7`).
+- `FastValidator.__init__()` gains `earnings_blocked_fn: Callable[[], set[str]] | None = None`. Stored as `self._earnings_blocked_fn`.
+- `_try_enter()` checks the callback (after `blocked_symbols_fn`, before corruption guard) — skips with log if symbol is in the earnings blackout set.
+- `main.py` wiring: `_fv_earnings_blocked: set[str]` is reset to `set()` at the top of each scan cycle; when the position-book loop detects earnings blackout for a symbol, it adds the symbol to this set (same point where `continue` fires). FastValidator receives `earnings_blocked_fn=lambda: _fv_earnings_blocked` — the lambda reads the current binding at call time, so the swing book sees the freshly populated set for each cycle's evaluation.
+- Both books now share the same earnings gate with zero duplication of the yfinance earnings fetch.
+
 ### Next feature roadmap (2026-07-06)
 
 #### Stock bot — near term
 | # | Feature | Why | Effort |
 |---|---------|-----|--------|
-| A | **Swing book cash tracking** | Add `FAST_STARTING_CASH` + real cash in `FastValidatorState` — unlocks $ expectancy for swing book, same Phase A gate as position book | Medium |
-| B | **Swing book Phase A gate** | Separate 30-trade / PF ≥ 1.2 counter for swing book, independent of position book | Small |
+| ~~A~~ | ~~**Swing book cash tracking**~~ | ~~Add `FAST_STARTING_CASH` + real cash in `FastValidatorState` — unlocks $ expectancy for swing book, same Phase A gate as position book~~ | ~~Medium~~ |
+| ~~B~~ | ~~**Swing book Phase A gate**~~ | ~~Separate 30-trade / PF ≥ 1.2 counter for swing book, independent of position book~~ | ~~Small~~ |
 | C | **Combined dashboard section** | Total capital across both books, per-book PF side by side, combined exposure | Medium |
 | D | **IBKR paper executor** | `IBKRExecutor(StockExecutorBase)` in `stock_bot/execution/ibkr.py` — paper mode first (port 7497), then live gate | Large (~10h) |
-| E | **5-day earnings blackout** | Block BUY within 5 days of next earnings — avoid pre-earnings gap risk | Small |
+| ~~E~~ | ~~**Earnings blackout for swing book**~~ | ~~Block swing BUY within N days of next earnings — mirrors position-book gate, shares same yfinance fetch~~ | ~~Small~~ |
 
 #### Crypto bot — near term
 | # | Feature | Why | Effort |

@@ -604,10 +604,15 @@ def run() -> None:
     # How many universe top movers the fast validator scans in addition to the
     # watchlist. Capped to bound yfinance fetch volume per cycle (rate limits).
     _fast_movers_count  = int(_os.getenv("FAST_MOVERS_COUNT", "5").strip() or "5")
+    # Symbols currently in earnings blackout — populated each scan cycle and
+    # shared with the swing book via closure so it also skips pre-earnings entries.
+    _fv_earnings_blocked: set[str] = set()
+
     fast_validator      = FastValidator(
         blocked_symbols_fn=(
             (lambda: set(executor.positions_snapshot().keys())) if executor else None
         ),
+        earnings_blocked_fn=(lambda: _fv_earnings_blocked) if _fast_enabled else None,
     ) if _fast_enabled else None
 
     print()
@@ -790,7 +795,8 @@ def run() -> None:
         watchlist_set = set(cfg.watchlist)
         scan_results: list[ScanResult] = []
 
-        # Reset duplicate price detector for this cycle
+        # Reset per-cycle state
+        _fv_earnings_blocked = set()
         reset_price_cache()
 
         # ── Phase 1: prices + indicators (all symbols, parallel) ───────────
@@ -964,6 +970,8 @@ def run() -> None:
                                 f"conf={verdict.confidence}% blocked"
                             )
                             print(f"  {'─' * 70}")
+                            # Also block swing book from entering this symbol
+                            _fv_earnings_blocked.add(symbol.upper())
                             continue
                         _regime_ok = True
                         if cfg.regime_filter_enabled and (not spy_closes or _cycle_regime != "BULL"):
