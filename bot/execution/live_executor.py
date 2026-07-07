@@ -675,53 +675,56 @@ class LiveExecutor:
 
                     quantity = filled_qty
 
-                # Recovery: SELL quantity is 0 after polling — try to recover the true fill.
-                # Priority:
+                # Recovery: quantity is 0 after polling — try to recover the true fill.
+                # Applies to both BUY and SELL (BUY can hit qty=0 when _place_limit_order
+                # falls back to a market order and the initial create_order response has
+                # filled=0 before the fill propagates). Priority:
                 #   1. last_raw["filled"] if non-zero — authoritative (exchange confirms it)
                 #   2. last_raw["amount"] ONLY for market orders that closed — safe inference
-                #      (closed market SELL = fully executed; amount = what was requested)
+                #      (closed market order = fully executed; amount = what was requested)
                 #      Never use amount for limit orders — they may partially fill or cancel.
-                #   3. If neither recovers a positive qty → refuse to write a phantom row.
-                if side == OrderSide.SELL and quantity <= 0:
+                #   3. If neither recovers a positive qty → return None to prevent phantom row.
+                if quantity <= 0:
                     _last_filled = float(last_raw.get("filled") or 0.0)
                     _last_status = last_raw.get("status")
                     _is_market   = (self._order_type != "limit")
 
+                    _side_str = side.value
                     if _last_filled > 0:
                         # `filled` is now non-zero — initial create_order response was stale.
                         quantity   = _last_filled
                         filled_qty = _last_filled
                         logger.warning(
-                            "SELL filled settled to %.6f after polling (order %s)"
+                            "%s filled settled to %.6f after polling (order %s)"
                             " — initial response had filled=0",
-                            _last_filled, order_id_str,
+                            _side_str, _last_filled, order_id_str,
                         )
                     elif _last_status in ("closed", "filled") and _is_market:
-                        # Market SELL closed with filled still=0 — infer from amount.
+                        # Market order closed with filled still=0 — infer from amount.
                         _req_amt = float(last_raw.get("amount") or 0.0)
                         if _req_amt > 0:
                             quantity   = _req_amt
                             filled_qty = _req_amt
                             logger.warning(
-                                "SELL market order %s closed with filled=0"
+                                "%s market order %s closed with filled=0"
                                 " — inferring fill qty from amount=%.6f."
                                 " Verify on exchange if P&L looks wrong.",
-                                order_id_str, _req_amt,
+                                _side_str, order_id_str, _req_amt,
                             )
                         else:
                             logger.error(
-                                "SELL qty=0 GUARD: order %s closed but amount=0 too"
+                                "%s qty=0 GUARD: order %s closed but amount=0 too"
                                 " — skipping fill record. Manual verification required.",
-                                order_id_str,
+                                _side_str, order_id_str,
                             )
                             return None
                     else:
                         # Limit order with filled=0, or order not yet closed — do not infer.
                         logger.error(
-                            "SELL qty=0 GUARD: order %s status=%s order_type=%s filled=0"
+                            "%s qty=0 GUARD: order %s status=%s order_type=%s filled=0"
                             " — skipping fill record to prevent phantom row."
                             " Manual verification required.",
-                            order_id_str, _last_status, self._order_type,
+                            _side_str, order_id_str, _last_status, self._order_type,
                         )
                         return None
 

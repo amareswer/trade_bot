@@ -1601,7 +1601,14 @@ def run():
             if approval:
                 order = ss['executor'].execute(final_signal, price, quantity=trade_qty)
                 if order:
-                    if order.status == OrderStatus.FILLED:
+                    if order.status == OrderStatus.FILLED and order.quantity <= 0:
+                        logger.error(
+                            "FILLED order returned with qty=0 for %s %s — skipping fill record."
+                            " Check Kraken manually.",
+                            order.side.value, sym,
+                        )
+                        order = None
+                    if order and order.status == OrderStatus.FILLED:
                         risk.record_fill(sym)
                         ss['sm'].on_fill(final_signal, order.price)
 
