@@ -363,14 +363,14 @@ class StockPaperExecutor(StockExecutorBase):
     def unrealized_pnl(self, prices: dict[str, float]) -> float:
         total = 0.0
         for sym, (shares, cost) in self._positions.items():
-            px = prices.get(sym, prices.get(sym.lower(), 0.0))
+            px = prices.get(sym, prices.get(sym.lower(), cost))
             total += (px - cost) * shares
         return round(total, 2)
 
     def total_value(self, prices: dict[str, float]) -> float:
         pos_value = sum(
-            prices.get(sym, prices.get(sym.lower(), 0.0)) * shares
-            for sym, (shares, _) in self._positions.items()
+            prices.get(sym, prices.get(sym.lower(), cost)) * shares
+            for sym, (shares, cost) in self._positions.items()
         )
         return round(self._cash + pos_value, 2)
 
