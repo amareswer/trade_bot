@@ -5,7 +5,30 @@ metadata:
   type: project
 ---
 
-**Status as of 2026-07-04 (Session 8 complete):**
+**Status as of 2026-07-10 (Session 10 complete):**
+
+## Session 2026-07-09/10 (Session 10) — Day-Trading Ruled Out + Held-Position Visibility Fixes (COMPLETE ✅)
+
+### Decisions
+- **1h day-trading FAILED walk-forward** (2026-07-10): full window PF 1.04, 3000c PF 0.99,
+  SL-exit rate ~63% — same pathology as every rejected altcoin. Roadmap gate closed as FAIL.
+  No day-trading on this strategy; 4h stays the only validated timeframe. Do not revisit
+  without a new strategy version or materially more 1h history.
+- **Kraken balance grew to $146.31 — slot deliberately stays $77** (MAX_SLOT_CASH_CAD).
+  Capital raises only via the 15-fill / net-PF ≥ 1.2 gate (progress: 0 fills).
+
+### Fixes (root-cause class: held position leaves scan scope → invisible to exit logic)
+- Stock bot: DLTR rotated out of universe → no price refresh/AI verdict, could never get a
+  strategy SELL; missing price also faked -$227.80 unrealized P&L ($0 fallback in
+  `unrealized_pnl()`/`total_value()` — now avg_cost, matching check_exposure).
+  Each scan cycle now builds `cycle_symbols = watchlist + movers + held positions`; held
+  symbols bypass the screener. SL/TP watcher was never affected.
+- Crypto bot: startup orphan guard `_check_orphaned_positions()` in bot/main.py — any
+  `position > 0` in live_state_*.json for a symbol not initialized this run fires
+  logger.error + Telegram. Alert-only. `test_orphaned_positions.py` (5).
+- Suite now **173 tests** (~4s). Both bots restarted on fixed code 2026-07-10.
+- Stock bot still buy-blocked by design: AC.TO+DLTR ≈ 48% exposure vs 25% cap — clears
+  when a position exits. Not a bug.
 
 ## Session 2026-07-04 (Session 8) — Stock Bot Breaker Fix + Unified Dashboard Rewrite (COMPLETE ✅)
 

@@ -618,6 +618,28 @@ def _fetch_kraken_price_raw(asset: str) -> float | None:
     return None
 
 
+def _fetch_kraken_balances() -> dict[str, float] | None:
+    """
+    Authenticated fetch of REAL account balances (Kraken `total`, matching
+    _sync_position / drift checks). Returns {asset: amount} for non-zero
+    assets incl. 'CAD', or None when keys are missing or the fetch fails —
+    caller falls back to the manual logs/kraken_holdings.json snapshot.
+    """
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+        key    = os.getenv("KRAKEN_API_KEY", "")
+        secret = os.getenv("KRAKEN_API_SECRET", "")
+        if not key or not secret:
+            return None
+        import ccxt
+        ex  = ccxt.kraken({"apiKey": key, "secret": secret, "enableRateLimit": True})
+        tot = ex.fetch_balance().get("total", {}) or {}
+        return {a: float(v) for a, v in tot.items() if v and float(v) > 1e-12}
+    except Exception:
+        return None
+
+
 def _fmt_price(p: float) -> str:
     return f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
 
@@ -631,8 +653,25 @@ def _fmt_balance(b: float) -> str:
 
 
 def _kraken_holdings_card(bot_cash: float) -> str:
-    holdings = _load_json(KRAKEN_HOLDINGS_PATH)
-    if not holdings:
+    """
+    Real Kraken account: live authenticated balances when API keys are
+    available; falls back to the manual logs/kraken_holdings.json snapshot
+    otherwise. The manual file only supplies avg-cost for P&L — it is NOT
+    the source of what the account holds (it went stale Jun 26 and kept
+    showing assets sold in the Jun 27 incident).
+    """
+    cost_ref = _load_json(KRAKEN_HOLDINGS_PATH) or {}
+    balances = _fetch_kraken_balances()
+
+    if balances is not None:
+        cad_cash = balances.pop("CAD", 0.0)
+        assets   = balances
+        title    = "Kraken Account (live)"
+    elif cost_ref:
+        cad_cash = None
+        assets   = {a: float(i.get("balance", 0)) for a, i in cost_ref.items()}
+        title    = "Kraken Holdings (manual snapshot — may be stale)"
+    else:
         return ""
 
     TH = ('style="text-align:left;padding:6px 10px;font-size:10px;color:#8b949e;'
@@ -643,26 +682,30 @@ def _kraken_holdings_card(bot_cash: float) -> str:
     rows = ""
     total_value = 0.0
 
-    for asset, info in holdings.items():
-        balance   = float(info.get("balance", 0))
-        avg_price = float(info.get("avg_price", 0))
+    for asset, balance in sorted(assets.items()):
+        avg_price = float(cost_ref.get(asset, {}).get("avg_price", 0))
         cost_val  = balance * avg_price
         current   = _fetch_kraken_price_raw(asset)
+        avg_str   = _fmt_price(avg_price) if avg_price > 0 else "—"
 
         if current is not None:
-            cur_val  = balance * current
-            pnl      = cur_val - cost_val
-            pnl_pct  = pnl / cost_val * 100 if cost_val else 0.0
-            pnl_col  = "#3fb950" if pnl >= 0 else "#f85149"
-            pnl_s    = "+" if pnl >= 0 else ""
-            cur_str  = _fmt_price(current)
-            val_str  = f"${cur_val:,.2f}"
-            pnl_str  = f'<span style="color:{pnl_col}">{pnl_s}${pnl:,.2f}</span>'
-            pct_str  = f'<span style="color:{pnl_col}">{pnl_s}{pnl_pct:.1f}%</span>'
+            cur_val = balance * current
+            cur_str = _fmt_price(current)
+            val_str = f"${cur_val:,.2f}"
             total_value += cur_val
+            if avg_price > 0:
+                pnl     = cur_val - cost_val
+                pnl_pct = pnl / cost_val * 100 if cost_val else 0.0
+                pnl_col = "#3fb950" if pnl >= 0 else "#f85149"
+                pnl_s   = "+" if pnl >= 0 else ""
+                pnl_str = f'<span style="color:{pnl_col}">{pnl_s}${pnl:,.2f}</span>'
+                pct_str = f'<span style="color:{pnl_col}">{pnl_s}{pnl_pct:.1f}%</span>'
+            else:
+                pnl_str = "—"
+                pct_str = "—"
         else:
             cur_str = "—"
-            val_str = f"${cost_val:,.2f}"
+            val_str = f"${cost_val:,.2f}" if avg_price > 0 else "—"
             pnl_str = "—"
             pct_str = "—"
             total_value += cost_val
@@ -671,7 +714,7 @@ def _kraken_holdings_card(bot_cash: float) -> str:
             f"<tr>"
             f'<td style="{TD};color:#c9d1d9"><strong>{asset}</strong></td>'
             f'<td style="{TD};color:#c9d1d9">{_fmt_balance(balance)}</td>'
-            f'<td style="{TD};color:#c9d1d9">{_fmt_price(avg_price)}</td>'
+            f'<td style="{TD};color:#c9d1d9">{avg_str}</td>'
             f'<td style="{TD};color:#c9d1d9">{cur_str}</td>'
             f'<td style="{TD};color:#c9d1d9">{val_str}</td>'
             f'<td style="{TD}">{pnl_str}</td>'
@@ -679,14 +722,35 @@ def _kraken_holdings_card(bot_cash: float) -> str:
             f"</tr>"
         )
 
-    total_combined = bot_cash + total_value
+    if not rows:
+        rows = (
+            f'<tr><td colspan="7" style="{TD};color:#8b949e">'
+            "no crypto assets held</td></tr>"
+        )
+
+    if cad_cash is not None:
+        # Live mode: account cash is real; slot cash is the bot's share of it.
+        total_combined = cad_cash + total_value
+        footer = (
+            f'Account cash: <strong style="color:#e6edf3">${cad_cash:,.2f} CAD</strong>'
+            f' (bot slot uses <strong style="color:#e6edf3">${bot_cash:,.2f}</strong>)'
+            f' + Holdings: <strong style="color:#e6edf3">${total_value:,.2f}</strong>'
+            f' = Total: <strong style="color:#3fb950">${total_combined:,.2f}</strong>'
+        )
+    else:
+        total_combined = bot_cash + total_value
+        footer = (
+            f'Bot Cash: <strong style="color:#e6edf3">${bot_cash:,.2f}</strong>'
+            f' + Holdings: <strong style="color:#e6edf3">${total_value:,.2f}</strong>'
+            f' = Total: <strong style="color:#3fb950">${total_combined:,.2f}</strong>'
+        )
 
     return (
         '<div style="margin-top:14px;background:#0d1117;border:1px solid #30363d;'
         'border-radius:6px;overflow:hidden;overflow-x:auto">'
         '<div style="padding:8px 12px;border-bottom:1px solid #30363d;font-size:10px;'
         'color:#8b949e;text-transform:uppercase;letter-spacing:.05em;font-weight:600">'
-        'Kraken Holdings'
+        f'{title}'
         '</div>'
         '<table style="width:100%;border-collapse:collapse">'
         '<thead><tr>'
@@ -701,9 +765,7 @@ def _kraken_holdings_card(bot_cash: float) -> str:
         f'<tbody>{rows}</tbody>'
         '</table>'
         '<div style="padding:10px 12px;border-top:1px solid #30363d;font-size:12px;color:#8b949e">'
-        f'Bot Cash: <strong style="color:#e6edf3">${bot_cash:,.2f}</strong>'
-        f' + Holdings: <strong style="color:#e6edf3">${total_value:,.2f}</strong>'
-        f' = Total: <strong style="color:#3fb950">${total_combined:,.2f}</strong>'
+        f'{footer}'
         '</div>'
         '</div>'
     )

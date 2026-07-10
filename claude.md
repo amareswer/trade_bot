@@ -165,7 +165,7 @@ A robust crypto trading system that:
 
 ## Test Suite Manifest (as of 2026-07-03)
 
-Expected total: **168 tests** (as of 2026-07-04). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
+Expected total: **173 tests** (as of 2026-07-10). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -182,12 +182,13 @@ Expected total: **168 tests** (as of 2026-07-04). If `pytest --collect-only -q` 
 | `test_stock_breaker.py` | 3 | Stock-bot daily-loss breaker: restart baseline includes position marks |
 | `test_candle_watchdog.py` | 5 | Candle watchdog: timing, alert, no double-fire |
 | `test_halt_flag.py` | 5 | Manual halt kill-switch: logs/HALT flag file engage/lift, ownership guard |
+| `test_orphaned_positions.py` | 5 | Startup orphan check: open position outside this run's symbol list alerts (removed-from-whitelist safety) |
 | `test_universe.py` | 4 | Universe screener: scoring, momentum filter, fallback |
 | `test_main_strategy.py` | 2 | Strategy builder: full config wiring |
 | `test_fast_validator_exits.py` | 6 | FastValidator exits: MAX_HOLD live-price fallback, corruption guard, SL regression |
 | `test_paper_report.py` | 6 | Expectancy math: IBKR commission model, net-of-cost flip, report rendering |
 
-Run: `python -m pytest --tb=short -q` — must show **168 passed**.
+Run: `python -m pytest --tb=short -q` — must show **173 passed**.
 
 ---
 
@@ -482,6 +483,26 @@ expectancy is unmeasured until trades complete. The report's expectancy number i
   log predates the fix — historical, not a regression.
 - **`.env` secret rotation deferred by user** (2026-07-06, "will do it later") — still the
   only open security item.
+
+### Held-position visibility fixes (2026-07-10) — both bots, 173 tests pass
+Root cause class: a held position whose symbol leaves the scanned universe becomes invisible
+to exit logic. Found via DLTR (stock bot): bought 2026-06-25 from a universe pick, then rotated
+out of the movers list — no price refresh, no AI verdict, could never get a strategy SELL, and
+its missing price also produced a phantom -$227.80 unrealized P&L (missing-symbol fallback was
+$0 instead of avg_cost in `unrealized_pnl()`/`total_value()` — fixed 2026-07-09).
+- **Stock bot (`stock_bot/main.py`):** each scan cycle now builds `cycle_symbols =
+  watchlist + movers + held positions` and adds held symbols to the screener-bypass set.
+  A held symbol can no longer be screened out of its own exit evaluation. The SL/TP watcher
+  was never affected (iterates `positions_snapshot()` directly).
+- **Crypto bot (`bot/main.py`):** startup orphan guard `_check_orphaned_positions()` — scans
+  all `logs/live_state_*.json`; any `position > 0` for a symbol not initialized this run
+  (e.g. removed from UNIVERSE_WHITELIST while holding) fires logger.error + Telegram alert.
+  Alert-only by design: auto-trading an orphan with a cold strategy would be worse. No live
+  orphans existed at ship time (all slots flat). Tests: `test_orphaned_positions.py` (5).
+- **Both bots restarted on the fixed code 2026-07-10** (usual caffeinate + .venv launch).
+- **Kraken balance is now $146.31 CAD; slot stays capped at $77** (`MAX_SLOT_CASH_CAD=77`).
+  Deliberate: capital increases go through the 15-fill / net-PF ≥ 1.2 gate, not deposits.
+  Current gate progress: 0 fills. Raise the cap in `.env` only after the gate passes.
 
 ### Dual-strategy formalization (2026-07-06)
 Stock bot now has two formally separated, named strategy books. 168 tests pass.

@@ -13,6 +13,8 @@ Architecture (top → bottom):
   →  Terminal Dashboard
 """
 import csv
+import glob
+import json
 import logging
 import logging.handlers
 import os
@@ -381,6 +383,46 @@ def _record_startup_and_check_crash_loop(alerter: "TelegramAlerter") -> None:
         logger.warning("Could not check crash-loop state: %s", exc)
 
 
+def _check_orphaned_positions(
+    initialized_symbols: "set[str]",
+    alerter: "TelegramAlerter",
+    log_dir: str = _log_dir,
+) -> list[str]:
+    """
+    Scan all logs/live_state_*.json for open positions whose symbol is NOT
+    being initialized this run (e.g. removed from UNIVERSE_WHITELIST while
+    holding). Such positions get no SL/TP checks, no drift reconciliation and
+    no alerts — alert loudly so a human closes or re-whitelists them.
+    Returns the list of orphaned symbols (for tests).
+    """
+    orphaned: list[str] = []
+    try:
+        for path in sorted(glob.glob(os.path.join(log_dir, "live_state_*.json"))):
+            try:
+                with open(path) as fh:
+                    state = json.load(fh)
+            except Exception as exc:
+                logger.warning("Orphan check: could not read %s: %s", path, exc)
+                continue
+            sym = state.get("symbol", "")
+            pos = float(state.get("position", 0.0) or 0.0)
+            if pos > 0 and sym and sym not in initialized_symbols:
+                orphaned.append(sym)
+                logger.error(
+                    "ORPHANED POSITION: %s holds %s but is not in this run's symbol list "
+                    "— NO SL/TP or drift monitoring. Close it manually or re-add to "
+                    "UNIVERSE_WHITELIST. State: %s", sym, pos, path,
+                )
+                alerter.error(
+                    f"ORPHANED POSITION: {sym} holds {pos} but is not monitored this run "
+                    f"(removed from whitelist?). No SL/TP will fire — close manually or "
+                    f"re-add to UNIVERSE_WHITELIST."
+                )
+    except Exception as exc:
+        logger.warning("Orphan position check failed: %s", exc)
+    return orphaned
+
+
 # ---------------------------------------------------------------------------
 # Candle watchdog helper (extracted for unit-testability)
 # ---------------------------------------------------------------------------
@@ -660,6 +702,7 @@ def run():
     _mode_label = "LIVE" if cfg.exchange.live_trading else ("DRY RUN" if cfg.exchange.dry_run else "PAPER")
     alerter.startup(cfg.exchange.exchange, cfg.exchange.symbol, _mode_label)
     _record_startup_and_check_crash_loop(alerter)
+    _check_orphaned_positions(set(executors.keys()), alerter)
 
     # ── Derive live candle timeframe from CANDLE_MINUTES ─────────────────────
     # This is the timeframe used for ALL live candle operations:

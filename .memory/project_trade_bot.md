@@ -205,3 +205,14 @@ OPENROUTER_API_KEY=sk-or-...
 Runtime = .venv (3.11.15), launch: `.venv/bin/python -m bot.main` / `caffeinate -i .venv/bin/python -m stock_bot.main`.
 yfinance 1.5.1 validated; pandas held at 2.3.3 deliberately. Suite = 168 tests ~3s via .venv/bin/python -m pytest.
 Full detail: CLAUDE.md "Ops changes (2026-07-05)" + "Stock bot Phase A" sections.
+
+## 2026-07-10 — 1h day-trading FAILED walk-forward + orphan-position guard
+- 1h (day-trading) walk-forward on current strategy: full window PF 1.04, 3000c PF 0.99,
+  ~63% SL-exit rate — FAILED. 4h stays the only validated live timeframe. Roadmap gate closed.
+- Startup orphan guard `_check_orphaned_positions()` in bot/main.py: open position in any
+  live_state_*.json whose symbol isn't initialized this run → ERROR log + Telegram alert
+  (alert-only). test_orphaned_positions.py (5). Suite = 173 tests.
+- Kraken balance $146.31 but slot capped $77 (MAX_SLOT_CASH_CAD) until 15-fill/PF≥1.2 gate
+  (progress: 0 fills). Bot restarted on fixed code; still HOLDing — ADX ~16-17 < 18 and
+  EMA spread < 0.4% on 4h (correct behavior, sideways market).
+Full detail: CLAUDE.md "1h day-trading walk-forward — FAILED" + "Held-position visibility fixes" sections.

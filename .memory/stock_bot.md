@@ -505,6 +505,21 @@ Phase A measures expectancy from 30 completed paper trades. Full notes in CLAUDE
       pandas HELD at 2.3.3 — pip wants 3.0.x on 3.11; upgrade deliberately, never as side effect
 - [x] fast_trades.csv untracked from git; all runtime data gitignored
 - [x] Banner shows restored cash (was .env starting cash); dashboard heartbeat amber 65h→80h
-- [ ] PENDING: restart stock bot under venv (caffeinate -i .venv/bin/python -m stock_bot.main)
-      — running process predates fast-book reset, holds AMZN/HOOD in memory
+- [x] PENDING: restart stock bot under venv (caffeinate -i .venv/bin/python -m stock_bot.main)
+      — DONE 2026-07-05 10:42, re-restarted 2026-07-10 on held-symbol scan fix
 - Docker decision: NOT now — venv + existing systemd deploy path; revisit at VPS move
+
+## Held-position visibility session (2026-07-09/10)
+
+- [x] Root cause of "bot not buying": AC.TO+DLTR ≈ 48% exposure vs PAPER_MAX_EXPOSURE_PCT=0.25
+      → every BUY skipped via check_exposure(). SKIP prints go to stdout only, NOT the log —
+      look at the bot's terminal, not stock_bot.log, when diagnosing silent no-buys.
+- [x] DLTR invisibility fixed: held positions merged into every scan cycle
+      (`cycle_symbols = watchlist + movers + held`) + added to screener-bypass set —
+      a held symbol always gets price/research/AI verdict so a strategy SELL can fire.
+      SL/TP watcher was never affected (iterates positions_snapshot directly).
+- [x] Phantom -$227.80 unrealized P&L fixed: unrealized_pnl()/total_value() in paper.py
+      fell back to $0 for symbols missing from the price map — now avg_cost (consistent
+      with check_exposure/build_paper_summary). DLTR was never down that much.
+- Exposure cap deliberately LEFT at 25% (user confirmed): buys resume when a position exits.
+- Suite = 173 tests. Bot restarted 2026-07-10 with the fix.
