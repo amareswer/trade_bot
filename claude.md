@@ -299,6 +299,37 @@ ATR SL drift incident (resolved 2026-07-02):
 - 1 live fill occurred under unvalidated ATR config (2026-06-22 16:36 UTC, pnl=-0.02 CAD, reason='trail_stop')
 - Live bot was on validated fixed SL=1.5% from 2026-06-22 21:24 UTC onwards.
 
+### 1h day-trading walk-forward — FAILED (2026-07-10)
+Tested whether the current strategy (hash `659d1c03987b72fd`, unchanged) has edge on 1h candles
+instead of the validated 4h timeframe — i.e. whether day-trading is viable. Same 5-window
+walk-forward discipline used for the 4h re-run on 2026-07-02, run on `EXCHANGE=binance
+SYMBOL=BTC/USDT BACKTEST_TIMEFRAME=1h`.
+
+| Window | Period | Trades | Win rate | PF | Return | SL-exit rate |
+|--------|--------|--------|----------|-----|--------|--------------|
+| 5000c (full) | 2025-12-13 → 2026-07-10 (~7mo) | 19 | 26.3% | **1.04** | -2.89% | 63% |
+| 4000c | 2026-01-24 → 2026-07-10 | 16 | 31.2% | 1.25 | -2.10% | 63% |
+| 3000c | 2026-03-07 → 2026-07-10 | 11 | 36.4% | **0.99** | -1.75% | 64% |
+| 2000c | 2026-04-17 → 2026-07-10 | 4 | 75.0% | 5.20 | -0.01% | 25% |
+| 1000c | 2026-05-29 → 2026-07-10 | 3 | 66.7% | 3.20 | -0.15% | 33% |
+
+**Verdict: FAILED.** The two windows with meaningful sample size — the full 7-month history and
+the 3000-candle window — come in at PF 1.04 and 0.99 (a straight fail). Compare to the 4h
+re-run where all 5 windows passed at PF 1.79–3.38. The last two "passing" windows have only
+3-4 trades each — the same small-sample caveat already noted for 4h's 1000c/2000c windows,
+not enough to act on alone.
+
+Failure mode matches every rejected altcoin (XRP, ETH, SOL, DOGE, the full USD screen): ~63%
+of trades exit via stop-loss at 1h vs a much healthier exit mix on 4h. The Mode A/B entry
+logic (pullback RSI 38-58 / breakout) does not have edge at hourly frequency — it is mostly
+noise that gets stopped out. Binance also only has ~7 months of 1h history via pagination vs
+2.3 years at 4h, so the full-window sample is inherently weaker too.
+
+**Decision: no live day-trading (1h or faster) on this strategy.** `CANDLE_MINUTES=240` (4h)
+stays the only validated live timeframe. Do not revisit without either a new/modified
+strategy (which would need its own fresh walk-forward and hash stamp) or materially more 1h
+history becoming available.
+
 ### Config change log (2026-06-19)
 Previous validated config: TP=4.5% (PF 1.38 at zero fee)
 New validated config: TP=10% (PF 1.79 at zero fee, 1.79 at 0.8% fee)
@@ -613,7 +644,7 @@ All critical bugs resolved:
 #### MONTH+ — Revenue unlock gates
 | Milestone | Gate | Impact |
 |---|---|---|
-| 1h backtest PF > 1.0 confirmed | Run this week | Validates live config isn't a gamble |
+| ~~1h backtest PF > 1.0 confirmed~~ | FAILED 2026-07-10 — see below | Day-trading (1h) ruled out on current strategy; stay on validated 4h |
 | 30–50 live trades accumulated | ~2–3 months | Compare live PF vs backtest |
 | Kraken maker fee confirmed <0.20% | Test one limit order | Validates limit-order cost model for XRP/CAD |
 | Stock bot: 30 paper trades, PF ≥ 1.2, win rate ≥ 30% | ~4–6 weeks | Gate for Phase 7 IBKR live |

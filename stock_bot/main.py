@@ -793,6 +793,12 @@ def run() -> None:
                 logger.info("Universe: waiting for %d:00 ET refresh", _UNIVERSE_REFRESH_HOUR)
 
         watchlist_set = set(cfg.watchlist)
+        # Held positions must always stay in the scan and bypass the screener:
+        # a symbol that rotates out of the universe (DLTR, Jul 2026) otherwise
+        # gets no price refresh and no AI verdict — the book can never exit it.
+        held_symbols  = list(executor.positions_snapshot().keys()) if executor else []
+        cycle_symbols = list(dict.fromkeys(all_symbols + held_symbols))
+        watchlist_set |= set(held_symbols)
         scan_results: list[ScanResult] = []
 
         # Reset per-cycle state
@@ -807,7 +813,7 @@ def run() -> None:
                     _fetch_symbol_data, sym, cfg, screener, watchlist_set,
                     market_status,
                 ): sym
-                for sym in all_symbols
+                for sym in cycle_symbols
             }
             for fut in as_completed(futs):
                 sym = futs[fut]
@@ -818,7 +824,7 @@ def run() -> None:
                     price_data[sym] = None
 
         active_symbols = [
-            s for s in all_symbols
+            s for s in cycle_symbols
             if isinstance(price_data.get(s), dict) and not price_data[s].get("screened")
         ]
 
@@ -884,7 +890,7 @@ def run() -> None:
         _ai_failed_n   = sum(1 for v in ai_verdicts.values() if v.provider in ("unavailable", "unknown"))
 
         # ── Phase 4: print results + paper trading + build scan list ────────
-        for symbol in all_symbols:
+        for symbol in cycle_symbols:
             data    = price_data.get(symbol)
             report  = research_data.get(symbol)
             verdict: AIVerdict | None = ai_verdicts.get(symbol)
