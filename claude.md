@@ -633,6 +633,68 @@ were underwater within a month; only offer-price allocations (institutions) kept
   Run `stock_backtest.py` on SPCX then; whitelist only on a PASS — same gate as MRNA/AMD/RY.TO/PLTR.
 - User personally holds 2 SPCX shares (visible in portfolio tracker; never bot-traded).
 
+### Investment philosophy — two-bucket policy + plan queue (2026-07-11, agreed with user)
+User defers strategy decisions ("follow the rules from great leaders and experienced persons,
+not what I set"). Standing interpretation: follow *evidence* and established-investor
+discipline, not hype or pasted "success rules" content.
+
+**Two buckets:**
+- **Bucket 1 — wealth building (personal, outside the bots):** Buffett's explicit guidance for
+  non-professionals — low-cost broad index fund (e.g., S&P 500 ETF), regular automatic
+  contributions, hold for decades (his 90/10 will instruction). The bots are NOT the wealth
+  engine and must never be treated as one; studies show 70–97% of active day traders lose money.
+- **Bucket 2 — trading system (this repo):** capped, gate-controlled experiment. Capital grows
+  only through the documented fill-count / net-PF gates — never through conviction, streaks,
+  or excitement (see Capital Sizing Rules).
+
+**Buffett rule mapping (already enforced in code, documented 2026-07-11):**
+capital protection = risk engine + breakers + slot caps · circle of competence = default-deny
+whitelists + walk-forward gates · patience = HOLD through weak regimes (ADX gate) · margin of
+safety = PF ≥ 1.2 net-of-fee gates + small sizing. Honest difference: the bots trade price
+patterns, not businesses — momentum trading, labeled as such, not Buffett-style investing.
+Permanently out of scope (unbacktestable macro plays): raw gold as store-of-value, forex
+speculation, commodity supply-deficit bets, IPO flips (see IPO policy above).
+
+**Plan queue (as of 2026-07-11):**
+1. **Mon 2026-07-13 market open:** verify first live session of the rule-based stock pipeline
+   ("📐 RULES:" lines per symbol, sane fills, no errors). First real test post-rebuild.
+2. **After a clean Monday session:** add GLD to WATCHLIST + RULE_WHITELIST (passed the gate
+   2026-07-11 — see metals screen below). One change at a time.
+3. **Keep filling gates:** crypto 0/15 live fills (BTC/CAD, $77 slot) · stock Phase A 30-trade
+   counter · swing book 30-signal counter. No capital changes before gates.
+4. **Open ops items:** `.env` secret rotation (H, user-deferred) · VPS logrotate (F) ·
+   UptimeRobot (G).
+5. **Next big build after gate progress:** IBKR paper executor (D).
+No new asset classes, strategies, or business pivots before these complete.
+
+### Metals & currency screen (2026-07-11) — GLD passes, currencies ruled out
+User asked whether metals/currencies could join the system. Answer: they go through the same
+gates as everything else — so we ran them. Zero new code: `STOCK_BT_SYMBOLS=GLD,SLV,FXE,UUP
+stock_backtest.py` (daily engine, same gate as the stock rebuild) + `EXCHANGE=binance
+SYMBOL=PAXG/USDT walkforward.py` (crypto 4h engine). Report: `logs/stock_backtest_20260711.md`.
+
+| Symbol | What | Result | Verdict |
+|--------|------|--------|---------|
+| GLD | Gold ETF (daily) | PF 2.18/4.66/6.07/3.60 across 4 windows, 12 full-window trades, SL ≤ 42% | **PASS** |
+| SLV | Silver ETF | PF ok (1.35–2.68) but only 8 full-window trades (< 10) + SL 62–67% | FAIL |
+| FXE | Euro ETF | 5 trades in ~6y, 0 in last 250d — FX volatility too low to trigger entries | FAIL |
+| UUP | USD ETF | 750d PF 0.99, 500d PF 0.84 | FAIL |
+| PAXG/USDT | Tokenized gold (4h crypto engine) | Train PF 1.82 (9 trades) / validation PF 5.13 (12 trades) — holds OOS | Promising, parked |
+
+**Decisions:**
+- **Currencies: closed.** The strategy structurally can't trade FX — daily moves are too small
+  to trigger Mode A/B entries (FXE: zero trades in the last year). Do not revisit with this
+  strategy. Buffett's 2002 forex short was a macro conviction trade — unbacktestable, out of scope.
+- **SLV: FAIL** — standard re-screen triggers apply (strategy change → re-run).
+- **GLD: legitimate PASS of the documented RULE_WHITELIST gate.** Plan: add to WATCHLIST +
+  RULE_WHITELIST only AFTER the rule pipeline's first live session (Mon 2026-07-13) runs clean —
+  one-change-at-a-time discipline. Paper book only, like all stock trading.
+- **PAXG/USDT: parked as conditional candidate.** Small samples (9/12 trades) and all USD-pair
+  preconditions still apply (BTC/CAD 15-fill live gate at 0/15, capital ≥ $500, FX-cost decision).
+  Re-evaluate only when those gates open.
+- Note: a GLD PASS does not contradict the Buffett discussion — the bot would trade gold's
+  price trend on daily candles, not hold gold as a store of value. Different game, honestly labeled.
+
 ### Dual-strategy formalization (2026-07-06)
 Stock bot now has two formally separated, named strategy books. 168 tests pass.
 
