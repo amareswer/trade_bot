@@ -608,6 +608,31 @@ allowed" philosophy.
   demote AI to advisory — per the project's original "AI cannot execute trades" principle.
   This exit policy is the stopgap that manages open positions sanely until that lands.
 
+### IPO policy — no automated IPO trading (2026-07-11, agreed with user)
+Trigger: SpaceX IPO'd 2026-06-12 as NASDAQ:SPCX — largest IPO in history (offer $135,
+raised ~$75B, ~$1.8T valuation). Pop-and-fade played out in 3 sessions: peak $225.64 on
+Jun 16, then multi-week decline to ~$145 by Jul 10. Day-1 open-market buyers ($150 open)
+were underwater within a month; only offer-price allocations (institutions) kept the pop.
+
+**Policy (standing, applies to every future IPO):**
+- The bots never trade IPOs or recent listings via any special path. New listings earn
+  entry exactly like every other symbol: accumulate history → screener eligibility
+  (needs ~36 daily candles for MACD scoring) → full `stock_backtest.py` walk-forward
+  PASS → RULE_WHITELIST. No exceptions for famous names.
+- Rationale: (1) the IPO pop belongs to offer-price allocations, not open-market buyers —
+  pooled research shows day-1 open→close averages ~zero for public buyers; (2) per-symbol
+  backtesting is impossible by definition on day 1; (3) fast trading already failed our own
+  validation (1h walk-forward FAILED 2026-07-10).
+- Hand-trades on hype names are the user's personal decision, outside bot capital. The bot
+  never touches holdings it didn't open.
+
+**SPCX timeline:**
+- ~Early Aug 2026: ~36 trading days accumulated → screener can score it; may appear in
+  universe movers / AI advisory / paper-only swing-book signals automatically. No code change.
+- ~Mid-2027: enough daily history for a meaningful walk-forward (250d window needs ~a year).
+  Run `stock_backtest.py` on SPCX then; whitelist only on a PASS — same gate as MRNA/AMD/RY.TO/PLTR.
+- User personally holds 2 SPCX shares (visible in portfolio tracker; never bot-traded).
+
 ### Dual-strategy formalization (2026-07-06)
 Stock bot now has two formally separated, named strategy books. 168 tests pass.
 
