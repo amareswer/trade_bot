@@ -68,6 +68,8 @@ class ScanResult:
     research:     ResearchReport
     verdict:      AIVerdict
     source:       str = "watchlist"     # "watchlist" | "universe"
+    rule_verdict: object = None         # RuleVerdict — the trade trigger (rule mode)
+    rule_whitelisted: bool = False      # True = rules may BUY this symbol
 
 
 # ---------------------------------------------------------------------------
@@ -529,24 +531,111 @@ def _fg_section_html(fg: FearGreedData) -> str:
   </div>"""
 
 
-def _summary_html(results: list[ScanResult]) -> str:
+def _rule_summary_html(results: list[ScanResult], held: Optional[set] = None) -> str:
+    """The DECIDER strip — rule-based signals that actually trigger trades.
+    Only rendered when at least one result carries a rule verdict."""
+    held = held or set()
+    with_rules = [r for r in results if r.rule_verdict is not None]
+    if not with_rules:
+        return ""
+
     groups: dict[str, list[str]] = {"BUY": [], "HOLD": [], "SELL": []}
-    for r in results:
-        sig = r.verdict.signal if r.verdict.signal in groups else "HOLD"
-        groups[sig].append(r.symbol)
+    for r in with_rules:
+        rv  = r.rule_verdict
+        sig = rv.signal if rv.signal in groups else "HOLD"
+        label = r.symbol
+        if sig == "BUY":
+            label += " → buying" if r.rule_whitelisted else " (not whitelisted — no entry)"
+        elif sig == "SELL":
+            label += " → exiting" if r.symbol.upper() in held else " (not held)"
+        groups[sig].append(label)
 
     def box(sig: str, emoji: str) -> str:
         count = len(groups[sig])
         syms  = " · ".join(groups[sig]) if groups[sig] else "—"
         color = _SIG_COLOR.get(sig, _MUTED)
         return f"""
-      <div class="summary-card" style="border-color:{color}33">
+      <div class="summary-card" style="border-color:{color}66">
         <div class="summary-label">{emoji} {sig}</div>
         <div class="summary-count" style="color:{color}">{count}</div>
         <div class="summary-syms">{_e(syms)}</div>
       </div>"""
 
     return f"""
+  <div style="margin:14px 0 4px;font-size:11px;color:#c9d1d9;font-weight:600;
+       text-transform:uppercase;letter-spacing:.05em">
+    📐 Rule Signals — backtested, these trigger trades
+  </div>
+  <div class="summary-grid">
+    {box("BUY",  "🟢")}
+    {box("HOLD", "⏸")}
+    {box("SELL", "🔴")}
+  </div>"""
+
+
+def _summary_html(
+    results: list[ScanResult],
+    held: Optional[set] = None,
+    exit_bars: Optional[dict] = None,
+) -> str:
+    """Signal summary cards. These are AI *opinions*, not orders — each entry
+    shows confidence and, for SELL, whether the bot will actually act
+    (needs: symbol held AND confidence over the exit bar / streak rule)."""
+    held = held or set()
+    groups: dict[str, list[str]] = {"BUY": [], "HOLD": [], "SELL": []}
+    for r in results:
+        sig  = r.verdict.signal if r.verdict.signal in groups else "HOLD"
+        conf = r.verdict.confidence
+        label = f"{r.symbol} {conf}%"
+        if sig == "SELL":
+            if r.symbol.upper() not in held:
+                label += " (not held)"
+            elif exit_bars and conf >= exit_bars.get("sell", 55):
+                label += " → exiting"
+            else:
+                label += " (held · below exit bar)"
+        elif sig == "BUY" and exit_bars and conf < exit_bars.get("buy", 65):
+            label += " (below buy bar)"
+        groups[sig].append(label)
+
+    notes = {"BUY": "", "HOLD": "", "SELL": ""}
+    if exit_bars:
+        if exit_bars.get("rule_mode"):
+            notes["BUY"] = "AI advisory only — BUYs come from backtested rules"
+        else:
+            notes["BUY"] = f"acts at ≥{exit_bars.get('buy', 65)}%"
+        notes["SELL"] = (
+            f"acts if held: ≥{exit_bars.get('sell', 55)}% or "
+            f"{exit_bars.get('streak_cycles', 2)}×≥{exit_bars.get('streak_conf', 50)}% in a row"
+        )
+
+    def box(sig: str, emoji: str) -> str:
+        count = len(groups[sig])
+        syms  = " · ".join(groups[sig]) if groups[sig] else "—"
+        color = _SIG_COLOR.get(sig, _MUTED)
+        note  = notes.get(sig, "")
+        note_html = (
+            f'<div class="summary-syms" style="color:{_MUTED};font-size:10px;'
+            f'margin-top:2px">{_e(note)}</div>'
+        ) if note else ""
+        return f"""
+      <div class="summary-card" style="border-color:{color}33">
+        <div class="summary-label">{emoji} {sig}</div>
+        <div class="summary-count" style="color:{color}">{count}</div>
+        <div class="summary-syms">{_e(syms)}</div>
+        {note_html}
+      </div>"""
+
+    header = ""
+    if exit_bars and exit_bars.get("rule_mode"):
+        header = (
+            '<div style="margin:14px 0 4px;font-size:11px;color:#8b949e;font-weight:600;'
+            'text-transform:uppercase;letter-spacing:.05em">'
+            '🤖 AI Advisory — opinions only, cannot open positions'
+            '</div>'
+        )
+    return f"""
+  {header}
   <div class="summary-grid">
     {box("BUY",  "🟢")}
     {box("HOLD", "⏸")}
@@ -711,6 +800,24 @@ def _stock_card_html(r: ScanResult, pos: Optional[PortfolioPosition] = None, ext
     else:
         port_tag = ""
 
+    # ── Rule verdict tag — the trade trigger (rule mode) ─────────
+    if r.rule_verdict is not None:
+        rv       = r.rule_verdict
+        rv_color = _SIG_COLOR.get(rv.signal, _MUTED)
+        if rv.signal == "BUY":
+            wl_note = " → will buy" if r.rule_whitelisted else " (not whitelisted — no entry)"
+        elif rv.signal == "SELL":
+            wl_note = " → exits if held"
+        else:
+            wl_note = ""
+        rule_tag = (
+            f'<div class="port-tag" style="border-left:2px solid {rv_color}">'
+            f'📐 Rules: <span style="color:{rv_color};font-weight:700">{_e(rv.signal)}</span>'
+            f'<span style="color:#8b949e">{_e(wl_note)}</span></div>'
+        )
+    else:
+        rule_tag = ""
+
     # ── Technicals row ──────────────────────────────────────────
     macd_icon = "↑" if "bullish" in (macd_str or "") else "↓" if "bearish" in (macd_str or "") else "→"
     tech_row = f"""
@@ -817,7 +924,7 @@ def _stock_card_html(r: ScanResult, pos: Optional[PortfolioPosition] = None, ext
     </div>"""
 
     cls = f"stock-card{' ' + extra_class if extra_class else ''}"
-    return f'<div class="{cls}">{card_header}{port_tag}{tech_row}{news_section}{meta_section}{verdict_section}</div>'
+    return f'<div class="{cls}">{card_header}{rule_tag}{port_tag}{tech_row}{news_section}{meta_section}{verdict_section}</div>'
 
 
 # ---------------------------------------------------------------------------
@@ -1252,6 +1359,7 @@ def _build_html(
     market_status: Optional[dict]             = None,
     loop_mode:     str                        = "LIVE",
     gate_status:   Optional[dict]             = None,
+    exit_bars:     Optional[dict]             = None,
 ) -> str:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1326,7 +1434,8 @@ def _build_html(
 
 {_header_html(now_str, loop_interval, ai_stats, market_status, loop_mode)}
 {_fg_section_html(fear_greed)}
-{_summary_html(results)}
+{_rule_summary_html(results, held={p.symbol.upper() for p in paper.positions} if paper else set())}
+{_summary_html(results, held={p.symbol.upper() for p in paper.positions} if paper else set(), exit_bars=exit_bars)}
 {portfolio_section}
 {paper_section}
 {overview_section}
@@ -1380,8 +1489,9 @@ class DashboardRenderer:
         market_status: Optional[dict]             = None,
         loop_mode:     str                        = "LIVE",
         gate_status:   Optional[dict]             = None,
+        exit_bars:     Optional[dict]             = None,
     ) -> None:
-        html_str = _build_html(scan_results, fear_greed, self.loop_interval, portfolio, alerts, paper, ai_stats, market_status, loop_mode, gate_status)
+        html_str = _build_html(scan_results, fear_greed, self.loop_interval, portfolio, alerts, paper, ai_stats, market_status, loop_mode, gate_status, exit_bars)
         os.makedirs(os.path.dirname(os.path.abspath(_OUTPUT_PATH)), exist_ok=True)
         with open(_OUTPUT_PATH, "w", encoding="utf-8") as f:
             f.write(html_str)

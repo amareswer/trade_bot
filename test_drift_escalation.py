@@ -1,11 +1,16 @@
 """
-Unit tests for BUG 2 — fill-confirmation drift (consecutive escalation logic).
+Unit tests for drift reconciliation — consecutive escalation + acknowledgment.
 
-Tests cover:
+Tests the REAL `_evaluate_drift()` from bot.main (extracted 2026-07-10; the
+old tests exercised a hand-mirrored copy of the inline logic).
+
+Covers:
   (a) Drift below threshold fires only logger.warning, not alerter.error
   (b) Drift at/above threshold fires alerter.error exactly once, then resets
-  (c) Drift resolves → counter resets → next N detections trigger a fresh escalation
-  (d) Post-fill position convergence: after a SELL fill with correct qty, executor.position == 0
+  (c) Drift resolves → counter + acknowledgment reset
+  (d) Post-fill position convergence: after a SELL fill, executor.position == 0
+  (e) Acknowledged (unchanged) drift never re-alerts — external-deposit spam fix
+  (f) A CHANGED drift amount re-arms the counter and re-alerts
 
 Run: python -m pytest test_drift_escalation.py -v
 """
@@ -22,149 +27,103 @@ import bot.execution.live_executor as le_mod
 from bot.execution.executor import OrderSide, OrderStatus
 from bot.execution.live_executor import LiveExecutor
 from bot.strategy.threshold_strategy import Signal
+from bot.main import _evaluate_drift
 
 
-# ---------------------------------------------------------------------------
-# Helper: simulate the drift-check logic extracted from bot/main.py
-#
-# The logic is inline in main.py but we mirror it here as a pure function
-# so we can unit-test it without starting the full bot loop.
-# ---------------------------------------------------------------------------
+def _ss() -> dict:
+    """Fresh per-symbol state slice, as built in bot.main run()."""
+    return {"drift_count": 0, "drift_acked": 0.0}
 
-def _run_drift_check(
-    exchange_pos: float,
-    bot_pos: float,
-    base: str,
-    drift_count: int,
-    drift_threshold: int,
-    alerter,
-    logger_mock,
-) -> int:
-    """
-    One iteration of the drift-check block from bot/main.py.
-    Returns the updated _drift_consecutive_count.
-    """
-    _DRIFT_MIN = 0.000010
-    drift = abs(exchange_pos - bot_pos)
-    if drift > _DRIFT_MIN:
-        drift_count += 1
-        logger_mock.warning(
-            "POSITION DRIFT [%d/%d]: exchange=%.6f bot=%.6f drift=%.6f %s",
-            drift_count, drift_threshold, exchange_pos, bot_pos, drift, base,
-        )
-        if drift_count >= drift_threshold:
-            alerter.error(
-                f"PERSISTENT position drift after"
-                f" {drift_count} consecutive checks:"
-                f" exchange={exchange_pos:.6f}"
-                f" bot={bot_pos:.6f} {base}"
-                f" — check logs/live_state.json"
-            )
-            drift_count = 0
-    else:
-        if drift_count > 0:
-            logger_mock.info(
-                "Position drift resolved: exchange=%.6f bot=%.6f %s",
-                exchange_pos, bot_pos, base,
-            )
-        drift_count = 0
-    return drift_count
+
+def _drift(ss, alerter, exchange_pos=0.0, bot_pos=0.000378, threshold=3):
+    _evaluate_drift("BTC/CAD", "BTC", exchange_pos, bot_pos, ss, threshold, alerter)
 
 
 # ── (a) Drift below threshold — warning only, no alert ───────────────────────
 
 def test_drift_below_threshold_no_alert():
-    """
-    With threshold=3, first 2 consecutive drifts must NOT call alerter.error.
-    """
     alerter = MagicMock()
-    log     = MagicMock()
-    count   = 0
+    ss = _ss()
     for _ in range(2):
-        count = _run_drift_check(
-            exchange_pos=0.0, bot_pos=0.000378,
-            base="BTC", drift_count=count,
-            drift_threshold=3, alerter=alerter, logger_mock=log,
-        )
+        _drift(ss, alerter)
     alerter.error.assert_not_called()
-    assert log.warning.call_count == 2
-    assert count == 2
+    assert ss["drift_count"] == 2
 
 
 # ── (b) At threshold → alerter.error fires once, counter resets ──────────────
 
 def test_drift_at_threshold_escalates_once():
-    """
-    3rd consecutive drift (threshold=3) → alerter.error called once, count resets to 0.
-    """
     alerter = MagicMock()
-    log     = MagicMock()
-    count   = 0
+    ss = _ss()
     for _ in range(3):
-        count = _run_drift_check(
-            exchange_pos=0.0, bot_pos=0.000378,
-            base="BTC", drift_count=count,
-            drift_threshold=3, alerter=alerter, logger_mock=log,
-        )
+        _drift(ss, alerter)
     alerter.error.assert_called_once()
     assert "PERSISTENT position drift" in alerter.error.call_args[0][0]
-    assert count == 0  # reset after escalation
+    assert ss["drift_count"] == 0            # reset after escalation
+    assert ss["drift_acked"] == pytest.approx(0.000378)
 
 
-def test_drift_N_plus_1_does_not_double_alert():
-    """
-    4th consecutive drift after reset should be back to warning only.
-    """
+def test_acknowledged_drift_does_not_realert():
+    """External-deposit incident (0.000085 BTC, Jul 6-10 2026): the same
+    unchanged drift re-alerted every `threshold` checks forever. After
+    escalation the amount is acknowledged — 20 more identical checks must
+    produce zero additional alerts."""
     alerter = MagicMock()
-    log     = MagicMock()
-    count   = 0
-    for _ in range(4):
-        count = _run_drift_check(
-            exchange_pos=0.0, bot_pos=0.000378,
-            base="BTC", drift_count=count,
-            drift_threshold=3, alerter=alerter, logger_mock=log,
-        )
-    # Alert fires at 3 and resets; 4th is count=1 → no second alert
+    ss = _ss()
+    for _ in range(3):
+        _drift(ss, alerter)                  # escalates once
+    for _ in range(20):
+        _drift(ss, alerter)                  # same drift, acknowledged
     alerter.error.assert_called_once()
+    assert ss["drift_count"] == 0
 
 
-# ── (c) Drift resolves → counter resets ──────────────────────────────────────
+def test_changed_drift_amount_realerts():
+    """If the drift AMOUNT changes (deposit grew / partial withdrawal), the
+    acknowledgment no longer matches — counter re-arms and a fresh escalation
+    fires at the threshold."""
+    alerter = MagicMock()
+    ss = _ss()
+    for _ in range(3):
+        _drift(ss, alerter, bot_pos=0.000378)          # escalate + ack 0.000378
+    for _ in range(3):
+        _drift(ss, alerter, bot_pos=0.000800)          # different amount
+    assert alerter.error.call_count == 2
+    assert ss["drift_acked"] == pytest.approx(0.000800)
+
+
+# ── (c) Drift resolves → counter and acknowledgment reset ────────────────────
 
 def test_drift_resolves_resets_counter():
-    """
-    Two drifts then resolution: counter goes to 0. Next two drifts again:
-    still no alert (< threshold).
-    """
     alerter = MagicMock()
-    log     = MagicMock()
-    count   = 0
+    ss = _ss()
 
-    # 2 drifts
     for _ in range(2):
-        count = _run_drift_check(
-            exchange_pos=0.0, bot_pos=0.000378,
-            base="BTC", drift_count=count,
-            drift_threshold=3, alerter=alerter, logger_mock=log,
-        )
-    assert count == 2
+        _drift(ss, alerter)
+    assert ss["drift_count"] == 2
 
     # Drift resolves (exchange matches bot)
-    count = _run_drift_check(
-        exchange_pos=0.000378, bot_pos=0.000378,
-        base="BTC", drift_count=count,
-        drift_threshold=3, alerter=alerter, logger_mock=log,
-    )
-    assert count == 0
-    log.info.assert_called()  # "Position drift resolved"
+    _drift(ss, alerter, exchange_pos=0.000378, bot_pos=0.000378)
+    assert ss["drift_count"] == 0
 
     # 2 more drifts — still below threshold
     for _ in range(2):
-        count = _run_drift_check(
-            exchange_pos=0.0, bot_pos=0.000378,
-            base="BTC", drift_count=count,
-            drift_threshold=3, alerter=alerter, logger_mock=log,
-        )
+        _drift(ss, alerter)
     alerter.error.assert_not_called()
+
+
+def test_resolution_clears_acknowledgment():
+    """Ack must clear on resolution so a FUTURE drift of the same size
+    (a genuinely new event) alerts again."""
+    alerter = MagicMock()
+    ss = _ss()
+    for _ in range(3):
+        _drift(ss, alerter)                                     # escalate + ack
+    _drift(ss, alerter, exchange_pos=0.000378, bot_pos=0.000378)  # resolved
+    assert ss["drift_acked"] == 0.0
+    for _ in range(3):
+        _drift(ss, alerter)                                     # same size, new event
+    assert alerter.error.call_count == 2
 
 
 # ── (d) Post-fill convergence: executor position == 0 after SELL fill ─────────

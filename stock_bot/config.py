@@ -72,7 +72,12 @@ class StockConfig:
     paper_trading_enabled: bool  # enable paper trading mode (virtual cash)
     paper_starting_cash:   float # virtual cash balance at startup
     paper_risk_pct:        float # fraction of cash to allocate per trade
-    paper_min_confidence:  int   # min AI confidence to trigger a paper trade
+    rule_trading_enabled:  bool  # rule-based signals trigger trades; AI is advisory only
+    rule_whitelist_str:    str   # comma-separated symbols that passed stock_backtest.py walk-forward
+    paper_min_confidence:  int   # min AI confidence to trigger a paper BUY (legacy mode: RULE_TRADING_ENABLED=false)
+    paper_min_confidence_sell: int  # min AI confidence to exit a HELD position (lower bar — exits reduce risk)
+    paper_sell_streak_min_conf: int # SELL verdicts >= this count toward the consecutive-SELL streak
+    paper_sell_streak_cycles:   int # consecutive SELL cycles (each >= streak_min_conf) that force an exit
     paper_daily_loss_pct:    float   # daily loss circuit breaker (fraction)
     paper_slippage_bps:      int     # simulated slippage in basis points
     paper_stop_loss_pct:   float # stop-loss threshold as a fraction (e.g. 0.05 = -5%)
@@ -160,7 +165,12 @@ def load() -> StockConfig:
         paper_trading_enabled  = _bool ("PAPER_TRADING_ENABLED",   False),
         paper_starting_cash    = _float("PAPER_STARTING_CASH",     10_000.0),
         paper_risk_pct         = _float("PAPER_RISK_PCT",          0.10),
+        rule_trading_enabled   = _bool ("RULE_TRADING_ENABLED",    True),
+        rule_whitelist_str     = _str  ("RULE_WHITELIST",          ""),
         paper_min_confidence   = _int  ("PAPER_MIN_CONFIDENCE",    65),
+        paper_min_confidence_sell  = _int("PAPER_MIN_CONFIDENCE_SELL",   55),
+        paper_sell_streak_min_conf = _int("PAPER_SELL_STREAK_MIN_CONF",  50),
+        paper_sell_streak_cycles   = _int("PAPER_SELL_STREAK_CYCLES",    2),
         paper_daily_loss_pct    = _float("PAPER_DAILY_LOSS_PCT",    0.03),
         paper_slippage_bps      = _int("PAPER_SLIPPAGE_BPS",      15),
         paper_stop_loss_pct    = _float("PAPER_STOP_LOSS_PCT",     0.05),

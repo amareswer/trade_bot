@@ -53,6 +53,8 @@ from stock_bot.alerts.evaluator     import AlertEvaluator
 from stock_bot.alerts.notifier      import AlertNotifier
 from stock_bot.execution.paper      import StockPaperExecutor
 from stock_bot.execution.base       import OrderStatus
+from stock_bot.execution.exit_policy import ExitPolicy
+from stock_bot.strategy.rules       import rule_signal
 from stock_bot.fast_validator       import FastValidator
 from stock_bot.analysis.accuracy_tracker import LiveTradingGate
 
@@ -225,6 +227,7 @@ def _fetch_symbol_data(
 
     return {
         "screened":    False,
+        "candles":     candles,
         "last_candle": candles[-1],
         "price":       closes[-1],
         "rsi":         rsi_val,
@@ -598,6 +601,19 @@ def run() -> None:
         executor.set_daily_loss_limit(cfg.paper_daily_loss_pct)
     if executor:
         executor.set_slippage_bps(cfg.paper_slippage_bps)
+    # Asymmetric exit bars: BUY needs paper_min_confidence, but exiting a HELD
+    # position needs only paper_min_confidence_sell OR a streak of consecutive
+    # SELL verdicts. Exits reduce risk — never harder than entries.
+    exit_policy = ExitPolicy(
+        min_confidence_sell = cfg.paper_min_confidence_sell,
+        streak_min_conf     = cfg.paper_sell_streak_min_conf,
+        streak_cycles       = cfg.paper_sell_streak_cycles,
+    )
+    # Symbols whose rule-based walk-forward PASSED (stock_backtest.py) —
+    # only these may be BOUGHT by the rules. Exits apply to anything held.
+    _rule_whitelist: set[str] = {
+        s.strip().upper() for s in cfg.rule_whitelist_str.split(",") if s.strip()
+    }
 
     _fast_enabled       = _os.getenv("FAST_ENABLED", "false").strip().lower() in ("1", "true", "yes")
     _fast_loop_interval = int(_os.getenv("FAST_LOOP_INTERVAL", "300").strip() or "300")
@@ -639,7 +655,14 @@ def run() -> None:
     if executor:
         # Show the executor's actual (restored) cash, not the .env starting
         # value — the banner said $1,000.00 while the restored book held $520.71.
-        print(f"  Paper trading: ON  cash=${executor.cash:,.2f}  risk={cfg.paper_risk_pct*100:.0f}%/trade  min_conf={cfg.paper_min_confidence}%")
+        print(f"  Paper trading: ON  cash=${executor.cash:,.2f}  risk={cfg.paper_risk_pct*100:.0f}%/trade  "
+              f"conf: BUY≥{cfg.paper_min_confidence}% · exit≥{cfg.paper_min_confidence_sell}% "
+              f"or {cfg.paper_sell_streak_cycles}×SELL≥{cfg.paper_sell_streak_min_conf}%")
+        if cfg.rule_trading_enabled:
+            print(f"  Trade trigger: RULES (backtested) — BUY whitelist: "
+                  f"{cfg.rule_whitelist_str or '(empty — no rule BUYs!)'}  ·  AI = advisory only")
+        else:
+            print(f"  Trade trigger: AI verdicts (legacy mode — RULE_TRADING_ENABLED=false)")
     if fast_validator:
         print(f"  Fast validator: ON  interval={_fast_loop_interval}s  state=fast_validator_state.json")
     print(f"  Dashboard : file://{_os.path.abspath('stock_dashboard.html')}")
@@ -941,13 +964,65 @@ def run() -> None:
                     print("  🤖 AI: disabled (AI_ENABLED=false in stock_bot/.env)")
 
                 # ── Paper trading execution ───────────────────────────────
-                if (
-                    executor is not None
-                    and verdict is not None
+                # ── Rule-based signal (the trade trigger when enabled) ─────
+                # Recomputed statelessly from the candle history each cycle —
+                # identical to the backtest by construction. Today's still-
+                # forming candle is excluded while the market is open (the
+                # backtest only ever saw completed candles).
+                rule_v = None
+                if cfg.rule_trading_enabled and data.get("candles"):
+                    _mkt      = market_status or {}
+                    _is_ca    = symbol.upper().endswith(".TO")
+                    _open_now = bool(_mkt.get("ca_open" if _is_ca else "us_open"))
+                    _last_c   = data["candles"][-1]
+                    rule_v = rule_signal(
+                        data["candles"],
+                        drop_last=_open_now and _last_c.timestamp.date() == date.today(),
+                    )
+                    _rv_note = ""
+                    if not rule_v.warmed_up:
+                        _rv_note = "  (warming up — need more history)"
+                    elif rule_v.signal == "BUY" and symbol.upper() not in _rule_whitelist:
+                        _rv_note = "  (not in RULE_WHITELIST — no entry)"
+                    _rv_parts = [f"📐 RULES: {rule_v.signal}"]
+                    if rule_v.rsi is not None:
+                        _rv_parts.append(f"RSI={rule_v.rsi:.1f}")
+                    if rule_v.adx is not None:
+                        _rv_parts.append(f"ADX={rule_v.adx:.1f}")
+                    if rule_v.trend:
+                        _rv_parts.append(rule_v.trend)
+                    if rule_v.regime:
+                        _rv_parts.append(rule_v.regime)
+                    print(f"  {'  '.join(_rv_parts)}{_rv_note}")
+
+                # AI exit policy runs on EVERY verdict (a HOLD/BUY verdict
+                # breaks a SELL streak). With rule trading on, AI cannot OPEN
+                # positions but may still CLOSE them (risk reduction only).
+                _exit_dec = None
+                _held_qty = 0.0
+                if executor is not None:
+                    _held_qty = executor.position(symbol)
+                    if verdict is not None:
+                        _exit_dec = exit_policy.decide(
+                            symbol, verdict.signal, verdict.confidence, _held_qty > 0
+                        )
+
+                _rule_buy  = (rule_v is not None and rule_v.signal == "BUY"
+                              and rule_v.warmed_up and symbol.upper() in _rule_whitelist)
+                _rule_sell = rule_v is not None and rule_v.signal == "SELL"
+                _ai_buy    = (
+                    verdict is not None
                     and verdict.confidence > 0
-                    and verdict.signal in ("BUY", "SELL")
+                    and verdict.signal == "BUY"
                     and verdict.confidence >= cfg.paper_min_confidence
-                ):
+                )
+                _act_buy  = _rule_buy if cfg.rule_trading_enabled else _ai_buy
+                _ai_exit  = (
+                    verdict is not None and verdict.confidence > 0
+                    and _exit_dec is not None and _exit_dec.should_exit
+                )
+                _act_sell = (_rule_sell and _held_qty > 0) or _ai_exit
+                if executor is not None and (_act_buy or _act_sell):
                     px              = data["last_candle"].close
                     live_price      = get_live_price(symbol)
                     raw_live_price  = live_price  # preserve original before sanity null
@@ -961,8 +1036,11 @@ def run() -> None:
                         )
                         live_price = None
                     execution_price = live_price if live_price else px
-                    sig = verdict.signal
-                    if sig == "BUY":
+                    _trigger = (
+                        f"RULE {rule_v.signal}" if (_rule_buy or (_rule_sell and _act_sell))
+                        else f"AI {verdict.confidence}%" if verdict else "?"
+                    )
+                    if _act_buy:
                         if _is_earnings_blackout(symbol, report, cfg):
                             _ned = report.earnings.next_earnings_date if report else None
                             _days_left = (_ned - date.today()).days if _ned else "?"
@@ -973,7 +1051,7 @@ def run() -> None:
                             print(
                                 f"  🚫 EARNINGS BLACKOUT: {symbol} — "
                                 f"earnings in {_days_left}d ({_ned}) | "
-                                f"conf={verdict.confidence}% blocked"
+                                f"{_trigger} blocked"
                             )
                             print(f"  {'─' * 70}")
                             # Also block swing book from entering this symbol
@@ -1003,10 +1081,25 @@ def run() -> None:
                                 alloc   = (executor.cash + pos_val) * cfg.paper_risk_pct
                                 shares  = int(alloc / execution_price) if execution_price > 0 else 0
                                 if shares > 0:
-                                    reason = f"BUY {verdict.confidence}% {verdict.trading_style}"
+                                    if _rule_buy:
+                                        reason = (f"RULE BUY rsi={rule_v.rsi:.0f} "
+                                                  f"adx={rule_v.adx:.0f}"
+                                                  if rule_v.rsi is not None and rule_v.adx is not None
+                                                  else "RULE BUY")
+                                        # AI shadow vote: record what the advisor
+                                        # thought at this exact moment. After ~30
+                                        # trades, compare outcomes where the AI
+                                        # agreed vs disagreed — if agreement is
+                                        # predictive, the AI earns veto power.
+                                        if verdict is not None and verdict.confidence > 0:
+                                            reason += f" | ai={verdict.signal}{verdict.confidence}"
+                                        else:
+                                            reason += " | ai=NONE"
+                                    else:
+                                        reason = f"BUY {verdict.confidence}% {verdict.trading_style}"
                                     order  = executor.buy(
                                         symbol, shares, execution_price, reason=reason,
-                                        confidence=verdict.confidence,
+                                        confidence=verdict.confidence if verdict else 0,
                                         candle_close=px, live_price=raw_live_price,
                                     )
                                     if order.status == OrderStatus.FILLED:
@@ -1019,17 +1112,45 @@ def run() -> None:
                     else:  # SELL
                         held = executor.position(symbol)
                         if held > 0:
-                            avg    = executor.avg_cost(symbol)
-                            reason = f"SELL {verdict.confidence}% {verdict.trading_style}"
+                            avg = executor.avg_cost(symbol)
+                            if _rule_sell:
+                                reason = "RULE SELL trend-exit"
+                                if verdict is not None and verdict.confidence > 0:
+                                    reason += f" | ai={verdict.signal}{verdict.confidence}"
+                                else:
+                                    reason += " | ai=NONE"
+                            else:
+                                reason = f"SELL {verdict.confidence}% {verdict.trading_style}"
+                                if _exit_dec is not None and _exit_dec.reason.startswith("SELL streak"):
+                                    reason += " [streak]"
                             order  = executor.sell(symbol, held, execution_price, reason=reason)
                             if order.status == OrderStatus.FILLED:
+                                exit_policy.clear(symbol)
                                 proceeds  = round(held * execution_price, 2)
                                 trade_pnl = round((execution_price - avg) * held, 2)
                                 pnl_pct   = round((execution_price - avg) / avg * 100, 1) if avg else 0.0
+                                logger.info(
+                                    "EXIT (%s): %s %.4f sh @ %.2f — %s",
+                                    "rule" if _rule_sell else "ai",
+                                    symbol, held, execution_price,
+                                    reason if _rule_sell else (_exit_dec.reason if _exit_dec else reason),
+                                )
                                 print(f"  📄 PAPER SELL: {symbol}  {held:.4f} shares")
                                 print(f"                 @ ${execution_price:,.2f} = ${proceeds:,.2f}")
                                 print(f"                 Realized P&L: {trade_pnl:+.2f} ({pnl_pct:+.1f}%)")
                                 print(f"                 Cash remaining: ${executor.cash:,.2f}")
+                elif (
+                    executor is not None
+                    and verdict is not None
+                    and verdict.signal == "SELL"
+                    and _held_qty > 0
+                    and _exit_dec is not None
+                ):
+                    # Held position with an AI SELL verdict that did NOT clear
+                    # the exit bars — say so loudly instead of silently ignoring
+                    # it (the AC.TO 58-60% incident, 2026-07-10).
+                    logger.info("AI SELL (advisory) below exit bar: %s — %s", symbol, _exit_dec.reason)
+                    print(f"  ⏳ HELD, not exiting: {symbol} — AI advisory: {_exit_dec.reason}")
 
                 # Build ScanResult for dashboard
                 if report is not None:
@@ -1063,6 +1184,8 @@ def run() -> None:
                         research     = report,
                         verdict      = verdict,
                         source       = "watchlist" if symbol in cfg.watchlist else "universe",
+                        rule_verdict = rule_v,
+                        rule_whitelisted = symbol.upper() in _rule_whitelist,
                     ))
 
             except Exception as exc:
@@ -1153,6 +1276,13 @@ def run() -> None:
                 market_status = market_status,
                 loop_mode     = mode,
                 gate_status   = _gate_status,
+                exit_bars     = {
+                    "buy":           cfg.paper_min_confidence,
+                    "sell":          cfg.paper_min_confidence_sell,
+                    "streak_conf":   cfg.paper_sell_streak_min_conf,
+                    "streak_cycles": cfg.paper_sell_streak_cycles,
+                    "rule_mode":     cfg.rule_trading_enabled,
+                },
             )
         except Exception as exc:
             logger.warning("Dashboard render failed: %s", exc)

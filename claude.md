@@ -165,7 +165,7 @@ A robust crypto trading system that:
 
 ## Test Suite Manifest (as of 2026-07-03)
 
-Expected total: **173 tests** (as of 2026-07-10). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
+Expected total: **202 tests** (as of 2026-07-10). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -177,7 +177,7 @@ Expected total: **173 tests** (as of 2026-07-10). If `pytest --collect-only -q` 
 | `test_fill_recording.py` | 8 | BUG 1: qty=0 fill — filled priority, amount fallback, guard, TradeLog guard |
 | `test_external_holdings.py` | 6 | External-holdings guard in _sync_position (adopt=false/true) |
 | `test_executor.py` | 6 | PaperExecutor: BUY/SELL, insufficient cash, history |
-| `test_drift_escalation.py` | 6 | BUG 2: consecutive drift counter, escalation threshold, resolution reset |
+| `test_drift_escalation.py` | 8 | Drift: tests REAL `_evaluate_drift()` from bot.main — escalation, ack (no re-alert on unchanged drift), changed-amount re-alert, resolution reset |
 | `test_tsx_validation.py` | 5 | Stock-bot TSX price sanity check |
 | `test_stock_breaker.py` | 3 | Stock-bot daily-loss breaker: restart baseline includes position marks |
 | `test_candle_watchdog.py` | 5 | Candle watchdog: timing, alert, no double-fire |
@@ -187,8 +187,11 @@ Expected total: **173 tests** (as of 2026-07-10). If `pytest --collect-only -q` 
 | `test_main_strategy.py` | 2 | Strategy builder: full config wiring |
 | `test_fast_validator_exits.py` | 6 | FastValidator exits: MAX_HOLD live-price fallback, corruption guard, SL regression |
 | `test_paper_report.py` | 6 | Expectancy math: IBKR commission model, net-of-cost flip, report rendering |
+| `test_exit_policy.py` | 11 | Stock-bot asymmetric exit bars: single-verdict exit, 2-strike SELL streak, streak resets, AC.TO incident regression |
+| `test_stock_backtest_engine.py` | 11 | Stock backtest engine: next-open fills, intra-candle SL/TP, gap handling, slippage/commission math, walk-forward gating |
+| `test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last (forming candle), determinism, validated-parameter pin |
 
-Run: `python -m pytest --tb=short -q` — must show **173 passed**.
+Run: `python -m pytest --tb=short -q` — must show **202 passed**.
 
 ---
 
@@ -503,6 +506,107 @@ $0 instead of avg_cost in `unrealized_pnl()`/`total_value()` — fixed 2026-07-0
 - **Kraken balance is now $146.31 CAD; slot stays capped at $77** (`MAX_SLOT_CASH_CAD=77`).
   Deliberate: capital increases go through the 15-fill / net-PF ≥ 1.2 gate, not deposits.
   Current gate progress: 0 fills. Raise the cap in `.env` only after the gate passes.
+
+### Crypto bot audit (2026-07-10 late) — applying the stock-bot rebuild lessons, 202 tests pass
+The crypto bot was the template for the stock rebuild, so "do the same thing" = audit, not
+rebuild. Findings:
+- **Backtest execution model verified honest for crypto:** intra-candle SL/TP vs low/high,
+  SL-before-TP pessimism; strategy fills at signal-candle close, which is FAITHFUL here
+  (live bot decides at candle close and fires a market order seconds later in a gapless
+  24/7 market — unlike daily stock bars, where next-open fills are required). The daily
+  shadow-signal check is the standing proof of that assumption.
+- **Shadow fidelity re-verified manually 2026-07-11 02:04 UTC: 96.6% match, PASS** (1
+  mismatch = known indicator-warmup boundary, no position at stake).
+  `logs/shadow_report_20260711.md`.
+- **Drift-alert spam fixed:** 0.000085 BTC (~$8) appeared in the Kraken account ~Jul 6
+  (confirmed by user 2026-07-10: manual purchase, not bot activity). The reconciliation re-alerted
+  every ~3h for 4 days because the counter reset after each escalation. `_evaluate_drift()`
+  extracted from the inline loop in `bot/main.py` (now unit-tested directly, not via a
+  hand-mirrored copy) and gained `drift_acked`: an escalated drift amount is acknowledged —
+  no re-alert while unchanged; a CHANGED amount re-arms; resolution clears the ack.
+  The 0.000085 BTC itself is safe by design (ADOPT_EXTERNAL_HOLDINGS=false — never traded).
+  **Crypto bot needs a restart to pick this up.**
+- **Cron jobs moved 02:00 → 12:05 local (weekly 09:00 Mon → 12:10 Mon):** macOS cron
+  doesn't fire while the lid is closed and never catches up — the shadow job silently
+  missed Jul 7–10. `caffeinate -i` prevents idle sleep, NOT lid-close sleep.
+  `ops/crontab.txt` updated + reinstalled.
+
+### Stock bot rule-based rebuild (2026-07-10) — AI demoted to advisory, 200 tests pass
+The position book's trade trigger is now the backtested rule strategy, not AI verdicts.
+Rationale: AI confidence numbers are uncalibrated, verdicts flip on unchanged data (AMD:
+BUY 58 → SELL 60 → HOLD 58 → BUY 68 → SELL 62 in ~10 min), and AI opinions cannot be
+backtested. This restores the project charter: "AI gives advisory signals only."
+
+**Walk-forward result (2026-07-10, `stock_backtest.py`, report `logs/stock_backtest_20260710.md`):**
+Crypto IndicatorStrategy (Mode A/B, unmodified — hash `659d1c03987b72fd` untouched) on
+daily candles, 4 windows (full ~6y / 750d / 500d / 250d), 15 bps slippage per fill + IBKR
+commissions, SL 5% / TP 15%. Parameters came from BTC — genuinely out-of-sample on stocks.
+- **PASS (4): MRNA (PF 1.52–2.22), AMD (1.36–3.18), RY.TO (3.90–7.95, WR 67–75%), PLTR (1.76–2.29)**
+- FAIL (10): HOOD, NCLH, AC.TO (PF 0.71!), CCL, INTC, NVDA, TSLA, SHOP.TO, META, AMZN
+- Gate: full-window trades ≥ 10, PF ≥ 1.2 every window with ≥ 3 trades, SL-exit ≤ 70%.
+
+**New pieces:**
+- `stock_bot/strategy/rules.py` — `build_indicator_config()` is THE single parameter source
+  (backtest imports it, live imports it — no drift possible; pinned by test). `rule_signal()`
+  statelessly replays candles through a fresh IndicatorStrategy each cycle → live signal is
+  identical to backtest by construction. `drop_last=True` excludes today's still-forming
+  candle while the market is open (backtest only saw completed candles).
+- `stock_bot/backtest/engine.py` — honest daily-bar engine: signal fills at NEXT open,
+  intra-candle SL/TP vs low/high with gap-through fills at the open, SL-before-TP pessimism,
+  slippage both ways + IBKR round-trip commission (same `_round_trip_commission` the paper
+  report uses). Replaced the 2026-06-23 one-off `stock_backtest.py` (look-ahead fills,
+  close-only SL checks, 0.5% notional commission, symbol-order-dependent shared cash).
+- `main.py` wiring: `RULE_TRADING_ENABLED=true` + `RULE_WHITELIST=MRNA,AMD,RY.TO,PLTR` in
+  stock_bot/.env. Rules may BUY only whitelist symbols; rule SELL exits anything held; AI
+  exit policy (below) stays as an extra risk-reducing exit; SL/TP watcher unchanged. AI can
+  never OPEN a position. `LOOKBACK_DAYS` 200 → 300 (200-day regime EMA needs ~204 warmup).
+  Per-symbol "📐 RULES:" line printed each scan; dashboard BUY card notes AI is advisory.
+- **Adding a symbol to RULE_WHITELIST requires a fresh `stock_backtest.py` PASS — never by hand.**
+- **Dashboard shows the decider (2026-07-10):** `renderer.py` — new "📐 Rule Signals" strip at
+  the top (per-symbol rule verdict with "→ buying" / "not whitelisted — no entry" / "→ exiting"
+  annotations); AI strip relabeled "🤖 AI Advisory — opinions only, cannot open positions";
+  each stock card carries a rule tag next to the AI verdict. `ScanResult` gained
+  `rule_verdict` + `rule_whitelisted` (default None/False — backward compatible).
+  Invariant restored twice today: what the dashboard shows is what the bot will do.
+- **AI shadow votes (2026-07-10):** every rule trade's CSV reason records the AI's opinion at
+  fill time (`RULE BUY ... | ai=SELL60`, `| ai=NONE` if unavailable) — frozen schema unchanged,
+  content only. After ~30 rule trades, compare outcomes where AI agreed vs disagreed; the AI
+  earns entry-veto power only if agreement proves predictive. Do not grant veto before that.
+- Held FAIL-symbol positions (AC.TO, DLTR at ship time) are managed by: rule SELL, AI exit
+  policy, SL/TP watcher. No new entries on FAIL symbols.
+- Re-run trigger: any change to `bot/strategy/*` or `build_indicator_config()` invalidates
+  RULE_WHITELIST until the stock walk-forward is re-run (same discipline as crypto).
+
+### Stock bot asymmetric exit policy (2026-07-10) — 184 tests pass
+Incident: AC.TO held while the AI issued SELL 60% then SELL 58% on consecutive cycles —
+both silently ignored because ONE confidence bar (PAPER_MIN_CONFIDENCE=65) gated both BUY
+and SELL. The dashboard showed "🔴 SELL — AC.TO" with no hint the bot wouldn't act.
+Design fix: entries and exits are not symmetric — a BUY adds risk (high bar stays), a SELL
+on a HELD position removes risk (lower bar). Mirrors the crypto risk manager's "SELL always
+allowed" philosophy.
+- **New module `stock_bot/execution/exit_policy.py` (`ExitPolicy`)** — pure logic, no I/O.
+  A held position exits on: single SELL verdict ≥ `PAPER_MIN_CONFIDENCE_SELL` (55), OR
+  `PAPER_SELL_STREAK_CYCLES` (2) consecutive SELL cycles each ≥ `PAPER_SELL_STREAK_MIN_CONF`
+  (50). HOLD/BUY verdicts and sub-50 SELLs break the streak; streak is in-memory (restart
+  resets it — SL/TP watcher is the crash-safe backstop and is untouched).
+- **`main.py`:** `exit_policy.decide()` runs on EVERY verdict (so HOLD breaks streaks);
+  BUY keeps the 65 bar; SELL path uses the policy. A held symbol with a below-bar SELL now
+  logs + prints "HELD, not exiting: <reason>" instead of silence. Streak-triggered fills
+  get " [streak]" appended to the CSV reason (schema unchanged — content only).
+- **Dashboard (`renderer.py` `_summary_html`):** signal cards now show per-symbol
+  confidence and action status — "AC.TO 60% → exiting" / "AMD 62% (not held)" /
+  "(held · below exit bar)" — plus a caption of the act thresholds. Advice and action are
+  no longer visually identical. Thresholds threaded via `render(exit_bars=...)`.
+- **Phase A note:** this changes the strategy being measured — position-book trades closed
+  before 2026-07-10 used the old single-bar exits. Only 8 completed trades existed; the
+  30-trade gate continues counting without reset, but any pre/post expectancy split should
+  use this date.
+- **Known limitation (bigger fix planned):** AI verdicts remain the trade trigger and are
+  noisy/unstable (AMD flipped BUY 58 → SELL 60 → HOLD 58 → BUY 68 → SELL 62 within ~10 min
+  on 2026-07-10) and unbacktestable. Direction agreed with user 2026-07-10: move the stock
+  bot to deterministic rule-based signals (backtested + walk-forwarded like the crypto bot),
+  demote AI to advisory — per the project's original "AI cannot execute trades" principle.
+  This exit policy is the stopgap that manages open positions sanely until that lands.
 
 ### Dual-strategy formalization (2026-07-06)
 Stock bot now has two formally separated, named strategy books. 168 tests pass.

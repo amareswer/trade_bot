@@ -447,6 +447,68 @@ def _check_candle_watchdog(
 
 
 # ---------------------------------------------------------------------------
+# Position drift evaluation (extracted for unit-testability)
+# ---------------------------------------------------------------------------
+_DRIFT_MIN = 0.000010
+
+
+def _evaluate_drift(
+    sym: str,
+    base: str,
+    exchange_pos: float,
+    bot_pos: float,
+    ss: dict,
+    threshold: int,
+    alerter,
+) -> None:
+    """One drift-reconciliation evaluation for one symbol.
+
+    Escalates via alerter.error after `threshold` consecutive detections, then
+    ACKNOWLEDGES that drift amount (ss['drift_acked']): an unchanged drift —
+    e.g. a manual deposit sitting in the account as external holdings, which
+    the bot will never trade — stays quiet instead of re-alerting every
+    `threshold` checks forever (incident: 0.000085 BTC deposit spammed
+    Telegram every ~3h from Jul 6–10, 2026). A drift that CHANGES re-arms
+    the counter; a resolved drift clears the acknowledgment.
+    """
+    drift = abs(exchange_pos - bot_pos)
+    if drift > _DRIFT_MIN:
+        if abs(drift - ss.get('drift_acked', 0.0)) <= _DRIFT_MIN:
+            logger.info(
+                "Known drift [%s] unchanged (%.6f %s) — acknowledged, not re-alerting",
+                sym, drift, base,
+            )
+            return
+        ss['drift_count'] += 1
+        logger.warning(
+            "POSITION DRIFT [%s] [%d/%d]: exchange=%.6f bot=%.6f"
+            " drift=%.6f %s",
+            sym, ss['drift_count'], threshold,
+            exchange_pos, bot_pos, drift, base,
+        )
+        if ss['drift_count'] >= threshold:
+            alerter.error(
+                f"PERSISTENT position drift [{sym}] after"
+                f" {ss['drift_count']} consecutive checks:"
+                f" exchange={exchange_pos:.6f}"
+                f" bot={bot_pos:.6f} {base}"
+                f" — check logs/live_state_{sym.replace('/', '_')}.json."
+                f" If this is a manual deposit it is safe (external holdings"
+                f" are never traded); no further alerts unless the amount changes."
+            )
+            ss['drift_acked'] = drift
+            ss['drift_count'] = 0
+    else:
+        if ss['drift_count'] > 0 or ss.get('drift_acked', 0.0) > 0:
+            logger.info(
+                "Position drift resolved [%s]: exchange=%.6f bot=%.6f %s",
+                sym, exchange_pos, bot_pos, base,
+            )
+        ss['drift_count'] = 0
+        ss['drift_acked'] = 0.0
+
+
+# ---------------------------------------------------------------------------
 # Manual halt flag file (extracted for unit-testability)
 # ---------------------------------------------------------------------------
 _HALT_FLAG_PATH = os.path.join(_log_dir, "HALT")
@@ -735,6 +797,7 @@ def run():
                 'last_price':       0.0,
                 'err_count':        0,            # consecutive price-fetch failures
                 'drift_count':      0,            # consecutive drift detections
+                'drift_acked':      0.0,          # drift amount already escalated (no re-alert until it changes)
                 'last_candle_time': time.time(),  # candle watchdog timer
                 'mtf_1d_closes':    [],           # daily closes cache — refreshed at gate 2c
             }
@@ -770,6 +833,7 @@ def run():
             'last_price':       0.0,
             'err_count':        0,
             'drift_count':      0,
+            'drift_acked':      0.0,
             'last_candle_time': time.time(),
             'mtf_1d_closes':    [],
         }
@@ -1021,33 +1085,10 @@ def run():
                         # not yet in free, and `free` here caused false drift alerts.
                         exchange_pos = float(balance.get("total", {}).get(base, 0))
                         bot_pos = ss['executor'].position
-                        drift = abs(exchange_pos - bot_pos)
-                        _drift_threshold = cfg.exchange.drift_alert_threshold
-                        if drift > 0.000010:
-                            ss['drift_count'] += 1
-                            logger.warning(
-                                "POSITION DRIFT [%s] [%d/%d]: exchange=%.6f bot=%.6f"
-                                " drift=%.6f %s",
-                                sym, ss['drift_count'], _drift_threshold,
-                                exchange_pos, bot_pos, drift, base,
-                            )
-                            if ss['drift_count'] >= _drift_threshold:
-                                alerter.error(
-                                    f"PERSISTENT position drift [{sym}] after"
-                                    f" {ss['drift_count']} consecutive checks:"
-                                    f" exchange={exchange_pos:.6f}"
-                                    f" bot={bot_pos:.6f} {base}"
-                                    f" — check logs/live_state_{sym.replace('/', '_')}.json"
-                                )
-                                ss['drift_count'] = 0
-                        else:
-                            if ss['drift_count'] > 0:
-                                logger.info(
-                                    "Position drift resolved [%s]: exchange=%.6f"
-                                    " bot=%.6f %s",
-                                    sym, exchange_pos, bot_pos, base,
-                                )
-                            ss['drift_count'] = 0
+                        _evaluate_drift(
+                            sym, base, exchange_pos, bot_pos, ss,
+                            cfg.exchange.drift_alert_threshold, alerter,
+                        )
                         _drift_succeeded = True
                         _drift_consecutive_failures = 0
                         break

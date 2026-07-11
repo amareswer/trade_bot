@@ -6,10 +6,11 @@
 #   crontab -l
 #
 # Notes
-# - Times are LOCAL machine time (this Mac runs ET; 02:00 ET ≈ 06:00 UTC in summer).
-# - macOS cron only fires while the machine is awake. The bots run under
-#   `caffeinate -i`, which keeps the Mac awake while they're up. If jobs are
-#   missed overnight, the shadow report simply appears a day late — not critical.
+# - Times are LOCAL machine time (this Mac runs ET; 12:05 ET ≈ 16:05 UTC in summer).
+# - macOS cron only fires while the machine is awake and does NOT catch up on
+#   missed runs. `caffeinate -i` prevents idle sleep but NOT lid-close sleep —
+#   the 02:00 shadow job silently missed Jul 7–10, 2026 (lid closed overnight).
+#   Jobs now run MIDDAY when the machine is reliably awake.
 # - VPS migration: prefer systemd timers (Persistent=true catches missed runs,
 #   failures land in journald). One .service + .timer per job below, installed
 #   by deploy.sh. Until then, this file IS the schedule.
@@ -19,7 +20,8 @@ PY=/Users/nishita/Desktop/Amaresh/projects/trade_bot/.venv/bin/python
 
 # Shadow signal fidelity audit — daily. Confirms the live bot's candle-close
 # decisions match a fresh replay of the validated strategy (capital-gate input).
-0 2 * * *  cd $TRADE_BOT && $PY shadow_signal.py >> logs/shadow_signal.log 2>&1
+# 12:05 local — moved from 02:00 (2026-07-10): machine asleep at 2am, runs missed.
+5 12 * * *  cd $TRADE_BOT && $PY shadow_signal.py >> logs/shadow_signal.log 2>&1
 
-# Live-vs-backtest comparison — weekly, Monday 09:00 (roadmap item 17).
-0 9 * * 1  cd $TRADE_BOT && $PY live_comparison.py >> logs/weekly.log 2>&1
+# Live-vs-backtest comparison — weekly, Monday midday (roadmap item 17).
+10 12 * * 1  cd $TRADE_BOT && $PY live_comparison.py >> logs/weekly.log 2>&1
