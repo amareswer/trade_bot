@@ -414,8 +414,11 @@ SELL signals do meaningful work, reducing fee sensitivity.
   minutes again, suspect a test reading live `.env` config.
 - **Known-inert leftover:** the DOGE/CAD liquidity gate in `bot/main.py` is dead code (DOGE
   is BLOCKED) and hardcodes a symbol — generalize to config or delete when next touched.
-- `.env` chmod 600 (was world-readable). A bare un-named secret sits as a comment under
-  "── Secrets ──" in `.env` — identify the service, move to a named var, and rotate it.
+- `.env` chmod 600 (was world-readable). ~~A bare un-named secret sits as a comment under
+  "── Secrets ──" in `.env`~~ — RESOLVED 2026-07-13: identified as an exact duplicate of
+  `OLLAMA_CLOUD_API_KEY` (already properly named in `stock_bot/.env`); stray comment copy
+  deleted from root `.env`. Remaining user action: rotate the Ollama Cloud key at
+  ollama.com (low urgency — local machine only, but the file was world-readable pre-2026-07-04).
 
 ### Stock bot Phase A — expectancy measurement (2026-07-04)
 Goal: get to 30 completed paper round-trips and measure per-trade expectancy net of costs.
@@ -485,7 +488,8 @@ expectancy is unmeasured until trades complete. The report's expectancy number i
   `logs/trade_bot.log` mtime/size untouched. The test noise stamped 2026-07-05 10:42 in the
   log predates the fix — historical, not a regression.
 - **`.env` secret rotation deferred by user** (2026-07-06, "will do it later") — still the
-  only open security item.
+  only open security item. UPDATE 2026-07-13: secret identified (Ollama Cloud key duplicate,
+  removed from root `.env`); only the key rotation itself remains.
 
 ### Held-position visibility fixes (2026-07-10) — both bots, 173 tests pass
 Root cause class: a held position whose symbol leaves the scanned universe becomes invisible
@@ -697,8 +701,9 @@ speculation, commodity supply-deficit bets, IPO flips (see IPO policy above).
    That is correct behavior. Stock bot needs a restart to pick up the new .env.
 3. **Keep filling gates:** crypto 0/15 live fills (BTC/CAD, $77 slot) · stock Phase A 30-trade
    counter · swing book 30-signal counter. No capital changes before gates.
-4. **Open ops items:** `.env` secret rotation (H, user-deferred) · VPS logrotate (F) ·
-   UptimeRobot (G).
+4. **Open ops items:** `.env` secret rotation (H — secret identified 2026-07-13 as Ollama
+   Cloud key duplicate, comment copy deleted; user still to rotate at ollama.com) ·
+   VPS logrotate (F) · UptimeRobot (G).
 5. **Next big build after gate progress:** IBKR paper executor (D).
 No new asset classes, strategies, or business pivots before these complete.
 
@@ -805,7 +810,7 @@ Features A, B, E from the roadmap completed. 168 tests pass.
 |---|---------|-----|--------|
 | F | **VPS logrotate** | `/etc/logrotate.d/trade_bot` — local log uses RotatingFileHandler, VPS has no rotation yet | Small |
 | G | **UptimeRobot monitor** | External uptime check — systemd stops after 5 crashes with no alert | Trivial |
-| H | **`.env` secret rotation** | Bare unnamed secret in `.env` — identify service, name it, rotate | Small |
+| H | **`.env` secret rotation** | ~~Identify service, name it~~ (done 2026-07-13: Ollama Cloud key duplicate, comment deleted) — user rotates key at ollama.com | Small |
 
 #### Both bots — longer term
 | # | Feature | Why | Effort |
