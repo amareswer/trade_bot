@@ -685,15 +685,16 @@ patterns, not businesses — momentum trading, labeled as such, not Buffett-styl
 Permanently out of scope (unbacktestable macro plays): raw gold as store-of-value, forex
 speculation, commodity supply-deficit bets, IPO flips (see IPO policy above).
 
-**Plan queue (as of 2026-07-11, item 1 verified 2026-07-13):**
+**Plan queue (as of 2026-07-11, items 1–2 done 2026-07-13):**
 1. ~~**Mon 2026-07-13 market open:** verify first live session of the rule-based stock pipeline~~
    — DONE: clean session (rule signals fired correctly, no errors); see sizing-visibility
    fix entry above. Found AMD's BUY signal was silently unfillable at current account size —
    fixed to log/print visibly, deliberately not fixed by forcing an oversized fill.
-2. **Before adding GLD:** GLD trades ~$300+/share — same `PAPER_RISK_PCT=0.20` sizing wall
-   that blocks AMD/RY.TO today will block GLD too (target alloc ~$203 < 1 share). Adding it
-   is still correct (it passed its own walk-forward gate) but expect it to sit as a visible
-   SIZE_SKIP rather than fill until the paper account grows. One change at a time.
+2. ~~**Before adding GLD**~~ — DONE 2026-07-13 (after item 1 verified clean): GLD added to
+   WATCHLIST + RULE_WHITELIST in `stock_bot/.env`. GLD trades ~$300+/share — the same
+   `PAPER_RISK_PCT=0.20` sizing wall that blocks AMD/RY.TO (target alloc ~$203 < 1 share)
+   means it will sit as a visible SIZE_SKIP rather than fill until the paper account grows.
+   That is correct behavior. Stock bot needs a restart to pick up the new .env.
 3. **Keep filling gates:** crypto 0/15 live fills (BTC/CAD, $77 slot) · stock Phase A 30-trade
    counter · swing book 30-signal counter. No capital changes before gates.
 4. **Open ops items:** `.env` secret rotation (H, user-deferred) · VPS logrotate (F) ·
@@ -720,9 +721,9 @@ SYMBOL=PAXG/USDT walkforward.py` (crypto 4h engine). Report: `logs/stock_backtes
   to trigger Mode A/B entries (FXE: zero trades in the last year). Do not revisit with this
   strategy. Buffett's 2002 forex short was a macro conviction trade — unbacktestable, out of scope.
 - **SLV: FAIL** — standard re-screen triggers apply (strategy change → re-run).
-- **GLD: legitimate PASS of the documented RULE_WHITELIST gate.** Plan: add to WATCHLIST +
-  RULE_WHITELIST only AFTER the rule pipeline's first live session (Mon 2026-07-13) runs clean —
-  one-change-at-a-time discipline. Paper book only, like all stock trading.
+- **GLD: legitimate PASS of the documented RULE_WHITELIST gate.** Added to WATCHLIST +
+  RULE_WHITELIST 2026-07-13 after the rule pipeline's first live session ran clean —
+  one-change-at-a-time discipline held. Paper book only, like all stock trading.
 - **PAXG/USDT: parked as conditional candidate.** Small samples (9/12 trades) and all USD-pair
   preconditions still apply (BTC/CAD 15-fill live gate at 0/15, capital ≥ $500, FX-cost decision).
   Re-evaluate only when those gates open.
