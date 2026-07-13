@@ -608,6 +608,36 @@ allowed" philosophy.
   demote AI to advisory — per the project's original "AI cannot execute trades" principle.
   This exit policy is the stopgap that manages open positions sanely until that lands.
 
+### Rule pipeline first live session + sizing-visibility fix (2026-07-13) — 202 tests pass
+Monday 2026-07-13 was the first live session of the rule-based stock pipeline (plan queue
+item 1 from 2026-07-11). Result: clean — `rule_signal()` fired correctly all day (AMD BUY,
+13 HOLDs, 1 no-op SELL on INTC), no crashes, only routine NVIDIA NIM (AI advisory) timeouts
+which don't affect trading since AI cannot open positions.
+
+**Found while verifying: AMD's BUY signal was silently unfillable.** Root cause —
+`PAPER_RISK_PCT=0.20` on the ~$1,014 paper account targets a ~$203 allocation per trade;
+AMD trades at ~$538/share, so `int(alloc / price)` rounds to 0 shares and the old code had
+no branch for that case — no log, no print, nothing. The dashboard's "AMD → buying" line
+was technically true (an entry would be attempted) but gave no hint it could never clear.
+RY.TO (~$298/share) and the pending GLD add (~$300+/share) hit the identical wall.
+
+**Fix — visibility, not a forced fill (`stock_bot/main.py`, sizing block ~line 1081):**
+when `shares == 0` the bot now logs `SIZE_SKIP` and prints the target allocation, risk %,
+and price so the skip is diagnosable instead of silent.
+
+**Deliberately did NOT fix this by forcing a fill** (bumping `PAPER_RISK_PCT`, allowing
+fractional shares, or rounding up to a minimum of 1 share regardless of cost). Buying 1
+AMD share would commit ~53% of account cash to one position — a 2.65x blowout over the
+intended 20%-per-trade risk cap. That is exactly the failure mode the Buffett rule mapping
+in the Investment philosophy section below calls "margin of safety": small, capped sizing
+over conviction-sized bets. **Standing warning:** do not "fix" a SIZE_SKIP by raising
+`PAPER_RISK_PCT`, adding fractional-share support, or special-casing a minimum share count
+for expensive symbols — any of those bypasses the margin-of-safety sizing rule the same way
+a crypto capital-gate bypass would. The correct lever is the documented one: let the paper
+account grow through the Phase A gate, or don't whitelist single-share-unaffordable symbols
+at the current account size. AMD, RY.TO, and (once added) GLD will keep skipping — that is
+correct behavior, not a bug, until account size catches up.
+
 ### IPO policy — no automated IPO trading (2026-07-11, agreed with user)
 Trigger: SpaceX IPO'd 2026-06-12 as NASDAQ:SPCX — largest IPO in history (offer $135,
 raised ~$75B, ~$1.8T valuation). Pop-and-fade played out in 3 sessions: peak $225.64 on
@@ -655,11 +685,15 @@ patterns, not businesses — momentum trading, labeled as such, not Buffett-styl
 Permanently out of scope (unbacktestable macro plays): raw gold as store-of-value, forex
 speculation, commodity supply-deficit bets, IPO flips (see IPO policy above).
 
-**Plan queue (as of 2026-07-11):**
-1. **Mon 2026-07-13 market open:** verify first live session of the rule-based stock pipeline
-   ("📐 RULES:" lines per symbol, sane fills, no errors). First real test post-rebuild.
-2. **After a clean Monday session:** add GLD to WATCHLIST + RULE_WHITELIST (passed the gate
-   2026-07-11 — see metals screen below). One change at a time.
+**Plan queue (as of 2026-07-11, item 1 verified 2026-07-13):**
+1. ~~**Mon 2026-07-13 market open:** verify first live session of the rule-based stock pipeline~~
+   — DONE: clean session (rule signals fired correctly, no errors); see sizing-visibility
+   fix entry above. Found AMD's BUY signal was silently unfillable at current account size —
+   fixed to log/print visibly, deliberately not fixed by forcing an oversized fill.
+2. **Before adding GLD:** GLD trades ~$300+/share — same `PAPER_RISK_PCT=0.20` sizing wall
+   that blocks AMD/RY.TO today will block GLD too (target alloc ~$203 < 1 share). Adding it
+   is still correct (it passed its own walk-forward gate) but expect it to sit as a visible
+   SIZE_SKIP rather than fill until the paper account grows. One change at a time.
 3. **Keep filling gates:** crypto 0/15 live fills (BTC/CAD, $77 slot) · stock Phase A 30-trade
    counter · swing book 30-signal counter. No capital changes before gates.
 4. **Open ops items:** `.env` secret rotation (H, user-deferred) · VPS logrotate (F) ·

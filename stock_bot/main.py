@@ -1080,6 +1080,18 @@ def run() -> None:
                                 pos_val = sum(sh * co for sh, co in snap.values())
                                 alloc   = (executor.cash + pos_val) * cfg.paper_risk_pct
                                 shares  = int(alloc / execution_price) if execution_price > 0 else 0
+                                if shares == 0 and execution_price > 0:
+                                    logger.info(
+                                        "SIZE_SKIP: %s — target allocation $%.2f "
+                                        "(%.0f%% of $%.2f) buys 0 shares @ $%.2f",
+                                        symbol, alloc, cfg.paper_risk_pct * 100,
+                                        executor.cash + pos_val, execution_price,
+                                    )
+                                    print(
+                                        f"  📄 SKIP: {symbol} — ${alloc:.2f} allocation "
+                                        f"({cfg.paper_risk_pct*100:.0f}% risk) can't buy "
+                                        f"1 share @ ${execution_price:,.2f}"
+                                    )
                                 if shares > 0:
                                     if _rule_buy:
                                         reason = (f"RULE BUY rsi={rule_v.rsi:.0f} "
