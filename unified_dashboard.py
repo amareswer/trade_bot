@@ -282,7 +282,11 @@ def _read_gate_stats() -> dict:
             d = re.search(r"shadow_report_(\d{8})\.md", reports[-1])
             if d:
                 report_day = datetime.strptime(d.group(1), "%Y%m%d").date()
-                out["shadow_age_d"] = (datetime.now().date() - report_day).days
+                # Reports are named by UTC date — can be "tomorrow" local
+                # in the evening; clamp so a fresh report never shows -1d.
+                out["shadow_age_d"] = max(
+                    0, (datetime.now().date() - report_day).days
+                )
     except Exception:
         pass
     return out
