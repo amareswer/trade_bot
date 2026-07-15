@@ -1,27 +1,28 @@
-# trade_bot scheduled jobs — SOURCE OF TRUTH for cron on any machine.
+# trade_bot scheduled jobs — RETIRED 2026-07-14. Cron is no longer used.
 #
-# Install / update (never edit the live crontab by hand):
+# This file is kept (empty of jobs) as the record of why. Installing it
+# clears the old broken schedule:
 #   crontab ops/crontab.txt
-# Verify:
+# Verify (should show only comments):
 #   crontab -l
 #
-# Notes
-# - Times are LOCAL machine time (this Mac runs ET; 12:05 ET ≈ 16:05 UTC in summer).
-# - macOS cron only fires while the machine is awake and does NOT catch up on
-#   missed runs. `caffeinate -i` prevents idle sleep but NOT lid-close sleep —
-#   the 02:00 shadow job silently missed Jul 7–10, 2026 (lid closed overnight).
-#   Jobs now run MIDDAY when the machine is reliably awake.
-# - VPS migration: prefer systemd timers (Persistent=true catches missed runs,
-#   failures land in journald). One .service + .timer per job below, installed
-#   by deploy.sh. Until then, this file IS the schedule.
-
-TRADE_BOT=/Users/nishita/Desktop/Amaresh/projects/trade_bot
-PY=/Users/nishita/Desktop/Amaresh/projects/trade_bot/.venv/bin/python
-
-# Shadow signal fidelity audit — daily. Confirms the live bot's candle-close
-# decisions match a fresh replay of the validated strategy (capital-gate input).
-# 12:05 local — moved from 02:00 (2026-07-10): machine asleep at 2am, runs missed.
-5 12 * * *  cd $TRADE_BOT && $PY shadow_signal.py >> logs/shadow_signal.log 2>&1
-
-# Live-vs-backtest comparison — weekly, Monday midday (roadmap item 17).
-10 12 * * 1  cd $TRADE_BOT && $PY live_comparison.py >> logs/weekly.log 2>&1
+# History — why cron was abandoned on this machine:
+# - 2026-07-06: shadow_signal.py (daily 02:00) + live_comparison.py (Mon 09:00)
+#   installed via this file.
+# - 2026-07-10: moved to 12:05/12:10 after runs were missed overnight —
+#   diagnosed then as lid-close sleep (cron never catches up missed runs).
+# - 2026-07-14: mail spool (/var/mail) revealed the REAL failure: every cron
+#   run since install — at 02:00 AND at 12:05 — died with
+#   "/bin/sh: logs/shadow_signal.log: Operation not permitted".
+#   macOS TCC denies /usr/sbin/cron access to ~/Desktop, where the repo
+#   lives. Cron NEVER successfully ran either job; the two existing shadow
+#   reports (Jul 6, Jul 11) were manual runs.
+#
+# Replacement: the crypto bot runs both audits itself — see
+# _scheduled_audits_loop() in bot/main.py (daemon thread, fresh subprocess
+# per run, catch-up after restart, failures in the bot log, state in
+# logs/audit_state.json). Env knobs: AUDIT_SCHEDULER_ENABLED,
+# SHADOW_AUDIT_TIME (default 12:05), WEEKLY_AUDIT_TIME (default 12:10).
+#
+# VPS migration: still prefer systemd timers (Persistent=true) over cron —
+# or simply keep the in-bot scheduler, which works identically there.

@@ -531,9 +531,15 @@ def _fg_section_html(fg: FearGreedData) -> str:
   </div>"""
 
 
-def _rule_summary_html(results: list[ScanResult], held: Optional[set] = None) -> str:
+def _rule_summary_html(
+    results: list[ScanResult],
+    held: Optional[set] = None,
+    buy_alloc: Optional[float] = None,
+) -> str:
     """The DECIDER strip — rule-based signals that actually trigger trades.
-    Only rendered when at least one result carries a rule verdict."""
+    Only rendered when at least one result carries a rule verdict.
+    buy_alloc = current per-trade dollar allocation; a whitelisted BUY whose
+    share price exceeds it will SIZE_SKIP, so the label must not say "buying"."""
     held = held or set()
     with_rules = [r for r in results if r.rule_verdict is not None]
     if not with_rules:
@@ -545,7 +551,15 @@ def _rule_summary_html(results: list[ScanResult], held: Optional[set] = None) ->
         sig = rv.signal if rv.signal in groups else "HOLD"
         label = r.symbol
         if sig == "BUY":
-            label += " → buying" if r.rule_whitelisted else " (not whitelisted — no entry)"
+            if not r.rule_whitelisted:
+                label += " (not whitelisted — no entry)"
+            elif buy_alloc is not None and 0 < buy_alloc < r.price:
+                label += (
+                    f" ⚠ signal valid, can't fill — 1 share ${r.price:,.0f}"
+                    f" > ${buy_alloc:,.0f} allocation"
+                )
+            else:
+                label += " → buying"
         elif sig == "SELL":
             label += " → exiting" if r.symbol.upper() in held else " (not held)"
         groups[sig].append(label)
@@ -1360,6 +1374,7 @@ def _build_html(
     loop_mode:     str                        = "LIVE",
     gate_status:   Optional[dict]             = None,
     exit_bars:     Optional[dict]             = None,
+    buy_alloc:     Optional[float]            = None,
 ) -> str:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1434,7 +1449,7 @@ def _build_html(
 
 {_header_html(now_str, loop_interval, ai_stats, market_status, loop_mode)}
 {_fg_section_html(fear_greed)}
-{_rule_summary_html(results, held={p.symbol.upper() for p in paper.positions} if paper else set())}
+{_rule_summary_html(results, held={p.symbol.upper() for p in paper.positions} if paper else set(), buy_alloc=buy_alloc)}
 {_summary_html(results, held={p.symbol.upper() for p in paper.positions} if paper else set(), exit_bars=exit_bars)}
 {portfolio_section}
 {paper_section}
@@ -1490,8 +1505,9 @@ class DashboardRenderer:
         loop_mode:     str                        = "LIVE",
         gate_status:   Optional[dict]             = None,
         exit_bars:     Optional[dict]             = None,
+        buy_alloc:     Optional[float]            = None,
     ) -> None:
-        html_str = _build_html(scan_results, fear_greed, self.loop_interval, portfolio, alerts, paper, ai_stats, market_status, loop_mode, gate_status, exit_bars)
+        html_str = _build_html(scan_results, fear_greed, self.loop_interval, portfolio, alerts, paper, ai_stats, market_status, loop_mode, gate_status, exit_bars, buy_alloc)
         os.makedirs(os.path.dirname(os.path.abspath(_OUTPUT_PATH)), exist_ok=True)
         with open(_OUTPUT_PATH, "w", encoding="utf-8") as f:
             f.write(html_str)

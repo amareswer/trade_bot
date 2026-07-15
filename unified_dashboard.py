@@ -234,7 +234,8 @@ def _read_gate_stats() -> dict:
     reason). Each SELL's pnl is reduced by its own fee plus an equal share of
     the window's BUY fees.
     """
-    out = {"sells": 0, "pf": None, "wins": 0, "losses": 0, "shadow": None, "realized": 0.0}
+    out = {"sells": 0, "pf": None, "wins": 0, "losses": 0, "shadow": None,
+           "shadow_age_d": None, "realized": 0.0}
     try:
         import sqlite3
         con = sqlite3.connect("logs/trades.db")
@@ -278,6 +279,10 @@ def _read_gate_stats() -> dict:
             m = re.search(r"Match rate[^0-9]*([0-9]+(?:\.[0-9]+)?)\s*%", text)
             if m:
                 out["shadow"] = float(m.group(1))
+            d = re.search(r"shadow_report_(\d{8})\.md", reports[-1])
+            if d:
+                report_day = datetime.strptime(d.group(1), "%Y%m%d").date()
+                out["shadow_age_d"] = (datetime.now().date() - report_day).days
     except Exception:
         pass
     return out
@@ -313,8 +318,20 @@ def _gate_tracker_section() -> str:
         sh_val, sh_sub = "—", "run python shadow_signal.py"
     else:
         sh_col = "#3fb950" if g["shadow"] >= 95 else "#f85149"
-        sh_val = f'<span style="color:{sh_col}">{g["shadow"]:.1f}%</span>'
-        sh_sub = "target ≥ 95% — strategy fidelity (latest report)"
+        age = g["shadow_age_d"]
+        # A stale report must not look like a fresh one — the daily audit
+        # silently failed for a week before this indicator existed.
+        if age is None:
+            age_html, age_sub = "", "report date unknown"
+        elif age <= 1:
+            age_html, age_sub = "", f"report {age}d old"
+        else:
+            age_col = "#d29922" if age <= 3 else "#f85149"
+            age_html = (f' <span style="color:{age_col};font-size:12px">'
+                        f'⚠ {age}d old</span>')
+            age_sub = f"STALE — daily audit hasn't run in {age} days"
+        sh_val = f'<span style="color:{sh_col}">{g["shadow"]:.1f}%</span>{age_html}'
+        sh_sub = f"target ≥ 95% — strategy fidelity · {age_sub}"
     sh_block = _stat_block("Gate 3 · Shadow Match", sh_val, sh_sub)
 
     return (
@@ -328,8 +345,67 @@ def _gate_tracker_section() -> str:
     )
 
 
+def _paper_book_stats(csv_path: str) -> tuple[int, float | None, float | None]:
+    """(completed trades, net PF, net win rate %) for a stock-bot trade CSV.
+    Reuses paper_report's pairing + net-of-commission math — no duplicate logic."""
+    try:
+        from stock_bot.analysis.paper_report import (
+            _expectancy_stats, _pair_trades, _read_trades,
+        )
+        pairs, _ = _pair_trades(_read_trades(csv_path))
+        stats = _expectancy_stats(pairs)
+        if stats is None:
+            return 0, None, None
+        return stats["n"], stats["net_pf"], stats["net_win_rate"]
+    except Exception:
+        return 0, None, None
+
+
+def _book_gates_section() -> str:
+    """Gates at a glance — every book's trade-count progress and net PF side
+    by side (roadmap item C). Detail stays in each book's own card below."""
+    def block(label: str, n: int, need: int, pf: float | None,
+              wr: float | None, sub: str) -> str:
+        if pf is None:
+            pf_html = '<span style="color:#8b949e">PF —</span>'
+        else:
+            pf_s   = "∞" if pf == float("inf") else f"{pf:.2f}"
+            pf_col = "#3fb950" if pf >= 1.2 else "#d29922"
+            pf_html = f'<span style="color:{pf_col}">PF {pf_s}</span>'
+        wr_s = f" · WR {wr:.0f}%" if wr is not None else ""
+        pct = min(100, int(n / need * 100)) if need else 0
+        bar = (
+            f'<div style="background:#21262d;border-radius:4px;height:6px;margin-top:6px">'
+            f'<div style="background:#1f6feb;height:6px;border-radius:4px;width:{pct}%"></div></div>'
+        )
+        return _stat_block(label, f"{n} / {need} · {pf_html}{wr_s}{bar}", sub)
+
+    g = _read_gate_stats()
+    wins, losses = g["wins"], g["losses"]
+    crypto_wr = wins / (wins + losses) * 100 if (wins + losses) else None
+
+    pos_n, pos_pf, pos_wr = _paper_book_stats("stock_bot/paper_trades.csv")
+    swi_n, swi_pf, swi_wr = _paper_book_stats("stock_bot/fast_trades.csv")
+
+    return (
+        '<div style="margin-bottom:8px;font-size:11px;color:#8b949e;'
+        'text-transform:uppercase;letter-spacing:.05em;font-weight:600">'
+        'Gates at a Glance — trades toward each book\'s gate · PF net of costs</div>'
+        '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));'
+        'gap:12px;margin-bottom:24px">'
+        + block("Crypto · Live", g["sells"], 15, g["pf"], crypto_wr,
+                "BTC/CAD · gate: PF ≥ 1.2 + shadow ≥ 95%")
+        + block("Position Book · Paper", pos_n, 30, pos_pf, pos_wr,
+                "daily candles · gate: PF ≥ 1.2, WR ≥ 30%")
+        + block("Swing Book · Paper", swi_n, 30, swi_pf, swi_wr,
+                "1h · 48h max hold · gate: PF ≥ 1.2, WR ≥ 30%")
+        + "</div>"
+    )
+
+
 def _pnl_trend_section() -> str:
-    """Daily realized P&L bars from trades.db (crypto — stock has no closed trades yet)."""
+    """Daily realized P&L bars from trades.db (crypto live only — stock
+    realized P&L lives in the Gates strip and position-book card)."""
     daily: dict[str, float] = {}
     try:
         import sqlite3
@@ -364,7 +440,7 @@ def _pnl_trend_section() -> str:
         'padding:14px 16px;margin-bottom:24px">'
         '<div style="font-size:11px;color:#8b949e;text-transform:uppercase;'
         'letter-spacing:.05em;font-weight:600;margin-bottom:10px">'
-        'Realized P&L by Day (crypto live · stock has no closed trades yet)</div>'
+        'Realized P&L by Day (crypto live only · stock P&L in Gates strip above)</div>'
         f'<div style="display:flex;gap:10px;align-items:flex-end">{bars}</div>'
         '</div>'
     )
@@ -1055,6 +1131,16 @@ def _portfolio_tab_html(
     )
     active_cash = sum(float(d.get("cash", 0)) for d in active.values())
 
+    stock_cash = float(stock.get("cash", 0)) if stock else 0.0
+    stock_pv   = sum(
+        float(p.get("shares", 0)) * float(p.get("avg_cost", 0))
+        for p in (stock.get("positions", {}) if stock else {}).values()
+    )
+    stock_label = (
+        f"Stocks paper (${stock_cash + stock_pv:,.0f} account)"
+        if stock else "Stocks paper"
+    )
+
     return (
         '<div style="padding:24px 20px;max-width:1000px;margin:0 auto">'
         '<div style="margin-bottom:24px">'
@@ -1062,12 +1148,13 @@ def _portfolio_tab_html(
         "Portfolio Overview"
         "</div>"
         '<div style="font-size:12px;color:#8b949e">'
-        "Crypto live (Kraken) · Stocks paper ($1,000 account)"
+        f"Crypto live (Kraken) · {stock_label}"
         "</div>"
         "</div>"
         + _combined_stats(active, stock)
         + _ops_status_section()
         + _gate_tracker_section()
+        + _book_gates_section()
         + _pnl_trend_section()
         + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px">'
         + crypto_cards

@@ -165,7 +165,7 @@ A robust crypto trading system that:
 
 ## Test Suite Manifest (as of 2026-07-03)
 
-Expected total: **202 tests** (as of 2026-07-10). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
+Expected total: **210 tests** (as of 2026-07-14). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -190,8 +190,9 @@ Expected total: **202 tests** (as of 2026-07-10). If `pytest --collect-only -q` 
 | `test_exit_policy.py` | 11 | Stock-bot asymmetric exit bars: single-verdict exit, 2-strike SELL streak, streak resets, AC.TO incident regression |
 | `test_stock_backtest_engine.py` | 11 | Stock backtest engine: next-open fills, intra-candle SL/TP, gap handling, slippage/commission math, walk-forward gating |
 | `test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last (forming candle), determinism, validated-parameter pin |
+| `test_audit_scheduler.py` | 8 | In-bot audit scheduler: tests REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, missed-Monday catch-up |
 
-Run: `python -m pytest --tb=short -q` — must show **202 passed**.
+Run: `python -m pytest --tb=short -q` — must show **210 passed**.
 
 ---
 
@@ -642,6 +643,61 @@ account grow through the Phase A gate, or don't whitelist single-share-unafforda
 at the current account size. AMD, RY.TO, and (once added) GLD will keep skipping — that is
 correct behavior, not a bug, until account size catches up.
 
+### Dashboard updates (2026-07-14) — 202 tests pass
+Three changes, no strategy files touched (hash `659d1c03987b72fd` still valid):
+- **Rule strip no longer says "→ buying" for unfillable signals.** The 2026-07-13 SIZE_SKIP
+  fix covered logs/stdout only; the dashboard still promised fills that would round to 0
+  shares. `renderer.py` `_rule_summary_html()` now takes `buy_alloc` (threaded through
+  `render()` from `main.py`, computed as `(cash + position value) × PAPER_RISK_PCT` at
+  render time); a whitelisted BUY whose share price exceeds it renders
+  "⚠ signal valid, can't fill — 1 share $538 > $203 allocation". AMD/RY.TO/GLD show this
+  today — the "dashboard shows what the bot will do" invariant holds again. Omitting
+  `buy_alloc` preserves old behavior (backward compatible).
+- **"Gates at a Glance" strip (roadmap item C closed):** `unified_dashboard.py`
+  `_book_gates_section()` — all three books side by side (crypto 0/15 · position book n/30 ·
+  swing book n/30, each with net PF + win rate + progress bar). Position/swing numbers come
+  from `stock_bot.analysis.paper_report`'s own `_pair_trades`/`_expectancy_stats` (imported,
+  not duplicated) — the strip can never disagree with the report.
+- **Retired slot state files archived:** `logs/live_state_XRP_CAD.json` and
+  `logs/live_state_DOGE_CAD.json` (both flat, position 0.0, untouched since Jul 1) moved to
+  `logs/archive/`. Dashboard "retired slots" note now empty; orphan guard unaffected.
+- Note: position book gate shows 1/30 — the current `paper_trades.csv` holds exactly one
+  round trip (AC.TO: BUY 2026-06-24, SL hit 2026-07-14 10:38, −$12.51 net) + open DLTR.
+  The pre-Jun-24 $10k-era trades were deleted from the CSV (last tracked at git fb1751a).
+  The "8 completed trades" cited in the 2026-07-10 exit-policy entry does not match the
+  current CSV (1 pair) — that count predates the reset or counted differently; the gate
+  counts what `paper_report.py` counts, and the dashboard imports the same functions.
+- **Stock bot needs a restart** to pick up the renderer change (crypto bot's unified refresh
+  is a fresh subprocess each minute — already live).
+
+### Cron retired → in-bot audit scheduler (2026-07-14) — 210 tests pass
+**Discovery: the cron jobs NEVER worked.** `/var/mail/nishita` shows every run since the
+2026-07-06 install — at 02:00 AND at the moved 12:05 slot — failed with
+`/bin/sh: logs/shadow_signal.log: Operation not permitted`. macOS TCC denies `/usr/sbin/cron`
+access to `~/Desktop` where the repo lives; errors went to local mail nobody reads. The
+2026-07-10 "lid-close sleep" diagnosis was wrong (cron fired fine — it just couldn't write).
+The Jul 6 and Jul 11 shadow reports were both manual runs. Consequence: Gate 3 of the capital
+gate (shadow ≥ 95%) was silently running on stale data.
+- **Replacement:** `_scheduled_audits_loop()` daemon thread in `bot/main.py` — runs
+  `shadow_signal.py` daily (SHADOW_AUDIT_TIME, default 12:05 local) and `live_comparison.py`
+  Mon-anchored weekly (WEEKLY_AUDIT_TIME, default 12:10). Fresh subprocess per run (same
+  isolation pattern as the unified-dashboard thread), output appends to the same
+  `logs/shadow_signal.log` / `logs/weekly.log`, last-run dates persist in
+  `logs/audit_state.json`. **Catch-up by design:** a bot started after the scheduled time
+  runs the missed audit immediately (fixes both cron failure modes). A failed script is
+  logged and retried next period, not every minute. `AUDIT_SCHEDULER_ENABLED=false` disables.
+  Pure due-logic in `_audit_due()` — tests: `test_audit_scheduler.py` (8).
+- **`ops/crontab.txt` rewritten as a tombstone** (full failure history inside) and
+  reinstalled — live crontab now has zero active jobs. VPS note: systemd timers or just
+  keep the in-bot scheduler.
+- **Dashboard: Gate 3 shows shadow-report age** — fresh (≤1d) plain, 2–3d amber "⚠ Nd old",
+  >3d red + "STALE" subtitle. A stale report can no longer impersonate a fresh one.
+- Stale labels fixed: P&L-by-day caption no longer claims "stock has no closed trades yet"
+  (AC.TO closed 2026-07-14; chart is crypto-only and now says so); "Stocks paper ($1,000
+  account)" header now computes the real account value (cash + positions at cost).
+- **Crypto bot needs a restart** to start the scheduler thread. On first start after 12:05
+  it will immediately catch up today's missed shadow audit.
+
 ### IPO policy — no automated IPO trading (2026-07-11, agreed with user)
 Trigger: SpaceX IPO'd 2026-06-12 as NASDAQ:SPCX — largest IPO in history (offer $135,
 raised ~$75B, ~$1.8T valuation). Pop-and-fade played out in 3 sessions: peak $225.64 on
@@ -801,7 +857,7 @@ Features A, B, E from the roadmap completed. 168 tests pass.
 |---|---------|-----|--------|
 | ~~A~~ | ~~**Swing book cash tracking**~~ | ~~Add `FAST_STARTING_CASH` + real cash in `FastValidatorState` — unlocks $ expectancy for swing book, same Phase A gate as position book~~ | ~~Medium~~ |
 | ~~B~~ | ~~**Swing book Phase A gate**~~ | ~~Separate 30-trade / PF ≥ 1.2 counter for swing book, independent of position book~~ | ~~Small~~ |
-| C | **Combined dashboard section** | Total capital across both books, per-book PF side by side, combined exposure | Medium |
+| ~~C~~ | ~~**Combined dashboard section**~~ | ~~Total capital across both books, per-book PF side by side, combined exposure~~ — DONE 2026-07-14 ("Gates at a Glance" strip, see Dashboard updates 2026-07-14) | ~~Medium~~ |
 | D | **IBKR paper executor** | `IBKRExecutor(StockExecutorBase)` in `stock_bot/execution/ibkr.py` — paper mode first (port 7497), then live gate | Large (~10h) |
 | ~~E~~ | ~~**Earnings blackout for swing book**~~ | ~~Block swing BUY within N days of next earnings — mirrors position-book gate, shares same yfinance fetch~~ | ~~Small~~ |
 
@@ -1028,12 +1084,10 @@ and only counts fills after 2026-06-22 21:24 UTC (validated-config go-live) — 
 - First run (2026-07-03): 97.6% match (41/42 comparable candles), 1 MACD-state boundary
   mismatch (identical RSI/ADX on both sides — expected fresh-init vs live-accumulated difference).
 
-**Cron invocation (suggested daily):**
-```
-# Shadow signal fidelity — run daily at 06:00 UTC
-0 6 * * *  cd /path/to/trade_bot && python shadow_signal.py >> logs/shadow_signal.log 2>&1
-```
-Override env for non-standard paths:
+**Scheduling:** runs automatically — the crypto bot's in-bot scheduler executes it daily
+(SHADOW_AUDIT_TIME, default 12:05 local; see "Cron retired → in-bot audit scheduler
+2026-07-14" — do NOT use macOS cron, it cannot write into ~/Desktop).
+Override env for non-standard paths (manual runs):
 ```
 SHADOW_LOOKBACK=100 SHADOW_LOG=logs/trade_bot.log SHADOW_DB=logs/trades.db python shadow_signal.py
 ```

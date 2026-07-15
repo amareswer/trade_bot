@@ -22,7 +22,7 @@ import signal as _signal_module
 import threading
 import time
 from collections import deque
-from datetime import datetime, timedelta, timezone as _tz
+from datetime import date, datetime, timedelta, timezone as _tz
 
 import ccxt as _ccxt
 from dotenv import load_dotenv
@@ -349,6 +349,102 @@ def _unified_dashboard_loop(interval_s: int = 60) -> None:
         except Exception as exc:
             logger.warning("Unified dashboard refresh failed: %s", exc)
         time.sleep(interval_s)
+
+
+# ---------------------------------------------------------------------------
+# Scheduled audits (in-process replacement for macOS cron, 2026-07-14)
+# ---------------------------------------------------------------------------
+# cron failed two independent ways on this laptop: no fire while the lid is
+# closed (never catches up), and TCC denies /usr/sbin/cron access to ~/Desktop
+# ("Operation not permitted" on every run since install — errors only visible
+# in /var/mail). The bot is already a caffeinated long-running process, so the
+# audits run here: same permissions as the bot, catch-up after restart,
+# failures land in the bot log.
+_AUDIT_STATE_PATH = os.path.join(_log_dir, "audit_state.json")
+
+
+def _audit_due(
+    last_run: str | None,
+    now: datetime,
+    run_at: str = "12:05",
+    weekly_monday: bool = False,
+) -> bool:
+    """Pure due-check (unit-tested — keep I/O out of here).
+
+    Daily: due once per calendar day, any time at/after run_at (local) —
+    a bot started at 15:00 still runs the 12:05 audit (catch-up).
+    Weekly: due once per Mon-anchored week; past Monday's run_at, or any
+    time Tue–Sun if that week's run was missed.
+    """
+    try:
+        hh, mm = (int(x) for x in run_at.split(":"))
+    except ValueError:
+        hh, mm = 12, 5
+    past_time_today = (now.hour, now.minute) >= (hh, mm)
+    last = date.fromisoformat(last_run) if last_run else None
+
+    if weekly_monday:
+        monday = now.date() - timedelta(days=now.weekday())
+        if last is not None and last >= monday:
+            return False
+        return now.date() > monday or past_time_today
+
+    if last is not None and last >= now.date():
+        return False
+    return past_time_today
+
+
+def _scheduled_audits_loop() -> None:
+    """Daemon thread: run shadow_signal.py daily and live_comparison.py weekly.
+
+    Fresh subprocess per run (same isolation rationale as the dashboard loop);
+    output appends to the same log files the cron jobs targeted. The run date
+    is recorded even when the script fails, so a broken audit retries next
+    period instead of every minute — the failure is in the bot log either way.
+    """
+    import subprocess
+    import sys as _sys
+
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    jobs = [
+        ("shadow_signal", "shadow_signal.py",
+         os.getenv("SHADOW_AUDIT_TIME", "12:05"), False, "shadow_signal.log"),
+        ("live_comparison", "live_comparison.py",
+         os.getenv("WEEKLY_AUDIT_TIME", "12:10"), True, "weekly.log"),
+    ]
+    while True:
+        try:
+            state: dict = {}
+            if os.path.exists(_AUDIT_STATE_PATH):
+                with open(_AUDIT_STATE_PATH, encoding="utf-8") as f:
+                    state = json.load(f) or {}
+            now = datetime.now()  # local time, like the cron schedule it replaces
+            for name, script, run_at, weekly, log_name in jobs:
+                if not _audit_due(state.get(name), now, run_at, weekly):
+                    continue
+                logger.info("Scheduled audit %s starting (in-bot scheduler)", name)
+                log_path = os.path.join(_log_dir, log_name)
+                try:
+                    with open(log_path, "a", encoding="utf-8") as lf:
+                        rc = subprocess.run(
+                            [_sys.executable, os.path.join(project_root, script)],
+                            cwd=project_root, timeout=600, stdout=lf, stderr=lf,
+                        ).returncode
+                except Exception as exc:
+                    logger.warning("Scheduled audit %s failed to launch: %s", name, exc)
+                    rc = -1
+                state[name] = now.date().isoformat()
+                with open(_AUDIT_STATE_PATH, "w", encoding="utf-8") as f:
+                    json.dump(state, f)
+                if rc == 0:
+                    logger.info("Scheduled audit %s completed → logs/%s", name, log_name)
+                else:
+                    logger.warning(
+                        "Scheduled audit %s exited rc=%s — see logs/%s", name, rc, log_name
+                    )
+        except Exception as exc:
+            logger.warning("Scheduled audit loop error: %s", exc)
+        time.sleep(60)
 
 
 # ---------------------------------------------------------------------------
@@ -987,6 +1083,20 @@ def run():
         logger.info("Unified dashboard thread started (interval=%ds)", _ud_interval)
         print(f"  Unified dashboard → file://{os.path.join(os.path.dirname(_DASHBOARD_PATH), 'unified_dashboard.html')}"
               f"  (refreshes every {_ud_interval}s)\n", flush=True)
+
+    # ── Scheduled audits thread (replaces macOS cron — see ops/crontab.txt) ──
+    if os.getenv("AUDIT_SCHEDULER_ENABLED", "true").lower() == "true":
+        _audit_thread = threading.Thread(
+            target=_scheduled_audits_loop,
+            daemon=True,
+            name="scheduled-audits",
+        )
+        _audit_thread.start()
+        logger.info(
+            "Scheduled audits thread started (shadow daily %s · comparison Mon %s)",
+            os.getenv("SHADOW_AUDIT_TIME", "12:05"),
+            os.getenv("WEEKLY_AUDIT_TIME", "12:10"),
+        )
 
     _halt_file_active = False
     _last_daily_pnl_date = datetime.now(_tz.utc).date()

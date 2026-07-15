@@ -1276,6 +1276,12 @@ def run() -> None:
                 logger.debug("Gate status check failed: %s", _ge)
                 _gate_status = None
 
+            # Current per-trade allocation — lets the rule strip flag
+            # whitelisted BUYs that would SIZE_SKIP (1 share > allocation).
+            _snap_r     = executor.positions_snapshot()
+            _pos_val_r  = sum(sh * co for sh, co in _snap_r.values())
+            _buy_alloc  = (executor.cash + _pos_val_r) * cfg.paper_risk_pct
+
             renderer.render(
                 scan_results, fear_greed_data, portfolio_summary, alerts,
                 paper         = paper_summary,
@@ -1295,6 +1301,7 @@ def run() -> None:
                     "streak_cycles": cfg.paper_sell_streak_cycles,
                     "rule_mode":     cfg.rule_trading_enabled,
                 },
+                buy_alloc     = _buy_alloc,
             )
         except Exception as exc:
             logger.warning("Dashboard render failed: %s", exc)
