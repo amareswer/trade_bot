@@ -221,7 +221,6 @@ class PortfolioConfig:
     max_concurrent_positions: int   = 2         # MAX_CONCURRENT_POSITIONS — capital pool slots
     max_slot_cash_cad:        float = 0.0       # MAX_SLOT_CASH_CAD — per-slot hard cap (0 = uncapped)
     live_dust_value_cad:      float = 10.0      # positions worth < this are dust — skip recovery
-    doge_vol_min_cad:         float = 50_000.0  # DOGE/CAD BUY blocked below this 24h quote volume
 
     def __post_init__(self):
         if self.starting_cash <= 0:
@@ -232,8 +231,6 @@ class PortfolioConfig:
             raise ValueError("MAX_SLOT_CASH_CAD must be >= 0")
         if self.live_dust_value_cad < 0:
             raise ValueError("LIVE_DUST_VALUE_CAD must be >= 0")
-        if self.doge_vol_min_cad < 0:
-            raise ValueError("DOGE_VOL_MIN_CAD must be >= 0")
 
 
 @dataclass
@@ -570,7 +567,6 @@ def _load() -> AppConfig:
             max_concurrent_positions = _int  ("MAX_CONCURRENT_POSITIONS",  2),
             max_slot_cash_cad        = _float("MAX_SLOT_CASH_CAD",         0.0),
             live_dust_value_cad      = _float("LIVE_DUST_VALUE_CAD",       10.0),
-            doge_vol_min_cad         = _float("DOGE_VOL_MIN_CAD",         50_000.0),
         ),
         ai=AIConfig(
             enabled        = _bool ("AI_ENABLED",        True),

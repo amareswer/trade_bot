@@ -68,28 +68,38 @@ import os as _os
 _LOG_DIR = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "logs")
 _os.makedirs(_LOG_DIR, exist_ok=True)
 
-_fh = logging.handlers.RotatingFileHandler(
-    _os.path.join(_LOG_DIR, "stock_bot.log"),
-    maxBytes=10_000_000,
-    backupCount=7,
-)
-_fh.setLevel(logging.INFO)
-_fh.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
-
-_ch = logging.StreamHandler(sys.stderr)
-_ch.setLevel(logging.WARNING)
-
-logging.getLogger().handlers.clear()
-logging.getLogger().setLevel(logging.INFO)
-logging.getLogger().addHandler(_fh)
-logging.getLogger().addHandler(_ch)
-
-# Silence yfinance/urllib noise in the terminal
-logging.getLogger("yfinance").setLevel(logging.WARNING)
-logging.getLogger("urllib3").setLevel(logging.WARNING)
-logging.getLogger("peewee").setLevel(logging.WARNING)
-
 logger = logging.getLogger(__name__)
+
+
+def _setup_logging() -> None:
+    """Install root handlers — called from run(), NOT at import time.
+
+    Import-time installation means anything that imports stock_bot.main
+    (tests, tooling) writes into the production logs/stock_bot.log —
+    the same failure mode fixed in bot/main.py on 2026-07-05 (polluted
+    forensics, faked heartbeat, live-log rotation from under the bot).
+    Only the actual bot process may touch this file."""
+    _fh = logging.handlers.RotatingFileHandler(
+        _os.path.join(_LOG_DIR, "stock_bot.log"),
+        maxBytes=10_000_000,
+        backupCount=7,
+    )
+    _fh.setLevel(logging.INFO)
+    _fh.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+
+    _ch = logging.StreamHandler(sys.stderr)
+    _ch.setLevel(logging.WARNING)
+
+    _root = logging.getLogger()
+    _root.handlers.clear()
+    _root.setLevel(logging.INFO)
+    _root.addHandler(_fh)
+    _root.addHandler(_ch)
+
+    # Silence yfinance/urllib noise in the terminal
+    logging.getLogger("yfinance").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("peewee").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
 # Formatting helpers
@@ -568,6 +578,7 @@ _UNIVERSE_REFRESH_HOUR = int(_os.getenv("UNIVERSE_REFRESH_HOUR", "16"))  # 4pm E
 
 def run() -> None:
     global _last_universe_refresh
+    _setup_logging()
     cfg = load()
     cfg.log_startup()
 

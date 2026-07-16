@@ -1630,47 +1630,6 @@ def run():
                     "CapitalPool: BUY blocked for %s — pool exhausted (%d/%d slots used)",
                     sym, len(capital_pool.allocated_symbols), _max_conc,
                 )
-            # ── 5b. Liquidity gate (DOGE/CAD) ────────────────────────
-            # Block new BUY entries when 24h CAD quote volume is below the
-            # configured minimum. SELL and open positions are unaffected —
-            # state machine already prevents BUY while in a position, but
-            # checking filtered_signal here ensures SELL paths are never touched.
-            if filtered_signal == Signal.BUY and sym == "DOGE/CAD" and live_exchange is not None:
-                _liq_vol_cad: float | None = None
-                try:
-                    _liq_ticker = live_exchange.fetch_ticker(sym)
-                    _qv = _liq_ticker.get("quoteVolume")
-                    if _qv is not None:
-                        _liq_vol_cad = float(_qv)
-                    else:
-                        _bv   = _liq_ticker.get("baseVolume")
-                        _last = _liq_ticker.get("last")
-                        if _bv is not None and _last is not None:
-                            _liq_vol_cad = float(_bv) * float(_last)
-                            logger.warning(
-                                "Liquidity gate [%s]: quoteVolume missing — "
-                                "using baseVolume*last (%.0f CAD)",
-                                sym, _liq_vol_cad,
-                            )
-                except Exception as _liq_exc:
-                    logger.warning("Liquidity gate: fetch_ticker failed for %s: %s", sym, _liq_exc)
-                if _liq_vol_cad is None:
-                    logger.warning(
-                        "Liquidity gate [%s]: volume unavailable — failing open, BUY proceeds",
-                        sym,
-                    )
-                elif _liq_vol_cad < cfg.portfolio.doge_vol_min_cad:
-                    _liq_msg = (
-                        f"LIQUIDITY GATE: DOGE/CAD BUY blocked"
-                        f" — 24h volume ${_liq_vol_cad:,.0f}"
-                        f" < ${cfg.portfolio.doge_vol_min_cad:,.0f} threshold"
-                    )
-                    print(f"  [{sym}] {_liq_msg}", flush=True)
-                    logger.warning(_liq_msg)
-                    filtered_signal = Signal.HOLD
-                    if not _buy_block_gate:
-                        _buy_block_gate = "liquidity"
-
             _max_cash_for_sym = ss['executor'].cash
             if filtered_signal == Signal.SELL:
                 trade_qty = ss['pm'].quantity

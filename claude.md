@@ -414,8 +414,10 @@ SELL signals do meaningful work, reducing fee sensitivity.
   test was rerouted into the limit-chase and busy-spun ~8 minutes at 100% CPU (time.sleep
   mocked + 120s wall-clock poll deadline). Suite runtime is back to ~5s; if it ever takes
   minutes again, suspect a test reading live `.env` config.
-- **Known-inert leftover:** the DOGE/CAD liquidity gate in `bot/main.py` is dead code (DOGE
-  is BLOCKED) and hardcodes a symbol — generalize to config or delete when next touched.
+- ~~**Known-inert leftover:** the DOGE/CAD liquidity gate in `bot/main.py` is dead code (DOGE
+  is BLOCKED) and hardcodes a symbol~~ — DELETED 2026-07-16 (gate block in `bot/main.py` plus
+  the `doge_vol_min_cad` PortfolioConfig field/validation/loader). `DOGE_VOL_MIN_CAD` stays
+  in `.env` — `regime_monitor.py` still reads it directly for watchlist health reporting.
 - `.env` chmod 600 (was world-readable). ~~A bare un-named secret sits as a comment under
   "── Secrets ──" in `.env`~~ — RESOLVED 2026-07-13: identified as an exact duplicate of
   `OLLAMA_CLOUD_API_KEY` (already properly named in `stock_bot/.env`); stray comment copy
@@ -470,8 +472,9 @@ expectancy is unmeasured until trades complete. The report's expectancy number i
   dashboard heartbeat (log mtime = "alive"), buried real forensics, and one pytest run rotated
   the live log at 10MB. Handler setup now lives in `_setup_logging()`, called only from
   `run()`. Verified: importing bot.main installs zero handlers; pytest no longer touches the
-  log. (`stock_bot/main.py` has the same import-time pattern — harmless today since no test
-  imports it; fix opportunistically on a future stock-bot change.)
+  log. (`stock_bot/main.py` had the same import-time pattern — FIXED 2026-07-16: handlers
+  now install in `_setup_logging()`, called only from `run()`; verified importing
+  stock_bot.main installs zero handlers.)
 - **Crypto bot found DOWN during this session** (no process; last real log 09:23 ET after
   ~3 min of Kraken network errors, no traceback — consistent with closed terminal or Mac
   sleep; it was launched WITHOUT caffeinate). Position was 0 — no exposure while down.
