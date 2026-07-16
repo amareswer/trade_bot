@@ -126,6 +126,38 @@ class StockConfig:
         if self.loop_interval < 10:
             raise ValueError("LOOP_INTERVAL must be >= 10 seconds")
 
+        # Paper-trading parameters — a typo here (negative risk, >100% exposure)
+        # must stop the bot at startup, not start it misconfigured.
+        errors = []
+        if self.paper_starting_cash <= 0:
+            errors.append("PAPER_STARTING_CASH must be > 0")
+        if not 0 < self.paper_risk_pct <= 1.0:
+            errors.append("PAPER_RISK_PCT must be between 0 (exclusive) and 1.0")
+        if not 0 <= self.paper_min_confidence <= 100:
+            errors.append("PAPER_MIN_CONFIDENCE must be between 0 and 100")
+        if not 0 <= self.paper_min_confidence_sell <= 100:
+            errors.append("PAPER_MIN_CONFIDENCE_SELL must be between 0 and 100")
+        if not 0 <= self.paper_sell_streak_min_conf <= 100:
+            errors.append("PAPER_SELL_STREAK_MIN_CONF must be between 0 and 100")
+        if self.paper_sell_streak_cycles < 1:
+            errors.append("PAPER_SELL_STREAK_CYCLES must be >= 1")
+        if not 0 < self.paper_daily_loss_pct <= 0.50:
+            errors.append("PAPER_DAILY_LOSS_PCT must be between 0 (exclusive) and 0.50")
+        if self.paper_slippage_bps < 0:
+            errors.append("PAPER_SLIPPAGE_BPS must be >= 0")
+        if not 0 <= self.paper_stop_loss_pct <= 0.50:
+            errors.append("PAPER_STOP_LOSS_PCT must be between 0 and 0.50 (0 = disabled)")
+        if not 0 <= self.paper_take_profit_pct <= 1.0:
+            errors.append("PAPER_TAKE_PROFIT_PCT must be between 0 and 1.0 (0 = disabled)")
+        if not 0 < self.paper_max_exposure_pct <= 1.0:
+            errors.append("PAPER_MAX_EXPOSURE_PCT must be between 0 (exclusive) and 1.0")
+        if self.paper_max_positions < 1:
+            errors.append("PAPER_MAX_POSITIONS must be >= 1")
+        if errors:
+            raise ValueError(
+                "Stock bot config errors:\n" + "\n".join(f"  - {e}" for e in errors)
+            )
+
         total_weight = (
             self.universe_weight_volume + self.universe_weight_mom5d
             + self.universe_weight_mom1d + self.universe_weight_relstr

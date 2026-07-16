@@ -73,7 +73,7 @@ STEP 1 — Backtest  ✓  (you are here)
   Zero risk. No network trading. Just numbers on a screen.
   Goal: find settings where the strategy is consistently profitable.
 
-  Command: python backtest.py
+  Command: .venv/bin/python backtest.py
   When to move on: profit factor > 1.5, Sharpe ratio > 1.0,
                    tested on at least 3 different time periods.
 
@@ -85,7 +85,7 @@ STEP 2 — Paper Trading with Live Prices
   Goal: watch the bot behave on real, live market conditions.
         Does it trade sensibly? Does it hold during bad markets?
 
-  Command: python -m bot.main
+  Command: .venv/bin/python -m bot.main
   When to move on: run for at least 2–4 weeks,
                    results look consistent with backtest.
 
@@ -131,7 +131,7 @@ The backtest report is **for you, not the bot**. The bot never reads it. It is y
 ### Running the backtest
 
 ```bash
-python backtest.py
+.venv/bin/python backtest.py
 ```
 
 All settings come from `.env`. To change symbol, timeframe, or strategy — edit `.env` and re-run. Results are saved to `logs/backtest_BTC_USDT_1h_DATE.csv`.
@@ -175,7 +175,7 @@ All settings come from `.env`. To change symbol, timeframe, or strategy — edit
 ### Tuning workflow
 
 ```
-1. Run:  python backtest.py
+1. Run:  .venv/bin/python backtest.py
 2. Note the results
 3. Change ONE setting at a time in .env:
      RSI_OVERBOUGHT / RSI_OVERSOLD
@@ -193,11 +193,14 @@ All settings come from `.env`. To change symbol, timeframe, or strategy — edit
 
 ## 4. Setup
 
-**Requirements:** Python 3.10+
+**Requirements:** Python 3.10+ — this repo runs everything through `.venv` (Python 3.11).
+On this machine the system `python3` is 3.9 and **will not work** (`str | None` annotations
+and yfinance both need 3.10+). Always use `.venv/bin/python`, never bare `python`.
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# Create the virtualenv (once) and install dependencies
+python3.11 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 
 # Create your .env file
 cp .env.example .env
@@ -221,8 +224,8 @@ AI_ENABLED=false
 ## 5. Running the Bot
 
 ```bash
-python -m bot.main      # live paper trading
-python backtest.py      # run backtest on historical data
+.venv/bin/python -m bot.main      # live paper trading
+.venv/bin/python backtest.py      # run backtest on historical data
 ```
 
 Stop the bot at any time with `Ctrl+C` — it prints a final summary before exiting.
@@ -372,9 +375,7 @@ tail -f logs/trade_bot.log
 ## 10. Running Tests
 
 ```bash
-python test_executor.py       # order lifecycle (6 tests)
-python test_risk_manager.py   # risk checks
-python test_indicators.py     # RSI, EMA, trend, strategy (21 tests)
+.venv/bin/python -m pytest --tb=short -q    # full suite (see CLAUDE.md manifest for expected count)
 ```
 
 All tests run standalone — no exchange connection needed.
@@ -423,9 +424,9 @@ RISK_MAX_DRAWDOWN=0.03      # block new buys if down 3% from peak
 ```
 trade_bot/
   config.py             ← ALL CONFIG — edit .env, never touch this file directly
-  backtest.py           ← run backtests: python backtest.py
+  backtest.py           ← run backtests: .venv/bin/python backtest.py
   bot/
-    main.py             ← live bot entry point: python -m bot.main
+    main.py             ← live bot entry point: .venv/bin/python -m bot.main
     display.py          ← terminal output (ANSI colors)
     data/
       price_feed.py     ← SimulatedFeed / CcxtFeed (live prices)

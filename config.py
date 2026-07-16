@@ -106,16 +106,24 @@ class ExchangeConfig:
             raise ValueError("CANDLE_MINUTES must be >= 1")
         if self.live_trading and not self.api_key:
             raise ValueError(
-                "LIVE_TRADING=true requires KRAKEN_API_KEY to be set in .env. "
-                "The bot refuses to start live without credentials."
+                "LIVE_TRADING=true requires EXCHANGE_API_KEY (or legacy KRAKEN_API_KEY) "
+                "to be set in .env. The bot refuses to start live without credentials."
             )
         if self.live_trading and not self.api_secret:
             raise ValueError(
-                "LIVE_TRADING=true requires KRAKEN_API_SECRET to be set in .env. "
-                "The bot refuses to start live without credentials."
+                "LIVE_TRADING=true requires EXCHANGE_API_SECRET (or legacy KRAKEN_API_SECRET) "
+                "to be set in .env. The bot refuses to start live without credentials."
             )
         if self.order_type not in ("market", "limit"):
             raise ValueError(f"ORDER_TYPE must be 'market' or 'limit', got '{self.order_type}'")
+        if self.limit_chase_timeout_s < 1:
+            raise ValueError("LIMIT_CHASE_TIMEOUT_S must be >= 1")
+        if self.limit_chase_max_retries < 0:
+            raise ValueError("LIMIT_CHASE_MAX_RETRIES must be >= 0")
+        if not 0 <= self.limit_chase_tick_pct <= 0.01:
+            raise ValueError("LIMIT_CHASE_TICK_PCT must be between 0 and 0.01 (1% of price)")
+        if self.drift_alert_threshold < 1:
+            raise ValueError("DRIFT_ALERT_THRESHOLD must be >= 1")
 
 
 @dataclass
@@ -176,6 +184,14 @@ class StrategyConfig:
             raise ValueError("MAX_PRICE_EXTENSION_PCT must be > 0")
         if self.breakout_lookback < 5:
             raise ValueError("BREAKOUT_LOOKBACK must be >= 5")
+        if self.atr_sl_mult < 0:
+            raise ValueError("ATR_SL_MULT must be >= 0 (0 = disabled)")
+        if self.atr_tp_mult < 0:
+            raise ValueError("ATR_TP_MULT must be >= 0")
+        if self.atr_period < 2:
+            raise ValueError("ATR_PERIOD must be >= 2")
+        if self.atr_volatile_multiplier < 0:
+            raise ValueError("ATR_VOLATILE_MULTIPLIER must be >= 0")
 
 
 @dataclass
@@ -286,6 +302,16 @@ class BacktestConfig:
             raise ValueError("STOP_LOSS_PCT must be between 0% and 50%")
         if not 0 <= self.take_profit_pct <= 1.0:
             raise ValueError("TAKE_PROFIT_PCT must be between 0% and 100%")
+        if not 0 <= self.trail_stop_pct <= 0.50:
+            raise ValueError("TRAILING_STOP_PCT must be between 0% and 50% (0 = disabled)")
+        if not 0 <= self.trail_stop_activation_pct <= 1.0:
+            raise ValueError("TRAILING_STOP_ACTIVATION_PCT must be between 0% and 100%")
+        if not 0 <= self.partial_tp_pct <= 1.0:
+            raise ValueError("PARTIAL_TP_PCT must be between 0% and 100% (0 = disabled)")
+        if not 0 < self.partial_tp_size <= 1.0:
+            raise ValueError("PARTIAL_TP_SIZE must be between 0 (exclusive) and 1")
+        if self.atr_sl_mult < 0:
+            raise ValueError("ATR_SL_MULT must be >= 0 (0 = disabled)")
 
 
 @dataclass
@@ -510,8 +536,10 @@ def _load() -> AppConfig:
             candle_minutes = _int ("CANDLE_MINUTES",  240),
             live_trading   = _bool("LIVE_TRADING",    False),
             dry_run        = _bool("DRY_RUN",         False),
-            api_key        = _str ("KRAKEN_API_KEY",  ""),
-            api_secret     = _str ("KRAKEN_API_SECRET", ""),
+            # Generic credentials preferred; KRAKEN_* kept as legacy fallback so
+            # existing live deployments keep working without an .env edit.
+            api_key        = _str ("EXCHANGE_API_KEY",    "") or _str("KRAKEN_API_KEY",    ""),
+            api_secret     = _str ("EXCHANGE_API_SECRET", "") or _str("KRAKEN_API_SECRET", ""),
             order_type              = _str  ("ORDER_TYPE",             "market"),
             limit_order_enabled     = _bool ("LIMIT_ORDER_ENABLED",      False),
             limit_chase_timeout_s   = _int  ("LIMIT_CHASE_TIMEOUT_S",    120),
