@@ -165,7 +165,7 @@ A robust crypto trading system that:
 
 ## Test Suite Manifest (as of 2026-07-03)
 
-Expected total: **216 tests** (as of 2026-07-15). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
+Expected total: **222 tests** (as of 2026-07-16). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -190,10 +190,10 @@ Expected total: **216 tests** (as of 2026-07-15). If `pytest --collect-only -q` 
 | `test_exit_policy.py` | 11 | Stock-bot asymmetric exit bars: single-verdict exit, 2-strike SELL streak, streak resets, AC.TO incident regression |
 | `test_stock_backtest_engine.py` | 11 | Stock backtest engine: next-open fills, intra-candle SL/TP, gap handling, slippage/commission math, walk-forward gating |
 | `test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last (forming candle), determinism, validated-parameter pin |
-| `test_audit_scheduler.py` | 8 | In-bot audit scheduler: tests REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, missed-Monday catch-up |
+| `test_audit_scheduler.py` | 14 | In-bot audit scheduler: tests REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, monthly 1st-anchored (re-screen), missed-run catch-up |
 | `test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
 
-Run: `python -m pytest --tb=short -q` — must show **216 passed**.
+Run: `python -m pytest --tb=short -q` — must show **222 passed**.
 
 ---
 
@@ -698,6 +698,38 @@ gate (shadow ≥ 95%) was silently running on stale data.
   account)" header now computes the real account value (cash + positions at cost).
 - **Crypto bot needs a restart** to start the scheduler thread. On first start after 12:05
   it will immediately catch up today's missed shadow audit.
+
+### Monthly automated re-screen + crypto re-research (2026-07-16) — 222 tests pass
+User direction: "make the crypto bot more powerful" — interpreted as research freely +
+automate evidence refresh; live-money gates unchanged (validation before capital, caps stay).
+- **`rescreen.py` (new):** monthly orchestrator — runs `screen_universe.py` (Kraken CAD
+  auto-discovery, so no hardcoded symbol list; includes BTC/CAD → live-symbol edge decay
+  is caught) and `stock_backtest.py` (full WATCHLIST → re-validates every RULE_WHITELIST
+  symbol). Compares PASS lists to live whitelists; flags 🔻 EDGE DECAY (whitelisted but
+  failed) and 🆕 NEW QUALIFIERS (passed but not whitelisted). Writes
+  `logs/rescreen_<date>.md` + Telegram alert on any flag. **Never changes a whitelist**
+  — additions/removals stay manual per Validation Discipline.
+- **Scheduler:** third job in `_scheduled_audits_loop` — monthly, 1st-of-month anchored
+  at RESCREEN_AUDIT_TIME (default 12:20 local), catch-up mid-month if the bot was down,
+  90-min subprocess timeout (jobs now carry per-job timeouts). `RESCREEN_ENABLED=false`
+  disables. `_audit_due()` gained `monthly_first`; tests in `test_audit_scheduler.py` (14).
+- **Fresh crypto re-screens (2026-07-16), all still FAIL but the picture moved:**
+  - SOL/CAD: PF now 1.48/1.35/1.40 (all ≥ 1.2 — was all < 1.0 on 2026-07-02!) — fails
+    ONLY the 79% SL-exit gate. ETH 1.05/1.43/0.73 + SL 79%; XRP 0.94/0.98/1.11 + SL 88%.
+  - SYN/USD still PF-strong (1.80/2.56/2.39) + SL 79%; LINK regressed (1000c PF 0.77);
+    PAXG/USD failed on a 1-trade recent window (2.36/3.65/0.00 — noise, but a fail).
+  - **ATR experiment on SOL:** ATR×2.0 PASSES the full gate in-sample (PF 1.49/1.56/1.20,
+    SL 79%→46%) — but single-multiplier pass with both neighbors failing (×1.5 and ×2.5
+    fail) = curve-fit risk. Report `logs/atr_sl_experiment_20260716.md`. BTC control:
+    ATR×2.0–3.0 beat fixed 1.5% SL in this window (×2.0: PF 2.07 vs 1.65). **Next research
+    step if crypto resumes:** OOS split (walkforward.py train/validation) for SOL@ATR×2.0
+    and a proper BTC ATR study; promotion would additionally need SL-distance position
+    sizing + all capital-gate preconditions. No config changed.
+- Crypto HALT LIFTED 2026-07-15 ~23:20 local — user chose "Resume buying" when asked
+  explicitly (the Jul 15 halt entry below is superseded). Bot logged "HALT lifted";
+  the fixed fill-recorder code was already running (22:45 restart), so the resume
+  precondition was met. BTC/CAD live again: $77 slot cap, capital gate 0/15, all risk
+  gates active.
 
 ### Affordable-symbol screen (2026-07-15) — 7 new RULE_WHITELIST symbols, 216 tests pass
 Goal: widen the funnel of symbols that can actually FILL at the ~$197 target allocation

@@ -59,3 +59,43 @@ def test_weekly_catches_up_midweek_when_monday_missed():
     assert _audit_due(
         "2026-07-06", _dt("2026-07-16", "08:00"), "12:10", weekly_monday=True
     ) is True
+
+
+# ── Monthly job (re-screen, 1st-of-month anchored) ──────────────────────────
+
+def test_monthly_not_due_first_before_run_time():
+    assert _audit_due(
+        "2026-06-01", _dt("2026-07-01", "08:00"), "12:20", monthly_first=True
+    ) is False
+
+
+def test_monthly_due_first_after_run_time():
+    assert _audit_due(
+        "2026-06-01", _dt("2026-07-01", "12:20"), "12:20", monthly_first=True
+    ) is True
+
+
+def test_monthly_due_when_never_run():
+    assert _audit_due(
+        None, _dt("2026-07-16", "08:00"), "12:20", monthly_first=True
+    ) is True
+
+
+def test_monthly_catches_up_midmonth_when_first_missed():
+    # Bot was down on the 1st; the 16th (even before run_at) still fires.
+    assert _audit_due(
+        "2026-06-02", _dt("2026-07-16", "08:00"), "12:20", monthly_first=True
+    ) is True
+
+
+def test_monthly_not_due_twice_same_month():
+    # Ran on the 3rd (catch-up); the 20th of the same month → not due.
+    assert _audit_due(
+        "2026-07-03", _dt("2026-07-20", "18:00"), "12:20", monthly_first=True
+    ) is False
+
+
+def test_monthly_rearms_next_month():
+    assert _audit_due(
+        "2026-07-03", _dt("2026-08-01", "12:20"), "12:20", monthly_first=True
+    ) is True

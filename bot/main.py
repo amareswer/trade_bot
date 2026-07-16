@@ -368,6 +368,7 @@ def _audit_due(
     now: datetime,
     run_at: str = "12:05",
     weekly_monday: bool = False,
+    monthly_first: bool = False,
 ) -> bool:
     """Pure due-check (unit-tested — keep I/O out of here).
 
@@ -375,6 +376,8 @@ def _audit_due(
     a bot started at 15:00 still runs the 12:05 audit (catch-up).
     Weekly: due once per Mon-anchored week; past Monday's run_at, or any
     time Tue–Sun if that week's run was missed.
+    Monthly: due once per calendar month; past the 1st's run_at, or any
+    later day that month if the 1st was missed.
     """
     try:
         hh, mm = (int(x) for x in run_at.split(":"))
@@ -382,6 +385,12 @@ def _audit_due(
         hh, mm = 12, 5
     past_time_today = (now.hour, now.minute) >= (hh, mm)
     last = date.fromisoformat(last_run) if last_run else None
+
+    if monthly_first:
+        first = now.date().replace(day=1)
+        if last is not None and last >= first:
+            return False
+        return now.date() > first or past_time_today
 
     if weekly_monday:
         monday = now.date() - timedelta(days=now.weekday())
@@ -406,12 +415,23 @@ def _scheduled_audits_loop() -> None:
     import sys as _sys
 
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # (name, script, run_at, due_kwargs, log_name, timeout_s)
     jobs = [
         ("shadow_signal", "shadow_signal.py",
-         os.getenv("SHADOW_AUDIT_TIME", "12:05"), False, "shadow_signal.log"),
+         os.getenv("SHADOW_AUDIT_TIME", "12:05"), {}, "shadow_signal.log", 600),
         ("live_comparison", "live_comparison.py",
-         os.getenv("WEEKLY_AUDIT_TIME", "12:10"), True, "weekly.log"),
+         os.getenv("WEEKLY_AUDIT_TIME", "12:10"), {"weekly_monday": True},
+         "weekly.log", 600),
+        # Monthly re-screen (2026-07-16): re-runs the crypto CAD screen and the
+        # stock walk-forward so edge decay and new qualifiers surface on their
+        # own instead of waiting for someone to remember. Report + alert only —
+        # whitelists never change automatically.
+        ("monthly_rescreen", "rescreen.py",
+         os.getenv("RESCREEN_AUDIT_TIME", "12:20"), {"monthly_first": True},
+         "rescreen.log", 5400),
     ]
+    if os.getenv("RESCREEN_ENABLED", "true").lower() != "true":
+        jobs = [j for j in jobs if j[0] != "monthly_rescreen"]
     while True:
         try:
             state: dict = {}
@@ -419,8 +439,8 @@ def _scheduled_audits_loop() -> None:
                 with open(_AUDIT_STATE_PATH, encoding="utf-8") as f:
                     state = json.load(f) or {}
             now = datetime.now()  # local time, like the cron schedule it replaces
-            for name, script, run_at, weekly, log_name in jobs:
-                if not _audit_due(state.get(name), now, run_at, weekly):
+            for name, script, run_at, due_kwargs, log_name, timeout_s in jobs:
+                if not _audit_due(state.get(name), now, run_at, **due_kwargs):
                     continue
                 logger.info("Scheduled audit %s starting (in-bot scheduler)", name)
                 log_path = os.path.join(_log_dir, log_name)
@@ -428,7 +448,7 @@ def _scheduled_audits_loop() -> None:
                     with open(log_path, "a", encoding="utf-8") as lf:
                         rc = subprocess.run(
                             [_sys.executable, os.path.join(project_root, script)],
-                            cwd=project_root, timeout=600, stdout=lf, stderr=lf,
+                            cwd=project_root, timeout=timeout_s, stdout=lf, stderr=lf,
                         ).returncode
                 except Exception as exc:
                     logger.warning("Scheduled audit %s failed to launch: %s", name, exc)
@@ -1093,9 +1113,11 @@ def run():
         )
         _audit_thread.start()
         logger.info(
-            "Scheduled audits thread started (shadow daily %s · comparison Mon %s)",
+            "Scheduled audits thread started (shadow daily %s · comparison Mon %s"
+            " · rescreen monthly %s)",
             os.getenv("SHADOW_AUDIT_TIME", "12:05"),
             os.getenv("WEEKLY_AUDIT_TIME", "12:10"),
+            os.getenv("RESCREEN_AUDIT_TIME", "12:20"),
         )
 
     _halt_file_active = False
