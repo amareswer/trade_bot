@@ -165,7 +165,7 @@ A robust crypto trading system that:
 
 ## Test Suite Manifest (as of 2026-07-03)
 
-Expected total: **210 tests** (as of 2026-07-14). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
+Expected total: **216 tests** (as of 2026-07-15). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -191,8 +191,9 @@ Expected total: **210 tests** (as of 2026-07-14). If `pytest --collect-only -q` 
 | `test_stock_backtest_engine.py` | 11 | Stock backtest engine: next-open fills, intra-candle SL/TP, gap handling, slippage/commission math, walk-forward gating |
 | `test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last (forming candle), determinism, validated-parameter pin |
 | `test_audit_scheduler.py` | 8 | In-bot audit scheduler: tests REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, missed-Monday catch-up |
+| `test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
 
-Run: `python -m pytest --tb=short -q` — must show **210 passed**.
+Run: `python -m pytest --tb=short -q` — must show **216 passed**.
 
 ---
 
@@ -697,6 +698,27 @@ gate (shadow ≥ 95%) was silently running on stale data.
   account)" header now computes the real account value (cash + positions at cost).
 - **Crypto bot needs a restart** to start the scheduler thread. On first start after 12:05
   it will immediately catch up today's missed shadow audit.
+
+### Affordable-symbol screen (2026-07-15) — 7 new RULE_WHITELIST symbols, 216 tests pass
+Goal: widen the funnel of symbols that can actually FILL at the ~$197 target allocation
+(0.20 × ~$987 account) — 3 of 5 whitelisted symbols were stuck in SIZE_SKIP, so the
+30-trade Phase A gate was fed by MRNA+PLTR alone. Ran `stock_backtest.py` (same 4-window
+gate, strategy hash `659d1c03987b72fd` unchanged) on 18 untested liquid candidates chosen
+for affordability. Report: `logs/stock_backtest_20260715.md`.
+- **PASS + whitelisted (7): TD.TO, BNS.TO, CM.TO, SU.TO, CSCO, KO, T** — all fill 1–9
+  shares at current prices. TSX banks echo RY.TO's strong pass (TD full PF 2.41,
+  CM 2.09, BNS 1.89, all SL ≤ 45%); CSCO 2.46/KO 2.00/T 2.20 with SL ≤ 33%.
+- **PASS but held out (1): UBER** — gate-letter pass (full PF 1.32, SL 66.7%) but
+  0-for-2 in the last 500d: decayed-edge profile, margin-of-safety skip. Re-eligible
+  on a future re-screen if recent windows recover.
+- FAIL (9): ENB.TO, CNQ.TO, PFE, BAC, DIS, TGT (9 trades < 10, PF was fine), XOM, GDX,
+  XLF. MU skipped (thin yfinance history).
+- Concentration note: whitelist now holds 4 Canadian banks (RY + TD + BNS + CM). Each
+  position risks ~1% of account (20% alloc × 5% SL) — acceptable for paper-book data
+  collection; revisit before any live capital.
+- Watchlist grew 15 → 22 symbols — watch for yfinance rate-limit pressure (known
+  failure mode; 15-min price cache mitigates).
+- **Stock bot needs a restart** to pick up the new .env.
 
 ### IPO policy — no automated IPO trading (2026-07-11, agreed with user)
 Trigger: SpaceX IPO'd 2026-06-12 as NASDAQ:SPCX — largest IPO in history (offer $135,

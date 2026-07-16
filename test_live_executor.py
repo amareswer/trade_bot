@@ -576,6 +576,11 @@ def test_limit_order_reprices_after_timeout(mock_cfg, mock_sleep):
     fill_raw = {"id": "limit-02", "status": "closed", "filled": 0.001, "average": 90009.0,
                 "fee": {"cost": 0.0144, "currency": "CAD"}}
     mock_ex.create_order.side_effect = [open_raw, fill_raw]
+    # Post-cancel race check: order cancelled clean, nothing filled → chase retries
+    mock_ex.fetch_order.return_value = {
+        "id": "limit-01", "status": "canceled", "type": "limit",
+        "filled": 0.0, "amount": 0.001, "average": None, "fee": {},
+    }
 
     order = ex.execute(Signal.BUY, 90000.0, 0.001)
 
@@ -609,6 +614,11 @@ def test_limit_order_falls_back_to_market_after_max_retries(mock_cfg, mock_sleep
         {**open_raw, "id": "limit-03"},
         market_raw,
     ]
+    # Post-cancel race check after each timeout: cancelled clean, nothing filled
+    mock_ex.fetch_order.side_effect = lambda oid, _sym: {
+        "id": oid, "status": "canceled", "type": "limit",
+        "filled": 0.0, "amount": 0.001, "average": None, "fee": {},
+    }
 
     with caplog.at_level(logging.WARNING, logger="bot.execution.live_executor"):
         order = ex.execute(Signal.BUY, 90000.0, 0.001)

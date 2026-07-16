@@ -427,7 +427,11 @@ class LiveExecutor:
             Falls back to market if tick_pct drops below 0.000001.
 
         Any other ccxt exception: falls back to market immediately.
-        Returns the raw ccxt order dict of the final filled order.
+
+        Returns the raw ccxt order dict of the final order. Market-fallback
+        paths return the immediate create_order response, which on Kraken can
+        still be status=None / filled=0 before the fill propagates — the
+        caller (execute) polls fetch_order until the order resolves.
         """
         _MIN_TICK_PCT    = 0.000001
         tick_pct         = cfg.exchange.limit_chase_tick_pct
@@ -500,6 +504,7 @@ class LiveExecutor:
                     logger.warning("fetch_order %s failed: %s", order_id, poll_exc)
 
             # Timeout — cancel and consume one timeout retry slot
+            cancel_ok = True
             try:
                 self._exchange.cancel_order(order_id, self.symbol)
                 logger.warning(
@@ -507,7 +512,34 @@ class LiveExecutor:
                     side.upper(), timeout_attempts + 1, order_id,
                 )
             except Exception as cancel_exc:
+                cancel_ok = False
                 logger.warning("cancel_order %s failed: %s", order_id, cancel_exc)
+
+            # The order may have filled (fully or partially) in the race between
+            # the last poll and the cancel — a cancel of a filled order raises.
+            # Re-placing without checking would double-fill; a partial fill on a
+            # cancelled order would vanish from the books. Verify before retrying.
+            try:
+                post_cancel = self._exchange.fetch_order(order_id, self.symbol)
+                if float(post_cancel.get("filled") or 0.0) > 0:
+                    logger.warning(
+                        "LIMIT %s %s filled %.6f during cancel race — recording it, no re-place",
+                        side.upper(), order_id, float(post_cancel.get("filled") or 0.0),
+                    )
+                    return post_cancel
+            except Exception as post_exc:
+                logger.warning("post-cancel fetch_order %s failed: %s", order_id, post_exc)
+                if not cancel_ok:
+                    # Cancel failed AND we cannot verify the order's fate — the
+                    # order may still be live. Re-placing risks a double fill;
+                    # return the unresolved dict and let execute()'s poll loop
+                    # settle it.
+                    logger.error(
+                        "LIMIT %s %s: cancel failed and state unverifiable — "
+                        "aborting chase without re-placing.",
+                        side.upper(), order_id,
+                    )
+                    return raw
 
             timeout_attempts += 1
 
@@ -591,14 +623,36 @@ class LiveExecutor:
                 ccxt_side = "buy" if side == OrderSide.BUY else "sell"
 
                 if cfg.exchange.limit_order_enabled and not urgent:
-                    # Limit-chase path: _place_limit_order handles all polling and
-                    # retries internally and always returns a resolved order dict.
+                    # Limit-chase path. _place_limit_order polls orders it placed
+                    # itself, but its market-FALLBACK paths return the immediate
+                    # create_order response — on Kraken that can be status=None /
+                    # filled=0 before the fill propagates. Poll until resolved,
+                    # same as the direct market path below. Incident 2026-07-15:
+                    # order OFIPRK-N6JMC-IRHKMX filled $7.73 but the unpolled
+                    # filled=0 hit the qty=0 guard and the fill went unrecorded.
                     raw          = self._place_limit_order(ccxt_side, quantity, price)
                     order_id_str = str(raw.get("id", ""))
                     filled_qty   = float(raw.get("filled") or 0.0)
                     fill_price   = float(raw.get("average") or raw.get("price") or price)
-                    quantity     = filled_qty
                     last_raw     = raw
+                    if order_id_str and last_raw.get("status") not in ("closed", "canceled"):
+                        for poll_num in range(1, 10):
+                            time.sleep(1)
+                            try:
+                                last_raw   = self._exchange.fetch_order(order_id_str, self.symbol)
+                                filled_qty = float(last_raw.get("filled") or filled_qty)
+                                if last_raw.get("status") in ("closed", "canceled"):
+                                    break
+                            except Exception as poll_exc:
+                                logger.warning(
+                                    "fetch_order poll %d failed: %s", poll_num, poll_exc,
+                                )
+                        fill_price = float(
+                            last_raw.get("average") or
+                            last_raw.get("price")   or
+                            fill_price
+                        )
+                    quantity = filled_qty
                 else:
                     if self._order_type == "limit" and side == OrderSide.BUY and not urgent:
                         # Passive bid 0.2% below market — post-only guarantees maker rate (0.40%, confirmed Jun 14 fill)
@@ -687,7 +741,12 @@ class LiveExecutor:
                 if quantity <= 0:
                     _last_filled = float(last_raw.get("filled") or 0.0)
                     _last_status = last_raw.get("status")
-                    _is_market   = (self._order_type != "limit")
+                    # Classify by the ACTUAL order type the exchange executed, not
+                    # the configured one: the limit-chase falls back to market
+                    # orders while ORDER_TYPE=limit, and treating that fallback as
+                    # a limit order blocked the amount inference on 2026-07-15.
+                    _actual_type = last_raw.get("type") or self._order_type
+                    _is_market   = (_actual_type != "limit")
 
                     _side_str = side.value
                     if _last_filled > 0:
@@ -724,7 +783,7 @@ class LiveExecutor:
                             "%s qty=0 GUARD: order %s status=%s order_type=%s filled=0"
                             " — skipping fill record to prevent phantom row."
                             " Manual verification required.",
-                            _side_str, order_id_str, _last_status, self._order_type,
+                            _side_str, order_id_str, _last_status, _actual_type,
                         )
                         return None
 
