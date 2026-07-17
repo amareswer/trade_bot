@@ -878,6 +878,83 @@ automate evidence refresh; live-money gates unchanged (validation before capital
   precondition was met. BTC/CAD live again: $77 slot cap, capital gate 0/15, all risk
   gates active.
 
+### SOL ATR×2.0 OOS validation — HOLDS (2026-07-17) — 243 tests pass, no config changed
+Closed the "next research step" from the entry above: `atr_oos_validation.py` (new) splits
+one 5000-candle SOL/USDT fetch by DATE into two genuinely non-overlapping halves — unlike
+`atr_sl_experiment.py`'s nested 5000c/3000c/1000c windows (1000c sits entirely inside 5000c),
+these share zero candles. Same cfg-from-.env strategy params, same PF≥1.2/trades≥10/SL≤70%
+gate as the screen.
+
+| Period | Window | Trades | Win% | PF | SL rate | Return |
+|--------|--------|--------|------|-----|---------|--------|
+| TRAIN (2024-04-05→2025-05-26) | fixed 1.5% | 38 | 16% | 1.25 | 84% | -4.84% |
+| TRAIN | ATRx2.0 | 28 | 39% | **1.40** | 46% | -1.38% |
+| VALIDATION (2025-05-27→2026-07-17) | fixed 1.5% | 30 | 23% | 1.79 | 73% | -2.13% |
+| VALIDATION | ATRx2.0 | 24 | 38% | **1.64** | 46% | -0.38% |
+
+**Verdict: HOLDS.** ATRx2.0's PF and 46% SL-exit rate reproduce on validation-half data the
+strategy never saw during the original screen — PF didn't collapse, it held (even ticked up
+1.40→1.64). Both halves clear the 10-trade floor. This resolves the curve-fit concern flagged
+2026-07-16 (single multiplier passing with both neighbors failing on nested windows).
+Report: `logs/atr_oos_SOL_2.0_20260717.md`. Reusable for future symbols/multipliers via
+`SYMBOL=`/`ATR_MULT=` env vars (e.g. the still-pending "proper BTC ATR study").
+
+**This is evidence, not a promotion.** SOL/CAD stays BLOCKED — adding it still requires,
+per the existing roadmap note: SL-distance-based position sizing (a wider ATR stop must not
+raise dollar risk per trade beyond the standard cap) + the capital-gate preconditions in the
+"Preconditions for any USD pair promotion" section (BTC/CAD ≥15 fills + PF≥1.2, capital ≥$500,
+documented FX handling) + a fresh full walk-forward pass on the CURRENT strategy hash at
+promotion time. No .env or whitelist change made.
+
+### BTC ATR×2.0 OOS validation — HOLDS, and this one is live-relevant (2026-07-17)
+Same `atr_oos_validation.py`, `SYMBOL=BTC/USDT ATR_MULT=2.0` — the "proper BTC ATR study"
+the 2026-07-16 entry flagged as still pending. Same non-overlapping date split as the SOL run.
+
+| Period | Window | Trades | Win% | PF | SL rate | Return |
+|--------|--------|--------|------|-----|---------|--------|
+| TRAIN (2024-04-05→2025-05-26) | fixed 1.5% | 26 | 19% | 1.34 | 81% | -2.69% |
+| TRAIN | ATRx2.0 | 21 | 33% | **1.79** | 52% | -0.39% |
+| VALIDATION (2025-05-27→2026-07-17) | fixed 1.5% | 12 | 33% | 1.88 | 58% | -0.94% |
+| VALIDATION | ATRx2.0 | 11 | 45% | **2.04** | 45% | -0.68% |
+
+**Verdict: HOLDS,** and PF improved out-of-sample (1.79→2.04) rather than merely surviving —
+win rate improved too (33%→45%). Fixed 1.5% SL fails the full gate outright on the training
+half (81% SL-exit rate, over the 70% cap); ATRx2.0 roughly halves it in both halves (52%→45%).
+Caveat: validation trade count is thin (11–12), just over the 10-trade floor — worth more
+months of confirmation before treating as fully settled. Report: `logs/atr_oos_BTC_2.0_20260717.md`.
+
+**Why this one is different from the SOL result: `ATR_SL_MULT` is a live-wired config knob,
+not a new-symbol question.** `bot/main.py:1813` already reads `cfg.strategy.atr_sl_mult`
+(env `ATR_SL_MULT`, currently `0.0` = disabled, fixed `STOP_LOSS_PCT=0.015` active) to compute
+the live SL level. Switching it on is a config change, NOT a `bot/strategy/*.py` change — it
+does not invalidate strategy hash `659d1c03987b72fd` per the Validation Discipline rule. This
+means, unlike SOL, adopting this doesn't require a new-symbol promotion path — only a full
+walk-forward re-run confirming PF≥1.79 with ATR_SL_MULT=2.0 (same discipline as the SL=1.5%/
+TP=10% sweep already done 2026-06-19) before it could go live. **Not yet decided or adopted —
+research only, no .env change.** Given the 2026-07-02 ATR SL drift incident (a stale .env key
+silently ran ATR SL on backtest at the wrong multiplier), any future adoption must double-check
+BacktestConfig and StrategyConfig read the identical `ATR_SL_MULT` key before trusting a result.
+
+**Follow-up same day — full 5-window walk-forward requested above, now run** (`atr_walkforward.py`,
+new; same nested-trailing-window shape — 5000/4000/3000/2000/1000 candles ending at present —
+used for every prior BTC strategy sweep in this file):
+
+| Window | fixed 1.5% PF | ATRx2.0 PF | fixed SL rate | ATRx2.0 SL rate |
+|--------|---------------|------------|----------------|-------------------|
+| 5000c | 1.65 | **1.98** | 71% | 49% |
+| 4000c | 2.09 | **2.33** | 66% | 42% |
+| 3000c | 3.03 | **3.76** | 55% | 35% |
+| 2000c | 2.56 | **2.88** | 56% | 38% |
+| 1000c | 1.70 | **2.39** | 67% | 40% |
+
+**Both variants pass PF > 1.0 on all 5 windows, but ATRx2.0 beats fixed 1.5% on every single
+window** — higher PF and 20–30 points lower SL-exit rate everywhere, not a marginal edge.
+Combined with the non-overlapping OOS split above (train 1.79 → validation 2.04, held), this
+is now validated by both methods this project uses (recency-robustness sweep + temporal
+holdout) and both are clean. Report: `logs/atr_walkforward_BTC_2.0_20260717.md`.
+**Still not adopted — this is the last research gate before a go/no-go decision on
+`ATR_SL_MULT=2.0` in live `.env`, which was deliberately left to the user, not auto-applied.**
+
 ### Affordable-symbol screen (2026-07-15) — 7 new RULE_WHITELIST symbols, 216 tests pass
 Goal: widen the funnel of symbols that can actually FILL at the ~$197 target allocation
 (0.20 × ~$987 account) — 3 of 5 whitelisted symbols were stuck in SIZE_SKIP, so the
@@ -1073,7 +1150,7 @@ Features A, B, E from the roadmap completed. 168 tests pass.
 |---|---------|-----|--------|
 | I | **IBKR live go-live** | After 30 paper trades + PF ≥ 1.2 on stock bot | Gate-blocked |
 | J | **USD symbol re-screen** | Re-run `screen_universe.py` after any strategy hash change | ~2h |
-| K | **ATR SL experiment for SYN/LINK** | ATR×2.0–2.5 cleared in-sample — needs OOS + per-symbol walk-forward before adding | Large |
+| K | **ATR SL experiment for SYN/LINK** | ATR×2.0–2.5 cleared in-sample — needs OOS + per-symbol walk-forward before adding. SOL@ATR×2.0 and BTC@ATR×2.0 OOS both HOLD (2026-07-17). SOL still needs SL-distance sizing + capital-gate preconditions before promotion (new symbol). BTC is live-wired (`ATR_SL_MULT`) — adopting would need a full walk-forward re-run first, not yet decided. SYN/LINK OOS not yet run | Large |
 
 ### Multi-coin readiness (2026-07-03)
 The live loop is now safe to run with >1 symbol in UNIVERSE_WHITELIST. Single-symbol behavior
