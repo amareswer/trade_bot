@@ -760,6 +760,35 @@ No strategy files touched (hash `659d1c03987b72fd` still valid).
   Sundays is still required by IBKR). Until that's set, a nightly logoff means the bot's
   orders fail (visibly, with logged errors) until TWS is logged back in.
 
+### TSX API orders BLOCKED by regulation → whitelist moved to NYSE listings (2026-07-17 pm)
+First live IBKR-era rule signal (CM.TO BUY, 12:37 + 13:41 ET retries) was rejected by IBKR:
+**Error 201 "API/CTCI orders for Canadian products are not allowed."** Root cause is
+regulatory, NOT a permission or account setting: CIRO rule DMR 3200 A.1.(b)(i) prohibits
+IBKR Canada clients from placing orders on Canadian exchanges via ANY automated system
+(API/third-party apps). US products via API are unaffected (KO smoke trade proved it).
+Canada trading permission was already enabled (verified in Client Portal) — there is NO
+fix; manual TWS orders are the only way to trade TSX. Do not re-attempt .TO via API.
+Error 10349 (TIF=DAY) in the same log is the known benign warning. The executor handled
+both rejections cleanly: no fill recorded, no state change.
+- **Consequence:** 5 of 12 whitelisted symbols (.TO) could never fill. Their dashboards
+  said "→ buying" — the visibility invariant was violated by forces outside the code.
+- **Response (same day):** ran `STOCK_BT_SYMBOLS=RY,TD,BNS,CM,SU stock_backtest.py` on
+  the NYSE cross-listings (USD — .TO validation does NOT transfer across listings).
+  Report `logs/stock_backtest_20260717.md`:
+  **PASS: RY (PF 1.60–5.77), TD (1.46–7.47), CM (1.87–6.28)** → whitelisted.
+  **BNS: gate-letter FAIL** (9 full-window trades < 10; PF 3.35–11.29 everywhere) —
+  held out, re-eligible on a future re-screen. **SU: real FAIL** (full PF 0.97, 500d
+  0.22) — proof the CAD/USD listings genuinely differ; SU.TO's pass did not carry over.
+- **stock_bot/.env updated:** RULE_WHITELIST=MRNA,AMD,RY,PLTR,GLD,TD,CM,CSCO,KO,T
+  (all US-listed, all API-tradeable). WATCHLIST swapped .TO→US 1:1 (BNS, SU stay
+  watched). AC.TO/SHOP.TO remain watch-only (advisory, never rule-buyable).
+- **Known FX sizing quirk (accepted for paper):** account is CAD; `PAPER_RISK_PCT`
+  allocation is computed in CAD but US share prices are USD, so USD positions can run
+  ~35% over the 20% target (e.g. 3 TD shares ≈ $267 CAD ≈ 27%). Exposure/sector caps
+  still bound it. Fix deliberately deferred — sizing change = measurement change;
+  revisit before live.
+- **Stock bot needs a restart** to load the new .env (also picks up the notifier fix).
+
 ### IBKR paper executor built + verified (2026-07-17) — roadmap item D, 239 tests pass
 IBKR paper environment set up end-to-end and the executor written the same day. No strategy
 files touched (hash `659d1c03987b72fd` still valid); stock bot NOT yet switched — sim paper
