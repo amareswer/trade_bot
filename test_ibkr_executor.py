@@ -193,10 +193,21 @@ def test_contract_mapping_tsx_class_shares():
 def test_contract_mapping_us():
     c = IBKRExecutor.to_contract("MRNA")
     assert (c.symbol, c.currency, c.exchange) == ("MRNA", "USD", "SMART")
+    assert c.primaryExchange == ""
+
+
+def test_contract_mapping_nyse_cross_listed():
+    # Bare Canadian-company tickers (no .TO) must force primaryExchange=NYSE.
+    # Without it, IBKR's SMART/USD qualification for symbols like "CM" was
+    # resolving to the TSX/CAD primary listing and hitting the CIRO API
+    # block (Error 201) even though these are meant to route as US orders.
+    for sym in ("RY", "TD", "BNS", "CM", "SU"):
+        c = IBKRExecutor.to_contract(sym)
+        assert (c.symbol, c.currency, c.primaryExchange) == (sym, "USD", "NYSE")
 
 
 def test_contract_roundtrip():
-    for sym in ("RY.TO", "TECK-B.TO", "MRNA", "BRK-B"):
+    for sym in ("RY.TO", "TECK-B.TO", "MRNA", "BRK-B", "RY", "CM"):
         c = IBKRExecutor.to_contract(sym)
         assert IBKRExecutor.from_contract(c) == sym
 

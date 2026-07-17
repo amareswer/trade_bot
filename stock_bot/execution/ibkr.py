@@ -228,6 +228,14 @@ class IBKRExecutor(StockExecutorBase):
 
     # ── contract mapping ─────────────────────────────────────────────────────
 
+    # Canadian companies that also trade on NYSE under the SAME bare ticker
+    # as their TSX primary listing (RY.TO/RY, TD.TO/TD, etc). Without an
+    # explicit primaryExchange, IBKR's SMART/USD qualification resolves the
+    # ambiguous symbol back to the TSX/CAD primary contract — exactly the
+    # listing our API access is blocked from (CIRO DMR 3200 A.1.(b)(i), see
+    # 2026-07-17 Error 201 incident). Force NYSE so the USD contract wins.
+    _NYSE_CROSS_LISTED = {"RY", "TD", "BNS", "CM", "SU"}
+
     @staticmethod
     def to_contract(symbol: str):
         """
@@ -235,13 +243,17 @@ class IBKRExecutor(StockExecutorBase):
         'RY.TO'  → Stock('RY',  SMART, CAD, primaryExchange=TSE)
         'TECK-B.TO' → Stock('TECK.B', SMART, CAD, primaryExchange=TSE)
         'BRK-B'  → Stock('BRK B', SMART, USD)
+        'RY'     → Stock('RY', SMART, USD, primaryExchange=NYSE)  (cross-listed)
         """
         from ib_async import Stock
         sym = symbol.upper()
         if sym.endswith(".TO"):
             return Stock(sym[:-3].replace("-", "."), "SMART", "CAD",
                          primaryExchange="TSE")
-        return Stock(sym.replace("-", " "), "SMART", "USD")
+        base = sym.replace("-", " ")
+        if base in IBKRExecutor._NYSE_CROSS_LISTED:
+            return Stock(base, "SMART", "USD", primaryExchange="NYSE")
+        return Stock(base, "SMART", "USD")
 
     @staticmethod
     def from_contract(contract) -> str:
