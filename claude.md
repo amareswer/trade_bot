@@ -165,7 +165,7 @@ A robust crypto trading system that:
 
 ## Test Suite Manifest (as of 2026-07-03)
 
-Expected total: **242 tests** (as of 2026-07-17). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
+Expected total: **243 tests** (as of 2026-07-17). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -192,9 +192,9 @@ Expected total: **242 tests** (as of 2026-07-17). If `pytest --collect-only -q` 
 | `test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last (forming candle), determinism, validated-parameter pin |
 | `test_audit_scheduler.py` | 14 | In-bot audit scheduler: tests REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, monthly 1st-anchored (re-screen), missed-run catch-up |
 | `test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
-| `test_ibkr_executor.py` | 17 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping (.TO↔TSE/CAD), broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence |
+| `test_ibkr_executor.py` | 18 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping (.TO↔TSE/CAD, bare NYSE cross-listings→NYSE), broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence |
 
-Run: `python -m pytest --tb=short -q` — must show **242 passed**.
+Run: `python -m pytest --tb=short -q` — must show **243 passed**.
 
 ---
 
@@ -788,6 +788,23 @@ both rejections cleanly: no fill recorded, no state change.
   still bound it. Fix deliberately deferred — sizing change = measurement change;
   revisit before live.
 - **Stock bot needs a restart** to load the new .env (also picks up the notifier fix).
+
+### Contract-mapping bug found + fixed same day — bare NYSE cross-listings were routing to TSX (2026-07-17 evening) — 243 tests pass
+The whitelist swap above (RY/TD/BNS/CM/SU as bare US tickers) didn't fully close the Error 201
+hole. `IBKRExecutor.to_contract()` built bare symbols as `Stock(sym, "SMART", "USD")` with no
+`primaryExchange` — for names whose *primary* listing is Toronto, IBKR's SMART/USD
+qualification resolved the ambiguous symbol back to the TSX/CAD contract despite the USD
+request. Live symptom: CM's rule-BUY signal fired and was rejected by the same CIRO Error 201
+**8 times over ~4 hours** (12:13–16:13 ET) before this was caught — a live no-op each time
+(no fill, no state change) but silently repeating.
+- **Fix:** `to_contract()` now forces `primaryExchange="NYSE"` for a known cross-listed set
+  (`_NYSE_CROSS_LISTED = {RY, TD, BNS, CM, SU}`) so the USD/NYSE contract wins over the
+  CAD/TSE one. Symbols with only a US listing (MRNA, AMD, PLTR, GLD, CSCO, KO, T) are
+  unaffected — `primaryExchange` stays unset for those, as before.
+- Tests: `test_contract_mapping_nyse_cross_listed` (new) + `test_contract_roundtrip` extended
+  to cover bare RY/CM. Suite 242 → 243.
+- **Stock bot needs a restart** to pick up the fix — next CM/RY/TD signal should route to
+  NYSE and fill instead of rejecting.
 
 ### IBKR paper executor built + verified (2026-07-17) — roadmap item D, 239 tests pass
 IBKR paper environment set up end-to-end and the executor written the same day. No strategy
