@@ -16,6 +16,8 @@ _TRADES_CSV      = os.path.join(_STOCK_BOT_DIR, "paper_trades.csv")
 _STATE_JSON      = os.path.join(_STOCK_BOT_DIR, "paper_state.json")
 _FAST_CSV        = os.path.join(_STOCK_BOT_DIR, "fast_trades.csv")
 _FAST_STATE_JSON = os.path.join(_STOCK_BOT_DIR, "fast_validator_state.json")
+_IBKR_CSV        = os.path.join(_STOCK_BOT_DIR, "ibkr_trades.csv")
+_IBKR_STATE_JSON = os.path.join(_STOCK_BOT_DIR, "ibkr_state.json")
 
 _COLS = [
     "timestamp", "symbol", "side", "shares",
@@ -52,6 +54,22 @@ def _read_trades(csv_path: str) -> list[dict]:
                 d["total_value"] = 0.0
                 d["confidence"] = 0
             trades.append(d)
+    return trades
+
+
+def read_position_book(
+    paper_csv: str = _TRADES_CSV,
+    ibkr_csv:  str = _IBKR_CSV,
+) -> list[dict]:
+    """
+    The position book's full trade history: sim-paper fills plus IBKR-paper
+    fills, merged in timestamp order. The Phase A 30-trade gate counts the
+    strategy's trades regardless of which executor filled them — the sim book
+    was closed flat before the 2026-07-17 switch, so pairs never straddle
+    executors.
+    """
+    trades = _read_trades(paper_csv) + _read_trades(ibkr_csv)
+    trades.sort(key=lambda t: t.get("timestamp", ""))
     return trades
 
 
@@ -191,22 +209,42 @@ def _expectancy_stats(pairs: list[dict]) -> dict | None:
 
 
 def generate_report(
-    csv_path:      str = _TRADES_CSV,
-    state_path:    str = _STATE_JSON,
-    fast_csv_path: str = _FAST_CSV,
+    csv_path:        str = _TRADES_CSV,
+    state_path:      str = _STATE_JSON,
+    fast_csv_path:   str = _FAST_CSV,
+    ibkr_csv_path:   str = _IBKR_CSV,
+    ibkr_state_path: str = _IBKR_STATE_JSON,
 ) -> str:
     """
     Build and return the full paper trading report as a string.
     No network calls. No yfinance. Pure file reads.
     """
-    trades = _read_trades(csv_path)
+    trades = read_position_book(csv_path, ibkr_csv_path)
     state  = _read_state(state_path)
     pairs, open_pos = _pair_trades(trades)
 
     # ── Account info ──────────────────────────────────────────────────────────
+    # When the IBKR executor is active its state file exists: the live account
+    # is IBKR (starting cash from state, current cash from the last fill's
+    # cash_remaining — the report makes no network calls so it cannot ask TWS).
+    # Realized P&L stays the combined book: sim realized + IBKR realized.
+    ibkr_state   = _read_state(ibkr_state_path)
+    ibkr_trades  = _read_trades(ibkr_csv_path)
     current_cash   = state.get("cash", None)
     starting_cash  = state.get("starting_cash", None)
     realized_pnl   = state.get("realized_pnl", None)
+    account_label  = ""
+    if ibkr_state:
+        starting_cash = ibkr_state.get("starting_cash", starting_cash)
+        if ibkr_trades:
+            current_cash = float(ibkr_trades[-1].get("cash_remaining") or 0.0)
+        else:
+            current_cash = starting_cash
+        realized_pnl = (
+            float(state.get("realized_pnl", 0.0) or 0.0)
+            + float(ibkr_state.get("realized_pnl", 0.0) or 0.0)
+        )
+        account_label = f"  [IBKR paper {ibkr_state.get('account', '')}]"
 
     # Fall back: infer starting_cash from first BUY if state file is missing
     if starting_cash is None and trades:
@@ -238,7 +276,7 @@ def generate_report(
         f"  Generated: {now_str}",
         "═" * width,
         "",
-        "  POSITION BOOK  (daily candles · multi-day holds · sized in $)",
+        "  POSITION BOOK  (daily candles · multi-day holds · sized in $)" + account_label,
         f"  {sep}",
     ]
 

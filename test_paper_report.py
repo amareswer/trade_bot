@@ -15,8 +15,10 @@ import tempfile
 
 from stock_bot.analysis.paper_report import (
     _expectancy_stats,
+    _pair_trades,
     _round_trip_commission,
     generate_report,
+    read_position_book,
 )
 
 
@@ -78,11 +80,75 @@ def test_generate_report_renders_expectancy_section():
         csv_path=trades_csv,
         state_path=os.path.join(tmp, "missing_state.json"),
         fast_csv_path=fast_csv,
+        ibkr_csv_path=os.path.join(tmp, "missing_ibkr.csv"),
+        ibkr_state_path=os.path.join(tmp, "missing_ibkr_state.json"),
     )
     assert "EXPECTANCY — NET OF COMMISSIONS" in report
     # $20 gross − $2 commission = $18 net on one trade
     assert "+18.00" in report
     assert "SWING BOOK" in report
+
+
+_CSV_HEADER = "timestamp,symbol,side,shares,price,total_value,cash_remaining,reason,confidence\n"
+
+
+def test_position_book_merges_paper_and_ibkr_csvs():
+    # The Phase A gate counts strategy trades across the 2026-07-17 executor
+    # switch: pairs completed in the sim book AND pairs filled via IBKR must
+    # both appear, in timestamp order.
+    tmp = tempfile.mkdtemp()
+    paper_csv = os.path.join(tmp, "paper_trades.csv")
+    ibkr_csv  = os.path.join(tmp, "ibkr_trades.csv")
+    with open(paper_csv, "w", encoding="utf-8") as f:
+        f.write(
+            _CSV_HEADER
+            + "2026-06-24 10:00:00,DLTR,BUY,2.0000,100.0000,200.00,800.00,BUY 70%,70\n"
+            + "2026-07-17 10:00:00,DLTR,SELL,2.0000,110.0000,220.00,1020.00,EXECUTOR_SWITCH_TO_IBKR,0\n"
+        )
+    with open(ibkr_csv, "w", encoding="utf-8") as f:
+        f.write(
+            _CSV_HEADER
+            + "2026-07-20 10:00:00,KO,BUY,2.0000,80.0000,160.00,835.30,RULE BUY,60\n"
+            + "2026-07-25 10:00:00,KO,SELL,2.0000,85.0000,170.00,1005.30,TAKE_PROFIT_HIT,0\n"
+        )
+    trades = read_position_book(paper_csv, ibkr_csv)
+    assert [t["symbol"] for t in trades] == ["DLTR", "DLTR", "KO", "KO"]
+    pairs, open_pos = _pair_trades(trades)
+    assert len(pairs) == 2
+    assert open_pos == {}
+    # Missing IBKR file must not change the sim-only view
+    solo = read_position_book(paper_csv, os.path.join(tmp, "nope.csv"))
+    assert len(solo) == 2
+
+
+def test_generate_report_shows_ibkr_account_when_state_exists():
+    import json
+    tmp = tempfile.mkdtemp()
+    paper_csv  = os.path.join(tmp, "paper_trades.csv")
+    ibkr_csv   = os.path.join(tmp, "ibkr_trades.csv")
+    ibkr_state = os.path.join(tmp, "ibkr_state.json")
+    with open(paper_csv, "w", encoding="utf-8") as f:
+        f.write(_CSV_HEADER)
+    with open(ibkr_csv, "w", encoding="utf-8") as f:
+        f.write(
+            _CSV_HEADER
+            + "2026-07-20 10:00:00,KO,BUY,2.0000,80.0000,160.00,835.30,RULE BUY,60\n"
+        )
+    with open(ibkr_state, "w", encoding="utf-8") as f:
+        json.dump({"account": "DUQ273338", "realized_pnl": 0.0,
+                   "starting_cash": 995.30}, f)
+    report = generate_report(
+        csv_path=paper_csv,
+        state_path=os.path.join(tmp, "missing_state.json"),
+        fast_csv_path=os.path.join(tmp, "missing_fast.csv"),
+        ibkr_csv_path=ibkr_csv,
+        ibkr_state_path=ibkr_state,
+    )
+    assert "IBKR paper DUQ273338" in report
+    # Current cash comes from the last IBKR fill's cash_remaining
+    assert "835.30" in report
+    # Starting cash comes from ibkr_state.json
+    assert "995.30" in report
 
 
 if __name__ == "__main__":
@@ -95,6 +161,8 @@ if __name__ == "__main__":
         test_expectancy_commission_can_flip_small_win_to_loss,
         test_expectancy_none_without_pairs,
         test_generate_report_renders_expectancy_section,
+        test_position_book_merges_paper_and_ibkr_csvs,
+        test_generate_report_shows_ibkr_account_when_state_exists,
     ]:
         try:
             t()

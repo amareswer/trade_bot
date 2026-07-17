@@ -165,7 +165,7 @@ A robust crypto trading system that:
 
 ## Test Suite Manifest (as of 2026-07-03)
 
-Expected total: **239 tests** (as of 2026-07-17). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
+Expected total: **241 tests** (as of 2026-07-17). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -186,7 +186,7 @@ Expected total: **239 tests** (as of 2026-07-17). If `pytest --collect-only -q` 
 | `test_universe.py` | 4 | Universe screener: scoring, momentum filter, fallback |
 | `test_main_strategy.py` | 2 | Strategy builder: full config wiring |
 | `test_fast_validator_exits.py` | 6 | FastValidator exits: MAX_HOLD live-price fallback, corruption guard, SL regression |
-| `test_paper_report.py` | 6 | Expectancy math: IBKR commission model, net-of-cost flip, report rendering |
+| `test_paper_report.py` | 8 | Expectancy math: IBKR commission model, net-of-cost flip, report rendering, merged paper+IBKR position book, IBKR account section |
 | `test_exit_policy.py` | 11 | Stock-bot asymmetric exit bars: single-verdict exit, 2-strike SELL streak, streak resets, AC.TO incident regression |
 | `test_stock_backtest_engine.py` | 11 | Stock backtest engine: next-open fills, intra-candle SL/TP, gap handling, slippage/commission math, walk-forward gating |
 | `test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last (forming candle), determinism, validated-parameter pin |
@@ -194,7 +194,7 @@ Expected total: **239 tests** (as of 2026-07-17). If `pytest --collect-only -q` 
 | `test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
 | `test_ibkr_executor.py` | 17 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping (.TO↔TSE/CAD), broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence |
 
-Run: `python -m pytest --tb=short -q` — must show **239 passed**.
+Run: `python -m pytest --tb=short -q` — must show **241 passed**.
 
 ---
 
@@ -706,6 +706,35 @@ gate (shadow ≥ 95%) was silently running on stale data.
   account)" header now computes the real account value (cash + positions at cost).
 - **Crypto bot needs a restart** to start the scheduler thread. On first start after 12:05
   it will immediately catch up today's missed shadow audit.
+
+### Stock bot SWITCHED to IBKR paper executor (2026-07-17 11:13 ET) — 241 tests pass
+The deliberate switch decision was made and executed the same day the executor shipped.
+No strategy files touched (hash `659d1c03987b72fd` still valid).
+- **Preconditions verified first:** account reset landed ($1M → $995.30 CAD net_liq,
+  no positions); ibkr_trades.csv contained no smoke-test rows (header only);
+  ibkr_state.json re-seeded starting_cash=$995.30.
+- **Sim book closed flat before the flip** (positions would otherwise become exit-less
+  orphans under the new executor — the 2026-07-10 visibility failure mode). DLTR sold
+  @ $130.39 (+$24.35) and CM.TO @ $171.03 (+$2.68), reason `EXECUTOR_SWITCH_TO_IBKR`,
+  via the normal executor path (slippage applied, CSV rows written). Sim book final:
+  $1,014.53 cash, +$14.52 realized (+1.45%), 3 completed round-trips. paper_state.json /
+  paper_trades.csv stay in place as the frozen sim-era record — do not delete.
+- **`STOCK_EXECUTOR=ibkr` set in stock_bot/.env; bot restarted 11:12 ET** — connected to
+  DUQ273338 (PAPER), cash $995.30, positions []. TWS must now be running + logged in
+  whenever the stock bot runs (connection failure stops startup, never falls back to sim).
+- **Phase A gate counts ACROSS the switch:** `paper_report.read_position_book()` merges
+  paper_trades.csv + ibkr_trades.csv in timestamp order (pairs never straddle executors
+  because the sim book closed flat). Gate at switch: 3/30 trades, net PF 1.59, WR 67%.
+  The report shows the IBKR account section when ibkr_state.json exists (current cash =
+  last fill's cash_remaining — the report makes no network calls); realized P&L shown is
+  sim + IBKR combined.
+- **Dashboard follows the active executor:** `_load_stock_state()` reads STOCK_EXECUTOR
+  from stock_bot/.env; ibkr mode synthesizes the card/table state from ibkr_state.json +
+  ibkr_trades.csv (badge "IBKR PAPER · DUQ273338"); gate strip uses the merged book.
+- Tests: test_paper_report.py 6 → 8 (merge + IBKR account section; existing report test
+  made hermetic against real ibkr files). Suite 239 → 241.
+- On connect TWS replays the day's account executions (execDetails) — fills from other
+  client IDs (e.g. manual TWS orders) are ignored by the executor, by design.
 
 ### IBKR paper executor built + verified (2026-07-17) — roadmap item D, 239 tests pass
 IBKR paper environment set up end-to-end and the executor written the same day. No strategy

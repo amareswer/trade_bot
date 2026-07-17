@@ -26,6 +26,8 @@ from pathlib import Path
 CRYPTO_STATE_GLOB    = "logs/live_state_*.json"   # per-symbol files (current bot)
 CRYPTO_STATE_LEGACY  = "logs/live_state.json"     # pre-multi-symbol — fallback only
 STOCK_STATE_PATH     = "stock_bot/paper_state.json"
+IBKR_STATE_PATH      = "stock_bot/ibkr_state.json"
+IBKR_TRADES_PATH     = "stock_bot/ibkr_trades.csv"
 KRAKEN_HOLDINGS_PATH = "logs/kraken_holdings.json"
 RISK_STATE_PATH      = "logs/risk_state.json"
 HALT_FLAG_PATH       = "logs/HALT"
@@ -42,6 +44,54 @@ def _load_json(path: str) -> dict | None:
             return json.load(f)
     except Exception:
         return None
+
+
+def _stock_executor_type() -> str:
+    """STOCK_EXECUTOR from stock_bot/.env — 'paper' (sim) or 'ibkr'."""
+    try:
+        from dotenv import dotenv_values
+        raw = dotenv_values("stock_bot/.env").get("STOCK_EXECUTOR", "") or ""
+    except Exception:
+        raw = ""
+    return raw.strip().lower() or "paper"
+
+
+def _load_stock_state() -> dict | None:
+    """
+    State dict for the stock card/positions table, shaped like
+    paper_state.json: {cash, starting_cash, realized_pnl, positions,
+    last_updated}. When STOCK_EXECUTOR=ibkr the live account is IBKR —
+    synthesize the same shape from ibkr_state.json + ibkr_trades.csv
+    (cash = last fill's cash_remaining; positions = unpaired BUYs), since
+    this subprocess can't ask TWS. Falls back to the sim book otherwise.
+    """
+    if _stock_executor_type() != "ibkr":
+        return _load_json(STOCK_STATE_PATH)
+    ibkr = _load_json(IBKR_STATE_PATH)
+    if ibkr is None:
+        return None
+    try:
+        from stock_bot.analysis.paper_report import _pair_trades, _read_trades
+        trades = _read_trades(IBKR_TRADES_PATH)
+        _, open_pos = _pair_trades(trades)
+    except Exception:
+        trades, open_pos = [], {}
+    starting = float(ibkr.get("starting_cash", 0.0) or 0.0)
+    cash = (
+        float(trades[-1].get("cash_remaining") or 0.0) if trades else starting
+    )
+    return {
+        "cash":          cash,
+        "starting_cash": starting,
+        "realized_pnl":  float(ibkr.get("realized_pnl", 0.0) or 0.0),
+        "positions":     {
+            sym: {"shares": p["shares"], "avg_cost": p["avg_cost"]}
+            for sym, p in open_pos.items()
+        },
+        "last_updated":  ibkr.get("last_updated"),
+        "executor":      "ibkr",
+        "account":       ibkr.get("account", ""),
+    }
 
 
 def _whitelist() -> list[str]:
@@ -349,14 +399,19 @@ def _gate_tracker_section() -> str:
     )
 
 
-def _paper_book_stats(csv_path: str) -> tuple[int, float | None, float | None]:
-    """(completed trades, net PF, net win rate %) for a stock-bot trade CSV.
+def _paper_book_stats(*csv_paths: str) -> tuple[int, float | None, float | None]:
+    """(completed trades, net PF, net win rate %) across one or more stock-bot
+    trade CSVs (position book = sim paper + IBKR paper, merged by timestamp).
     Reuses paper_report's pairing + net-of-commission math — no duplicate logic."""
     try:
         from stock_bot.analysis.paper_report import (
             _expectancy_stats, _pair_trades, _read_trades,
         )
-        pairs, _ = _pair_trades(_read_trades(csv_path))
+        trades: list[dict] = []
+        for p in csv_paths:
+            trades += _read_trades(p)
+        trades.sort(key=lambda t: t.get("timestamp", ""))
+        pairs, _ = _pair_trades(trades)
         stats = _expectancy_stats(pairs)
         if stats is None:
             return 0, None, None
@@ -388,7 +443,7 @@ def _book_gates_section() -> str:
     wins, losses = g["wins"], g["losses"]
     crypto_wr = wins / (wins + losses) * 100 if (wins + losses) else None
 
-    pos_n, pos_pf, pos_wr = _paper_book_stats("stock_bot/paper_trades.csv")
+    pos_n, pos_pf, pos_wr = _paper_book_stats("stock_bot/paper_trades.csv", IBKR_TRADES_PATH)
     swi_n, swi_pf, swi_wr = _paper_book_stats("stock_bot/fast_trades.csv")
 
     return (
@@ -934,7 +989,7 @@ def _stock_card(state: dict | None) -> str:
             '<div class="pf-card offline">'
             '<div>📈 Stock bot offline</div>'
             '<div style="font-size:11px;color:#8b949e;margin-top:4px">'
-            'stock_bot/paper_state.json not found</div>'
+            'no executor state file found (paper_state.json / ibkr_state.json)</div>'
             '</div>'
         )
 
@@ -953,11 +1008,17 @@ def _stock_card(state: dict | None) -> str:
     ret_col = "#3fb950" if ret_pct >= 0 else "#f85149"
     ret_s   = "+" if ret_pct >= 0 else ""
 
+    if state.get("executor") == "ibkr":
+        acct  = state.get("account", "")
+        badge = f"IBKR PAPER{' · ' + acct if acct else ''}"
+    else:
+        badge = "PAPER"
+
     return (
         '<div class="pf-card">'
         '<div class="pf-card-header">'
         '<span class="pf-card-title">📈 Stock Bot</span>'
-        '<span class="pf-card-badge" style="background:#7c8cf822;color:#7c8cf8;border-color:#7c8cf855">PAPER</span>'
+        f'<span class="pf-card-badge" style="background:#7c8cf822;color:#7c8cf8;border-color:#7c8cf855">{badge}</span>'
         '</div>'
         + _kv("Cash", f"${cash:,.2f}")
         + _kv("Open positions", str(len(positions)))
@@ -1140,9 +1201,13 @@ def _portfolio_tab_html(
         float(p.get("shares", 0)) * float(p.get("avg_cost", 0))
         for p in (stock.get("positions", {}) if stock else {}).values()
     )
+    _stock_kind = (
+        "Stocks IBKR paper" if stock and stock.get("executor") == "ibkr"
+        else "Stocks paper"
+    )
     stock_label = (
-        f"Stocks paper (${stock_cash + stock_pv:,.0f} account)"
-        if stock else "Stocks paper"
+        f"{_stock_kind} (${stock_cash + stock_pv:,.0f} account)"
+        if stock else _stock_kind
     )
 
     return (
@@ -1314,7 +1379,7 @@ def _build_html(
 
 def generate() -> None:
     active, retired = _load_crypto_states()
-    stock = _load_json(STOCK_STATE_PATH)
+    stock = _load_stock_state()
     html  = _build_html(active, retired, stock)
     Path(OUTPUT_PATH).write_text(html, encoding="utf-8")
     ts = datetime.now().strftime("%H:%M:%S")
