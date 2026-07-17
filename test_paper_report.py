@@ -151,6 +151,43 @@ def test_generate_report_shows_ibkr_account_when_state_exists():
     assert "995.30" in report
 
 
+def test_load_active_book_state_ibkr_branch():
+    # ibkr mode synthesizes the paper_state.json shape from ibkr files:
+    # cash from the last fill's cash_remaining, positions from unpaired BUYs.
+    import json
+    import stock_bot.analysis.paper_report as pr
+    tmp = tempfile.mkdtemp()
+    ibkr_csv   = os.path.join(tmp, "ibkr_trades.csv")
+    ibkr_state = os.path.join(tmp, "ibkr_state.json")
+    with open(ibkr_csv, "w", encoding="utf-8") as f:
+        f.write(
+            _CSV_HEADER
+            + "2026-07-20 10:00:00,KO,BUY,2.0000,80.0000,160.00,835.30,RULE BUY,60\n"
+        )
+    with open(ibkr_state, "w", encoding="utf-8") as f:
+        json.dump({"account": "DUQ273338", "realized_pnl": 1.5,
+                   "starting_cash": 995.30, "last_updated": "2026-07-20T10:00:01"}, f)
+
+    saved = (pr._IBKR_CSV, pr._IBKR_STATE_JSON, os.environ.get("STOCK_EXECUTOR"))
+    pr._IBKR_CSV, pr._IBKR_STATE_JSON = ibkr_csv, ibkr_state
+    os.environ["STOCK_EXECUTOR"] = "ibkr"
+    try:
+        state = pr.load_active_book_state()
+    finally:
+        pr._IBKR_CSV, pr._IBKR_STATE_JSON = saved[0], saved[1]
+        if saved[2] is None:
+            os.environ.pop("STOCK_EXECUTOR", None)
+        else:
+            os.environ["STOCK_EXECUTOR"] = saved[2]
+
+    assert state["executor"] == "ibkr"
+    assert state["account"] == "DUQ273338"
+    assert state["cash"] == 835.30
+    assert state["starting_cash"] == 995.30
+    assert state["realized_pnl"] == 1.5
+    assert state["positions"] == {"KO": {"shares": 2.0, "avg_cost": 80.0}}
+
+
 if __name__ == "__main__":
     import sys
     failures = 0
@@ -163,6 +200,7 @@ if __name__ == "__main__":
         test_generate_report_renders_expectancy_section,
         test_position_book_merges_paper_and_ibkr_csvs,
         test_generate_report_shows_ibkr_account_when_state_exists,
+        test_load_active_book_state_ibkr_branch,
     ]:
         try:
             t()

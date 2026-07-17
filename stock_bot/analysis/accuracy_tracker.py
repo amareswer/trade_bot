@@ -19,6 +19,7 @@ from datetime import datetime
 _STOCK_BOT_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 _TRADES_CSV      = os.path.join(_STOCK_BOT_DIR, "paper_trades.csv")
+_IBKR_CSV        = os.path.join(_STOCK_BOT_DIR, "ibkr_trades.csv")
 _FAST_TRADES_CSV = os.path.join(_STOCK_BOT_DIR, "fast_trades.csv")
 _BACKTEST_JSON   = os.path.join(_STOCK_BOT_DIR, "backtest_results.json")
 
@@ -399,7 +400,10 @@ class LiveTradingGate:
 
     def check_gate3(self) -> dict:
         tracker = ConfidenceBandTracker()
-        trades  = tracker.load_trades()          # default → paper_trades.csv
+        # Position book spans the 2026-07-17 executor switch: sim-era fills in
+        # paper_trades.csv plus IBKR-era fills in ibkr_trades.csv.
+        trades  = tracker.load_trades() + tracker.load_trades(_IBKR_CSV)
+        trades.sort(key=lambda t: t.get("timestamp", ""))
         pairs   = tracker.pair_trades(trades)
         n       = len(pairs)
 

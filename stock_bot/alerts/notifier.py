@@ -35,7 +35,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _STOCK_BOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_PAPER_STATE   = os.path.join(_STOCK_BOT_DIR, "paper_state.json")
 
 # Warn once if plyer is absent, then stay silent
 _plyer_warned    = False
@@ -146,10 +145,12 @@ class AlertNotifier:
         except Exception as exc:
             fv_lines = [f"  Fast validator stats unavailable: {exc}"]
 
-        # ── 3. Swing paper stats (paper_state.json — read-only) ───────────────
+        # ── 3. Position book stats (active executor: sim paper OR IBKR paper) ──
         try:
-            with open(_PAPER_STATE, "r", encoding="utf-8") as f:
-                ps = json.load(f)
+            from stock_bot.analysis.paper_report import load_active_book_state
+            ps = load_active_book_state()
+            if not ps:
+                raise FileNotFoundError("no executor state file")
             positions   = ps.get("positions", {})
             open_count  = len(positions)
             cash        = float(ps.get("cash", 0.0))
@@ -159,16 +160,19 @@ class AlertNotifier:
                 float(v.get("shares", 0)) * float(v.get("avg_cost", 0))
                 for v in positions.values()
             )
+            acct = ps.get("account", "")
             paper_lines = [
                 f"  Open positions   : {open_count} ({', '.join(positions.keys()) or 'none'})",
                 f"  Cash             : ${cash:,.2f}",
                 f"  Cost basis (open): ${cost_basis:,.2f}",
                 f"  Realized P&L     : ${realized:+,.2f}",
             ]
+            if ps.get("executor") == "ibkr":
+                paper_lines.insert(0, f"  Account          : IBKR paper {acct}")
         except FileNotFoundError:
-            paper_lines = ["  paper_state.json not found — no paper trades yet"]
+            paper_lines = ["  no executor state file — no paper trades yet"]
         except Exception as exc:
-            paper_lines = [f"  Swing paper stats unavailable: {exc}"]
+            paper_lines = [f"  Position book stats unavailable: {exc}"]
 
         # ── 4. Regime (SPY vs 200-day MA) ─────────────────────────────────────
         try:

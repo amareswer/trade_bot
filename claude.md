@@ -165,7 +165,7 @@ A robust crypto trading system that:
 
 ## Test Suite Manifest (as of 2026-07-03)
 
-Expected total: **241 tests** (as of 2026-07-17). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
+Expected total: **242 tests** (as of 2026-07-17). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -186,7 +186,7 @@ Expected total: **241 tests** (as of 2026-07-17). If `pytest --collect-only -q` 
 | `test_universe.py` | 4 | Universe screener: scoring, momentum filter, fallback |
 | `test_main_strategy.py` | 2 | Strategy builder: full config wiring |
 | `test_fast_validator_exits.py` | 6 | FastValidator exits: MAX_HOLD live-price fallback, corruption guard, SL regression |
-| `test_paper_report.py` | 8 | Expectancy math: IBKR commission model, net-of-cost flip, report rendering, merged paper+IBKR position book, IBKR account section |
+| `test_paper_report.py` | 9 | Expectancy math: IBKR commission model, net-of-cost flip, report rendering, merged paper+IBKR position book, IBKR account section, active-book state synthesis |
 | `test_exit_policy.py` | 11 | Stock-bot asymmetric exit bars: single-verdict exit, 2-strike SELL streak, streak resets, AC.TO incident regression |
 | `test_stock_backtest_engine.py` | 11 | Stock backtest engine: next-open fills, intra-candle SL/TP, gap handling, slippage/commission math, walk-forward gating |
 | `test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last (forming candle), determinism, validated-parameter pin |
@@ -194,7 +194,7 @@ Expected total: **241 tests** (as of 2026-07-17). If `pytest --collect-only -q` 
 | `test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
 | `test_ibkr_executor.py` | 17 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping (.TO↔TSE/CAD), broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence |
 
-Run: `python -m pytest --tb=short -q` — must show **241 passed**.
+Run: `python -m pytest --tb=short -q` — must show **242 passed**.
 
 ---
 
@@ -746,6 +746,19 @@ No strategy files touched (hash `659d1c03987b72fd` still valid).
   crypto bot). `stock_dashboard.html` stays as the stock bot's per-symbol drill-down
   (rule-signal strip, AI advisory, exit-bar status — the "why did/didn't it act" view).
   Both are kept; do not fold one into the other without a user decision.
+- **Post-switch audit (same day) — remaining sim-file readers fixed, 242 tests pass:**
+  `paper_report.load_active_book_state()` (new) returns the ACTIVE executor's book in
+  the paper_state.json shape (env-driven; used by the daily Telegram/email summary in
+  `alerts/notifier.py`, which previously read the frozen sim state); readiness Gate 3
+  (`accuracy_tracker.check_gate3`) and the `stock_analysis.py` accuracy CLI default now
+  count the merged paper+IBKR book. Verified non-issues: order placement runs
+  `_ensure_connected_async()` (auto-reconnect after a TWS restart); read paths degrade
+  to logged warnings when TWS is away; ibkr_state.json/ibkr_trades.csv are gitignored;
+  fast_validator/tracker references were comment-only.
+- **OPS: TWS auto-logoff.** Classic TWS logs itself off daily by default — set
+  Global Configuration → Lock and Exit → "Auto restart" so it stays up (weekly re-login
+  Sundays is still required by IBKR). Until that's set, a nightly logoff means the bot's
+  orders fail (visibly, with logged errors) until TWS is logged back in.
 
 ### IBKR paper executor built + verified (2026-07-17) — roadmap item D, 239 tests pass
 IBKR paper environment set up end-to-end and the executor written the same day. No strategy

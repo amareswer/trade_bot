@@ -73,6 +73,39 @@ def read_position_book(
     return trades
 
 
+def load_active_book_state() -> dict:
+    """
+    Position-book account state for the ACTIVE executor (STOCK_EXECUTOR env,
+    set inside the bot process): sim → paper_state.json as-is; ibkr →
+    synthesized from ibkr_state.json + ibkr_trades.csv (cash = last fill's
+    cash_remaining, positions = unpaired BUYs — no TWS call). Same dict shape
+    either way: {cash, starting_cash, realized_pnl, positions, last_updated}.
+    unified_dashboard.py has its own copy of this logic because it runs as a
+    subprocess without the bot's env and must read stock_bot/.env itself.
+    """
+    if os.getenv("STOCK_EXECUTOR", "paper").strip().lower() != "ibkr":
+        return _read_state(_STATE_JSON)
+    ibkr = _read_state(_IBKR_STATE_JSON)
+    if not ibkr:
+        return {}
+    trades = _read_trades(_IBKR_CSV)
+    _, open_pos = _pair_trades(trades)
+    starting = float(ibkr.get("starting_cash", 0.0) or 0.0)
+    cash = float(trades[-1].get("cash_remaining") or 0.0) if trades else starting
+    return {
+        "cash":          cash,
+        "starting_cash": starting,
+        "realized_pnl":  float(ibkr.get("realized_pnl", 0.0) or 0.0),
+        "positions":     {
+            sym: {"shares": p["shares"], "avg_cost": p["avg_cost"]}
+            for sym, p in open_pos.items()
+        },
+        "last_updated":  ibkr.get("last_updated"),
+        "executor":      "ibkr",
+        "account":       ibkr.get("account", ""),
+    }
+
+
 def _read_state(state_path: str) -> dict:
     if not os.path.exists(state_path):
         return {}
