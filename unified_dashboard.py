@@ -454,8 +454,11 @@ def _book_gates_section() -> str:
         'gap:12px;margin-bottom:24px">'
         + block("Crypto · Live", g["sells"], 15, g["pf"], crypto_wr,
                 "BTC/CAD · gate: PF ≥ 1.2 + shadow ≥ 95%")
-        + block("Position Book · Paper", pos_n, 30, pos_pf, pos_wr,
-                "daily candles · gate: PF ≥ 1.2, WR ≥ 30%")
+        + block(
+            "Position Book · IBKR" if _stock_executor_type() == "ibkr"
+            else "Position Book · Paper",
+            pos_n, 30, pos_pf, pos_wr,
+            "daily candles · gate: PF ≥ 1.2, WR ≥ 30%")
         + block("Swing Book · Paper", swi_n, 30, swi_pf, swi_wr,
                 "1h · 48h max hold · gate: PF ≥ 1.2, WR ≥ 30%")
         + "</div>"
@@ -1164,12 +1167,16 @@ def _stock_positions_table(state: dict | None) -> str:
             '</div>'
         )
 
+    _tbl_title = (
+        "📦 Stock Positions — IBKR paper"
+        if state.get("executor") == "ibkr" else "📦 Stock Paper Positions"
+    )
     return (
         '<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;'
         'overflow:hidden;overflow-x:auto;margin-top:16px">'
         '<div style="padding:10px 14px;border-bottom:1px solid #30363d;font-size:11px;'
         'color:#8b949e;text-transform:uppercase;letter-spacing:.05em;font-weight:600">'
-        "📦 Stock Paper Positions"
+        f"{_tbl_title}"
         "</div>"
         '<table style="width:100%;border-collapse:collapse">'
         "<thead><tr>"

@@ -1247,9 +1247,15 @@ def _paper_section_html(paper: PaperSummary) -> str:
     else:
         trades_html = ""
 
+    # Badge reflects the active executor: sim fills ("VIRTUAL") vs real order
+    # routing on the IBKR paper API — the dashboard must show which one is live.
+    if os.getenv("STOCK_EXECUTOR", "paper").strip().lower() == "ibkr":
+        badge = "IBKR PAPER · real order routing, simulated money"
+    else:
+        badge = "VIRTUAL"
     return f"""
   <div class="paper-section">
-    <h2>📄 Paper Trading <span class="paper-label">VIRTUAL</span></h2>
+    <h2>📄 Paper Trading <span class="paper-label">{_e(badge)}</span></h2>
     {summary_bar}
     {positions_html}
     {trades_html}

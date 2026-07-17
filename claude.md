@@ -735,6 +735,17 @@ No strategy files touched (hash `659d1c03987b72fd` still valid).
   made hermetic against real ibkr files). Suite 239 → 241.
 - On connect TWS replays the day's account executions (execDetails) — fills from other
   client IDs (e.g. manual TWS orders) are ignored by the executor, by design.
+- **Dashboard labels follow the active executor (same day, post-switch):** unified gate
+  strip "Position Book · IBKR" (dynamic via `_stock_executor_type()`), positions table
+  "Stock Positions — IBKR paper", and `stock_bot/dashboard/renderer.py`'s Paper Trading
+  section badge "IBKR PAPER · real order routing, simulated money" (reads STOCK_EXECUTOR
+  env; renderer change appears at the stock bot's next restart — cosmetic, no restart
+  needed for it alone). All numbers were already executor-correct; only labels lagged.
+- **Dashboard roles (agreed with user 2026-07-17):** `unified_dashboard.html` is the
+  daily-glance dashboard (both bots, gates, ops, P&L — auto-refreshed every 60s by the
+  crypto bot). `stock_dashboard.html` stays as the stock bot's per-symbol drill-down
+  (rule-signal strip, AI advisory, exit-bar status — the "why did/didn't it act" view).
+  Both are kept; do not fold one into the other without a user decision.
 
 ### IBKR paper executor built + verified (2026-07-17) — roadmap item D, 239 tests pass
 IBKR paper environment set up end-to-end and the executor written the same day. No strategy
