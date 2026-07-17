@@ -165,7 +165,7 @@ A robust crypto trading system that:
 
 ## Test Suite Manifest (as of 2026-07-03)
 
-Expected total: **222 tests** (as of 2026-07-16). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
+Expected total: **239 tests** (as of 2026-07-17). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -192,8 +192,9 @@ Expected total: **222 tests** (as of 2026-07-16). If `pytest --collect-only -q` 
 | `test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last (forming candle), determinism, validated-parameter pin |
 | `test_audit_scheduler.py` | 14 | In-bot audit scheduler: tests REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, monthly 1st-anchored (re-screen), missed-run catch-up |
 | `test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
+| `test_ibkr_executor.py` | 17 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping (.TO↔TSE/CAD), broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence |
 
-Run: `python -m pytest --tb=short -q` — must show **222 passed**.
+Run: `python -m pytest --tb=short -q` — must show **239 passed**.
 
 ---
 
@@ -706,6 +707,46 @@ gate (shadow ≥ 95%) was silently running on stale data.
 - **Crypto bot needs a restart** to start the scheduler thread. On first start after 12:05
   it will immediately catch up today's missed shadow audit.
 
+### IBKR paper executor built + verified (2026-07-17) — roadmap item D, 239 tests pass
+IBKR paper environment set up end-to-end and the executor written the same day. No strategy
+files touched (hash `659d1c03987b72fd` still valid); stock bot NOT yet switched — sim paper
+book remains the Phase A measurement account until a deliberate switch decision.
+- **Accounts:** live U26459664 (approved, deliberately UNFUNDED — paper needs no funding);
+  paper **DUQ273338** (CAD-denominated). Paper page is HIDDEN in the portal menu on unfunded
+  accounts — deep link: `interactivebrokers.com/sso/resolver?action=AccountSettings&config=PaperTrading`.
+  Paper login = usual credentials with the Live/Paper toggle set to Paper.
+- **Mac setup:** classic TWS at `~/Applications/Trader Workstation/` (paper mode, API port
+  7497, localhost-only, Read-Only off, "Bypass Order Precautions for API Orders" checked).
+  **`/Applications/IBKR Desktop` is the WRONG app** (no API support, installed by mistake
+  first, kept for manual use) — never point the bot at it. TWS must be running + logged in
+  for the executor to work.
+- **`stock_bot/execution/ibkr.py` — `IBKRExecutor(StockExecutorBase)`:** full drop-in for
+  StockPaperExecutor (same extra methods main.py calls, same pre-trade sanity gates, same
+  daily-loss breaker + sector cap semantics — risk behavior unchanged, only fills are real).
+  Dedicated event-loop daemon thread + `run_coroutine_threadsafe` (scan loop AND SL/TP
+  watcher call it concurrently). Guards: live ports 7496/4001 raise without
+  `IBKR_ALLOW_LIVE=true`; connected account must start "DU". Market orders wait for fill;
+  on timeout cancel-then-recheck (a fill racing the cancel is recorded — Jul-15 lesson,
+  and it actually happened in the smoke test: TWS reported `filled=0` on a cancelled BUY
+  that later filled server-side, leaving an orphan share we cleaned up).
+  Contract mapping `RY.TO` ↔ `Stock('RY', SMART, CAD, primaryExchange=TSE)`; realized P&L
+  + starting_cash persist in `stock_bot/ibkr_state.json`; fills append to
+  `stock_bot/ibkr_trades.csv` (frozen 9-col schema; both gitignored).
+- **Library: `ib_async` 2.1.0** (maintained successor of the archived ib_insync — same
+  API; earlier roadmap notes saying "ib_insync" mean this). Side effect: pip downgraded
+  tzdata 2026.2→2025.3.
+- **Wiring:** `STOCK_EXECUTOR=paper|ibkr` in stock_bot/.env (+ IBKR_HOST/PORT/CLIENT_ID/
+  ALLOW_LIVE, defaults documented there). `main.py` instantiates by type; a failed IBKR
+  connection raises at startup — never a silent fallback to sim fills.
+- **Verified against live TWS:** read paths PASS; 1-share KO round trip PASS (BUY $83.52 /
+  SELL $83.49). TWS error 10349 ("TIF set to DAY") is a WARNING, not a rejection.
+  Smoke CLI: `.venv/bin/python ibkr_smoke.py [--trade SYMBOL]`.
+- **Account reset $1M → $1,000 CAD requested 2026-07-17** (processes overnight; portal
+  only offers preset $250k or "Other Amount" free entry). Local ibkr_state.json deleted so
+  starting_cash re-seeds from the reset account. **Do not set STOCK_EXECUTOR=ibkr before
+  confirming the reset landed** — sizing against $1M would produce ~$200k allocations.
+- Tests: `test_ibkr_executor.py` (17, hermetic FakeIB — no network/TWS). Suite 222 → 239.
+
 ### Monthly automated re-screen + crypto re-research (2026-07-16) — 222 tests pass
 User direction: "make the crypto bot more powerful" — interpreted as research freely +
 automate evidence refresh; live-money gates unchanged (validation before capital, caps stay).
@@ -918,7 +959,7 @@ Features A, B, E from the roadmap completed. 168 tests pass.
 | ~~A~~ | ~~**Swing book cash tracking**~~ | ~~Add `FAST_STARTING_CASH` + real cash in `FastValidatorState` — unlocks $ expectancy for swing book, same Phase A gate as position book~~ | ~~Medium~~ |
 | ~~B~~ | ~~**Swing book Phase A gate**~~ | ~~Separate 30-trade / PF ≥ 1.2 counter for swing book, independent of position book~~ | ~~Small~~ |
 | ~~C~~ | ~~**Combined dashboard section**~~ | ~~Total capital across both books, per-book PF side by side, combined exposure~~ — DONE 2026-07-14 ("Gates at a Glance" strip, see Dashboard updates 2026-07-14) | ~~Medium~~ |
-| D | **IBKR paper executor** | `IBKRExecutor(StockExecutorBase)` in `stock_bot/execution/ibkr.py` — paper mode first (port 7497), then live gate | Large (~10h) |
+| ~~D~~ | ~~**IBKR paper executor**~~ | DONE 2026-07-17 — built, tested (17 hermetic tests), verified vs live TWS paper (see "IBKR paper executor built"). Remaining: confirm $1k reset landed, then decide when to flip `STOCK_EXECUTOR=ibkr` | ~~Large (~10h)~~ |
 | ~~E~~ | ~~**Earnings blackout for swing book**~~ | ~~Block swing BUY within N days of next earnings — mirrors position-book gate, shares same yfinance fetch~~ | ~~Small~~ |
 
 #### Crypto bot — near term

@@ -70,6 +70,11 @@ class StockConfig:
     alert_email_password:  str   # Gmail app password (not login password)
     alert_desktop_enabled: bool  # plyer desktop notifications (HIGH only)
     paper_trading_enabled: bool  # enable paper trading mode (virtual cash)
+    executor_type:         str   # "paper" (in-memory sim) or "ibkr" (TWS/Gateway paper API)
+    ibkr_host:             str   # TWS/Gateway host (default 127.0.0.1)
+    ibkr_port:             int   # 7497 = TWS paper (7496/4001 live — refused unless allow_live)
+    ibkr_client_id:        int   # TWS API client id for the bot
+    ibkr_allow_live:       bool  # must be true to connect to a live port/account — leave false
     paper_starting_cash:   float # virtual cash balance at startup
     paper_risk_pct:        float # fraction of cash to allocate per trade
     rule_trading_enabled:  bool  # rule-based signals trigger trades; AI is advisory only
@@ -131,6 +136,10 @@ class StockConfig:
         errors = []
         if self.paper_starting_cash <= 0:
             errors.append("PAPER_STARTING_CASH must be > 0")
+        if self.executor_type not in ("paper", "ibkr"):
+            errors.append("STOCK_EXECUTOR must be 'paper' or 'ibkr'")
+        if self.ibkr_port <= 0 or self.ibkr_port > 65535:
+            errors.append("IBKR_PORT must be a valid TCP port")
         if not 0 < self.paper_risk_pct <= 1.0:
             errors.append("PAPER_RISK_PCT must be between 0 (exclusive) and 1.0")
         if not 0 <= self.paper_min_confidence <= 100:
@@ -195,6 +204,11 @@ def load() -> StockConfig:
         alert_email_password  = _str ("ALERT_EMAIL_PASSWORD",  ""),
         alert_desktop_enabled = _bool ("ALERT_DESKTOP_ENABLED",  False),
         paper_trading_enabled  = _bool ("PAPER_TRADING_ENABLED",   False),
+        executor_type          = _str  ("STOCK_EXECUTOR",          "paper").strip().lower(),
+        ibkr_host              = _str  ("IBKR_HOST",               "127.0.0.1"),
+        ibkr_port              = _int  ("IBKR_PORT",               7497),
+        ibkr_client_id         = _int  ("IBKR_CLIENT_ID",          7),
+        ibkr_allow_live        = _bool ("IBKR_ALLOW_LIVE",         False),
         paper_starting_cash    = _float("PAPER_STARTING_CASH",     10_000.0),
         paper_risk_pct         = _float("PAPER_RISK_PCT",          0.10),
         rule_trading_enabled   = _bool ("RULE_TRADING_ENABLED",    True),

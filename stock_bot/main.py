@@ -607,7 +607,23 @@ def run() -> None:
     tracker   = PortfolioTracker(cfg.portfolio)
     evaluator = AlertEvaluator(tracker)
     notifier  = AlertNotifier(cfg)
-    executor  = StockPaperExecutor(cfg.paper_starting_cash, max_exposure_pct=cfg.paper_max_exposure_pct) if cfg.paper_trading_enabled else None
+    # Executor selection: STOCK_EXECUTOR=paper (in-memory sim, default) or
+    # ibkr (real fills on the TWS paper API — requires TWS running, port 7497).
+    # A failed IBKR connection raises and stops startup — the bot must never
+    # silently fall back to simulated fills when real ones were requested.
+    if not cfg.paper_trading_enabled:
+        executor = None
+    elif cfg.executor_type == "ibkr":
+        from stock_bot.execution.ibkr import IBKRExecutor
+        executor = IBKRExecutor(
+            host             = cfg.ibkr_host,
+            port             = cfg.ibkr_port,
+            client_id        = cfg.ibkr_client_id,
+            allow_live       = cfg.ibkr_allow_live,
+            max_exposure_pct = cfg.paper_max_exposure_pct,
+        )
+    else:
+        executor = StockPaperExecutor(cfg.paper_starting_cash, max_exposure_pct=cfg.paper_max_exposure_pct)
     if executor:
         executor.set_daily_loss_limit(cfg.paper_daily_loss_pct)
     if executor:
