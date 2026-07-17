@@ -248,8 +248,9 @@ ADX_THRESHOLD=18
 RSI_FILTER_ENABLED=true
 MIN_EMA_SPREAD_PCT=0.004   # validated 2026-06-27: improves PF +0.15–0.17 in both in-sample and OOS
 VOLUME_K=0
-STOP_LOSS_PCT=0.015
+STOP_LOSS_PCT=0.015   # fallback only as of 2026-07-17 — see ATR_SL_MULT below, takes priority when set
 TAKE_PROFIT_PCT=0.10   # was 0.045 — validated 2026-06-19
+ATR_SL_MULT=2.0   # ADOPTED 2026-07-17 — see "ATR SL adopted live" entry below. backtest.py reads this too (cfg.backtest.atr_sl_mult, same key) — the canonical fingerprint command below now reflects it.
 BACKTEST_LIMIT=5000
 BACKTEST_TIMEFRAME=4h
 EXCHANGE=binance
@@ -260,13 +261,17 @@ EXCHANGE=kraken
 SYMBOL=BTC/CAD
 CANDLE_MINUTES=240   # 4h — now matches the validation timeframe (was 60; the 1h config was never backtested — roadmap item 2 closed by this change)
 RISK_PER_TRADE_PCT=0.10   # intentionally high at $100 capital (Kraken min order ~$4.50 CAD)
-STOP_LOSS_PCT=0.015
+STOP_LOSS_PCT=0.015   # fallback only — ATR_SL_MULT=2.0 takes priority whenever ATR is available at entry (bot/main.py:1813); falls back to this fixed % and logs "ATR SL disabled or unavailable" if ATR can't be computed
 TAKE_PROFIT_PCT=0.10   # confirmed 2026-07-01: matches backtest and regime monitor (was stale 0.045)
 ORDER_TYPE=limit / LIMIT_ORDER_ENABLED=true   # BUY entries limit-chase for maker rate; ALL SL/TP exits forced to market via urgent=True (2026-07-04)
 
 ### How to verify the config is active
 Run: EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py
-Expected: ~39 trades, PF ~1.79 (see note below on trade count evolution)
+Expected (as of ATR_SL_MULT=2.0, 2026-07-17): 35 trades, PF ~1.98 (confirmed same day — matches
+the 5000c row of `logs/atr_walkforward_BTC_2.0_20260717.md` exactly). The older "39 trades,
+PF ~1.79" figure below (Canonical strategy fingerprint section) was the fixed-SL-only result —
+still correct for STRATEGY hash purposes (SL/TP are config, not strategy files) but no longer
+what a fresh `backtest.py` run reproduces, since ATR_SL_MULT now overrides fixed SL by default.
 If RSI_FILTER_ENABLED=false accidentally: trade count jumps significantly, PF drops below 1.2
 
 Reproducible pinned-window verification (identical result to rolling run):
@@ -294,6 +299,9 @@ Note — trade count evolution:
   - *(fingerprint.py and __init__.py excluded — non-behavioral)*
 - **Window:** BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-06-20 (pinned) or rolling 5000 × 4h (same trade count)
 - **Result:** 39 trades, PF 1.77 (range 1.77–1.79 depending on rolling-window end date; all > 1.0)
+  — this was the fixed-SL-only fingerprint. As of 2026-07-17, `ATR_SL_MULT=2.0` is live (see
+  "ATR SL adopted live" entry below) — the hash itself is unchanged (SL is config, not a
+  strategy file) but a fresh `backtest.py` run now returns 35 trades / PF ~1.98, not this figure.
 - **Stamped:** run `python stamp_strategy.py` after each passing walk-forward to write `logs/validated_strategy_hash`
 - If the bot or backtest prints `STRATEGY CODE DIFFERS`, re-run walk-forward before trusting any PF numbers
 - Prior hash `d3c7c383d91d5ef9` (2026-07-02) was computed over all `bot/strategy/*.py` including fingerprint.py — that scope was wrong. Hash value changed when scope was corrected to behavior-only files. No strategy logic changed.
@@ -954,6 +962,34 @@ is now validated by both methods this project uses (recency-robustness sweep + t
 holdout) and both are clean. Report: `logs/atr_walkforward_BTC_2.0_20260717.md`.
 **Still not adopted — this is the last research gate before a go/no-go decision on
 `ATR_SL_MULT=2.0` in live `.env`, which was deliberately left to the user, not auto-applied.**
+
+### ATR SL adopted live — ATR_SL_MULT 0.0 → 2.0 (2026-07-17) — 243 tests pass, strategy hash unchanged
+User approved after reviewing both validation results above. `.env`: `ATR_SL_MULT=0.0` → `2.0`.
+`STOP_LOSS_PCT=0.015` stays in place as the documented fallback — `bot/main.py:1813` already
+falls back to it (logging "ATR SL disabled or unavailable — using fixed SL/TP") on any entry
+where ATR can't be computed; this is pre-existing, tested behavior, not new code.
+- **This is a config change, not a strategy change** — `bot/strategy/*.py` untouched, hash
+  `659d1c03987b72fd` stays valid, no `stamp_strategy.py` re-run needed (Validation Discipline:
+  "Changes to config, execution, risk, data, or tests do NOT invalidate the hash").
+- **Verified same day:** `EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py` now returns
+  35 trades / PF 1.98, exactly matching the 5000c row of the walk-forward report — confirms
+  `.env` and the backtest/live code paths agree (the 2026-07-02 ATR SL drift incident was
+  exactly this kind of mismatch going undetected, hence checking explicitly here).
+- **Full suite (243) re-run after the `.env` edit — unaffected** (no test forces a specific
+  SL variant at the unit level; `walkforward.py`'s own canonical run stays fixed-SL-only,
+  since it never passes `atr_sl_mult` to `engine.run()` — only `backtest.py` and the live bot
+  read `ATR_SL_MULT` from `.env`).
+- Two new reusable research scripts added this session: `atr_oos_validation.py` (non-overlapping
+  train/validation split, any symbol/multiplier via `SYMBOL=`/`ATR_MULT=`) and
+  `atr_walkforward.py` (canonical 5000/4000/3000/2000/1000 trailing-window sweep, same env vars).
+- **Crypto bot needs a restart** to pick up the new `.env` — live SL exits will compute against
+  `entry_price - ATR(14)×2.0` instead of `entry_price × (1 - 0.015)` from the next BUY onward;
+  any position already open at restart keeps whatever SL was set at its own entry.
+- **Watch for going forward:** expect a lower stop-out rate on the next live SL exits (walk-forward
+  showed 71%→49% on the fullest window) and possibly wider-than-1.5%-stop losses on any trade that
+  does hit stop, since ATR-based stops are usually looser than the old fixed 1.5%. This trades
+  fewer-but-larger occasional losses for meaningfully fewer stop-outs overall — consistent with
+  the validated PF improvement, but worth knowing before the first live ATR stop fires.
 
 ### Affordable-symbol screen (2026-07-15) — 7 new RULE_WHITELIST symbols, 216 tests pass
 Goal: widen the funnel of symbols that can actually FILL at the ~$197 target allocation
