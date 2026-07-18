@@ -165,7 +165,7 @@ A robust crypto trading system that:
 
 ## Test Suite Manifest (as of 2026-07-03)
 
-Expected total: **280 tests** (as of 2026-07-17 late). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
+Expected total: **286 tests** (as of 2026-07-18). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -198,8 +198,9 @@ Expected total: **280 tests** (as of 2026-07-17 late). If `pytest --collect-only
 | `test_atr_sizing.py` | 7 | calc_trade_qty_atr_risk: dollar-risk-at-stop == fixed-SL baseline, tight-stop cap, fallbacks |
 | `test_stock_telegram.py` | 7 | Stock→Telegram relay: root-.env credential sourcing, ops_alert/fill forwarding, HIGH-only filter, channel-off no-ops |
 | `test_crash_hardening.py` | 9 | atomic_write_json (valid/replace/no-tmp/parents/old-file-preserved), send_now sync + disabled, crash-alert helpers never raise |
+| `test_engine_params.py` | 6 | `engine_kwargs_from_cfg` builder: keys accepted by engine.run, ATR keys sourced from cfg, previously-drifted keys present, macd_enabled deliberately excluded, both validation scripts use the builder |
 
-Run: `python -m pytest --tb=short -q` — must show **280 passed**.
+Run: `python -m pytest --tb=short -q` — must show **286 passed**.
 
 ---
 
@@ -985,7 +986,9 @@ where ATR can't be computed; this is pre-existing, tested behavior, not new code
 - **Full suite (243) re-run after the `.env` edit — unaffected** (no test forces a specific
   SL variant at the unit level; `walkforward.py`'s own canonical run stays fixed-SL-only,
   since it never passes `atr_sl_mult` to `engine.run()` — only `backtest.py` and the live bot
-  read `ATR_SL_MULT` from `.env`).
+  read `ATR_SL_MULT` from `.env`). SUPERSEDED 2026-07-18: walkforward.py now builds its
+  engine kwargs from the shared `engine_kwargs_from_cfg()` and runs the full live config,
+  ATR SL + sizing included — see "Validation-script config drift fixed" entry below.
 - Two new reusable research scripts added this session: `atr_oos_validation.py` (non-overlapping
   train/validation split, any symbol/multiplier via `SYMBOL=`/`ATR_MULT=`) and
   `atr_walkforward.py` (canonical 5000/4000/3000/2000/1000 trailing-window sweep, same env vars).
@@ -1133,6 +1136,45 @@ nothing to build locally.**
 TWS monitor running clean; Telegram end-to-end confirmed by user ("🔧 Direct send-path
 test" received). Watch Monday: CM's first rule signal through the fixed NYSE contract
 mapping should FILL — arriving as a 🟢 BUY Telegram message.
+
+### Validation-script config drift fixed — shared engine-kwargs builder (2026-07-18) — 286 tests pass
+Follow-up to the ATR adoptions: audit found `walkforward.py` hand-listed a PARTIAL, stale
+engine.run() arg set — it was validating a config that differed from live in at least six
+ways: `volume_k` missing (engine default 1.2 vs validated 0 = filter OFF), `min_ema_spread_pct`
+missing (0.002 vs validated 0.004), a stale hardcoded 0.5% `max_ema_spread_pct` ceiling
+(live runs 0.0 = disabled), `adx_max`/regime/partial-TP params missing, and NO ATR keys
+(`ATR_SL_MULT`, `ATR_SIZING_ENABLED`) — so the Validation Discipline workflow's step 3 ran a
+config nobody trades. Same failure class as the 2026-07-02 ATR SL drift incident.
+- **Fix: `bot/backtest/params.py` — `engine_kwargs_from_cfg(cfg)`** is now THE single source
+  of engine kwargs (same pattern as the stock bot's `build_indicator_config()`). Both
+  `backtest.py` (CLI flags override on top) and `walkforward.py` use it; a test pins that
+  they keep doing so and that every emitted key is accepted by `engine.run()`.
+  Tests: `test_engine_params.py` (6, hermetic — fake cfg, never reads live `.env`).
+- **Fingerprint parity verified:** refactored `backtest.py` reproduces 35 trades / PF 1.90,
+  hash `659d1c03987b72fd` — behavior byte-identical to pre-refactor baseline run same day.
+- **New walkforward.py reference numbers (full live config: ATR SL 2.0 + sizing ON,
+  VolK=0, EMA≥0.4%, run 2026-07-18):** training (2024-04-05→2025-02-21, 17 trades)
+  PF 1.16 / −1.11%; validation (2025-02-22→2026-07-18, 18 trades) PF 3.00 / +0.22% —
+  PASS (PF holds ≥1.2 out-of-sample). Prior walkforward numbers in this file were produced
+  under the old drifted arg set and are not comparable.
+- **False-positive CONFIG DRIFT warning fixed:** `ATR_SIZING_ENABLED` was missing from
+  `_KNOWN_STRATEGY_ENV_KEYS` in `config.py` (the adoption added the reader but not the
+  drift-guard whitelist), so EVERY config load — including live bot startups — logged
+  "unrecognised strategy keys: ATR_SIZING_ENABLED". The key was always read correctly
+  (PF 1.90 = sizing ON confirms); only the warning was wrong. Whitelist updated.
+- **OPEN DECISION — macd_enabled live-vs-backtest divergence (found during this audit):**
+  live (`bot/main.py`) and `shadow_signal.py` run `macd_enabled=cfg.strategy.macd_enabled`
+  (True — MACD gates both entry modes), but `backtest.py` never passed it, so every
+  canonical fingerprint was produced with MACD OFF. Measured on the canonical 5000c window
+  (2026-07-18): MACD OFF 35 trades / PF 1.90 / 40.0% win; MACD ON 32 trades / PF 1.72 /
+  37.5% win. Live is STRICTER than what was validated (its trades ⊂ backtest's), so this is
+  a fidelity gap, not a safety hole — but the validated numbers describe a slightly more
+  permissive strategy than the one trading. `engine_kwargs_from_cfg` deliberately EXCLUDES
+  `macd_enabled` (pinned by test) to preserve the canonical fingerprint until the user
+  decides: either (a) add it to the builder and re-validate everything with MACD ON as the
+  new canonical (numbers above suggest PF drops to ~1.72), or (b) set `MACD_ENABLED=false`
+  — but that changes LIVE behavior (same key) and would need its own decision. Do neither
+  silently.
 
 ### Affordable-symbol screen (2026-07-15) — 7 new RULE_WHITELIST symbols, 216 tests pass
 Goal: widen the funnel of symbols that can actually FILL at the ~$197 target allocation

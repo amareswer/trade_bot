@@ -1,0 +1,69 @@
+"""
+Single source of engine.run() kwargs for every validation script.
+
+Why this exists: backtest.py and walkforward.py each hand-listed their
+engine.run() arguments, and the lists drifted apart. By 2026-07-17
+walkforward.py was missing volume_k (engine default 1.2 vs validated 0),
+min_ema_spread_pct (0.002 vs validated 0.004), adx_max, the regime and
+partial-TP params, and the live ATR keys (ATR_SL_MULT / ATR_SIZING_ENABLED)
+— it was validating a config that no longer matched what trades live.
+Same failure class as the 2026-07-02 ATR SL drift incident.
+
+Rule: any script that validates the strategy (backtest.py, walkforward.py,
+future sweeps) builds its engine kwargs HERE and only overrides deliberately
+(e.g. backtest.py's CLI flags). Never hand-list engine.run() args again.
+
+Deliberate exclusions — do not add without a validation decision:
+  - macd_enabled: live (bot/main.py) and shadow_signal.py run with
+    cfg.strategy.macd_enabled (True), but every canonical fingerprint was
+    produced with the engine default (False). Adding it here changes the
+    fingerprint and requires a full walk-forward re-run + CLAUDE.md update.
+  - slippage_pct: engine default 0.0 — fee_pct is the validated cost model.
+"""
+
+
+def engine_kwargs_from_cfg(cfg) -> dict:
+    """Build the full engine.run() kwarg dict from the loaded AppConfig.
+
+    Returns everything except `candles`. Callers may .update() individual
+    keys for CLI overrides before passing to engine.run().
+    """
+    return dict(
+        symbol               = cfg.exchange.symbol,
+        timeframe            = cfg.backtest.timeframe,
+        strategy_mode        = cfg.strategy.mode,
+        starting_cash        = cfg.portfolio.starting_cash,
+        risk_per_trade_pct   = cfg.risk.risk_per_trade_pct,
+        fee_pct              = cfg.backtest.fee_pct,
+        cooldown_ticks       = cfg.risk.cooldown_ticks,
+        rsi_period           = cfg.strategy.rsi_period,
+        rsi_oversold         = cfg.strategy.rsi_oversold,
+        rsi_overbought       = cfg.strategy.rsi_overbought,
+        fast_ema_period      = cfg.strategy.fast_ema_period,
+        slow_ema_period      = cfg.strategy.slow_ema_period,
+        adx_period           = cfg.strategy.adx_period,
+        adx_threshold        = cfg.strategy.adx_threshold,
+        adx_max              = cfg.strategy.adx_max,
+        min_ema_spread_pct   = cfg.strategy.min_ema_spread_pct,
+        max_ema_spread_pct   = cfg.strategy.max_ema_spread_pct,
+        rsi_filter_enabled   = cfg.strategy.rsi_filter_enabled,
+        buy_threshold        = cfg.strategy.buy_threshold,
+        sell_threshold       = cfg.strategy.sell_threshold,
+        max_position_pct     = cfg.risk.max_position_pct,
+        daily_loss_limit_pct = cfg.risk.daily_loss_limit_pct,
+        max_drawdown_pct     = 0.25,
+        max_trades_per_day   = cfg.risk.max_trades_per_day,
+        stop_loss_pct        = cfg.backtest.stop_loss_pct,
+        take_profit_pct      = cfg.backtest.take_profit_pct,
+        trail_stop_pct            = cfg.backtest.trail_stop_pct,
+        trail_stop_activation_pct = cfg.backtest.trail_stop_activation_pct,
+        partial_tp_pct       = cfg.backtest.partial_tp_pct,
+        partial_tp_size      = cfg.backtest.partial_tp_size,
+        regime_ema_period       = cfg.strategy.regime_ema_period,
+        regime_ema_slope_filter = cfg.strategy.regime_ema_slope_filter,
+        volume_k                = cfg.strategy.volume_k,
+        atr_volatile_multiplier = cfg.strategy.atr_volatile_multiplier,
+        atr_sl_mult             = cfg.backtest.atr_sl_mult,
+        atr_risk_sizing         = cfg.backtest.atr_sizing_enabled,
+        atr_sizing_baseline_sl_pct = cfg.backtest.stop_loss_pct or 0.015,
+    )

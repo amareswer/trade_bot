@@ -25,6 +25,7 @@ logging.basicConfig(level=logging.WARNING)
 from config import cfg
 from bot.data.historical_feed import fetch_candles_paginated
 from bot.backtest import engine, metrics as metrics_mod, report
+from bot.backtest.params import engine_kwargs_from_cfg
 from bot.backtest.attribution import compute_attribution, print_attribution, save_attribution_csv
 from bot.strategy.fingerprint import compute_strategy_hash
 
@@ -105,46 +106,14 @@ def main():
     )
     print(f"  Running backtest …\n")
 
-    result = engine.run(
-        candles                 = candles,
-        symbol                  = cfg.exchange.symbol,
-        timeframe               = cfg.backtest.timeframe,
-        strategy_mode           = cfg.strategy.mode,
-        starting_cash           = cfg.portfolio.starting_cash,
-        risk_per_trade_pct      = cfg.risk.risk_per_trade_pct,
-        fee_pct                 = args.fee,
-        cooldown_ticks          = cfg.risk.cooldown_ticks,
-        rsi_period              = cfg.strategy.rsi_period,
-        rsi_oversold            = cfg.strategy.rsi_oversold,
-        rsi_overbought          = cfg.strategy.rsi_overbought,
-        fast_ema_period         = cfg.strategy.fast_ema_period,
-        slow_ema_period         = cfg.strategy.slow_ema_period,
-        adx_period              = cfg.strategy.adx_period,
-        adx_threshold           = cfg.strategy.adx_threshold,
-        adx_max                 = cfg.strategy.adx_max,
-        min_ema_spread_pct      = cfg.strategy.min_ema_spread_pct,
-        max_ema_spread_pct      = cfg.strategy.max_ema_spread_pct,
-        rsi_filter_enabled      = cfg.strategy.rsi_filter_enabled,
-        buy_threshold           = cfg.strategy.buy_threshold,
-        sell_threshold          = cfg.strategy.sell_threshold,
-        max_position_pct        = cfg.risk.max_position_pct,
-        daily_loss_limit_pct    = cfg.risk.daily_loss_limit_pct,
-        max_drawdown_pct        = args.max_drawdown,
-        max_trades_per_day      = cfg.risk.max_trades_per_day,
-        stop_loss_pct           = args.stop_loss,
-        take_profit_pct         = args.take_profit,
-        trail_stop_pct              = cfg.backtest.trail_stop_pct,
-        trail_stop_activation_pct   = cfg.backtest.trail_stop_activation_pct,
-        partial_tp_pct          = cfg.backtest.partial_tp_pct,
-        partial_tp_size         = cfg.backtest.partial_tp_size,
-        regime_ema_period       = cfg.strategy.regime_ema_period,
-        regime_ema_slope_filter = cfg.strategy.regime_ema_slope_filter,
-        volume_k                = cfg.strategy.volume_k,
-        atr_volatile_multiplier = cfg.strategy.atr_volatile_multiplier,
-        atr_sl_mult             = cfg.backtest.atr_sl_mult,
-        atr_risk_sizing         = cfg.backtest.atr_sizing_enabled,
-        atr_sizing_baseline_sl_pct = cfg.backtest.stop_loss_pct or 0.015,
+    run_kwargs = engine_kwargs_from_cfg(cfg)
+    run_kwargs.update(
+        fee_pct          = args.fee,
+        max_drawdown_pct = args.max_drawdown,
+        stop_loss_pct    = args.stop_loss,
+        take_profit_pct  = args.take_profit,
     )
+    result = engine.run(candles=candles, **run_kwargs)
 
     m = metrics_mod.compute(result)
     report.print_report(m, result)

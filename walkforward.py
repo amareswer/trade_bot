@@ -23,6 +23,7 @@ from config import cfg
 from bot.data.historical_feed import fetch_candles_paginated, slice_candles
 from bot.backtest import engine, metrics as metrics_mod
 from bot.backtest.attribution import compute_attribution, print_attribution
+from bot.backtest.params import engine_kwargs_from_cfg
 
 # ── Split dates ───────────────────────────────────────────────────────────────
 TRAIN_START = "2024-02-22"
@@ -30,14 +31,21 @@ TRAIN_END   = "2025-02-22"
 VAL_START   = "2025-02-22"
 VAL_END     = None           # through present
 
-# ── Best config found in Exp 2 — do not change these ─────────────────────────
-# These are the parameters being validated, not optimised here.
-VALIDATED_CONFIG = dict(
-    adx_threshold      = 18.0,
-    max_ema_spread_pct = 0.005,   # 0.5% ceiling
-    rsi_filter_enabled = True,
-    # Everything else from cfg
-)
+# All engine parameters come from engine_kwargs_from_cfg() — the same .env-backed
+# source backtest.py uses. This script validates the ACTIVE config, nothing else.
+# (Until 2026-07-17 it hand-listed a partial arg set that had drifted from live:
+# volume filter on, min EMA spread 0.2%, stale 0.5% spread ceiling, no ATR keys.)
+
+
+def _config_summary() -> str:
+    """One-line description of the active config for the report header."""
+    b, s = cfg.backtest, cfg.strategy
+    sl = (f"ATRx{b.atr_sl_mult}" if b.atr_sl_mult > 0
+          else f"{b.stop_loss_pct*100:.1f}%")
+    return (f"ADX≥{s.adx_threshold:g}  EMA≥{s.min_ema_spread_pct*100:.1f}%  "
+            f"RSI={'on' if s.rsi_filter_enabled else 'off'}  "
+            f"VolK={s.volume_k:g}  SL={sl}  TP={b.take_profit_pct*100:.0f}%  "
+            f"ATRsizing={'on' if b.atr_sizing_enabled else 'off'}")
 
 
 def run_period(candles, label, start, end):
@@ -51,35 +59,7 @@ def run_period(candles, label, start, end):
           f"({period_candles[0].timestamp.strftime('%Y-%m-%d')} → "
           f"{period_candles[-1].timestamp.strftime('%Y-%m-%d')})")
 
-    result = engine.run(
-        candles              = period_candles,
-        symbol               = cfg.exchange.symbol,
-        timeframe            = cfg.backtest.timeframe,
-        strategy_mode        = cfg.strategy.mode,
-        starting_cash        = cfg.portfolio.starting_cash,
-        risk_per_trade_pct   = cfg.risk.risk_per_trade_pct,
-        fee_pct              = cfg.backtest.fee_pct,
-        cooldown_ticks       = cfg.risk.cooldown_ticks,
-        rsi_period           = cfg.strategy.rsi_period,
-        rsi_oversold         = cfg.strategy.rsi_oversold,
-        rsi_overbought       = cfg.strategy.rsi_overbought,
-        fast_ema_period      = cfg.strategy.fast_ema_period,
-        slow_ema_period      = cfg.strategy.slow_ema_period,
-        adx_period           = cfg.strategy.adx_period,
-        adx_threshold        = VALIDATED_CONFIG["adx_threshold"],
-        max_ema_spread_pct   = VALIDATED_CONFIG["max_ema_spread_pct"],
-        rsi_filter_enabled   = VALIDATED_CONFIG["rsi_filter_enabled"],
-        buy_threshold        = cfg.strategy.buy_threshold,
-        sell_threshold       = cfg.strategy.sell_threshold,
-        max_position_pct     = cfg.risk.max_position_pct,
-        daily_loss_limit_pct = cfg.risk.daily_loss_limit_pct,
-        max_drawdown_pct     = 0.25,
-        max_trades_per_day   = cfg.risk.max_trades_per_day,
-        stop_loss_pct             = cfg.backtest.stop_loss_pct,
-        take_profit_pct           = cfg.backtest.take_profit_pct,
-        trail_stop_pct            = cfg.backtest.trail_stop_pct,
-        trail_stop_activation_pct = cfg.backtest.trail_stop_activation_pct,
-    )
+    result = engine.run(candles=period_candles, **engine_kwargs_from_cfg(cfg))
     m = metrics_mod.compute(result)
     return m, result
 
@@ -103,9 +83,7 @@ def print_comparison(train_m, train_r, val_m, val_r):
 
     print(f"\n{_B}{bar}{_R}")
     print(f"  {_B}WALK-FORWARD VALIDATION RESULTS{_R}")
-    print(f"  Config: ADX≥{VALIDATED_CONFIG['adx_threshold']}  "
-          f"EMA≤{VALIDATED_CONFIG['max_ema_spread_pct']*100:.1f}%  "
-          f"RSI={'on' if VALIDATED_CONFIG['rsi_filter_enabled'] else 'off'}")
+    print(f"  Config: {_config_summary()}")
     print(f"{_B}{bar}{_R}\n")
 
     col = 24
