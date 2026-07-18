@@ -165,7 +165,7 @@ A robust crypto trading system that:
 
 ## Test Suite Manifest (as of 2026-07-03)
 
-Expected total: **286 tests** (as of 2026-07-18). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
+Expected total: **289 tests** (as of 2026-07-18). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -192,7 +192,7 @@ Expected total: **286 tests** (as of 2026-07-18). If `pytest --collect-only -q` 
 | `test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last (forming candle), determinism, validated-parameter pin |
 | `test_audit_scheduler.py` | 14 | In-bot audit scheduler: tests REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, monthly 1st-anchored (re-screen), missed-run catch-up |
 | `test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
-| `test_ibkr_executor.py` | 18 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping (.TO↔TSE/CAD, bare NYSE cross-listings→NYSE), broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence |
+| `test_ibkr_executor.py` | 21 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping (.TO↔TSE/CAD, bare NYSE cross-listings→NYSE), broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe (redial/never-raise/no-op) |
 | `test_heartbeat.py` | 8 | Heartbeat pings (bot/alerts/heartbeat.py): URL-off, success/failure never raise, healthy_fn gate |
 | `test_tws_monitor.py` | 6 | TwsConnectionMonitor state machine: blip tolerance, alert-once per outage, recovery notice |
 | `test_atr_sizing.py` | 7 | calc_trade_qty_atr_risk: dollar-risk-at-stop == fixed-SL baseline, tight-stop cap, fallbacks |
@@ -200,7 +200,7 @@ Expected total: **286 tests** (as of 2026-07-18). If `pytest --collect-only -q` 
 | `test_crash_hardening.py` | 9 | atomic_write_json (valid/replace/no-tmp/parents/old-file-preserved), send_now sync + disabled, crash-alert helpers never raise |
 | `test_engine_params.py` | 6 | `engine_kwargs_from_cfg` builder: keys accepted by engine.run, ATR keys sourced from cfg, previously-drifted keys present, macd_enabled deliberately excluded, both validation scripts use the builder |
 
-Run: `python -m pytest --tb=short -q` — must show **286 passed**.
+Run: `python -m pytest --tb=short -q` — must show **289 passed**.
 
 ---
 
@@ -1175,6 +1175,23 @@ config nobody trades. Same failure class as the 2026-07-02 ATR SL drift incident
   new canonical (numbers above suggest PF drops to ~1.72), or (b) set `MACD_ENABLED=false`
   — but that changes LIVE behavior (same key) and would need its own decision. Do neither
   silently.
+
+### TWS "restored" notice actually fires now — reconnect probe (2026-07-18) — 289 tests pass
+First real outage (TWS daily logoff, Sat 08:00 ET) proved the down-alert works end-to-end
+(user received it), and exposed the recovery half's gap: `is_connected` only REPORTS the
+socket state, ib_async never redials on its own, and `_ensure_connected_async()` ran only
+at order placement — so after logging back into TWS the socket stayed dead, the monitor's
+"restored" notice never fired, and the stock-tws heartbeat stayed red until the next order
+(possibly days later on a weekend).
+- **`IBKRExecutor.try_reconnect()` (new):** non-raising redial probe (non-blocking lock
+  guards concurrent probes; DEBUG-logs failures). The TWS monitor thread calls it every
+  5th tick (~5 min) while disconnected — a relogged-in TWS now produces the
+  "TWS connection restored" ops alert within ~5 min, and the TWS heartbeat resumes
+  pinging healthchecks.io on its own.
+- Tests: `test_ibkr_executor.py` 18 → 21 (redial after socket drop, never-raises while
+  TWS still down, no redial while healthy). Suite 286 → 289.
+- **Stock bot needs a restart** to run the probe — the pre-fix instance will NOT send the
+  restored notice when TWS comes back; restart it before (or when) logging into TWS.
 
 ### Affordable-symbol screen (2026-07-15) — 7 new RULE_WHITELIST symbols, 216 tests pass
 Goal: widen the funnel of symbols that can actually FILL at the ~$197 target allocation

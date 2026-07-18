@@ -125,6 +125,7 @@ class IBKRExecutor(StockExecutorBase):
         self._daily_loss_tripped: bool = False
         self._slippage_bps: int = 0        # real broker — kept only for interface parity
         self._state_lock = threading.Lock()
+        self._reconnect_lock = threading.Lock()
 
         # ── dedicated event-loop thread ──────────────────────────────────────
         self._loop = asyncio.new_event_loop()
@@ -225,6 +226,29 @@ class IBKRExecutor(StockExecutorBase):
             return bool(self._call(_chk(), timeout=5))
         except Exception:
             return False
+
+    def try_reconnect(self) -> bool:
+        """Re-establish the TWS API socket if it is down. Never raises.
+
+        ib_async does not redial on its own after TWS drops the socket
+        (nightly auto-logoff, weekend maintenance), and _ensure_connected_async
+        otherwise runs only at order placement — so a TWS that came back
+        would go undetected (no "restored" notice, TWS heartbeat stays red)
+        until the next order. The TWS monitor thread calls this while the
+        connection is down. Returns the resulting connection state; a probe
+        already in flight from another thread returns False immediately.
+        """
+        if not self._reconnect_lock.acquire(blocking=False):
+            return False
+        try:
+            self._call(self._ensure_connected_async(),
+                       timeout=self._connect_timeout_s + 5)
+            return True
+        except Exception as exc:
+            logger.debug("TWS reconnect probe failed: %s", exc)
+            return False
+        finally:
+            self._reconnect_lock.release()
 
     # ── contract mapping ─────────────────────────────────────────────────────
 

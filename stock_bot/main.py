@@ -773,9 +773,21 @@ def run() -> None:
             mon = TwsConnectionMonitor(
                 alert_after_s=float(os.getenv("TWS_DISCONNECT_ALERT_MIN", "10")) * 60
             )
+            down_ticks = 0
             while True:
                 try:
-                    event = mon.update(bool(executor.is_connected), time.time())
+                    connected = bool(executor.is_connected)
+                    if not connected:
+                        # ib_async never redials on its own; probe every 5th
+                        # tick (~5 min) so a relogged-in TWS is detected —
+                        # and the "restored" notice fires — without waiting
+                        # for the next order attempt.
+                        down_ticks += 1
+                        if down_ticks % 5 == 0 and executor.try_reconnect():
+                            connected = bool(executor.is_connected)
+                    else:
+                        down_ticks = 0
+                    event = mon.update(connected, time.time())
                     if event == "down":
                         notifier.ops_alert(
                             "TWS connection lost",

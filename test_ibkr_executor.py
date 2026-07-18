@@ -336,3 +336,57 @@ def test_realized_pnl_persists_across_instances(executors, tmp_path):
     ex2 = make_executor(fake2)
     executors.append(ex2)
     assert ex2.realized_pnl() == pytest.approx(pnl, abs=0.01)
+
+
+# ---------------------------------------------------------------------------
+# Reconnect probe (TWS monitor leg — 2026-07-18)
+# ---------------------------------------------------------------------------
+
+def test_try_reconnect_redials_after_socket_drop(executors):
+    """After TWS drops the socket (nightly logoff), try_reconnect restores it
+    — this is what lets the monitor fire "restored" without waiting for the
+    next order."""
+    fake = FakeIB()
+    ex = make_executor(fake)
+    executors.append(ex)
+
+    fake.disconnect()                      # TWS logged off
+    assert not ex.is_connected
+    assert ex.try_reconnect() is True      # TWS is back — probe redials
+    assert ex.is_connected
+
+
+def test_try_reconnect_never_raises_while_tws_still_down(executors):
+    class FlakyIB(FakeIB):
+        fail_reconnect = False
+
+        async def connectAsync(self, *a, **k):
+            if self.fail_reconnect:
+                raise ConnectionRefusedError("TWS still down")
+            await super().connectAsync(*a, **k)
+
+    fake = FlakyIB()
+    ex = make_executor(fake)
+    executors.append(ex)
+
+    fake.fail_reconnect = True
+    fake.disconnect()
+    assert ex.try_reconnect() is False     # swallowed, not raised
+    assert not ex.is_connected
+
+
+def test_try_reconnect_noop_when_already_connected(executors):
+    class CountingIB(FakeIB):
+        connect_calls = 0
+
+        async def connectAsync(self, *a, **k):
+            self.connect_calls += 1
+            await super().connectAsync(*a, **k)
+
+    fake = CountingIB()
+    ex = make_executor(fake)
+    executors.append(ex)
+
+    assert fake.connect_calls == 1         # startup connect only
+    assert ex.try_reconnect() is True
+    assert fake.connect_calls == 1         # no redial while healthy
