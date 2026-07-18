@@ -256,6 +256,7 @@ VOLUME_K=0
 STOP_LOSS_PCT=0.015   # fallback only as of 2026-07-17 — see ATR_SL_MULT below, takes priority when set
 TAKE_PROFIT_PCT=0.10   # was 0.045 — validated 2026-06-19
 ATR_SL_MULT=2.0   # ADOPTED 2026-07-17 — see "ATR SL adopted live" entry below. backtest.py reads this too (cfg.backtest.atr_sl_mult, same key) — the canonical fingerprint command below now reflects it.
+ATR_SIZING_ENABLED=true   # ADOPTED 2026-07-17 (same evening): caps BUY qty so an ATR stop-out never risks more $ than the fixed-SL baseline (cash × RISK_PER_TRADE_PCT × STOP_LOSS_PCT). Validated: 5-window walk-forward with sizing ON all PF > 1.0 (1.90/2.24/3.46/3.29/2.03). One key, read by BOTH StrategyConfig and BacktestConfig.
 BACKTEST_LIMIT=5000
 BACKTEST_TIMEFRAME=4h
 EXCHANGE=binance
@@ -272,8 +273,9 @@ ORDER_TYPE=limit / LIMIT_ORDER_ENABLED=true   # BUY entries limit-chase for make
 
 ### How to verify the config is active
 Run: EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py
-Expected (as of ATR_SL_MULT=2.0, 2026-07-17): 35 trades, PF ~1.98 (confirmed same day — matches
-the 5000c row of `logs/atr_walkforward_BTC_2.0_20260717.md` exactly). The older "39 trades,
+Expected (as of ATR_SIZING_ENABLED=true, 2026-07-17 late): 35 trades, PF ~1.90 (confirmed at
+adoption — matches the 5000c ATR row of the sizing-ON walk-forward exactly; with sizing OFF
+the expectation is PF ~1.98, the `logs/atr_walkforward_BTC_2.0_20260717.md` figure). The older "39 trades,
 PF ~1.79" figure below (Canonical strategy fingerprint section) was the fixed-SL-only result —
 still correct for STRATEGY hash purposes (SL/TP are config, not strategy files) but no longer
 what a fresh `backtest.py` run reproduces, since ATR_SL_MULT now overrides fixed SL by default.
@@ -1060,9 +1062,12 @@ pass-through. Tests: `test_atr_sizing.py` (7). **Validation run (sizing ON, BTC 
 5-window):** PF 1.90/2.24/3.46/3.29/2.03 — all 5 windows > 1.0 and every window still
 beats fixed-SL. Canonical fingerprint with flag OFF re-verified same session: 35 trades /
 PF 1.98, unchanged. Report `logs/atr_walkforward_BTC_2.0_20260718.md` (UTC date).
-**Adoption = set `ATR_SIZING_ENABLED=true` in `.env` — deliberately left to the user,
-same as the ATR_SL_MULT adoption.** Note: at $77 slot cash the cap rarely binds (the
-existing 98%-affordability clamp dominates); this matters as capital grows.
+**ADOPTED same night (user approved "proceed with 1"): `ATR_SIZING_ENABLED=true` in
+`.env`.** Fresh `backtest.py` now returns 35 trades / PF 1.90 (matches the sizing-ON
+5000c walk-forward row exactly — env/code agreement verified at adoption). Rationale for
+flipping BEFORE gate fills accumulate: all 15 capital-gate trades get measured under one
+consistent sizing config. Note: at $77 slot cash the cap rarely binds (the existing
+98%-affordability clamp dominates); this matters as capital grows.
 
 **5. SYN/LINK ATR OOS validations run (roadmap K progress):** same
 `atr_oos_validation.py` non-overlapping split as the SOL/BTC runs.
