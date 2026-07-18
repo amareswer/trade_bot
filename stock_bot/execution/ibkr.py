@@ -683,8 +683,8 @@ class IBKRExecutor(StockExecutorBase):
             "last_updated": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         }
         try:
-            with open(_STATE_JSON, "w", encoding="utf-8") as f:
-                json.dump(state, f, indent=2)
+            from bot.atomic_json import atomic_write_json
+            atomic_write_json(_STATE_JSON, state)
         except OSError as exc:
             logger.warning("Could not save ibkr_state.json: %s", exc)
 

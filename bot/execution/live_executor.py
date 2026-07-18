@@ -317,11 +317,8 @@ class LiveExecutor:
             "saved_at":     datetime.now(timezone.utc).isoformat(),
         }
         try:
-            dirpath = os.path.dirname(self._state_path)
-            if dirpath:
-                os.makedirs(dirpath, exist_ok=True)
-            with open(self._state_path, "w") as f:
-                json.dump(state, f, indent=2)
+            from bot.atomic_json import atomic_write_json
+            atomic_write_json(self._state_path, state)
             logger.warning(
                 "State saved: cash=%.2f pos=%.6f", state["cash"], state["position"],
             )

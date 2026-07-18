@@ -89,6 +89,14 @@ class TelegramAlerter:
         its alert taxonomy doesn't map onto the typed methods above)."""
         self._send_async(text)
 
+    def send_now(self, text: str) -> None:
+        """SYNCHRONOUS send — blocks up to the request timeout. Only for
+        process-exit paths (fatal-crash alert): the usual daemon-thread send
+        races process teardown and the message can be lost."""
+        if not self._enabled:
+            return
+        self._send(text)
+
     def error(self, message: str) -> None:
         msg = f"⚠️ BOT ERROR\n{message}\n{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
         self._send_async(msg)

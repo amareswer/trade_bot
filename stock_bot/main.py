@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import os
+import signal as _signal_module
 import sys
 import threading
 import time
@@ -585,9 +586,16 @@ _last_universe_refresh = None                                        # datetime 
 _UNIVERSE_REFRESH_HOUR = int(_os.getenv("UNIVERSE_REFRESH_HOUR", "16"))  # 4pm ET default
 
 
+def _handle_sigterm(sig, frame):
+    # Route SIGTERM (launchd/systemd/kill default) into the existing
+    # KeyboardInterrupt path so the loop exits gracefully, not mid-write.
+    raise KeyboardInterrupt
+
+
 def run() -> None:
     global _last_universe_refresh
     _setup_logging()
+    _signal_module.signal(_signal_module.SIGTERM, _handle_sigterm)
     cfg = load()
     cfg.log_startup()
 
@@ -1417,5 +1425,26 @@ def run() -> None:
         print("\n⛔ Stock Bot stopped. Goodbye!")
 
 
+def _send_crash_alert(tb: str) -> None:
+    """Last-gasp Telegram alert on fatal crash (synchronous — the process is
+    about to die). Never raises. Mirrors bot/main.py's handler."""
+    try:
+        from stock_bot.alerts.notifier import _make_telegram
+        alerter = _make_telegram()
+        if alerter is not None:
+            alerter.send_now(f"💀 Stock bot CRASHED\n\n{tb[-900:]}")
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    run()
+    try:
+        run()
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        import traceback as _tb_mod
+        _tb = _tb_mod.format_exc()
+        logger.critical("FATAL CRASH — stock bot exiting:\n%s", _tb)
+        _send_crash_alert(_tb)
+        raise

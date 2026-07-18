@@ -165,7 +165,7 @@ A robust crypto trading system that:
 
 ## Test Suite Manifest (as of 2026-07-03)
 
-Expected total: **271 tests** (as of 2026-07-17 pm). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
+Expected total: **280 tests** (as of 2026-07-17 late). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -197,8 +197,9 @@ Expected total: **271 tests** (as of 2026-07-17 pm). If `pytest --collect-only -
 | `test_tws_monitor.py` | 6 | TwsConnectionMonitor state machine: blip tolerance, alert-once per outage, recovery notice |
 | `test_atr_sizing.py` | 7 | calc_trade_qty_atr_risk: dollar-risk-at-stop == fixed-SL baseline, tight-stop cap, fallbacks |
 | `test_stock_telegram.py` | 7 | Stock→Telegram relay: root-.env credential sourcing, ops_alert/fill forwarding, HIGH-only filter, channel-off no-ops |
+| `test_crash_hardening.py` | 9 | atomic_write_json (valid/replace/no-tmp/parents/old-file-preserved), send_now sync + disabled, crash-alert helpers never raise |
 
-Run: `python -m pytest --tb=short -q` — must show **271 passed**.
+Run: `python -m pytest --tb=short -q` — must show **280 passed**.
 
 ---
 
@@ -1095,6 +1096,28 @@ nothing to build locally.**
   indistinguishable from a broken channel; the crypto bot already had `alerter.startup`.
   Appears from the stock bot's next natural restart (the 20:35 instance predates it and
   is otherwise fully healthy: TWS monitor clean, all threads up).
+
+**Crash-hardening audit follow-up (same night, items 1–3 of the resilience audit) —
+280 tests pass:**
+- **Fatal-crash Telegram alert, both bots:** `__main__` now wraps `run()` — any unhandled
+  exception logs the full traceback (logger.critical) and fires a synchronous
+  "💀 ... CRASHED" Telegram via new `TelegramAlerter.send_now()` (the usual daemon-thread
+  send races process teardown), then re-raises. Helpers `_send_crash_alert` in both mains;
+  never raise, no-op when Telegram is off. Until healthchecks.io is set up this is the
+  ONLY way a crash reaches the user.
+- **Atomic state writes:** new `bot/atomic_json.py` (tmp + `os.replace`) now used by
+  `live_executor._save_state`, `ibkr._save_state_json`, and the audit-state write in
+  `bot/main.py`. RiskManager already wrote atomically — pattern now shared. A crash or
+  power loss mid-write can no longer truncate live position/cash state (the 2026-06-27
+  incident class). Failed writes preserve the previous good file (tested).
+- **SIGTERM = graceful shutdown:** crypto registers its SIGINT handler for SIGTERM too;
+  stock bot routes SIGTERM into its KeyboardInterrupt path (registered in `run()`).
+  launchd/systemd/`kill` now save state instead of hard-killing.
+- Audit items NOT built (deliberate): launchd auto-start (medium, later), requirements
+  lockfile (small, later), lid-close sleep (ops habit / future VPS), FX sizing (deferred
+  pre-live), TWS auto-restart setting (user side).
+- **Both bots need a restart** to run the new crash paths — fine to fold into the next
+  natural restart; nothing about live trading behavior changes.
 
 **Post-restart verified state (2026-07-17 ~20:40):** crypto bot live with Telegram
 (startup message delivered 20:31); stock bot live on IBKR (DUQ273338, $995.30, flat),

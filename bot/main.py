@@ -96,6 +96,9 @@ def _handle_sigint(sig, frame):
 
 
 _signal_module.signal(_signal_module.SIGINT, _handle_sigint)
+# SIGTERM too (launchd/systemd/kill default) — same graceful path as Ctrl-C,
+# so state saves and the shutdown summary run instead of a hard kill.
+_signal_module.signal(_signal_module.SIGTERM, _handle_sigint)
 
 
 # ---------------------------------------------------------------------------
@@ -454,8 +457,8 @@ def _scheduled_audits_loop() -> None:
                     logger.warning("Scheduled audit %s failed to launch: %s", name, exc)
                     rc = -1
                 state[name] = now.date().isoformat()
-                with open(_AUDIT_STATE_PATH, "w", encoding="utf-8") as f:
-                    json.dump(state, f)
+                from bot.atomic_json import atomic_write_json
+                atomic_write_json(_AUDIT_STATE_PATH, state, indent=0)
                 if rc == 0:
                     logger.info("Scheduled audit %s completed → logs/%s", name, log_name)
                 else:
@@ -1942,5 +1945,29 @@ def run():
     )
 
 
+def _send_crash_alert(bot_name: str, tb: str) -> None:
+    """Last-gasp Telegram alert on fatal crash. Synchronous (the process is
+    about to die — an async send would be lost). Never raises."""
+    try:
+        from bot.alerts.telegram import TelegramAlerter
+        alerter = TelegramAlerter(
+            cfg.alerts.telegram_bot_token,
+            cfg.alerts.telegram_chat_id,
+            enabled=cfg.alerts.telegram_enabled,
+        )
+        alerter.send_now(f"💀 {bot_name} CRASHED\n\n{tb[-900:]}")
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    run()
+    try:
+        run()
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        import traceback as _tb_mod
+        _tb = _tb_mod.format_exc()
+        logger.critical("FATAL CRASH — bot exiting:\n%s", _tb)
+        _send_crash_alert("Crypto bot", _tb)
+        raise
