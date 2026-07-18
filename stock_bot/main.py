@@ -519,7 +519,7 @@ def _is_earnings_blackout(symbol: str, research, cfg) -> bool:
         return False
 
 
-def _check_open_positions_sl_tp(executor, cfg) -> None:
+def _check_open_positions_sl_tp(executor, cfg, notifier=None) -> None:
     """
     Lightweight stop-loss / take-profit check for all open paper positions.
     Fetches only the live price (fast_info) — no OHLCV, no indicators, no AI.
@@ -539,10 +539,18 @@ def _check_open_positions_sl_tp(executor, cfg) -> None:
             order = executor.sell(symbol, shares, live, reason="STOP_LOSS_HIT")
             if order.status == OrderStatus.FILLED:
                 print(f"  🛑 STOP LOSS triggered: {symbol} @ ${live:.2f} ({pct_change:+.1%})")
+                if notifier:
+                    notifier.fill("SELL", symbol, shares, live, shares * live,
+                                  pnl=round((live - avg_cost) * shares, 2),
+                                  reason="stop loss")
         elif pct_change >= cfg.paper_take_profit_pct:
             order = executor.sell(symbol, shares, live, reason="TAKE_PROFIT_HIT")
             if order.status == OrderStatus.FILLED:
                 print(f"  ✅ TAKE PROFIT triggered: {symbol} @ ${live:.2f} ({pct_change:+.1%})")
+                if notifier:
+                    notifier.fill("SELL", symbol, shares, live, shares * live,
+                                  pnl=round((live - avg_cost) * shares, 2),
+                                  reason="take profit")
 
 
 def _run_news_scan(symbols: list[str]) -> None:
@@ -704,7 +712,7 @@ def run() -> None:
         while True:
             try:
                 if _get_market_status()["any_open"]:
-                    _check_open_positions_sl_tp(executor, cfg)
+                    _check_open_positions_sl_tp(executor, cfg, notifier)
                     time.sleep(30)
                 else:
                     time.sleep(300)   # closed — check the clock, not Yahoo
@@ -1198,6 +1206,9 @@ def run() -> None:
                                         total = round(shares * execution_price, 2)
                                         print(f"  📄 PAPER BUY:  {symbol}  {shares} shares")
                                         print(f"                 @ ${execution_price:,.2f} = ${total:,.2f}")
+                                        notifier.fill("BUY", symbol, shares,
+                                                      execution_price, total,
+                                                      reason=reason)
                                         print(f"                 Cash remaining: ${executor.cash:,.2f}")
                                     else:
                                         print(f"  📄 REJECTED:   {symbol} — {order.reject_reason}")
@@ -1220,6 +1231,8 @@ def run() -> None:
                                 exit_policy.clear(symbol)
                                 proceeds  = round(held * execution_price, 2)
                                 trade_pnl = round((execution_price - avg) * held, 2)
+                                notifier.fill("SELL", symbol, held, execution_price,
+                                              proceeds, pnl=trade_pnl, reason=reason)
                                 pnl_pct   = round((execution_price - avg) / avg * 100, 1) if avg else 0.0
                                 logger.info(
                                     "EXIT (%s): %s %.4f sh @ %.2f — %s",

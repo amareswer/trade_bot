@@ -48,6 +48,36 @@ except ImportError:
 _BOX_WIDTH = 50
 
 
+def _make_telegram(root_env: dict | None = None):
+    """Build the shared TelegramAlerter from the ROOT .env credentials
+    (2026-07-17 — one token/chat source for both bots; keys in the process
+    environment, e.g. from stock_bot/.env, override the root file).
+    Returns None when Telegram is not enabled or the crypto package is
+    unavailable — callers must treat None as "channel off"."""
+    try:
+        from bot.alerts.telegram import TelegramAlerter
+    except ImportError:
+        return None
+    if root_env is None:
+        try:
+            from dotenv import dotenv_values
+            root_env = dotenv_values(
+                os.path.join(os.path.dirname(_STOCK_BOT_DIR), ".env")
+            )
+        except Exception:
+            root_env = {}
+
+    def _get(key: str) -> str:
+        return (os.getenv(key) or root_env.get(key) or "").strip()
+
+    if _get("TELEGRAM_ENABLED").lower() != "true":
+        return None
+    token, chat_id = _get("TELEGRAM_BOT_TOKEN"), _get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return None
+    return TelegramAlerter(token, chat_id, enabled=True)
+
+
 def _box_line(text: str = "", fill: str = " ") -> str:
     """Pad text to fixed box width."""
     padded = f"  {text}"
@@ -75,9 +105,12 @@ class AlertNotifier:
     Call start_weekly_summary() after __init__ to arm the Sunday 18:00 timer.
     """
 
-    def __init__(self, config: StockConfig) -> None:
+    def __init__(self, config: StockConfig, telegram_factory=_make_telegram) -> None:
         self._cfg   = config
         self._timer: threading.Timer | None = None
+        self._telegram = telegram_factory()
+        if self._telegram is not None:
+            logger.info("Stock bot Telegram channel active (shared amaresh_tradebot)")
 
     def start_weekly_summary(self) -> None:
         """
@@ -126,15 +159,19 @@ class AlertNotifier:
         )
 
     def ops_alert(self, title: str, message: str) -> None:
-        """Operational alert: log WARNING + terminal + desktop notification.
-        Local-only by design — there is no configured remote channel
-        (Telegram/email were never set up); the remote leg is the
-        healthchecks.io heartbeat. Never raises."""
+        """Operational alert: log WARNING + terminal + desktop notification
+        + Telegram (channel configured 2026-07-17; healthchecks.io heartbeat
+        remains the dead-bot leg). Never raises."""
         logger.warning("OPS ALERT — %s: %s", title, message)
         try:
             print(f"\n{Fore.YELLOW}⚠ {title}: {message}{Style.RESET_ALL}\n", flush=True)
         except Exception:
             pass
+        if self._telegram is not None:
+            try:
+                self._telegram.message(f"⚠️ Stock Bot — {title}\n{message}")
+            except Exception as exc:
+                logger.warning("Telegram ops relay failed: %s", exc)
         if _plyer_available:
             try:
                 _plyer_notification.notify(
@@ -303,6 +340,53 @@ class AlertNotifier:
             self._email(alerts)
         if self._cfg.alert_desktop_enabled:
             self._desktop(alerts)
+        self._telegram_alerts(alerts)
+
+    def _telegram_alerts(self, alerts: list[Alert]) -> None:
+        """HIGH-priority alerts only (same filter as desktop) — MEDIUM
+        strong-buy chatter every scan cycle would drown the channel."""
+        if self._telegram is None:
+            return
+        try:
+            for a in alerts:
+                if a.priority != "HIGH":
+                    continue
+                self._telegram.message(
+                    f"📊 Stock Bot — {a.alert_type.value}\n"
+                    f"{a.symbol} @ ${a.price:,.2f} {a.currency}\n{a.message}"
+                )
+        except Exception as exc:
+            logger.warning("Telegram alert relay failed: %s", exc)
+
+    def fill(
+        self,
+        side:   str,
+        symbol: str,
+        shares: float,
+        price:  float,
+        total:  float,
+        pnl:    float | None = None,
+        reason: str = "",
+    ) -> None:
+        """Trade-fill Telegram notification (stock book). No-op when the
+        Telegram channel is off. Never raises."""
+        if self._telegram is None:
+            return
+        try:
+            executor = os.getenv("STOCK_EXECUTOR", "paper").strip().lower()
+            tag = "IBKR paper" if executor == "ibkr" else "sim paper"
+            side_emoji = "🟢 BUY" if side.upper() == "BUY" else "🔴 SELL"
+            pnl_line = (
+                f"\nP&L: {'🟢' if pnl >= 0 else '🔴'} ${pnl:+.2f}" if pnl is not None else ""
+            )
+            reason_line = f"\nReason: {reason}" if reason else ""
+            self._telegram.message(
+                f"{side_emoji}  {symbol} ({tag})\n"
+                f"{shares:g} sh @ ${price:,.2f} = ${total:,.2f}"
+                f"{pnl_line}{reason_line}"
+            )
+        except Exception as exc:
+            logger.warning("Telegram fill relay failed: %s", exc)
 
     # ── Terminal ─────────────────────────────────────────────────────────────
 

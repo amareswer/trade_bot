@@ -84,6 +84,11 @@ class TelegramAlerter:
         )
         self._send_async(msg)
 
+    def message(self, text: str) -> None:
+        """Generic pre-formatted message (used by the stock bot's notifier —
+        its alert taxonomy doesn't map onto the typed methods above)."""
+        self._send_async(text)
+
     def error(self, message: str) -> None:
         msg = f"⚠️ BOT ERROR\n{message}\n{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
         self._send_async(msg)

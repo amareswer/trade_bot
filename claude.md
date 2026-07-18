@@ -165,7 +165,7 @@ A robust crypto trading system that:
 
 ## Test Suite Manifest (as of 2026-07-03)
 
-Expected total: **264 tests** (as of 2026-07-17 pm). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
+Expected total: **271 tests** (as of 2026-07-17 pm). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -196,8 +196,9 @@ Expected total: **264 tests** (as of 2026-07-17 pm). If `pytest --collect-only -
 | `test_heartbeat.py` | 8 | Heartbeat pings (bot/alerts/heartbeat.py): URL-off, success/failure never raise, healthy_fn gate |
 | `test_tws_monitor.py` | 6 | TwsConnectionMonitor state machine: blip tolerance, alert-once per outage, recovery notice |
 | `test_atr_sizing.py` | 7 | calc_trade_qty_atr_risk: dollar-risk-at-stop == fixed-SL baseline, tight-stop cap, fallbacks |
+| `test_stock_telegram.py` | 7 | Stock→Telegram relay: root-.env credential sourcing, ops_alert/fill forwarding, HIGH-only filter, channel-off no-ops |
 
-Run: `python -m pytest --tb=short -q` — must show **264 passed**.
+Run: `python -m pytest --tb=short -q` — must show **271 passed**.
 
 ---
 
@@ -1004,7 +1005,18 @@ from `.env` (TelegramAlerter constructs disabled, silently) and the stock bot's
 drift escalation, HALT engage/lift, daily P&L, fill alerts, candle watchdog — only ever
 reached the log files. The code paths exist and are tested; the delivery channel was never
 configured. Response is the heartbeat inversion below (no credentials needed in repo)
-rather than BotFather setup; Telegram remains available later if wanted.
+plus — same evening — actual BotFather setup: **Telegram configured and verified
+2026-07-17** (bot t.me/amaresh_tradebot, TELEGRAM_* keys in root `.env`, test message
+delivered). Crypto-bot alerts go live at its next restart. **Stock bot wired to the
+SAME Telegram channel (same evening):** `_make_telegram()` in
+`stock_bot/alerts/notifier.py` sources TELEGRAM_* from the ROOT `.env` (one token, one
+revoke point; process env overrides); `AlertNotifier` gains `fill()` (BUY/SELL fills
+with P&L + reason, tagged sim/IBKR-paper), `ops_alert()` forwards (TWS disconnects,
+Sunday reminder), and `notify()` relays HIGH-priority scan alerts only (MEDIUM chatter
+excluded by design — same filter as desktop). `bot/alerts/telegram.py` gained a generic
+`message()` method. Fill sites wired in `stock_bot/main.py`: scan-loop BUY/SELL + both
+SL/TP-watcher exits. Tests: `test_stock_telegram.py` (7, hermetic — injected
+credentials, mock alerter).
 
 **2. Heartbeat dead-man's switch (roadmap G closed in code):** `bot/alerts/heartbeat.py`
 (shared by both bots, same cross-package import pattern as stock rules). Bot pings a
