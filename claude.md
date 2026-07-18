@@ -1026,8 +1026,11 @@ death, Mac sleep, and network loss with zero secrets in the repo. Env (all empty
 `HEARTBEAT_TWS_URL` (stock; pinged only while `executor.is_connected()` — separates "TWS
 logged off" from "bot died"). Fail-silent by design; a broken healthy_fn counts as
 unhealthy (no ping) so monitoring can't mask an outage. Tests: `test_heartbeat.py` (8).
-**USER ACTION REQUIRED: create 3 free checks at healthchecks.io (period 5 min, grace
-10 min), paste ping URLs into the three env keys, restart both bots.**
+**healthchecks.io setup DEFERRED by user (2026-07-17 late evening — "we will do it
+later"): create 3 free checks (period 5 min, grace 10 min), paste ping URLs into the
+three env keys, restart both bots. Until then heartbeat threads log "disabled" at boot
+and dead-bot detection does not exist — Telegram only proves the bots are alive when
+they have something to say (the exact 2026-07-05 silent-death gap).**
 
 **3. TWS disconnect alert + Sunday re-login reminder:** `stock_bot/alerts/tws_monitor.py`
 (`TwsConnectionMonitor`, pure state machine — blip-tolerant, alert-once per outage,
@@ -1069,9 +1072,35 @@ existing 98%-affordability clamp dominates); this matters as capital grows.
   decision, fresh walk-forward at promotion time) — this closes the "SYN/LINK OOS not yet
   run" gap in roadmap item K, it does not promote anything.
 
-**Restarts needed:** both bots (heartbeat threads + TWS monitor + sizing plumbing —
-inert until env keys are set, but the threads only start at boot). VPS migration (the
-5th "build all" item) is blocked on provisioning a server — nothing to build locally.
+**Restarts DONE same evening (crypto 20:31, stock 20:35 after two live-caught bugs
+below). VPS migration (the 5th "build all" item) is blocked on provisioning a server —
+nothing to build locally.**
+
+**Two bugs caught during the restart cycle — both mine, both fixed, both carry a lesson:**
+- **`stock_bot/main.py` had no `import os`** — the new heartbeat block used `os.getenv`,
+  so the first restart (20:30) died with NameError right after "Weekly summary timer
+  armed" (traceback to terminal only; the bot was down flat with TWS untouched).
+  `import stock_bot.main` had passed pre-restart — an import check does NOT execute
+  `run()`; runtime-path code needs runtime-path verification.
+- **`IBKRExecutor.is_connected` is a PROPERTY, not a method** — the TWS monitor called
+  the returned bool ("'bool' object is not callable" warning every 60s) and the TWS
+  heartbeat's `healthy_fn=executor.is_connected` had evaluated the property ONCE at
+  wiring time (frozen True — would never have detected a disconnect once a URL was set).
+  Fixed with `lambda: bool(executor.is_connected)` / `bool(executor.is_connected)`;
+  wiring pattern now exercised against a property-based fake. Same trap exists on
+  `cash` (property) vs `positions_snapshot()` (method) — signatures verified before the
+  startup-notification call was added.
+- **Stock bot startup Telegram message added** (`notifier.startup()` — executor type,
+  cash, position count, called once the executor is ready): a silent boot is
+  indistinguishable from a broken channel; the crypto bot already had `alerter.startup`.
+  Appears from the stock bot's next natural restart (the 20:35 instance predates it and
+  is otherwise fully healthy: TWS monitor clean, all threads up).
+
+**Post-restart verified state (2026-07-17 ~20:40):** crypto bot live with Telegram
+(startup message delivered 20:31); stock bot live on IBKR (DUQ273338, $995.30, flat),
+TWS monitor running clean; Telegram end-to-end confirmed by user ("🔧 Direct send-path
+test" received). Watch Monday: CM's first rule signal through the fixed NYSE contract
+mapping should FILL — arriving as a 🟢 BUY Telegram message.
 
 ### Affordable-symbol screen (2026-07-15) — 7 new RULE_WHITELIST symbols, 216 tests pass
 Goal: widen the funnel of symbols that can actually FILL at the ~$197 target allocation
