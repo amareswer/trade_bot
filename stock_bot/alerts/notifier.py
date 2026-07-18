@@ -158,6 +158,21 @@ class AlertNotifier:
             "bot order will fail.",
         )
 
+    def startup(self, executor_type: str, cash: float, positions: int) -> None:
+        """Boot confirmation to Telegram (parity with the crypto bot's
+        alerter.startup — a silent boot is indistinguishable from a broken
+        channel). No-op when Telegram is off. Never raises."""
+        if self._telegram is None:
+            return
+        try:
+            self._telegram.message(
+                f"🤖 Stock Bot started\n"
+                f"Executor: {executor_type}\n"
+                f"Cash: ${cash:,.2f} | Positions: {positions}"
+            )
+        except Exception as exc:
+            logger.warning("Telegram startup relay failed: %s", exc)
+
     def ops_alert(self, title: str, message: str) -> None:
         """Operational alert: log WARNING + terminal + desktop notification
         + Telegram (channel configured 2026-07-17; healthchecks.io heartbeat

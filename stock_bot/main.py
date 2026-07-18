@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
+import os
 import sys
 import threading
 import time
@@ -636,6 +637,15 @@ def run() -> None:
         executor.set_daily_loss_limit(cfg.paper_daily_loss_pct)
     if executor:
         executor.set_slippage_bps(cfg.paper_slippage_bps)
+    if executor:
+        try:
+            notifier.startup(
+                cfg.executor_type,
+                executor.cash,
+                len(executor.positions_snapshot()),
+            )
+        except Exception as _exc:
+            logger.warning("Startup notification failed: %s", _exc)
     # Asymmetric exit bars: BUY needs paper_min_confidence, but exiting a HELD
     # position needs only paper_min_confidence_sell OR a streak of consecutive
     # SELL verdicts. Exits reduce risk — never harder than entries.
@@ -742,7 +752,9 @@ def run() -> None:
         start_heartbeat_thread(
             os.getenv("HEARTBEAT_TWS_URL", ""),
             interval_s=_hb_interval,
-            healthy_fn=executor.is_connected,
+            # is_connected is a PROPERTY — wrap it so the check runs per beat,
+            # not once at wiring time (caught live 2026-07-17)
+            healthy_fn=lambda: bool(executor.is_connected),
             name="heartbeat-tws",
         )
 
@@ -755,7 +767,7 @@ def run() -> None:
             )
             while True:
                 try:
-                    event = mon.update(executor.is_connected(), time.time())
+                    event = mon.update(bool(executor.is_connected), time.time())
                     if event == "down":
                         notifier.ops_alert(
                             "TWS connection lost",
