@@ -1027,11 +1027,15 @@ death, Mac sleep, and network loss with zero secrets in the repo. Env (all empty
 `HEARTBEAT_TWS_URL` (stock; pinged only while `executor.is_connected()` — separates "TWS
 logged off" from "bot died"). Fail-silent by design; a broken healthy_fn counts as
 unhealthy (no ping) so monitoring can't mask an outage. Tests: `test_heartbeat.py` (8).
-**healthchecks.io setup DEFERRED by user (2026-07-17 late evening — "we will do it
-later"): create 3 free checks (period 5 min, grace 10 min), paste ping URLs into the
-three env keys, restart both bots. Until then heartbeat threads log "disabled" at boot
-and dead-bot detection does not exist — Telegram only proves the bots are alive when
-they have something to say (the exact 2026-07-05 silent-death gap).**
+**healthchecks.io LIVE (2026-07-17 21:19, same night — user provided an API key and
+setup was done programmatically):** 3 checks (crypto-bot / stock-bot / stock-tws),
+period 5 min, grace 10 min, all attached to the account email channel (API-created
+checks get NO notification channel by default — had to be assigned explicitly).
+Ping URLs in the three env keys; bots restarted 21:19; all checks verified "up" with
+pings received. Dead-bot detection now exists: bot death, Mac sleep, network loss →
+email within ~10 min; TWS logoff → stock-tws email + Telegram ops alert. The account
+also has an unused auto-created "My First Check" (status new, never alerts) — user can
+delete it in the dashboard for tidiness.**
 
 **3. TWS disconnect alert + Sunday re-login reminder:** `stock_bot/alerts/tws_monitor.py`
 (`TwsConnectionMonitor`, pure state machine — blip-tolerant, alert-once per outage,
