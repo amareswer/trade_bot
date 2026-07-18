@@ -719,6 +719,59 @@ def run() -> None:
 
     notifier.start_weekly_summary()
 
+    # ── Heartbeat pings (dead-man's switch — see bot/alerts/heartbeat.py) ──
+    # HEARTBEAT_URL: process alive. HEARTBEAT_TWS_URL: pinged only while the
+    # IBKR connection is up, so "TWS logged off" alerts separately from
+    # "bot died". Both off when unset.
+    from bot.alerts.heartbeat import start_heartbeat_thread
+    _hb_interval = int(os.getenv("HEARTBEAT_INTERVAL_S", "60"))
+    start_heartbeat_thread(
+        os.getenv("HEARTBEAT_URL", ""),
+        interval_s=_hb_interval,
+        name="heartbeat-stock",
+    )
+    if hasattr(executor, "is_connected"):
+        start_heartbeat_thread(
+            os.getenv("HEARTBEAT_TWS_URL", ""),
+            interval_s=_hb_interval,
+            healthy_fn=executor.is_connected,
+            name="heartbeat-tws",
+        )
+
+        # ── TWS disconnect monitor (local alert leg — see tws_monitor.py) ──
+        from stock_bot.alerts.tws_monitor import TwsConnectionMonitor
+
+        def _tws_monitor_worker() -> None:
+            mon = TwsConnectionMonitor(
+                alert_after_s=float(os.getenv("TWS_DISCONNECT_ALERT_MIN", "10")) * 60
+            )
+            while True:
+                try:
+                    event = mon.update(executor.is_connected(), time.time())
+                    if event == "down":
+                        notifier.ops_alert(
+                            "TWS connection lost",
+                            f"IBKR/TWS unreachable for {mon.alert_after_s / 60:.0f}+ "
+                            "minutes — orders will fail until TWS is logged back in.",
+                        )
+                    elif event == "recovered":
+                        notifier.ops_alert(
+                            "TWS connection restored",
+                            "IBKR/TWS is reachable again — order routing resumed.",
+                        )
+                except Exception as _exc:
+                    logger.warning("TWS monitor error: %s", _exc)
+                time.sleep(60)
+
+        _tws_mon_thread = threading.Thread(
+            target=_tws_monitor_worker, daemon=True, name="tws-monitor"
+        )
+        _tws_mon_thread.start()
+        logger.info(
+            "TWS disconnect monitor started (alert after %s min)",
+            os.getenv("TWS_DISCONNECT_ALERT_MIN", "10"),
+        )
+
     def _fast_validator_worker() -> None:
         # Market-hours gated for the same reason as the SL/TP watcher — its
         # candle fetches for exit checks were part of the weekend rate-limit spiral.

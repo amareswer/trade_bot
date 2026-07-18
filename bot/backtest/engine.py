@@ -106,6 +106,11 @@ def run(
     atr_volatile_multiplier:  float = 1.5,
     # ATR-based SL (0.0 = disabled, uses fixed stop_loss_pct instead)
     atr_sl_mult:              float = 0.0,
+    # ATR-aware sizing (2026-07-17): cap BUY qty so an ATR stop-out never
+    # risks more $ than the fixed-SL baseline (cash × risk_pct × baseline).
+    # Default off — the canonical fingerprint runs use plain notional sizing.
+    atr_risk_sizing:          bool  = False,
+    atr_sizing_baseline_sl_pct: float = 0.015,
 ) -> BacktestResult:
     """Run a full backtest and return the result."""
 
@@ -260,6 +265,17 @@ def run(
             trade_qty = executor.position
         else:
             trade_qty = round(executor.cash * risk_per_trade_pct / price, 6) if price > 0 else 0.0
+            if (
+                atr_risk_sizing and atr_sl_mult > 0 and is_indicator
+                and atr_sizing_baseline_sl_pct > 0 and price > 0
+            ):
+                _atr_now = strategy.last_atr or 0.0
+                if _atr_now > 0:
+                    _risk_qty = (
+                        executor.cash * risk_per_trade_pct * atr_sizing_baseline_sl_pct
+                        / (_atr_now * atr_sl_mult)
+                    )
+                    trade_qty = round(min(trade_qty, _risk_qty), 6)
 
         approval = risk.evaluate(filtered_signal, price, executor.portfolio, trade_qty, candle.timestamp.date())
 

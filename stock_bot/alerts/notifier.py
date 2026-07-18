@@ -101,12 +101,49 @@ class AlertNotifier:
     def _weekly_summary_callback(self) -> None:
         """Timer callback — send email then rearm for next Sunday."""
         try:
+            self._tws_relogin_reminder()
+        except Exception as exc:
+            logger.warning("TWS reminder error: %s", exc)
+        try:
             self._send_weekly_summary()
         except Exception as exc:
             logger.warning("Weekly summary callback error: %s", exc)
         finally:
             # Always rearm, even if this firing failed
             self.start_weekly_summary()
+
+    def _tws_relogin_reminder(self) -> None:
+        """Sunday 18:00 piggyback: IBKR forces a weekly TWS re-login on
+        Sundays — without it, every Monday order fails until someone logs
+        in. Only relevant when the IBKR executor is active."""
+        if os.getenv("STOCK_EXECUTOR", "paper").strip().lower() != "ibkr":
+            return
+        self.ops_alert(
+            "TWS weekly re-login due",
+            "IBKR requires a weekly TWS re-login on Sundays. Check that TWS "
+            "is running and logged in before Monday's open, or every stock "
+            "bot order will fail.",
+        )
+
+    def ops_alert(self, title: str, message: str) -> None:
+        """Operational alert: log WARNING + terminal + desktop notification.
+        Local-only by design — there is no configured remote channel
+        (Telegram/email were never set up); the remote leg is the
+        healthchecks.io heartbeat. Never raises."""
+        logger.warning("OPS ALERT — %s: %s", title, message)
+        try:
+            print(f"\n{Fore.YELLOW}⚠ {title}: {message}{Style.RESET_ALL}\n", flush=True)
+        except Exception:
+            pass
+        if _plyer_available:
+            try:
+                _plyer_notification.notify(
+                    title=f"Stock Bot — {title}",
+                    message=message[:200],
+                    timeout=10,
+                )
+            except Exception as exc:
+                logger.warning("Desktop notification failed: %s", exc)
 
     def _send_weekly_summary(self) -> None:
         from_addr = self._cfg.alert_email_from.strip()

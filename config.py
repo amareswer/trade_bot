@@ -148,6 +148,7 @@ class StrategyConfig:
     macd_enabled:            bool  = True  # BUY only when MACD histogram is rising
     atr_volatile_multiplier: float = 1.5   # ATR > mult × avg ATR → sit flat (VOLATILE)
     atr_sl_mult:             float = 0.0   # reads ATR_SL_MULT — SL = entry - atr × mult; 0 = disabled (use fixed SL)
+    atr_sizing_enabled:      bool  = False # reads ATR_SIZING_ENABLED — cap qty so an ATR stop-out never risks more $ than the fixed-SL baseline
     atr_tp_mult:             float = 4.0   # reads ATR_TP_MULT — TP = entry + atr × mult
     atr_period:              int   = 14    # reads ATR_PERIOD
     # ── Entry mode parameters (Mode A = pullback, Mode B = breakout) ──
@@ -285,6 +286,7 @@ class BacktestConfig:
     partial_tp_pct:      float = 0.0     # sell partial_tp_size at this gain (0 = disabled)
     partial_tp_size:     float = 0.5     # fraction of position to sell at partial TP
     atr_sl_mult:         float = 0.0     # ATR SL multiplier; 0 = disabled (uses fixed stop_loss_pct)
+    atr_sizing_enabled:  bool  = False   # same ATR_SIZING_ENABLED key as StrategyConfig (drift-incident rule: one key, two readers)
 
     _VALID_TIMEFRAMES = {"1m","5m","15m","30m","1h","2h","4h","6h","12h","1d","1w"}
 
@@ -402,6 +404,37 @@ class AppConfig:
         sl_distance = atr_value * mult
         dollar_risk = cash * self.risk.risk_per_trade_pct
         return round(dollar_risk / sl_distance, 6)
+
+    def calc_trade_qty_atr_risk(
+        self,
+        cash:            float,
+        price:           float,
+        atr_value:       float,
+        atr_mult:        float,
+        baseline_sl_pct: float,
+    ) -> float:
+        """
+        ATR-aware sizing with a fixed-SL dollar-risk baseline (2026-07-17).
+
+        The validated fixed-SL config risked cash × risk_pct × baseline_sl_pct
+        dollars per stop-out (10% notional × 1.5% SL = 0.15% of cash). With
+        ATR stops (ATR_SL_MULT) the stop distance varies per entry, so plain
+        notional sizing lets a wide-ATR entry risk MORE dollars than that
+        baseline. This caps qty so a stop-out never exceeds the baseline
+        dollar risk; a tight ATR stop does NOT size up past the standard
+        notional (min(), not equality — sizing up would be a leverage change,
+        not a risk cap). Falls back to calc_trade_qty() whenever any input
+        is unusable.
+        """
+        base_qty = self.calc_trade_qty(cash, price)
+        if (
+            price <= 0 or cash <= 0 or atr_value <= 0
+            or atr_mult <= 0 or baseline_sl_pct <= 0
+        ):
+            return base_qty
+        sl_distance = atr_value * atr_mult
+        risk_budget = cash * self.risk.risk_per_trade_pct * baseline_sl_pct
+        return round(min(base_qty, risk_budget / sl_distance), 6)
 
     def calc_trade_qty_sl(
         self,
@@ -569,6 +602,7 @@ def _load() -> AppConfig:
             macd_enabled            = _bool ("MACD_ENABLED",            True),
             atr_volatile_multiplier = _float("ATR_VOLATILE_MULTIPLIER", 1.5),
             atr_sl_mult             = _float("ATR_SL_MULT",              0.0),
+            atr_sizing_enabled      = _bool ("ATR_SIZING_ENABLED",      False),
             atr_tp_mult             = _float("ATR_TP_MULT",              4.0),
             atr_period              = _int  ("ATR_PERIOD",               14),
             pullback_rsi_min        = _float("PULLBACK_RSI_MIN",        38.0),
@@ -617,6 +651,7 @@ def _load() -> AppConfig:
             partial_tp_pct   = _float("PARTIAL_TP_PCT",       0.0),
             partial_tp_size  = _float("PARTIAL_TP_SIZE",      0.5),
             atr_sl_mult      = _float("ATR_SL_MULT",           0.0),
+            atr_sizing_enabled = _bool("ATR_SIZING_ENABLED",  False),
         ),
         signals=ExternalSignalsConfig(
             fng_enabled            = _bool ("EXT_FNG_ENABLED",       True),

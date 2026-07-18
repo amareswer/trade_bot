@@ -1120,6 +1120,14 @@ def run():
             os.getenv("RESCREEN_AUDIT_TIME", "12:20"),
         )
 
+    # ── Heartbeat ping thread (dead-man's switch — see bot/alerts/heartbeat.py) ──
+    from bot.alerts.heartbeat import start_heartbeat_thread
+    start_heartbeat_thread(
+        os.getenv("HEARTBEAT_URL", ""),
+        interval_s=int(os.getenv("HEARTBEAT_INTERVAL_S", "60")),
+        name="heartbeat-crypto",
+    )
+
     _halt_file_active = False
     _last_daily_pnl_date = datetime.now(_tz.utc).date()
 
@@ -1635,6 +1643,25 @@ def run():
                 trade_qty = ss['pm'].quantity
             else:
                 trade_qty = cfg.calc_trade_qty(_max_cash_for_sym, price)
+                # ATR-aware sizing (ATR_SIZING_ENABLED): cap qty so an ATR
+                # stop-out never risks more $ than the fixed-SL baseline.
+                if (
+                    is_indicator
+                    and cfg.strategy.atr_sizing_enabled
+                    and cfg.strategy.atr_sl_mult > 0
+                ):
+                    _atr_sz = _atr_fn(
+                        list(ss['strategy']._highs),
+                        list(ss['strategy']._lows),
+                        list(ss['strategy']._closes),
+                        cfg.strategy.atr_period,
+                    )
+                    if _atr_sz is not None and _atr_sz > 0:
+                        trade_qty = cfg.calc_trade_qty_atr_risk(
+                            _max_cash_for_sym, price, _atr_sz,
+                            cfg.strategy.atr_sl_mult,
+                            cfg.backtest.stop_loss_pct or 0.015,
+                        )
                 max_affordable = (_max_cash_for_sym * 0.98) / price
                 trade_qty = min(trade_qty, max_affordable)
                 trade_qty = round(trade_qty, 6)

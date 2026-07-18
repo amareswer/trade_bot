@@ -142,6 +142,8 @@ def main():
         volume_k                = cfg.strategy.volume_k,
         atr_volatile_multiplier = cfg.strategy.atr_volatile_multiplier,
         atr_sl_mult             = cfg.backtest.atr_sl_mult,
+        atr_risk_sizing         = cfg.backtest.atr_sizing_enabled,
+        atr_sizing_baseline_sl_pct = cfg.backtest.stop_loss_pct or 0.015,
     )
 
     m = metrics_mod.compute(result)

@@ -33,6 +33,10 @@ from bot.data.historical_feed import fetch_candles_paginated
 
 SYMBOL      = os.getenv("SYMBOL", "BTC/USDT")
 ATR_MULT    = float(os.getenv("ATR_MULT", "2.0"))
+# ATR_SIZING_ENABLED=true: the ATR variant also runs the 2026-07-17
+# risk-capped sizing (engine atr_risk_sizing) so the sizing change can be
+# validated with the same 5-window sweep as the stop itself.
+ATR_SIZING  = os.getenv("ATR_SIZING_ENABLED", "false").strip().lower() == "true"
 TIMEFRAME   = os.getenv("BACKTEST_TIMEFRAME", "4h")
 FEE         = float(os.getenv("BACKTEST_FEE_PCT", "0.008"))
 TOTAL_LIMIT = 5000
@@ -82,6 +86,8 @@ def run_window(candles: list, stop_loss_pct: float, atr_sl_mult: float) -> dict:
         volume_k                   = cfg.strategy.volume_k,
         atr_volatile_multiplier    = cfg.strategy.atr_volatile_multiplier,
         atr_sl_mult                = atr_sl_mult,
+        atr_risk_sizing            = ATR_SIZING and atr_sl_mult > 0,
+        atr_sizing_baseline_sl_pct = 0.015,
     )
     m        = metrics_mod.compute(result)
     sells    = [f for f in result.fills if f.side == "SELL"]

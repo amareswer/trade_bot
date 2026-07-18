@@ -165,7 +165,7 @@ A robust crypto trading system that:
 
 ## Test Suite Manifest (as of 2026-07-03)
 
-Expected total: **243 tests** (as of 2026-07-17). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
+Expected total: **264 tests** (as of 2026-07-17 pm). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -193,8 +193,11 @@ Expected total: **243 tests** (as of 2026-07-17). If `pytest --collect-only -q` 
 | `test_audit_scheduler.py` | 14 | In-bot audit scheduler: tests REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, monthly 1st-anchored (re-screen), missed-run catch-up |
 | `test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
 | `test_ibkr_executor.py` | 18 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping (.TO↔TSE/CAD, bare NYSE cross-listings→NYSE), broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence |
+| `test_heartbeat.py` | 8 | Heartbeat pings (bot/alerts/heartbeat.py): URL-off, success/failure never raise, healthy_fn gate |
+| `test_tws_monitor.py` | 6 | TwsConnectionMonitor state machine: blip tolerance, alert-once per outage, recovery notice |
+| `test_atr_sizing.py` | 7 | calc_trade_qty_atr_risk: dollar-risk-at-stop == fixed-SL baseline, tight-stop cap, fallbacks |
 
-Run: `python -m pytest --tb=short -q` — must show **243 passed**.
+Run: `python -m pytest --tb=short -q` — must show **264 passed**.
 
 ---
 
@@ -991,6 +994,73 @@ where ATR can't be computed; this is pre-existing, tested behavior, not new code
   fewer-but-larger occasional losses for meaningfully fewer stop-outs overall — consistent with
   the validated PF improvement, but worth knowing before the first live ATR stop fires.
 
+### Ops + research build session (2026-07-17 evening) — 264 tests pass, strategy hash unchanged
+Four builds in one session ("build all" from the post-adoption roadmap discussion). No
+`bot/strategy/*` files touched — hash `659d1c03987b72fd` still valid.
+
+**1. DISCOVERY: no outbound alert channel has EVER worked.** `TELEGRAM_*` keys are absent
+from `.env` (TelegramAlerter constructs disabled, silently) and the stock bot's
+`ALERT_EMAIL_FROM/TO/PASSWORD` are empty. Every "Telegram alert" described in this file —
+drift escalation, HALT engage/lift, daily P&L, fill alerts, candle watchdog — only ever
+reached the log files. The code paths exist and are tested; the delivery channel was never
+configured. Response is the heartbeat inversion below (no credentials needed in repo)
+rather than BotFather setup; Telegram remains available later if wanted.
+
+**2. Heartbeat dead-man's switch (roadmap G closed in code):** `bot/alerts/heartbeat.py`
+(shared by both bots, same cross-package import pattern as stock rules). Bot pings a
+healthchecks.io check URL every 60s; the service emails when pings STOP — covers process
+death, Mac sleep, and network loss with zero secrets in the repo. Env (all empty = off):
+`HEARTBEAT_URL` in `.env` (crypto) and in `stock_bot/.env` (stock process), plus
+`HEARTBEAT_TWS_URL` (stock; pinged only while `executor.is_connected()` — separates "TWS
+logged off" from "bot died"). Fail-silent by design; a broken healthy_fn counts as
+unhealthy (no ping) so monitoring can't mask an outage. Tests: `test_heartbeat.py` (8).
+**USER ACTION REQUIRED: create 3 free checks at healthchecks.io (period 5 min, grace
+10 min), paste ping URLs into the three env keys, restart both bots.**
+
+**3. TWS disconnect alert + Sunday re-login reminder:** `stock_bot/alerts/tws_monitor.py`
+(`TwsConnectionMonitor`, pure state machine — blip-tolerant, alert-once per outage,
+recovery notice only after an alert; tests `test_tws_monitor.py` 6). Wired as a 60s
+monitor thread in `stock_bot/main.py` (IBKR executor only): 10+ min disconnect →
+`notifier.ops_alert()` = log WARNING + terminal + desktop notification (plyer). The
+Sunday-18:00 weekly-summary timer now also fires a TWS re-login reminder when
+`STOCK_EXECUTOR=ibkr` (IBKR forces weekly Sunday re-auth; without it every Monday order
+fails). `TWS_DISCONNECT_ALERT_MIN=10` to tune. Local-only delivery by design — the remote
+email leg is HEARTBEAT_TWS_URL.
+
+**4. ATR-aware position sizing — built, validated, NOT enabled (flag off).** Gap: with
+`ATR_SL_MULT=2.0` live, stop distance varies per entry but sizing was plain notional
+(`calc_trade_qty`), so a wide-ATR entry risks MORE dollars at its stop than the validated
+fixed-SL baseline (cash × 10% × 1.5% = 0.15% of cash). New
+`AppConfig.calc_trade_qty_atr_risk()` caps qty so a stop-out never exceeds that baseline;
+a tight ATR stop does NOT size up past standard notional (min, not equality). Wired:
+engine (`atr_risk_sizing` + `atr_sizing_baseline_sl_pct` params, default off),
+`backtest.py`, live BUY path in `bot/main.py` (behind `ATR_SIZING_ENABLED`, same one key
+read by BacktestConfig AND StrategyConfig — drift-incident rule), `atr_walkforward.py`
+pass-through. Tests: `test_atr_sizing.py` (7). **Validation run (sizing ON, BTC ATRx2.0,
+5-window):** PF 1.90/2.24/3.46/3.29/2.03 — all 5 windows > 1.0 and every window still
+beats fixed-SL. Canonical fingerprint with flag OFF re-verified same session: 35 trades /
+PF 1.98, unchanged. Report `logs/atr_walkforward_BTC_2.0_20260718.md` (UTC date).
+**Adoption = set `ATR_SIZING_ENABLED=true` in `.env` — deliberately left to the user,
+same as the ATR_SL_MULT adoption.** Note: at $77 slot cash the cap rarely binds (the
+existing 98%-affordability clamp dominates); this matters as capital grows.
+
+**5. SYN/LINK ATR OOS validations run (roadmap K progress):** same
+`atr_oos_validation.py` non-overlapping split as the SOL/BTC runs.
+- **SYN/USDT: HOLDS cleanly at both mults** — ATRx2.0 train PF 1.57 / validation 1.99
+  (SL 25%/21%); ATRx2.5 train 2.04 / validation 1.86 (SL 11%/14%). Trades 19–28 per half.
+- **LINK/USDT: mixed — not candidate-grade.** ATRx2.0 FAILS the train half outright
+  (PF 0.85); ATRx2.5 passes both halves but thin margins (1.29 train / 1.61 validation).
+  A multiplier that only works at one setting and fails at its neighbor on half the data
+  is the same curve-fit profile the OOS script exists to catch. LINK stays out.
+- Reports: `logs/atr_oos_{SYN,LINK}_{2.0,2.5}_20260717.md`. SYN remains blocked on the
+  unchanged USD-pair preconditions (BTC/CAD 15-fill gate at 0/15, capital ≥ $500, FX
+  decision, fresh walk-forward at promotion time) — this closes the "SYN/LINK OOS not yet
+  run" gap in roadmap item K, it does not promote anything.
+
+**Restarts needed:** both bots (heartbeat threads + TWS monitor + sizing plumbing —
+inert until env keys are set, but the threads only start at boot). VPS migration (the
+5th "build all" item) is blocked on provisioning a server — nothing to build locally.
+
 ### Affordable-symbol screen (2026-07-15) — 7 new RULE_WHITELIST symbols, 216 tests pass
 Goal: widen the funnel of symbols that can actually FILL at the ~$197 target allocation
 (0.20 × ~$987 account) — 3 of 5 whitelisted symbols were stuck in SIZE_SKIP, so the
@@ -1178,7 +1248,7 @@ Features A, B, E from the roadmap completed. 168 tests pass.
 | # | Feature | Why | Effort |
 |---|---------|-----|--------|
 | F | **VPS logrotate** | `/etc/logrotate.d/trade_bot` — local log uses RotatingFileHandler, VPS has no rotation yet | Small |
-| G | **UptimeRobot monitor** | External uptime check — systemd stops after 5 crashes with no alert | Trivial |
+| ~~G~~ | ~~**UptimeRobot monitor**~~ | DONE in code 2026-07-17 as healthchecks.io heartbeat (bot/alerts/heartbeat.py, both bots + TWS leg) — user still needs to create the 3 checks and paste URLs into env | ~~Trivial~~ |
 | H | **Ollama Cloud key revoke** | ~~Identify service~~ (done 2026-07-13); key confirmed UNUSED 2026-07-16 (provider is nvidia_nim) — revoke at ollama.com + strip from stock_bot/.env. **Parked by user 2026-07-16** | Small |
 
 #### Both bots — longer term
@@ -1186,7 +1256,7 @@ Features A, B, E from the roadmap completed. 168 tests pass.
 |---|---------|-----|--------|
 | I | **IBKR live go-live** | After 30 paper trades + PF ≥ 1.2 on stock bot | Gate-blocked |
 | J | **USD symbol re-screen** | Re-run `screen_universe.py` after any strategy hash change | ~2h |
-| K | **ATR SL experiment for SYN/LINK** | ATR×2.0–2.5 cleared in-sample — needs OOS + per-symbol walk-forward before adding. SOL@ATR×2.0 and BTC@ATR×2.0 OOS both HOLD (2026-07-17). SOL still needs SL-distance sizing + capital-gate preconditions before promotion (new symbol). BTC is live-wired (`ATR_SL_MULT`) — adopting would need a full walk-forward re-run first, not yet decided. SYN/LINK OOS not yet run | Large |
+| K | **ATR SL experiment for SYN/LINK** | ATR×2.0–2.5 cleared in-sample — needs OOS + per-symbol walk-forward before adding. SOL@ATR×2.0 and BTC@ATR×2.0 OOS both HOLD (2026-07-17). SOL still needs SL-distance sizing + capital-gate preconditions before promotion (new symbol). BTC is live-wired (`ATR_SL_MULT`) — adopting would need a full walk-forward re-run first, not yet decided. SYN/LINK OOS run 2026-07-17: SYN HOLDS at x2.0 and x2.5 (val PF 1.99/1.86, SL ≤ 21%); LINK mixed (x2.0 train FAIL 0.85; x2.5 thin pass) — LINK out, SYN still gate-blocked. ATR-aware sizing built + validated 2026-07-17 (ATR_SIZING_ENABLED, off) | Large |
 
 ### Multi-coin readiness (2026-07-03)
 The live loop is now safe to run with >1 symbol in UNIVERSE_WHITELIST. Single-symbol behavior
