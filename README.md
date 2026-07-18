@@ -1,7 +1,14 @@
 # Crypto Trading Bot — User Guide
 
-A modular paper trading bot that uses real crypto market data via ccxt.
-Runs locally. No real money is ever spent.
+A modular trading bot that uses real crypto market data via ccxt. Runs locally.
+Defaults to paper trading — real orders happen only with `LIVE_TRADING=true`
+(the current live deployment trades BTC/CAD on Kraken with a hard $77 slot cap).
+
+> **Run commands, secrets inventory, and new-machine migration → [`SETUP.md`](SETUP.md).**
+> That guide covers BOTH bots (this crypto bot and the stock bot in `stock_bot/`),
+> the exact launch commands, every required secret and where to get it, which
+> state files must be copied when moving computers, and TWS setup for the stock
+> bot. Strategy/validation rules live in `CLAUDE.md`.
 
 ---
 
