@@ -82,6 +82,21 @@ def run(
     max_ema_spread_pct:       float = 0.0,
     rsi_filter_enabled:       bool  = True,
     macd_enabled:             bool  = False,
+    # Entry mode parameters (Mode A = pullback, Mode B = breakout).
+    # Added 2026-07-20: live (bot/main.py build_strategy()) has always sourced
+    # these from cfg.strategy, but the backtest engine silently fell back to
+    # IndicatorConfig's hardcoded defaults regardless of .env — same drift
+    # class as the ATR SL and macd_enabled incidents, just never yet triggered
+    # because .env has never overridden these. Defaults below match
+    # IndicatorConfig's own dataclass defaults, so this is a no-op until
+    # someone actually tunes one of these in .env.
+    pullback_rsi_min:         float = 38.0,
+    pullback_rsi_max:         float = 58.0,
+    breakout_rsi_min:         float = 50.0,
+    breakout_rsi_max:         float = 72.0,
+    breakout_lookback:        int   = 20,
+    max_price_extension_pct:  float = 0.03,
+    breakout_adx_threshold:   float = 22.0,
     # Threshold config
     buy_threshold:            float = 0.0,
     sell_threshold:           float = 0.0,
@@ -133,6 +148,13 @@ def run(
             regime_ema_slope_filter  = regime_ema_slope_filter,
             volume_k                 = volume_k,
             atr_volatile_multiplier  = atr_volatile_multiplier,
+            pullback_rsi_min         = pullback_rsi_min,
+            pullback_rsi_max         = pullback_rsi_max,
+            breakout_rsi_min         = breakout_rsi_min,
+            breakout_rsi_max         = breakout_rsi_max,
+            breakout_lookback        = breakout_lookback,
+            max_price_extension_pct  = max_price_extension_pct,
+            breakout_adx_threshold   = breakout_adx_threshold,
         ))
         is_indicator = True
     else:

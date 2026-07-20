@@ -55,6 +55,13 @@ def make_fake_cfg(**overrides):
             regime_ema_slope_filter=False,
             volume_k=0.0,
             atr_volatile_multiplier=1.5,
+            pullback_rsi_min=38.0,
+            pullback_rsi_max=58.0,
+            breakout_rsi_min=50.0,
+            breakout_rsi_max=72.0,
+            breakout_lookback=20,
+            max_price_extension_pct=0.03,
+            breakout_adx_threshold=22.0,
         ),
         risk=SimpleNamespace(
             risk_per_trade_pct=0.10,
@@ -124,6 +131,67 @@ def test_macd_enabled_is_sourced_from_cfg():
     assert kwargs["macd_enabled"] is False
     kwargs = engine_kwargs_from_cfg(make_fake_cfg())
     assert kwargs["macd_enabled"] is True
+
+
+def test_mode_ab_entry_params_are_sourced_from_cfg():
+    """2026-07-20 audit finding: live (bot/main.py build_strategy()) has
+    always sourced these seven from cfg.strategy, but engine.run() didn't
+    even accept them — the backtest silently used IndicatorConfig's hardcoded
+    defaults regardless of .env. No live impact found at the time (.env never
+    overrode any of them), but it was one .env edit away from repeating the
+    ATR SL / macd_enabled drift incidents undetected.
+    """
+    cfg = make_fake_cfg(**{
+        "strategy.pullback_rsi_min":        40.0,
+        "strategy.pullback_rsi_max":        60.0,
+        "strategy.breakout_rsi_min":        52.0,
+        "strategy.breakout_rsi_max":        74.0,
+        "strategy.breakout_lookback":       25,
+        "strategy.max_price_extension_pct": 0.05,
+        "strategy.breakout_adx_threshold":  24.0,
+    })
+    kwargs = engine_kwargs_from_cfg(cfg)
+    assert kwargs["pullback_rsi_min"] == 40.0
+    assert kwargs["pullback_rsi_max"] == 60.0
+    assert kwargs["breakout_rsi_min"] == 52.0
+    assert kwargs["breakout_rsi_max"] == 74.0
+    assert kwargs["breakout_lookback"] == 25
+    assert kwargs["max_price_extension_pct"] == 0.05
+    assert kwargs["breakout_adx_threshold"] == 24.0
+
+
+def test_every_shared_strategy_field_reaches_the_backtest():
+    """Future-proofing for the whole bug class (ATR SL 2026-07-02, macd_enabled
+    and Mode A/B params 2026-07-20): any field that exists on BOTH the real
+    StrategyConfig (live, .env-backed) and the real IndicatorConfig (what the
+    backtest strategy is built from) is, by construction, something live can
+    configure that the backtest must also see. If a future field is added to
+    both dataclasses with the same name but never wired into
+    engine_kwargs_from_cfg() or engine.run(), this test fails instead of the
+    gap sitting silent for months.
+
+    Only introspects field NAMES on the real dataclasses (no .env read) —
+    stays hermetic.
+    """
+    from dataclasses import fields as dc_fields
+    from config import StrategyConfig
+    from bot.strategy.indicator_strategy import IndicatorConfig
+
+    strategy_fields   = {f.name for f in dc_fields(StrategyConfig)}
+    indicator_fields  = {f.name for f in dc_fields(IndicatorConfig)}
+    shared            = strategy_fields & indicator_fields
+
+    kwargs   = engine_kwargs_from_cfg(make_fake_cfg())
+    accepted = set(inspect.signature(engine.run).parameters)
+
+    not_emitted = {f for f in shared if f not in kwargs}
+    not_accepted = {f for f in shared if f not in accepted}
+    assert not not_emitted, (
+        f"fields configurable live but never sourced by engine_kwargs_from_cfg: {not_emitted}"
+    )
+    assert not not_accepted, (
+        f"fields configurable live but not accepted by engine.run(): {not_accepted}"
+    )
 
 
 def test_validation_scripts_use_the_builder():

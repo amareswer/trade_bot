@@ -21,6 +21,16 @@ the one actually trading. Resolved by validating what's live (option a from
 the 2026-07-18 CLAUDE.md entry) rather than turning MACD off to match the
 old numbers. New canonical fingerprint: see CLAUDE.md.
 
+2026-07-20 (same day, audit follow-up): the seven Mode A/B entry-mode params
+(pullback_rsi_min/max, breakout_rsi_min/max, breakout_lookback,
+max_price_extension_pct, breakout_adx_threshold) had the identical gap —
+live-configurable via cfg.strategy / .env, silently ignored by the backtest
+engine (engine.run() didn't even accept them as arguments). No live impact
+found (.env has never overridden any of the seven), but it was one .env edit
+away from repeating the ATR SL / macd_enabled incidents undetected. Added
+here and to engine.run()'s signature. test_engine_params.py now also has a
+generic parity test so a NEW shared field can't reopen this gap silently.
+
 Deliberate exclusions — do not add without a validation decision:
   - slippage_pct: engine default 0.0 — fee_pct is the validated cost model.
 """
@@ -52,6 +62,13 @@ def engine_kwargs_from_cfg(cfg) -> dict:
         max_ema_spread_pct   = cfg.strategy.max_ema_spread_pct,
         rsi_filter_enabled   = cfg.strategy.rsi_filter_enabled,
         macd_enabled         = cfg.strategy.macd_enabled,
+        pullback_rsi_min         = cfg.strategy.pullback_rsi_min,
+        pullback_rsi_max         = cfg.strategy.pullback_rsi_max,
+        breakout_rsi_min         = cfg.strategy.breakout_rsi_min,
+        breakout_rsi_max         = cfg.strategy.breakout_rsi_max,
+        breakout_lookback        = cfg.strategy.breakout_lookback,
+        max_price_extension_pct  = cfg.strategy.max_price_extension_pct,
+        breakout_adx_threshold   = cfg.strategy.breakout_adx_threshold,
         buy_threshold        = cfg.strategy.buy_threshold,
         sell_threshold       = cfg.strategy.sell_threshold,
         max_position_pct     = cfg.risk.max_position_pct,

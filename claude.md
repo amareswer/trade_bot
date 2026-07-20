@@ -165,7 +165,7 @@ A robust crypto trading system that:
 
 ## Test Suite Manifest (as of 2026-07-03)
 
-Expected total: **289 tests** (as of 2026-07-18). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
+Expected total: **291 tests** (as of 2026-07-20). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -198,9 +198,9 @@ Expected total: **289 tests** (as of 2026-07-18). If `pytest --collect-only -q` 
 | `test_atr_sizing.py` | 7 | calc_trade_qty_atr_risk: dollar-risk-at-stop == fixed-SL baseline, tight-stop cap, fallbacks |
 | `test_stock_telegram.py` | 7 | Stock→Telegram relay: root-.env credential sourcing, ops_alert/fill forwarding, HIGH-only filter, channel-off no-ops |
 | `test_crash_hardening.py` | 9 | atomic_write_json (valid/replace/no-tmp/parents/old-file-preserved), send_now sync + disabled, crash-alert helpers never raise |
-| `test_engine_params.py` | 6 | `engine_kwargs_from_cfg` builder: keys accepted by engine.run, ATR keys sourced from cfg, previously-drifted keys present, macd_enabled sourced from cfg, both validation scripts use the builder |
+| `test_engine_params.py` | 8 | `engine_kwargs_from_cfg` builder: keys accepted by engine.run, ATR keys sourced from cfg, previously-drifted keys present, macd_enabled + Mode A/B entry params sourced from cfg, generic parity test (every StrategyConfig∩IndicatorConfig field reaches the backtest), both validation scripts use the builder |
 
-Run: `python -m pytest --tb=short -q` — must show **289 passed**.
+Run: `python -m pytest --tb=short -q` — must show **291 passed**.
 
 ---
 
@@ -1216,6 +1216,42 @@ actually running, not turn MACD off to preserve the old numbers.
   was purely closing a validation-script fidelity gap, not a strategy or risk change.
 - **Crypto bot does not need a restart** — `bot/main.py` was already running with
   `macd_enabled=True` before this fix; only the backtest/walk-forward tooling changed.
+
+### Audit follow-up same day — Mode A/B entry params had the identical drift gap (2026-07-20) — 291 tests pass, strategy hash unchanged, fingerprint unchanged
+Requested self-audit after the MACD fix ("find any other misjudgments"). Found one real
+structural gap of the same shape, currently dormant.
+- **The gap:** seven entry-mode parameters — `pullback_rsi_min/max`, `breakout_rsi_min/max`,
+  `breakout_lookback`, `max_price_extension_pct`, `breakout_adx_threshold` — are live-configurable
+  (`bot/main.py build_strategy()` sources all seven from `cfg.strategy`, which is `.env`-backed),
+  but `engine.run()` didn't accept them as parameters at all, and `engine_kwargs_from_cfg()`
+  didn't emit them. The backtest silently used `IndicatorConfig`'s hardcoded dataclass defaults
+  regardless of `.env` — the same failure shape as the 2026-07-02 ATR SL incident and the
+  macd_enabled gap just above, just with different variables.
+- **No live impact found:** `.env` has never overridden any of the seven, so live and backtest
+  happened to agree by coincidence, not by design. It was one future `.env` tuning edit (e.g. to
+  `BREAKOUT_ADX_THRESHOLD`) away from silently repeating the incident.
+- **Fix:** all seven added to `engine.run()`'s signature (`bot/backtest/engine.py`) and to
+  `engine_kwargs_from_cfg()` (`bot/backtest/params.py`), with defaults matching
+  `IndicatorConfig`'s own dataclass defaults — a no-op today, live protection going forward.
+- **Fingerprint reconfirmed unchanged:** fresh `backtest.py` run still returns exactly
+  **32 trades, PF 1.72** — proves the fix is behavior-neutral at current `.env` values.
+- **Future-proofed, not just patched:** `test_engine_params.py` gained
+  `test_every_shared_strategy_field_reaches_the_backtest` — introspects the REAL
+  `StrategyConfig` and `IndicatorConfig` dataclasses (not the test's fake cfg) and asserts every
+  field name present on BOTH (i.e. anything live can configure that the backtest strategy also
+  reads) is sourced by `engine_kwargs_from_cfg()` and accepted by `engine.run()`. A future field
+  added to both dataclasses with the same name but never wired through will fail this test
+  immediately instead of sitting silent for weeks like this one did. Suite 289 → 291
+  (`test_mode_ab_entry_params_are_sourced_from_cfg` + the generic parity test).
+- **Audited and found clean (no fix needed):** strategy hash genuinely in sync with
+  `logs/validated_strategy_hash` right now; zero "STRATEGY CODE DIFFERS" or "unrecognised
+  strategy keys" warnings in either bot's full log history; stock bot's `build_indicator_config()`
+  is structurally immune to this bug class (one hardcoded function used identically by both
+  `stock_backtest.py` and live — not two independently-wired construction sites); no stale/orphaned
+  `.env` keys (`DOGE_VOL_MIN_CAD`, `HEARTBEAT_URL`, `REGIME_MONITOR_INTERVAL`,
+  `OPENROUTER_API_KEY` are all read directly by other modules, not config.py — legitimate, not
+  dead); no silent `except: pass` exception-swallowing found in either bot's execution/risk code.
+- **No restart needed** — backtest/walk-forward tooling only, live behavior unchanged.
 
 ### Affordable-symbol screen (2026-07-15) — 7 new RULE_WHITELIST symbols, 216 tests pass
 Goal: widen the funnel of symbols that can actually FILL at the ~$197 target allocation
