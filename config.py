@@ -149,7 +149,6 @@ class StrategyConfig:
     atr_volatile_multiplier: float = 1.5   # ATR > mult × avg ATR → sit flat (VOLATILE)
     atr_sl_mult:             float = 0.0   # reads ATR_SL_MULT — SL = entry - atr × mult; 0 = disabled (use fixed SL)
     atr_sizing_enabled:      bool  = False # reads ATR_SIZING_ENABLED — cap qty so an ATR stop-out never risks more $ than the fixed-SL baseline
-    atr_tp_mult:             float = 4.0   # reads ATR_TP_MULT — TP = entry + atr × mult
     atr_period:              int   = 14    # reads ATR_PERIOD
     # ── Entry mode parameters (Mode A = pullback, Mode B = breakout) ──
     pullback_rsi_min:        float = 38.0  # Mode A: RSI lower bound
@@ -187,8 +186,6 @@ class StrategyConfig:
             raise ValueError("BREAKOUT_LOOKBACK must be >= 5")
         if self.atr_sl_mult < 0:
             raise ValueError("ATR_SL_MULT must be >= 0 (0 = disabled)")
-        if self.atr_tp_mult < 0:
-            raise ValueError("ATR_TP_MULT must be >= 0")
         if self.atr_period < 2:
             raise ValueError("ATR_PERIOD must be >= 2")
         if self.atr_volatile_multiplier < 0:
@@ -471,8 +468,8 @@ class AppConfig:
             self.strategy.adx_threshold, adx_src,
             self.strategy.regime_ema_period,
             self.strategy.regime_ema_slope_filter)
-        logger.info("CONFIG  atr  sl_mult=%.1f  tp_mult=%.1f  period=%d",
-            self.strategy.atr_sl_mult, self.strategy.atr_tp_mult, self.strategy.atr_period)
+        logger.info("CONFIG  atr  sl_mult=%.1f  period=%d",
+            self.strategy.atr_sl_mult, self.strategy.atr_period)
         logger.info("CONFIG  risk  per_trade=%.0f%%  max_pos=%.0f%%  daily_loss=%.0f%%  max_dd=%.0f%%  max_trades=%d/day  cooldown=%d",
             self.risk.risk_per_trade_pct * 100,
             self.risk.max_position_pct * 100,
@@ -541,7 +538,7 @@ _STRATEGY_CRITICAL_PREFIXES: tuple[str, ...] = (
 )
 _KNOWN_STRATEGY_ENV_KEYS: frozenset[str] = frozenset({
     # ATR
-    "ATR_SL_MULT", "ATR_TP_MULT", "ATR_PERIOD", "ATR_VOLATILE_MULTIPLIER",
+    "ATR_SL_MULT", "ATR_PERIOD", "ATR_VOLATILE_MULTIPLIER",
     "ATR_SIZING_ENABLED",
     # RSI
     "RSI_PERIOD", "RSI_OVERSOLD", "RSI_OVERBOUGHT", "RSI_FILTER_ENABLED",
@@ -604,7 +601,6 @@ def _load() -> AppConfig:
             atr_volatile_multiplier = _float("ATR_VOLATILE_MULTIPLIER", 1.5),
             atr_sl_mult             = _float("ATR_SL_MULT",              0.0),
             atr_sizing_enabled      = _bool ("ATR_SIZING_ENABLED",      False),
-            atr_tp_mult             = _float("ATR_TP_MULT",              4.0),
             atr_period              = _int  ("ATR_PERIOD",               14),
             pullback_rsi_min        = _float("PULLBACK_RSI_MIN",        38.0),
             pullback_rsi_max        = _float("PULLBACK_RSI_MAX",        58.0),

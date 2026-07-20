@@ -33,6 +33,20 @@ generic parity test so a NEW shared field can't reopen this gap silently.
 
 Deliberate exclusions — do not add without a validation decision:
   - slippage_pct: engine default 0.0 — fee_pct is the validated cost model.
+  - max_drawdown_pct: intentionally decoupled from cfg.risk.max_drawdown_pct
+    (live: 0.05 / 5%). Backtests and walk-forward run at a loose 0.25 (25%)
+    ceiling so they measure the strategy's raw signal quality — the sequence
+    of BUY/SELL decisions the strategy itself would make — rather than being
+    truncated or reshaped by where live's 5% capital-protection breaker would
+    have halted new BUYs. The breaker is a separate, independently-tested
+    safety layer (RiskManager, test_risk_manager.py) that runs for real in
+    live/paper trading; it does not need to be re-proven inside every
+    backtest. Practical consequence: a live max-drawdown halt event would
+    make live's actual trade sequence diverge from a walk-forward's — that
+    divergence is expected and acceptable, not a fidelity bug. This was
+    flagged during the 2026-07-20 audit as undocumented; now documented
+    rather than changed. backtest.py's own --max_drawdown CLI flag (default
+    0.25, same number) can still override it per-run.
 """
 
 
@@ -73,6 +87,8 @@ def engine_kwargs_from_cfg(cfg) -> dict:
         sell_threshold       = cfg.strategy.sell_threshold,
         max_position_pct     = cfg.risk.max_position_pct,
         daily_loss_limit_pct = cfg.risk.daily_loss_limit_pct,
+        # Deliberately NOT cfg.risk.max_drawdown_pct (live: 0.05) — see the
+        # "max_drawdown_pct is intentionally decoupled" note above.
         max_drawdown_pct     = 0.25,
         max_trades_per_day   = cfg.risk.max_trades_per_day,
         stop_loss_pct        = cfg.backtest.stop_loss_pct,

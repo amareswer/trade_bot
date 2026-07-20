@@ -1253,6 +1253,53 @@ structural gap of the same shape, currently dormant.
   dead); no silent `except: pass` exception-swallowing found in either bot's execution/risk code.
 - **No restart needed** — backtest/walk-forward tooling only, live behavior unchanged.
 
+### Second audit pass same day — ATR_TP_MULT removed (dead config), drawdown breaker documented (2026-07-20) — 291 tests pass, strategy hash unchanged, fingerprint unchanged
+User asked for a further pass ("any other missing or misconfigured"). Two more findings, both closed same session.
+
+**1. `ATR_TP_MULT` was fully-configured dead code — removed.** It had a dataclass default
+(4.0), an `.env` reader, a validator, a startup log line, and a `_KNOWN_STRATEGY_ENV_KEYS`
+whitelist entry — everything a real config field has. But nothing ever computed a value from
+it: `bot/main.py`'s exit check was built to use `ss['atr_tp']` (`price >= ss['atr_tp'] if
+ss['atr_tp'] > 0 else <fixed TP>`, mirroring the working `ss['atr_sl']` pattern), but
+`ss['atr_tp']` was only ever initialized/reset to `0.0` — the line that would have set it to
+`order.price + atr × atr_tp_mult` on BUY was never written. `engine.run()` never had it as a
+parameter either. Net effect: TP has always been the fixed `TAKE_PROFIT_PCT` (10%), live and
+backtest, completely independent of `ATR_TP_MULT` — the field looked live and never was.
+Chose removal (option b of the three offered) over finishing the feature: an unfinished
+feature masquerading as configured is worse than no feature, and implementing real ATR-TP
+would be new research (backtest + walk-forward) rather than a quick fix.
+- Removed: `StrategyConfig.atr_tp_mult` field + validator + `_load()` reader + startup log
+  arg (`config.py`); `ATR_TP_MULT` from `_KNOWN_STRATEGY_ENV_KEYS` (`config.py`); `ss['atr_tp']`
+  init/reset (4 sites) and the dead `_ic_tp` ATR branch (`bot/main.py`) — TP check is now just
+  the fixed-percent condition, unconditionally. Also removed an adjacent always-unused local
+  `_atr_tp_price` (declared, never read — same dead-code shape, caught while in the area).
+  Log messages "ATR SL disabled or unavailable — using fixed SL/TP" → "...using fixed SL" and
+  "ATR SL/TP [%s]: ..." → "ATR SL [%s]: ..." (both only ever reported SL; the "/TP" was the
+  same misleading implication as the dead field itself).
+- `.env` never set `ATR_TP_MULT`, so this is a pure no-op for live/backtest behavior. Fresh
+  `backtest.py` run reconfirmed unchanged: **32 trades, PF 1.72**.
+
+**2. `max_drawdown_pct` backtest/live divergence — documented, not changed.** Audit-flagged:
+`engine_kwargs_from_cfg()` hardcodes `max_drawdown_pct=0.25` (25%) with zero comment, while
+live's `RiskManager` runs at `cfg.risk.max_drawdown_pct=0.05` (5%, a real .env-driven value,
+not a coincidental default match like the other findings this session). Decided this is
+intentional and left it as-is: backtests/walk-forward measure the strategy's raw signal
+quality — the BUY/SELL sequence the strategy itself would produce — without being reshaped by
+where live's capital-protection breaker would have halted new BUYs. The breaker itself is a
+separate, independently-tested safety layer (`test_risk_manager.py`) that runs for real in
+live/paper trading and doesn't need re-proving inside every backtest. Practical consequence
+now written down: a live max-drawdown halt event will make live's real trade sequence diverge
+from what a walk-forward predicted — that's expected, not a fidelity bug, and should not be
+mistaken for validation-script drift if it's ever observed.
+- Documented in `bot/backtest/params.py`'s module docstring ("Deliberate exclusions" list)
+  and with an inline comment at the `max_drawdown_pct = 0.25` line itself.
+- No code behavior changed — `backtest.py`'s own `--max_drawdown` CLI flag (also defaults to
+  0.25) is unaffected and still available for a one-off override.
+
+**Both:** full suite 291/291 pass, canonical fingerprint reconfirmed unchanged (32 trades,
+PF 1.72), no bot restart needed (crypto bot never read `ATR_TP_MULT` for anything, and the
+drawdown change is docs-only).
+
 ### Affordable-symbol screen (2026-07-15) — 7 new RULE_WHITELIST symbols, 216 tests pass
 Goal: widen the funnel of symbols that can actually FILL at the ~$197 target allocation
 (0.20 × ~$987 account) — 3 of 5 whitelisted symbols were stuck in SIZE_SKIP, so the

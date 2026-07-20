@@ -912,7 +912,6 @@ def run():
                 'trail_peak':       0.0,
                 'partial_done':     False,
                 'atr_sl':           0.0,
-                'atr_tp':           0.0,
                 'last_price':       0.0,
                 'err_count':        0,            # consecutive price-fetch failures
                 'drift_count':      0,            # consecutive drift detections
@@ -948,7 +947,6 @@ def run():
             'trail_peak':       0.0,
             'partial_done':     False,
             'atr_sl':           0.0,
-            'atr_tp':           0.0,
             'last_price':       0.0,
             'err_count':        0,
             'drift_count':      0,
@@ -1029,7 +1027,6 @@ def run():
     _trail_peak:      float = 0.0
     _partial_tp_done: bool  = False
     _atr_sl_price:    float = 0.0
-    _atr_tp_price:    float = 0.0
 
     # Sticky indicator values — updated each candle close, displayed between closes
     _dash_signal = "HOLD"
@@ -1331,9 +1328,8 @@ def run():
                         or (_fixed_sl_level > 0 and price <= _fixed_sl_level)
                     )
                     _ic_tp = (
-                        price >= ss['atr_tp'] if ss['atr_tp'] > 0
-                        else (cfg.backtest.take_profit_pct > 0
-                              and price >= _ic_entry * (1 + cfg.backtest.take_profit_pct))
+                        cfg.backtest.take_profit_pct > 0
+                        and price >= _ic_entry * (1 + cfg.backtest.take_profit_pct)
                     )
                     if _ic_sl or _ic_tp:
                         if _ic_sl:
@@ -1832,7 +1828,6 @@ def run():
                             )
                             ss['partial_done'] = False
                             ss['atr_sl'] = 0.0
-                            ss['atr_tp'] = 0.0
                             if is_indicator:
                                 _atr_val = _atr_fn(
                                     list(ss['strategy']._highs),
@@ -1842,11 +1837,11 @@ def run():
                                 )
                                 if _atr_val is None or _atr_val <= 0 or cfg.strategy.atr_sl_mult <= 0:
                                     ss['atr_sl'] = 0.0
-                                    logger.info("ATR SL disabled or unavailable — using fixed SL/TP")
+                                    logger.info("ATR SL disabled or unavailable — using fixed SL")
                                 else:
                                     ss['atr_sl'] = order.price - _atr_val * cfg.strategy.atr_sl_mult
                                     logger.info(
-                                        "ATR SL/TP [%s]: entry=%.2f atr=%.2f sl=%.2f mult=%.1f",
+                                        "ATR SL [%s]: entry=%.2f atr=%.2f sl=%.2f mult=%.1f",
                                         sym, order.price, _atr_val, ss['atr_sl'], cfg.strategy.atr_sl_mult,
                                     )
                         else:
@@ -1854,7 +1849,6 @@ def run():
                             ss['trail_peak'] = 0.0
                             ss['partial_done'] = False
                             ss['atr_sl'] = 0.0
-                            ss['atr_tp'] = 0.0
                             if not ss['pm'].has_position:
                                 capital_pool.release(sym, ss['executor'].cash)
 
