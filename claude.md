@@ -192,7 +192,7 @@ Expected total: **291 tests** (as of 2026-07-20). If `pytest --collect-only -q` 
 | `test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last (forming candle), determinism, validated-parameter pin |
 | `test_audit_scheduler.py` | 14 | In-bot audit scheduler: tests REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, monthly 1st-anchored (re-screen), missed-run catch-up |
 | `test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
-| `test_ibkr_executor.py` | 21 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping (.TO↔TSE/CAD, bare NYSE cross-listings→NYSE), broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe (redial/never-raise/no-op) |
+| `test_ibkr_executor.py` | 23 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping (.TO↔TSE/CAD, bare NYSE cross-listings→NYSE), broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe (redial/never-raise/no-op), low-equity FX/margin-minimum guard (CAD exempt) |
 | `test_heartbeat.py` | 8 | Heartbeat pings (bot/alerts/heartbeat.py): URL-off, success/failure never raise, healthy_fn gate |
 | `test_tws_monitor.py` | 6 | TwsConnectionMonitor state machine: blip tolerance, alert-once per outage, recovery notice |
 | `test_atr_sizing.py` | 7 | calc_trade_qty_atr_risk: dollar-risk-at-stop == fixed-SL baseline, tight-stop cap, fallbacks |
@@ -200,7 +200,7 @@ Expected total: **291 tests** (as of 2026-07-20). If `pytest --collect-only -q` 
 | `test_crash_hardening.py` | 9 | atomic_write_json (valid/replace/no-tmp/parents/old-file-preserved), send_now sync + disabled, crash-alert helpers never raise |
 | `test_engine_params.py` | 8 | `engine_kwargs_from_cfg` builder: keys accepted by engine.run, ATR keys sourced from cfg, previously-drifted keys present, macd_enabled + Mode A/B entry params sourced from cfg, generic parity test (every StrategyConfig∩IndicatorConfig field reaches the backtest), both validation scripts use the builder |
 
-Run: `python -m pytest --tb=short -q` — must show **291 passed**.
+Run: `python -m pytest --tb=short -q` — must show **293 passed**.
 
 ---
 
@@ -1375,6 +1375,38 @@ mismatch (not a live danger) plus two more dead methods, same shape as the prior
 - Verified: full suite 291/291 pass; fresh `backtest.py` run reconfirmed the canonical
   fingerprint unchanged (**32 trades, PF 1.72**) — this was docs + dead-code removal only, no
   sizing formula that anything actually calls was touched. No bot restart needed.
+
+### IBKR $2,500 CAD equity floor discovered + guarded — real root cause of zero stock fills (2026-07-20) — 293 tests pass
+CM's rule strategy produced its first live BUY signal (RULE BUY, contract correctly routed
+NYSE/USD by the 2026-07-17 contract-mapping fix) and IBKR rejected it: **Error 201 —
+"YOUR ORDER IS NOT ACCEPTED. MINIMUM OF 2500 CAD ... IS REQUIRED IN ORDER TO ... TRADE
+CURRENCY."** IBKR treats buying a USD-denominated security from a CAD-base account as an
+implicit margin/currency trade and refuses it outright below $2,500 CAD equity — unrelated to
+order size (1 share of ~$119 CM hit it the same as any size would).
+- **This is the actual reason the stock bot had zero fills since the 2026-07-17 IBKR switch** —
+  not just "signals are rare." The account (DUQ273338) holds ~$995 CAD, and **every single
+  RULE_WHITELIST symbol is USD-denominated** (MRNA, AMD, RY, PLTR, GLD, TD, CM, CSCO, KO, T —
+  all US-listed, per the 2026-07-17 TSX-API-blocked whitelist swap). Every future rule BUY on
+  any whitelisted symbol would have repeated this exact rejection until the account crosses
+  $2,500 CAD.
+- **Fix — proactive guard, not just noise reduction:** `IBKRExecutor.buy()`
+  (`stock_bot/execution/ibkr.py`) now checks `contract.currency != "CAD" and self.cash <
+  _MIN_EQUITY_FOR_FX_TRADE_CAD` (2500.0, matching IBKR's own stated minimum) and rejects
+  early with a clear reason — before ever placing the order. A CAD-denominated (.TO) buy is
+  unaffected by the floor. This doesn't unblock trading (that requires more account equity,
+  an action outside this repo) — it stops every future signal from wastefully round-tripping
+  a doomed order through IBKR and makes the real blocker visible in `reject_reason` instead of
+  only in the raw ib_async error log.
+- Tests: `test_buy_rejected_low_equity_fx_trade` (new — pins the guard fires at $995 CAD
+  equity on a USD symbol) + `test_buy_allowed_low_equity_cad_security` (new — confirms the
+  floor does NOT block a CAD/.TO buy at the same equity) + `test_buy_rejected_insufficient_cash`
+  adjusted (cash raised to $3,000 so it tests the cash check, not this new floor). Suite
+  291 → 293.
+- **Action required (outside code, user must do it):** request an IBKR paper account top-up
+  above $2,500 CAD via the portal (same free "Other Amount" reset path used 2026-07-17) —
+  it's simulated money, no cost. Until then, every rule BUY signal on the current whitelist
+  will keep rejecting cleanly (visible, not silent) rather than repeatedly hitting the broker.
+- **Stock bot needs a restart** to load this guard.
 
 ### Affordable-symbol screen (2026-07-15) — 7 new RULE_WHITELIST symbols, 216 tests pass
 Goal: widen the funnel of symbols that can actually FILL at the ~$197 target allocation

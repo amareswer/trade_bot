@@ -260,6 +260,15 @@ class IBKRExecutor(StockExecutorBase):
     # 2026-07-17 Error 201 incident). Force NYSE so the USD contract wins.
     _NYSE_CROSS_LISTED = {"RY", "TD", "BNS", "CM", "SU"}
 
+    # IBKR refuses to buy a non-base-currency security below this account
+    # equity (CAD) — it treats the purchase as an implicit margin/currency
+    # trade (Error 201: "MINIMUM OF 2500 CAD ... REQUIRED ... TO ... TRADE
+    # CURRENCY"). Discovered 2026-07-20: CM's first live rule BUY (account
+    # equity ~$995 CAD, all ten RULE_WHITELIST symbols USD-denominated) hit
+    # this wall — every future USD BUY would have repeated the same rejection
+    # cycle. Checked proactively so a doomed order never reaches IBKR.
+    _MIN_EQUITY_FOR_FX_TRADE_CAD = 2500.0
+
     @staticmethod
     def to_contract(symbol: str):
         """
@@ -403,6 +412,16 @@ class IBKRExecutor(StockExecutorBase):
             return self._reject(
                 sym, OrderSide.BUY, shares, price,
                 f"Insufficient cash for 1 share @ ${price:.2f}",
+            )
+
+        contract_currency = self.to_contract(sym).currency
+        if contract_currency != "CAD" and self.cash < self._MIN_EQUITY_FOR_FX_TRADE_CAD:
+            return self._reject(
+                sym, OrderSide.BUY, shares, price,
+                f"Account equity ${self.cash:,.2f} CAD is below IBKR's "
+                f"${self._MIN_EQUITY_FOR_FX_TRADE_CAD:,.0f} CAD minimum required to buy "
+                f"a {contract_currency}-denominated security (IBKR Error 201 — "
+                "margin/currency-trade minimum)",
             )
 
         if sym not in self.positions_snapshot():

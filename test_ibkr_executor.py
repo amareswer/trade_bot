@@ -239,13 +239,39 @@ def test_buy_fills_at_broker_price_not_request_price(executors, tmp_path):
 
 
 def test_buy_rejected_insufficient_cash(executors):
-    fake = FakeIB(cash=50.0)
+    # Cash kept above the FX/margin-minimum threshold (below tests that
+    # specifically) so this exercises the cash check, not the equity guard.
+    fake = FakeIB(cash=3_000.0)
     ex = make_executor(fake)
     executors.append(ex)
-    order = ex.buy("KO", 10, 60.0, reason="test")
+    order = ex.buy("KO", 100, 60.0, reason="test")   # costs $6,000 > $3,000 cash
     assert order.status == OrderStatus.REJECTED
     assert "Insufficient cash" in order.reject_reason
     assert fake.placed == []              # never reached the broker
+
+
+def test_buy_rejected_low_equity_fx_trade(executors):
+    # IBKR refuses to buy a non-CAD security below $2,500 CAD equity — it
+    # treats the purchase as an implicit margin/currency trade (Error 201).
+    # Discovered 2026-07-20: CM's first live rule BUY hit this wall at
+    # ~$995 CAD equity. Checked proactively so the order never reaches IBKR.
+    fake = FakeIB(cash=995.28)
+    ex = make_executor(fake)
+    executors.append(ex)
+    order = ex.buy("KO", 1, 60.0, reason="test")
+    assert order.status == OrderStatus.REJECTED
+    assert "2,500" in order.reject_reason
+    assert fake.placed == []              # never reached the broker
+
+
+def test_buy_allowed_low_equity_cad_security(executors):
+    # The equity floor only applies to non-CAD (foreign-currency) contracts —
+    # a CAD-denominated TSX buy must not be blocked by it.
+    fake = FakeIB(cash=995.28, fill_price=24.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+    order = ex.buy("CM.TO", 1, 24.0, reason="test")
+    assert order.status == OrderStatus.FILLED
 
 
 def test_buy_rejected_on_fill_timeout(executors):
