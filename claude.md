@@ -1300,6 +1300,41 @@ mistaken for validation-script drift if it's ever observed.
 PF 1.72), no bot restart needed (crypto bot never read `ATR_TP_MULT` for anything, and the
 drawdown change is docs-only).
 
+### Third audit pass same day — 4 orphaned StockConfig fields removed (2026-07-20) — 291 tests pass, no behavior change
+Continued the audit further into the stock bot (crypto side came back clean on this pass:
+every `RiskConfig`/`BacktestConfig`/`PortfolioConfig`/`ExchangeConfig` field is referenced
+somewhere, correlation gate logic is sound, stock backtest imports the same
+`_round_trip_commission()` the live paper/IBKR accounting uses — no drift possible there by
+construction). Ran the systematic "is every config field actually consumed" sweep (the same
+method that found `ATR_TP_MULT`) against `StockConfig` and found four fields with a milder
+version of the same shape: defined, `.env`-loaded, validated where applicable — but never
+actually read through `cfg` anywhere.
+- **`nvidia_api_key`, `nvidia_model`:** `stock_bot/ai/ai_engine.py` reads `NVIDIA_API_KEY` /
+  `NVIDIA_MODEL` directly via `os.getenv()`, bypassing `cfg` entirely. The AI provider (the
+  bot's active one, per the earlier "AI_PROVIDER=nvidia_nim" note) works correctly — these two
+  `StockConfig` fields were just an unused duplicate path to the same env vars.
+- **`price_outlier_factor`:** same pattern — `stock_bot/data/price_feed.py` reads
+  `PRICE_OUTLIER_FACTOR` directly via its own module-level `os.getenv()`. The outlier-rejection
+  safety guard (rejects a fetched close that's >10x the median of the same fetch) **works
+  correctly**; the `StockConfig` field was the unused duplicate.
+- **`base_currency`:** zero consumers anywhere, not even a duplicate path — looks like a stub
+  for a mixed-currency portfolio display that was never built.
+- **Not a live bug in any case** — unlike `ATR_TP_MULT`, nothing was ever built to consume
+  these through `cfg`, so there was no half-wired feature silently failing. Pure dead weight:
+  editing `cfg.price_outlier_factor` in code would have done nothing, but editing the `.env`
+  var `PRICE_OUTLIER_FACTOR` itself always worked (the real consumer reads it directly).
+- **Removed:** all four field declarations, `_load()` reader lines, and their inline comments
+  from `stock_bot/config.py`. No validators referenced any of them (checked `__post_init__`
+  first), so removal is a pure no-op — confirmed via `hasattr(cfg, ...)` returning `False` for
+  all four post-removal and a clean `stock_bot.config.load()`.
+- **`.env` left untouched** — `NVIDIA_API_KEY`/`NVIDIA_MODEL` in `stock_bot/.env` are still
+  live and required (read directly by `ai_engine.py`); `PRICE_OUTLIER_FACTOR` isn't even set
+  there (using `price_feed.py`'s own default of 10); `BASE_CURRENCY=CAD` is now fully inert
+  but harmless to leave — editing `.env` is a more sensitive action than code cleanup and was
+  out of scope for this pass.
+- Full suite reconfirmed: 291/291 (same count — no test referenced any of the four fields,
+  confirming they were truly dead). No bot restart needed — no behavior changed anywhere.
+
 ### Affordable-symbol screen (2026-07-15) — 7 new RULE_WHITELIST symbols, 216 tests pass
 Goal: widen the funnel of symbols that can actually FILL at the ~$197 target allocation
 (0.20 × ~$987 account) — 3 of 5 whitelisted symbols were stuck in SIZE_SKIP, so the
