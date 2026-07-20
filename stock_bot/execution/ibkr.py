@@ -76,6 +76,15 @@ _CSV_HEADER = [
 _LIVE_PORTS = {7496, 4001}   # TWS live, IB Gateway live
 _PAPER_ACCOUNT_PREFIX = "DU"
 
+# A manual IBKR paper-account reset (or any other external deposit/withdrawal)
+# changes NetLiquidation outside of anything this executor traded — at cost
+# basis, a BUY just moves cash into inventory at no gain/loss, so absent an
+# external change, net_liq should always equal starting_cash + realized_pnl
+# to within normal unrealized mark-to-market drift. A gap bigger than this
+# means something external happened; see _rebaseline_if_external_change().
+_REBASELINE_ABS_MIN_CAD = 50.0
+_REBASELINE_PCT_OF_STARTING = 0.02
+
 
 def _default_ib_factory():
     from ib_async import IB
@@ -157,8 +166,12 @@ class IBKRExecutor(StockExecutorBase):
         self._load_state()
         net_liq = self._net_liquidation()
         if self._starting_cash <= 0 and net_liq > 0:
+            # First-ever connection with this state file: seed the permanent
+            # baseline from the live account, exactly once.
             self._starting_cash = net_liq
             self.save_state()
+        elif net_liq > 0:
+            self._rebaseline_if_external_change(net_liq)
         self._session_start_value = net_liq
 
         self._ensure_csv_header()
@@ -695,6 +708,37 @@ class IBKRExecutor(StockExecutorBase):
         )
 
     # ── state persistence (local realized P&L only) ──────────────────────────
+
+    def _rebaseline_if_external_change(self, net_liq: float) -> None:
+        """
+        Detect an external cash change (a manual paper-account reset, or any
+        deposit/withdrawal) and re-baseline starting_cash to absorb it.
+
+        At cost basis, a BUY just moves cash into inventory at no gain or
+        loss — so with no external change, net_liq should track
+        starting_cash + realized_pnl to within small unrealized
+        mark-to-market drift on any open position. A gap larger than that
+        can only come from something outside this executor's own trading,
+        most commonly a manual "Paper Trading Account Reset" in the IBKR
+        portal (discovered 2026-07-20: a reset landed while the bot kept
+        running, and the frozen starting_cash required a manual JSON edit
+        to reflect it — this makes that automatic).
+        """
+        expected = self._starting_cash + self._realized_pnl
+        drift = net_liq - expected
+        threshold = max(_REBASELINE_ABS_MIN_CAD,
+                         _REBASELINE_PCT_OF_STARTING * self._starting_cash)
+        if abs(drift) <= threshold:
+            return
+        old_starting = self._starting_cash
+        self._starting_cash = net_liq - self._realized_pnl
+        logger.warning(
+            "IBKR net_liq $%.2f is $%.2f away from tracked P&L (expected ~$%.2f) "
+            "— treating as an external deposit/reset and re-baselining "
+            "starting_cash $%.2f → $%.2f",
+            net_liq, drift, expected, old_starting, self._starting_cash,
+        )
+        self.save_state()
 
     def _load_state(self) -> bool:
         if not os.path.exists(_STATE_JSON):

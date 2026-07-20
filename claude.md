@@ -192,7 +192,7 @@ Expected total: **291 tests** (as of 2026-07-20). If `pytest --collect-only -q` 
 | `test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last (forming candle), determinism, validated-parameter pin |
 | `test_audit_scheduler.py` | 14 | In-bot audit scheduler: tests REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, monthly 1st-anchored (re-screen), missed-run catch-up |
 | `test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
-| `test_ibkr_executor.py` | 23 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping (.TO↔TSE/CAD, bare NYSE cross-listings→NYSE), broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe (redial/never-raise/no-op), low-equity FX/margin-minimum guard (CAD exempt) |
+| `test_ibkr_executor.py` | 27 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping (.TO↔TSE/CAD, bare NYSE cross-listings→NYSE), broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe (redial/never-raise/no-op), low-equity FX/margin-minimum guard (CAD exempt), starting_cash auto-rebaseline on external reset/deposit |
 | `test_heartbeat.py` | 8 | Heartbeat pings (bot/alerts/heartbeat.py): URL-off, success/failure never raise, healthy_fn gate |
 | `test_tws_monitor.py` | 6 | TwsConnectionMonitor state machine: blip tolerance, alert-once per outage, recovery notice |
 | `test_atr_sizing.py` | 7 | calc_trade_qty_atr_risk: dollar-risk-at-stop == fixed-SL baseline, tight-stop cap, fallbacks |
@@ -200,7 +200,7 @@ Expected total: **291 tests** (as of 2026-07-20). If `pytest --collect-only -q` 
 | `test_crash_hardening.py` | 9 | atomic_write_json (valid/replace/no-tmp/parents/old-file-preserved), send_now sync + disabled, crash-alert helpers never raise |
 | `test_engine_params.py` | 8 | `engine_kwargs_from_cfg` builder: keys accepted by engine.run, ATR keys sourced from cfg, previously-drifted keys present, macd_enabled + Mode A/B entry params sourced from cfg, generic parity test (every StrategyConfig∩IndicatorConfig field reaches the backtest), both validation scripts use the builder |
 
-Run: `python -m pytest --tb=short -q` — must show **293 passed**.
+Run: `python -m pytest --tb=short -q` — must show **297 passed**.
 
 ---
 
@@ -1407,6 +1407,52 @@ order size (1 share of ~$119 CM hit it the same as any size would).
   it's simulated money, no cost. Until then, every rule BUY signal on the current whitelist
   will keep rejecting cleanly (visible, not silent) rather than repeatedly hitting the broker.
 - **Stock bot needs a restart** to load this guard.
+
+### Resolved same day — paper account reset to $5,000 CAD, first live fill, starting_cash auto-rebaseline built (2026-07-20) — 297 tests pass
+User requested and completed the account top-up via the IBKR portal (Settings → Account
+Settings → Paper Trading Account Reset → "Other Amount" → 5000). It landed the same day
+(faster than the portal's stated "next business day") while the stock bot kept running —
+**no restart was needed for trading to unblock**, because the $2,500-equity guard added
+above reads live IBKR data (`self.cash`) on every order, not a cached value.
+- **First real stock-bot fill ever:** CM's rule strategy fired again once equity cleared
+  $2,500 and this time filled — 10 shares @ $117.72, `RULE BUY rsi=70 adx=23 | ai=BUY70`.
+  Confirmed via a direct IBKR query (separate short-lived client connection, clientId=99,
+  read-only): `NetLiquidation` = $4,999.72 CAD — matches the requested $5,000 reset almost
+  exactly (the $0.28 gap is the new position's own tiny mark-to-market movement, not a
+  different reset amount).
+- **New gap found immediately after, same session — `starting_cash` doesn't know about
+  external resets.** `IBKRExecutor.__init__` only ever auto-seeds `starting_cash` from live
+  `NetLiquidation` on the very first-ever connection (`stock_bot/execution/ibkr.py:157-161`)
+  then freezes it forever by design — correct for tracking real trading return against a
+  stable baseline, but it has no way to detect a human manually resetting the paper account
+  balance outside of any trade. After this reset, `ibkr_state.json` was still holding the
+  stale pre-reset `995.30` baseline, which would have made every future % return calculation
+  wrong (comparing new equity against an obsolete number) until someone noticed and manually
+  edited the file — exactly the same manual correction this project already had to do once
+  before, after the 2026-07-17 $1M→$1,000 reset. That's a recurring manual chore, not a
+  one-off.
+- **Fix: `IBKRExecutor._rebaseline_if_external_change()`** (new, `stock_bot/execution/ibkr.py`)
+  — runs on every connect after the first. At cost basis, a BUY only moves cash into
+  inventory at no gain/loss, so absent any external change `net_liq` should always equal
+  `starting_cash + realized_pnl` to within small unrealized mark-to-market drift on any open
+  position. A gap bigger than `max($50, 2% of starting_cash)` can only come from something
+  outside this executor's own trading — most commonly a manual portal reset — and triggers
+  an automatic re-baseline (`starting_cash = net_liq - realized_pnl`, preserving already-
+  tracked realized P&L rather than discarding it) plus a `logger.warning` and a `save_state()`
+  so the corrected value persists. No manual JSON edit will be needed the next time this
+  account gets reset.
+- Tests (new, `test_ibkr_executor.py`): `test_starting_cash_seeds_on_first_ever_connect`
+  (unchanged first-connect behavior), `test_starting_cash_rebaselines_on_external_reset`
+  (995.30 → 5000.0 jump triggers and persists), `test_starting_cash_not_rebaselined_for_small_drift`
+  ($10 drift on a $1,000 baseline stays untouched — under the $50 floor),
+  `test_starting_cash_rebaseline_accounts_for_realized_pnl` (a $4,000 external jump on top of
+  $50 already-realized P&L re-baselines to exactly $5,000, not $5,050 — realized P&L isn't
+  double-counted). Suite 293 → 297.
+- `stock_bot/ibkr_state.json`'s `starting_cash` manually corrected to `5000.0` this session
+  (before the auto-rebaseline code existed) — future resets will self-correct.
+- **Stock bot needs a restart** to load the auto-rebaseline code (the currently-running
+  process still holds the pre-fix build; the manual JSON correction above holds until then,
+  as long as no further trade fires and re-saves the old in-memory value first).
 
 ### Affordable-symbol screen (2026-07-15) — 7 new RULE_WHITELIST symbols, 216 tests pass
 Goal: widen the funnel of symbols that can actually FILL at the ~$197 target allocation

@@ -14,6 +14,7 @@ cancel-race guard (a fill racing the cancel is recorded, never dropped —
 """
 import asyncio
 import csv
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -416,3 +417,61 @@ def test_try_reconnect_noop_when_already_connected(executors):
     assert fake.connect_calls == 1         # startup connect only
     assert ex.try_reconnect() is True
     assert fake.connect_calls == 1         # no redial while healthy
+
+
+# ---------------------------------------------------------------------------
+# starting_cash rebaseline (2026-07-20 manual-paper-reset incident)
+# ---------------------------------------------------------------------------
+
+def _seed_state(tmp_path, starting_cash, realized_pnl=0.0):
+    with open(tmp_path / "ibkr_state.json", "w") as f:
+        json.dump({
+            "account": "DUQ273338",
+            "realized_pnl": realized_pnl,
+            "starting_cash": starting_cash,
+            "last_updated": "2026-07-17T00:00:00",
+        }, f)
+
+
+def test_starting_cash_seeds_on_first_ever_connect(executors, sandbox):
+    # No state file yet — starting_cash must be auto-pulled from the live
+    # NetLiquidation feed, not hardcoded.
+    fake = FakeIB(net_liq=995.28)
+    ex = make_executor(fake)
+    executors.append(ex)
+    assert ex.starting_cash == 995.28
+
+
+def test_starting_cash_rebaselines_on_external_reset(executors, sandbox):
+    # A manual IBKR paper-account reset changes net_liq with zero trades in
+    # between — the executor must detect the unexplained jump and
+    # re-baseline automatically instead of keeping the stale figure.
+    _seed_state(sandbox, starting_cash=995.30, realized_pnl=0.0)
+    fake = FakeIB(net_liq=5000.0, cash=5000.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+    assert ex.starting_cash == 5000.0
+
+    with open(sandbox / "ibkr_state.json") as f:
+        saved = json.load(f)
+    assert saved["starting_cash"] == 5000.0
+
+
+def test_starting_cash_not_rebaselined_for_small_drift(executors, sandbox):
+    # Ordinary unrealized mark-to-market drift on an open position must NOT
+    # be mistaken for an external reset.
+    _seed_state(sandbox, starting_cash=1000.0, realized_pnl=0.0)
+    fake = FakeIB(net_liq=1010.0)   # $10 drift, under the $50 floor
+    ex = make_executor(fake)
+    executors.append(ex)
+    assert ex.starting_cash == 1000.0
+
+
+def test_starting_cash_rebaseline_accounts_for_realized_pnl(executors, sandbox):
+    # The re-baseline must subtract already-tracked realized P&L so it isn't
+    # double-counted as part of the "external" jump.
+    _seed_state(sandbox, starting_cash=1000.0, realized_pnl=50.0)
+    fake = FakeIB(net_liq=5050.0)   # a $4,000 external deposit on top of the $50 already realized
+    ex = make_executor(fake)
+    executors.append(ex)
+    assert ex.starting_cash == 5000.0   # 5050 - 50, not 5050
