@@ -1335,6 +1335,47 @@ actually read through `cfg` anywhere.
 - Full suite reconfirmed: 291/291 (same count — no test referenced any of the four fields,
   confirming they were truly dead). No bot restart needed — no behavior changed anywhere.
 
+### Fourth audit pass same day — position-sizing docstring fixed, 2 dead sizing methods removed (2026-07-20) — 291 tests pass, fingerprint unchanged, no behavior change
+Continued the audit into `config.py`'s position-sizing methods — the highest-stakes area
+checked yet, since it directly determines real dollar risk per trade. Found a documentation
+mismatch (not a live danger) plus two more dead methods, same shape as the prior findings.
+
+- **`calc_trade_qty()` — the function that sizes every live BUY (`bot/main.py:1644`) — had a
+  wrong docstring.** It claimed "industry standard fixed-fractional method... risk exactly
+  risk_per_trade_pct of current cash per trade," but the formula (`cash × risk_per_trade_pct
+  / price`) is **notional allocation** (invest X% of cash), not risk-based sizing (size so a
+  stop-out costs X% of cash) — those are different formulas with very different outputs.
+  Textbook fixed-fractional risk sizing is `(cash × risk_pct) / stop_distance`; this function
+  never looks at a stop distance at all.
+- **What this means for real risk, verified numerically:** with the live config
+  (`RISK_PER_TRADE_PCT=0.10`, fixed SL fallback 1.5%), actual dollar loss if a stop-loss hits
+  is `10% × 1.5% = 0.15%` of cash (≈$0.12 on the current $77 slot) — not the 10%/$7.70 the old
+  docstring implied. This is good news (real risk is far more conservative than the "10%,
+  intentionally high" framing elsewhere in this file suggests, and more conservative than the
+  standard expert 1–2%-per-trade guideline) but it means "RISK_PER_TRADE_PCT" has been
+  informally read as "% risked" when it's actually a capital-allocation dial that combines
+  with the SL% to produce a much smaller real risk number. Not dangerous — mislabeled.
+  **No live risk-per-trade number in this file changes as a result of this entry** — this is
+  a correction to what the number MEANS, not a change to it.
+- **Two fully dead sizing methods removed:** `calc_trade_qty_sl()` (correctly implemented the
+  real textbook fixed-fractional method — its own docstring was accurate) and
+  `calc_trade_qty_atr()` (ATR-based sizing without the fixed-SL-baseline cap). Neither was
+  called anywhere — not `bot/main.py`, not the backtest engine, not a single test. Confirmed
+  via `hasattr(cfg, ...)` returning `False` for both post-removal.
+  `calc_trade_qty_atr_risk()` — the method that DOES run live whenever
+  `ATR_SIZING_ENABLED=true` (the setting since 2026-07-17) — is the actual real-dollar-risk
+  cap in production today, and its own docstring was already accurate; left untouched.
+- Fresh docstring on `calc_trade_qty()` states plainly what it does, the 0.15%-of-cash real
+  number under the current live config, and points to `calc_trade_qty_atr_risk()` as the
+  actual risk-based control that runs live.
+- **Not acted on, noted only:** actual risk-per-trade (~0.15% of cash) is quite conservative
+  by expert standards — there would be room to size up within the standard 1–2% band if faster
+  statistical signal on the capital gates is ever wanted. Deliberately left as a future
+  decision for the user, not changed here.
+- Verified: full suite 291/291 pass; fresh `backtest.py` run reconfirmed the canonical
+  fingerprint unchanged (**32 trades, PF 1.72**) — this was docs + dead-code removal only, no
+  sizing formula that anything actually calls was touched. No bot restart needed.
+
 ### Affordable-symbol screen (2026-07-15) — 7 new RULE_WHITELIST symbols, 216 tests pass
 Goal: widen the funnel of symbols that can actually FILL at the ~$197 target allocation
 (0.20 × ~$987 account) — 3 of 5 whitelisted symbols were stuck in SIZE_SKIP, so the

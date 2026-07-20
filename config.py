@@ -374,33 +374,28 @@ class AppConfig:
 
     def calc_trade_qty(self, cash: float, price: float) -> float:
         """
-        Dynamic position sizing — industry standard fixed-fractional method.
-        Risk exactly risk_per_trade_pct of current cash per trade.
-        Quantity shrinks when you lose, grows when you profit.
+        Notional position sizing: allocate risk_per_trade_pct of current cash
+        to this trade's position value (NOT dollar-risk-at-stop — this does
+        not look at any stop-loss distance). Quantity shrinks when cash
+        shrinks, grows when cash grows.
+
+        2026-07-20 audit note: this docstring previously (incorrectly)
+        described this as the "industry standard fixed-fractional method"
+        that "risks exactly risk_per_trade_pct of cash" — that description
+        belongs to true risk-based sizing (position size derived from a stop
+        distance so a stop-out costs exactly risk_per_trade_pct of cash),
+        which this function does NOT do. With the live config
+        (RISK_PER_TRADE_PCT=0.10, fixed SL fallback 1.5%), the REAL dollar
+        risk if a stop is hit is risk_per_trade_pct × stop_loss_pct ≈ 0.15%
+        of cash — not 10%. The actual risk-based cap on live BUYs comes from
+        calc_trade_qty_atr_risk() below, which IS a true dollar-risk
+        calculation and is the one that runs whenever ATR_SIZING_ENABLED=true
+        (the live setting since 2026-07-17).
         """
         if price <= 0 or cash <= 0:
             return 0.0
         trade_value = cash * self.risk.risk_per_trade_pct
         return round(trade_value / price, 6)
-
-    def calc_trade_qty_atr(
-        self,
-        cash:          float,
-        price:         float,
-        atr_value:     float,
-        atr_multiplier: float | None = None,
-    ) -> float:
-        """
-        ATR-based sizing: SL distance = ATR × multiplier.
-        Risks exactly risk_per_trade_pct of cash if the ATR stop is hit.
-        Falls back to calc_trade_qty() when ATR is 0 or unavailable.
-        """
-        mult = atr_multiplier if atr_multiplier is not None else self.backtest.atr_sl_mult
-        if price <= 0 or cash <= 0 or atr_value <= 0 or mult <= 0:
-            return self.calc_trade_qty(cash, price)
-        sl_distance = atr_value * mult
-        dollar_risk = cash * self.risk.risk_per_trade_pct
-        return round(dollar_risk / sl_distance, 6)
 
     def calc_trade_qty_atr_risk(
         self,
@@ -432,24 +427,6 @@ class AppConfig:
         sl_distance = atr_value * atr_mult
         risk_budget = cash * self.risk.risk_per_trade_pct * baseline_sl_pct
         return round(min(base_qty, risk_budget / sl_distance), 6)
-
-    def calc_trade_qty_sl(
-        self,
-        cash:            float,
-        entry_price:     float,
-        stop_loss_price: float,
-    ) -> float:
-        """
-        SL-based sizing: if stop is hit, lose exactly risk_per_trade_pct of cash.
-        Falls back to calc_trade_qty() when stop_loss_price is 0 or sl_distance ~ 0.
-        """
-        if stop_loss_price <= 0 or entry_price <= 0 or cash <= 0:
-            return self.calc_trade_qty(cash, entry_price)
-        sl_distance = abs(entry_price - stop_loss_price)
-        if sl_distance < 1e-9:
-            return self.calc_trade_qty(cash, entry_price)
-        dollar_risk = cash * self.risk.risk_per_trade_pct
-        return round(dollar_risk / sl_distance, 6)
 
     def log_startup(self) -> None:
         """Log all config on startup (no secrets logged)."""
