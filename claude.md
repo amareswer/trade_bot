@@ -198,7 +198,7 @@ Expected total: **289 tests** (as of 2026-07-18). If `pytest --collect-only -q` 
 | `test_atr_sizing.py` | 7 | calc_trade_qty_atr_risk: dollar-risk-at-stop == fixed-SL baseline, tight-stop cap, fallbacks |
 | `test_stock_telegram.py` | 7 | Stock→Telegram relay: root-.env credential sourcing, ops_alert/fill forwarding, HIGH-only filter, channel-off no-ops |
 | `test_crash_hardening.py` | 9 | atomic_write_json (valid/replace/no-tmp/parents/old-file-preserved), send_now sync + disabled, crash-alert helpers never raise |
-| `test_engine_params.py` | 6 | `engine_kwargs_from_cfg` builder: keys accepted by engine.run, ATR keys sourced from cfg, previously-drifted keys present, macd_enabled deliberately excluded, both validation scripts use the builder |
+| `test_engine_params.py` | 6 | `engine_kwargs_from_cfg` builder: keys accepted by engine.run, ATR keys sourced from cfg, previously-drifted keys present, macd_enabled sourced from cfg, both validation scripts use the builder |
 
 Run: `python -m pytest --tb=short -q` — must show **289 passed**.
 
@@ -274,12 +274,12 @@ ORDER_TYPE=limit / LIMIT_ORDER_ENABLED=true   # BUY entries limit-chase for make
 
 ### How to verify the config is active
 Run: EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py
-Expected (as of ATR_SIZING_ENABLED=true, 2026-07-17 late): 35 trades, PF ~1.90 (confirmed at
-adoption — matches the 5000c ATR row of the sizing-ON walk-forward exactly; with sizing OFF
-the expectation is PF ~1.98, the `logs/atr_walkforward_BTC_2.0_20260717.md` figure). The older "39 trades,
-PF ~1.79" figure below (Canonical strategy fingerprint section) was the fixed-SL-only result —
-still correct for STRATEGY hash purposes (SL/TP are config, not strategy files) but no longer
-what a fresh `backtest.py` run reproduces, since ATR_SL_MULT now overrides fixed SL by default.
+Expected (as of macd_enabled added to engine_kwargs_from_cfg, 2026-07-20): **32 trades, PF 1.72**
+(hash `659d1c03987b72fd` unchanged — see "MACD live/backtest divergence resolved" entry below).
+This superseded the prior "35 trades, PF ~1.90" figure, which was produced with MACD silently
+OFF in the backtest while live always ran with MACD ON — the two disagreed. Sizing-OFF and the
+older ATR-only ("35/1.90", "35/1.98") and fixed-SL-only ("39/1.79") figures elsewhere in this
+file are historical record of earlier config states, not what a fresh run reproduces today.
 If RSI_FILTER_ENABLED=false accidentally: trade count jumps significantly, PF drops below 1.2
 
 Reproducible pinned-window verification (identical result to rolling run):
@@ -309,7 +309,10 @@ Note — trade count evolution:
 - **Result:** 39 trades, PF 1.77 (range 1.77–1.79 depending on rolling-window end date; all > 1.0)
   — this was the fixed-SL-only fingerprint. As of 2026-07-17, `ATR_SL_MULT=2.0` is live (see
   "ATR SL adopted live" entry below) — the hash itself is unchanged (SL is config, not a
-  strategy file) but a fresh `backtest.py` run now returns 35 trades / PF ~1.98, not this figure.
+  strategy file) but a fresh `backtest.py` run returned 35 trades / PF ~1.98 at that point, not
+  this figure. As of 2026-07-20, `macd_enabled` was added to `engine_kwargs_from_cfg()` (see
+  "MACD live/backtest divergence resolved" below) — a fresh run now returns **32 trades, PF
+  1.72**. Hash still unchanged throughout (none of these were `bot/strategy/*.py` edits).
 - **Stamped:** run `python stamp_strategy.py` after each passing walk-forward to write `logs/validated_strategy_hash`
 - If the bot or backtest prints `STRATEGY CODE DIFFERS`, re-run walk-forward before trusting any PF numbers
 - Prior hash `d3c7c383d91d5ef9` (2026-07-02) was computed over all `bot/strategy/*.py` including fingerprint.py — that scope was wrong. Hash value changed when scope was corrected to behavior-only files. No strategy logic changed.
@@ -1162,19 +1165,13 @@ config nobody trades. Same failure class as the 2026-07-02 ATR SL drift incident
   drift-guard whitelist), so EVERY config load — including live bot startups — logged
   "unrecognised strategy keys: ATR_SIZING_ENABLED". The key was always read correctly
   (PF 1.90 = sizing ON confirms); only the warning was wrong. Whitelist updated.
-- **OPEN DECISION — macd_enabled live-vs-backtest divergence (found during this audit):**
-  live (`bot/main.py`) and `shadow_signal.py` run `macd_enabled=cfg.strategy.macd_enabled`
-  (True — MACD gates both entry modes), but `backtest.py` never passed it, so every
-  canonical fingerprint was produced with MACD OFF. Measured on the canonical 5000c window
-  (2026-07-18): MACD OFF 35 trades / PF 1.90 / 40.0% win; MACD ON 32 trades / PF 1.72 /
-  37.5% win. Live is STRICTER than what was validated (its trades ⊂ backtest's), so this is
-  a fidelity gap, not a safety hole — but the validated numbers describe a slightly more
-  permissive strategy than the one trading. `engine_kwargs_from_cfg` deliberately EXCLUDES
-  `macd_enabled` (pinned by test) to preserve the canonical fingerprint until the user
-  decides: either (a) add it to the builder and re-validate everything with MACD ON as the
-  new canonical (numbers above suggest PF drops to ~1.72), or (b) set `MACD_ENABLED=false`
-  — but that changes LIVE behavior (same key) and would need its own decision. Do neither
-  silently.
+- **macd_enabled live-vs-backtest divergence — RESOLVED 2026-07-20 (option a):** live
+  (`bot/main.py`) and `shadow_signal.py` had always run `macd_enabled=cfg.strategy.macd_enabled`
+  (True — MACD gates both entry modes), but `backtest.py` never passed it, so every canonical
+  fingerprint through 2026-07-18 was produced with MACD OFF — a fidelity gap, not a safety
+  hole (live was the stricter, subset strategy). User chose to validate what's actually live
+  rather than turn MACD off to match the old numbers. See "MACD live/backtest divergence
+  resolved" entry below for the full re-validation.
 
 ### TWS "restored" notice actually fires now — reconnect probe (2026-07-18) — 289 tests pass
 First real outage (TWS daily logoff, Sat 08:00 ET) proved the down-alert works end-to-end
@@ -1192,6 +1189,33 @@ at order placement — so after logging back into TWS the socket stayed dead, th
   TWS still down, no redial while healthy). Suite 286 → 289.
 - **Stock bot needs a restart** to run the probe — the pre-fix instance will NOT send the
   restored notice when TWS comes back; restart it before (or when) logging into TWS.
+
+### MACD live/backtest divergence resolved — option (a), validate what's live (2026-07-20) — 289 tests pass, strategy hash unchanged
+Closed the OPEN DECISION flagged during the 2026-07-18 config-drift audit (see the superseded
+entry above). `bot/main.py` and `shadow_signal.py` have always run with `macd_enabled=True`
+(MACD gates both Mode A/B entries), but `engine_kwargs_from_cfg()` never passed it through, so
+`backtest.py` and `walkforward.py` silently validated a MACD-OFF variant — live was trading a
+stricter, unvalidated subset of what was on record. User chose (a): validate the strategy
+actually running, not turn MACD off to preserve the old numbers.
+- **Fix:** `bot/backtest/params.py` — `macd_enabled = cfg.strategy.macd_enabled` added to
+  `engine_kwargs_from_cfg()`. No `bot/strategy/*.py` edit, so strategy hash `659d1c03987b72fd`
+  is unchanged and `stamp_strategy.py` did not need a re-run.
+  `test_engine_params.py`'s `test_macd_enabled_is_deliberately_excluded` replaced with
+  `test_macd_enabled_is_sourced_from_cfg` (asserts both True and False flow through). Suite
+  stays at 289 (one test replaced, not added).
+- **New canonical fingerprint:** `EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py` →
+  **32 trades, PF 1.72, 37.5% win rate** (was 35 trades / PF 1.90 / 40.0% under the old
+  MACD-OFF backtest). This is now what a fresh run reproduces — see "How to verify the config
+  is active" and "Canonical strategy fingerprint" sections above, both updated.
+- **Walk-forward (`walkforward.py`, train 2024-04-08→2025-02-21 / validation 2025-02-22→2026-07-20):**
+  training 15 trades, PF 1.09; validation 17 trades, PF **2.30**, 35.3% win. PF holds well
+  out-of-sample (validation ≥ 1.2, and improves on training) — interpretation printed by the
+  script: "Strong: PF holds above 1.2 out-of-sample. This config may have a genuine edge worth
+  pursuing." Same pass bar used for every prior walk-forward in this file.
+- **Nothing else changes:** ADX/EMA/RSI/ATR thresholds, sizing, SL/TP — all untouched. This
+  was purely closing a validation-script fidelity gap, not a strategy or risk change.
+- **Crypto bot does not need a restart** — `bot/main.py` was already running with
+  `macd_enabled=True` before this fix; only the backtest/walk-forward tooling changed.
 
 ### Affordable-symbol screen (2026-07-15) — 7 new RULE_WHITELIST symbols, 216 tests pass
 Goal: widen the funnel of symbols that can actually FILL at the ~$197 target allocation

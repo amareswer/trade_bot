@@ -48,6 +48,7 @@ def make_fake_cfg(**overrides):
             min_ema_spread_pct=0.004,
             max_ema_spread_pct=0.0,
             rsi_filter_enabled=True,
+            macd_enabled=True,
             buy_threshold=0.0,
             sell_threshold=0.0,
             regime_ema_period=200,
@@ -114,15 +115,15 @@ def test_previously_drifted_keys_are_sourced_from_cfg():
     assert kwargs["partial_tp_pct"] == 0.05
 
 
-def test_macd_enabled_is_deliberately_excluded():
-    """Canonical-fingerprint parity: every validated result (35 trades /
-    PF 1.90 as of 2026-07-17) was produced with the engine's macd_enabled
-    default (False), while live runs True. Including it here would silently
-    change the fingerprint. If that divergence is ever resolved by decision,
-    flip this test alongside a full walk-forward re-run + CLAUDE.md update.
+def test_macd_enabled_is_sourced_from_cfg():
+    """2026-07-20: resolved the live/backtest MACD divergence by validating
+    what's actually live (cfg.strategy.macd_enabled, True) instead of
+    matching the old MACD-off fingerprint. New canonical numbers in CLAUDE.md.
     """
+    kwargs = engine_kwargs_from_cfg(make_fake_cfg(**{"strategy.macd_enabled": False}))
+    assert kwargs["macd_enabled"] is False
     kwargs = engine_kwargs_from_cfg(make_fake_cfg())
-    assert "macd_enabled" not in kwargs
+    assert kwargs["macd_enabled"] is True
 
 
 def test_validation_scripts_use_the_builder():

@@ -13,11 +13,15 @@ Rule: any script that validates the strategy (backtest.py, walkforward.py,
 future sweeps) builds its engine kwargs HERE and only overrides deliberately
 (e.g. backtest.py's CLI flags). Never hand-list engine.run() args again.
 
+2026-07-20: macd_enabled added — live (bot/main.py) and shadow_signal.py have
+always run with cfg.strategy.macd_enabled (True), but every canonical
+fingerprint through 2026-07-18 was produced with the engine default (False),
+so the validated numbers described a slightly more permissive strategy than
+the one actually trading. Resolved by validating what's live (option a from
+the 2026-07-18 CLAUDE.md entry) rather than turning MACD off to match the
+old numbers. New canonical fingerprint: see CLAUDE.md.
+
 Deliberate exclusions — do not add without a validation decision:
-  - macd_enabled: live (bot/main.py) and shadow_signal.py run with
-    cfg.strategy.macd_enabled (True), but every canonical fingerprint was
-    produced with the engine default (False). Adding it here changes the
-    fingerprint and requires a full walk-forward re-run + CLAUDE.md update.
   - slippage_pct: engine default 0.0 — fee_pct is the validated cost model.
 """
 
@@ -47,6 +51,7 @@ def engine_kwargs_from_cfg(cfg) -> dict:
         min_ema_spread_pct   = cfg.strategy.min_ema_spread_pct,
         max_ema_spread_pct   = cfg.strategy.max_ema_spread_pct,
         rsi_filter_enabled   = cfg.strategy.rsi_filter_enabled,
+        macd_enabled         = cfg.strategy.macd_enabled,
         buy_threshold        = cfg.strategy.buy_threshold,
         sell_threshold       = cfg.strategy.sell_threshold,
         max_position_pct     = cfg.risk.max_position_pct,
