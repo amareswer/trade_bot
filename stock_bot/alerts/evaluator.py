@@ -40,15 +40,35 @@ class AlertEvaluator:
 
     def __init__(self, portfolio_tracker: PortfolioTracker) -> None:
         self._tracker = portfolio_tracker
+        self._live_positions: dict[str, tuple[float, float]] | None = None
 
     # ── Public ───────────────────────────────────────────────────────────────
 
-    def evaluate(self, scan_results: list[ScanResult]) -> list[Alert]:
+    def evaluate(
+        self,
+        scan_results: list[ScanResult],
+        held_positions: dict[str, tuple[float, float]] | None = None,
+    ) -> list[Alert]:
         """
         Run all checks over each symbol in the scan cycle.
         Returns a flat list of Alert objects (0 or more per symbol).
         Alerts re-fire every cycle — no deduplication across scans.
+
+        held_positions: the ACTIVE executor's real positions_snapshot()
+        ({symbol: (shares, avg_cost)}), when the caller has one. Same
+        precedence as portfolio_summary in main.py ("executor takes
+        precedence over static tracker") — an executor real position always
+        wins over the static PORTFOLIO env tracker for "is this held".
+        2026-07-21 fix: PORTFOLIO_SELL / RSI_OVERBOUGHT / RSI_OVERSOLD /
+        EARNINGS_SOON all gate on "is this symbol held", but previously that
+        only ever checked the static tracker (personal declared holdings in
+        stock_bot/.env PORTFOLIO=) — the bot's own real trades (e.g. the
+        IBKR CM position) were invisible to these protective alerts because
+        they were never in that static list. Passing the live snapshot here
+        closes that gap; omitting it preserves old static-tracker-only
+        behavior (backward compatible for any caller that doesn't have one).
         """
+        self._live_positions = held_positions
         alerts: list[Alert] = []
         today  = date.today()
 
@@ -174,10 +194,14 @@ class AlertEvaluator:
         )
 
     def _in_portfolio(self, symbol: str) -> bool:
+        if self._live_positions is not None:
+            return symbol.upper() in self._live_positions
         return any(s == symbol.upper() for s, _, _ in self._tracker._holdings)
 
     def _get_holding(self, symbol: str) -> Optional[tuple[float, float]]:
         """Return (shares, avg_cost) or None."""
+        if self._live_positions is not None:
+            return self._live_positions.get(symbol.upper())
         for s, shares, avg_cost in self._tracker._holdings:
             if s == symbol.upper():
                 return shares, avg_cost

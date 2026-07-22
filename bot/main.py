@@ -1317,6 +1317,7 @@ def run():
                                         total_value = _p_order.total_value,
                                         pnl         = _p_pnl,
                                         exchange    = cfg.exchange.exchange,
+                                        reason      = "partial take-profit — banking profit, position trimmed",
                                     )
 
                     _fixed_sl_level = (
@@ -1387,6 +1388,11 @@ def run():
                                     fee_cost      = _ic_order.fee_cost,
                                     fee_currency  = _ic_order.fee_currency,
                                 )
+                                _ic_reason_label = {
+                                    "trail_stop":  "trailing stop hit — protecting gained profit",
+                                    "stop_loss":   "stop-loss hit — cutting the loss",
+                                    "take_profit": "take-profit hit — target reached",
+                                }.get(_ic_reason, _ic_reason)
                                 alerter.fill(
                                     side        = "SELL",
                                     symbol      = sym,
@@ -1395,6 +1401,7 @@ def run():
                                     total_value = _ic_order.total_value,
                                     pnl         = _ic_pnl,
                                     exchange    = cfg.exchange.exchange,
+                                    reason      = _ic_reason_label,
                                 )
                         else:
                             logger.warning(
@@ -1875,6 +1882,8 @@ def run():
                             total_value = order.total_value,
                             pnl         = pnl,
                             exchange    = cfg.exchange.exchange,
+                            reason      = f"strategy {order.side.value.lower()} signal"
+                                          + (f" — {filter_reason}" if filter_reason else ""),
                         )
                     else:
                         display.reject(order.reject_reason or "")

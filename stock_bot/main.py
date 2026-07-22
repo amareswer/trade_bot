@@ -1387,7 +1387,8 @@ def run() -> None:
         # Evaluate and deliver alerts
         alerts = []
         try:
-            alerts = evaluator.evaluate(scan_results)
+            _held = executor.positions_snapshot() if executor is not None else None
+            alerts = evaluator.evaluate(scan_results, held_positions=_held)
             notifier.notify(alerts)
             logger.info("Alerts: %d triggered this cycle", len(alerts))
         except Exception as exc:

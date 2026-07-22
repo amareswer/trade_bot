@@ -53,15 +53,18 @@ class TelegramAlerter:
         total_value: float,
         pnl:         Optional[float] = None,
         exchange:    str             = "",
+        reason:      str             = "",
     ) -> None:
         side_emoji = "🟢 BUY" if side.upper() == "BUY" else "🔴 SELL"
         pnl_str    = f"\nP&L: {'🟢' if pnl and pnl >= 0 else '🔴'} ${pnl:+.2f}" if pnl is not None else ""
+        reason_str = f"\nReason: {reason}" if reason else ""
         msg = (
             f"{side_emoji}  {symbol}\n"
             f"Qty:   {quantity:.6f}\n"
             f"Price: ${price:,.2f}\n"
             f"Value: ${total_value:,.2f}"
-            f"{pnl_str}\n"
+            f"{pnl_str}"
+            f"{reason_str}\n"
             f"{'Exchange: ' + exchange.upper() + chr(10) if exchange else ''}"
             f"Time:  {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
         )
