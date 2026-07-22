@@ -50,7 +50,6 @@ from stock_bot.research.google_trends import fetch_market_trends
 from stock_bot.ai.ai_engine         import AIEngine
 from stock_bot.ai.verdict           import AIVerdict
 from stock_bot.dashboard.renderer   import DashboardRenderer, ScanResult
-from stock_bot.portfolio.tracker    import PortfolioTracker
 from stock_bot.alerts.evaluator     import AlertEvaluator
 from stock_bot.alerts.notifier      import AlertNotifier
 from stock_bot.execution.paper      import StockPaperExecutor
@@ -621,8 +620,7 @@ def run() -> None:
     # Initialise components once at startup
     ai_engine = AIEngine() if cfg.ai_enabled else None
     renderer  = DashboardRenderer(loop_interval=cfg.loop_interval)
-    tracker   = PortfolioTracker(cfg.portfolio)
-    evaluator = AlertEvaluator(tracker)
+    evaluator = AlertEvaluator()
     notifier  = AlertNotifier(cfg)
     # Executor selection: STOCK_EXECUTOR=paper (in-memory sim, default) or
     # ibkr (real fills on the TWS paper API — requires TWS running, port 7497).
@@ -1346,7 +1344,8 @@ def run() -> None:
             print(f"  ⏱  Total AI time: {_ai_elapsed:.1f}s")
             print(f"  {'─' * 44}")
 
-        # Build portfolio summary — paper executor takes precedence over static tracker
+        # Build portfolio summary from the live executor (no executor →
+        # PAPER_TRADING_ENABLED=false → no portfolio to summarize).
         portfolio_summary = None
         paper_summary     = None
         try:
@@ -1355,8 +1354,6 @@ def run() -> None:
                 paper_summary     = executor.build_paper_summary(scan_results)
                 executor.log_state({r.symbol: r.price for r in scan_results})
                 executor.save_state()
-            else:
-                portfolio_summary = tracker.build_summary(scan_results)
         except Exception as exc:
             logger.warning("Portfolio build failed: %s", exc)
 

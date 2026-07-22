@@ -13,7 +13,6 @@ from datetime import date, datetime
 from typing import TYPE_CHECKING, Optional
 
 from stock_bot.alerts.alert import Alert, AlertType, _HIGH_TYPES
-from stock_bot.portfolio.tracker import PortfolioTracker
 
 if TYPE_CHECKING:
     from stock_bot.dashboard.renderer import ScanResult
@@ -35,11 +34,14 @@ _RSI_OVERSOLD      = 25.0  # RSI below this → RSI_OVERSOLD  (owned symbols)
 class AlertEvaluator:
     """
     Evaluates scan results each cycle and returns a list of Alert objects.
-    Instantiated once at startup with the portfolio tracker.
+    "Is this symbol held" is always answered from the live executor's
+    positions_snapshot(), passed into evaluate() per cycle — there is no
+    static/manual holdings list (the old PORTFOLIO-env PortfolioTracker
+    fallback was removed 2026-07-22; it had gone fully dormant once an
+    executor became mandatory 2026-07-17 and was never read otherwise).
     """
 
-    def __init__(self, portfolio_tracker: PortfolioTracker) -> None:
-        self._tracker = portfolio_tracker
+    def __init__(self) -> None:
         self._live_positions: dict[str, tuple[float, float]] | None = None
 
     # ── Public ───────────────────────────────────────────────────────────────
@@ -55,18 +57,18 @@ class AlertEvaluator:
         Alerts re-fire every cycle — no deduplication across scans.
 
         held_positions: the ACTIVE executor's real positions_snapshot()
-        ({symbol: (shares, avg_cost)}), when the caller has one. Same
-        precedence as portfolio_summary in main.py ("executor takes
-        precedence over static tracker") — an executor real position always
-        wins over the static PORTFOLIO env tracker for "is this held".
-        2026-07-21 fix: PORTFOLIO_SELL / RSI_OVERBOUGHT / RSI_OVERSOLD /
-        EARNINGS_SOON all gate on "is this symbol held", but previously that
-        only ever checked the static tracker (personal declared holdings in
-        stock_bot/.env PORTFOLIO=) — the bot's own real trades (e.g. the
-        IBKR CM position) were invisible to these protective alerts because
-        they were never in that static list. Passing the live snapshot here
-        closes that gap; omitting it preserves old static-tracker-only
-        behavior (backward compatible for any caller that doesn't have one).
+        ({symbol: (shares, avg_cost)}), when the caller has one — None when
+        there is no executor (PAPER_TRADING_ENABLED=false), in which case
+        every "is this held" check is False (nothing is held by the bot in
+        that mode). 2026-07-21 fix: PORTFOLIO_SELL / RSI_OVERBOUGHT /
+        RSI_OVERSOLD / EARNINGS_SOON all gate on "is this symbol held", but
+        previously that checked a static, hand-typed PORTFOLIO-env list
+        (stock_bot/.env) that the bot's own real trades (e.g. the IBKR CM
+        position) were never part of — those protective alerts were
+        invisible to the bot's actual holdings. Passing the live snapshot
+        here closes that gap. The static-list fallback itself was removed
+        2026-07-22 (see stock_bot/portfolio/tracker.py) — it had gone fully
+        dormant once an executor became mandatory 2026-07-17.
         """
         self._live_positions = held_positions
         alerts: list[Alert] = []
@@ -194,15 +196,12 @@ class AlertEvaluator:
         )
 
     def _in_portfolio(self, symbol: str) -> bool:
-        if self._live_positions is not None:
-            return symbol.upper() in self._live_positions
-        return any(s == symbol.upper() for s, _, _ in self._tracker._holdings)
+        if self._live_positions is None:
+            return False
+        return symbol.upper() in self._live_positions
 
     def _get_holding(self, symbol: str) -> Optional[tuple[float, float]]:
         """Return (shares, avg_cost) or None."""
-        if self._live_positions is not None:
-            return self._live_positions.get(symbol.upper())
-        for s, shares, avg_cost in self._tracker._holdings:
-            if s == symbol.upper():
-                return shares, avg_cost
-        return None
+        if self._live_positions is None:
+            return None
+        return self._live_positions.get(symbol.upper())

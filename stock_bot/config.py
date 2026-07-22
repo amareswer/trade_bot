@@ -62,7 +62,6 @@ class StockConfig:
     lookback_days:  int          # how many days of history to fetch
     loop_interval:  int          # seconds between full watchlist scans
     ai_enabled:     bool         # set False to skip AI and save API calls
-    portfolio:             str   # raw PORTFOLIO env var — "SYMBOL:SHARES:COST,..."
     alert_email_enabled:   bool  # send email alerts (HIGH only)
     alert_email_from:      str   # Gmail sender address
     alert_email_to:        str   # alert destination address
@@ -192,7 +191,6 @@ def load() -> StockConfig:
         lookback_days = _int ("LOOKBACK_DAYS",  200),
         loop_interval = _int ("LOOP_INTERVAL",  60),
         ai_enabled    = _bool("AI_ENABLED",     True),
-        portfolio             = _str ("PORTFOLIO",             ""),
         alert_email_enabled   = _bool("ALERT_EMAIL_ENABLED",   False),
         alert_email_from      = _str ("ALERT_EMAIL_FROM",      ""),
         alert_email_to        = _str ("ALERT_EMAIL_TO",        ""),
