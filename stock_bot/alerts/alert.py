@@ -23,8 +23,11 @@ class AlertType(Enum):
 
 
 # Priority assignment by type:
-# HIGH:   PORTFOLIO_SELL, RSI_OVERBOUGHT, RSI_OVERSOLD + EARNINGS_SOON (≤1 day)
-# MEDIUM: STRONG_BUY, STRONG_SELL, PORTFOLIO_BUY_MORE, EARNINGS_SOON (2-3 days)
+# HIGH:   PORTFOLIO_SELL, RSI_OVERBOUGHT, RSI_OVERSOLD
+#         + EARNINGS_SOON (≤1 day, HELD position only — see evaluator.py)
+# MEDIUM: STRONG_BUY, STRONG_SELL, PORTFOLIO_BUY_MORE
+#         + EARNINGS_SOON (not held, any days-away — informational, already
+#           auto-blocked from new entries by the earnings blackout)
 _HIGH_TYPES = {
     AlertType.PORTFOLIO_SELL,
     AlertType.RSI_OVERBOUGHT,

@@ -103,16 +103,31 @@ class AlertEvaluator:
                     ))
 
             # 5. EARNINGS_SOON
+            # Priority (and Telegram delivery, HIGH-only) depends on whether the
+            # symbol is actually held: earnings risk on a real position is
+            # actionable, but a watchlist-only symbol is already auto-blocked
+            # from new entries by the earnings blackout (main.py
+            # _is_earnings_blackout) — surfacing it as HIGH/Telegram for every
+            # scanned symbol was noise with nothing for the user to do.
             e = r.research.earnings if r.research else None
             if e and e.next_earnings_date:
                 days_away = (e.next_earnings_date - today).days
                 if 0 <= days_away <= _EARNINGS_DAYS:
-                    priority = "HIGH" if days_away <= 1 else "MEDIUM"
+                    if in_pf:
+                        priority = "HIGH" if days_away <= 1 else "MEDIUM"
+                        msg = (
+                            f"EARNINGS in {days_away} day(s): {r.symbol} "
+                            f"reports {e.next_earnings_date} — you hold this position"
+                        )
+                    else:
+                        priority = "MEDIUM"
+                        msg = (
+                            f"EARNINGS in {days_away} day(s): {r.symbol} "
+                            f"reports {e.next_earnings_date} — not held, no action needed "
+                            f"(new entries already auto-blocked by earnings blackout)"
+                        )
                     alerts.append(self._make(
-                        AlertType.EARNINGS_SOON, r,
-                        f"EARNINGS in {days_away} day(s): {r.symbol} "
-                        f"reports {e.next_earnings_date}",
-                        None, priority,
+                        AlertType.EARNINGS_SOON, r, msg, None, priority,
                     ))
 
             # 6. RSI_OVERBOUGHT  (portfolio only)
