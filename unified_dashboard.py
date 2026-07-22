@@ -62,8 +62,10 @@ def _load_stock_state() -> dict | None:
     paper_state.json: {cash, starting_cash, realized_pnl, positions,
     last_updated}. When STOCK_EXECUTOR=ibkr the live account is IBKR —
     synthesize the same shape from ibkr_state.json + ibkr_trades.csv
-    (cash = last fill's cash_remaining; positions = unpaired BUYs), since
-    this subprocess can't ask TWS. Falls back to the sim book otherwise.
+    (cash = live snapshot the executor persists in ibkr_state.json each scan
+    cycle, falling back to the last fill's cash_remaining; positions =
+    unpaired BUYs), since this subprocess can't ask TWS. Falls back to the
+    sim book otherwise.
     """
     if _stock_executor_type() != "ibkr":
         return _load_json(STOCK_STATE_PATH)
@@ -77,9 +79,11 @@ def _load_stock_state() -> dict | None:
     except Exception:
         trades, open_pos = [], {}
     starting = float(ibkr.get("starting_cash", 0.0) or 0.0)
-    cash = (
-        float(trades[-1].get("cash_remaining") or 0.0) if trades else starting
-    )
+    cash = float(ibkr.get("cash", 0.0) or 0.0)
+    if cash <= 0:
+        cash = (
+            float(trades[-1].get("cash_remaining") or 0.0) if trades else starting
+        )
     return {
         "cash":          cash,
         "starting_cash": starting,

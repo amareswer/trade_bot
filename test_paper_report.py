@@ -188,6 +188,52 @@ def test_load_active_book_state_ibkr_branch():
     assert state["positions"] == {"KO": {"shares": 2.0, "avg_cost": 80.0}}
 
 
+def test_ibkr_cash_prefers_live_state_snapshot_over_csv():
+    # The fill CSV's cash_remaining can be a stale/transient snapshot (e.g. the
+    # 2026-07-20 reset-window fill recorded $6,000). When ibkr_state.json holds
+    # a live "cash" value the report and active-book state must prefer it.
+    import json
+    import stock_bot.analysis.paper_report as pr
+    tmp = tempfile.mkdtemp()
+    paper_csv  = os.path.join(tmp, "paper_trades.csv")
+    ibkr_csv   = os.path.join(tmp, "ibkr_trades.csv")
+    ibkr_state = os.path.join(tmp, "ibkr_state.json")
+    with open(paper_csv, "w", encoding="utf-8") as f:
+        f.write(_CSV_HEADER)
+    with open(ibkr_csv, "w", encoding="utf-8") as f:
+        f.write(
+            _CSV_HEADER
+            + "2026-07-20 10:00:00,CM,BUY,10.0000,117.7200,1177.20,6000.00,RULE BUY,70\n"
+        )
+    with open(ibkr_state, "w", encoding="utf-8") as f:
+        json.dump({"account": "DUQ273338", "realized_pnl": 0.0,
+                   "starting_cash": 5000.0, "cash": 3337.56,
+                   "last_updated": "2026-07-21T19:15:05"}, f)
+
+    report = generate_report(
+        csv_path=paper_csv,
+        state_path=os.path.join(tmp, "missing_state.json"),
+        fast_csv_path=os.path.join(tmp, "missing_fast.csv"),
+        ibkr_csv_path=ibkr_csv,
+        ibkr_state_path=ibkr_state,
+    )
+    assert "3,337.56" in report          # live snapshot wins
+    assert "6,000.00" not in report      # stale CSV value not shown as cash
+
+    saved = (pr._IBKR_CSV, pr._IBKR_STATE_JSON, os.environ.get("STOCK_EXECUTOR"))
+    pr._IBKR_CSV, pr._IBKR_STATE_JSON = ibkr_csv, ibkr_state
+    os.environ["STOCK_EXECUTOR"] = "ibkr"
+    try:
+        state = pr.load_active_book_state()
+    finally:
+        pr._IBKR_CSV, pr._IBKR_STATE_JSON = saved[0], saved[1]
+        if saved[2] is None:
+            os.environ.pop("STOCK_EXECUTOR", None)
+        else:
+            os.environ["STOCK_EXECUTOR"] = saved[2]
+    assert state["cash"] == 3337.56
+
+
 if __name__ == "__main__":
     import sys
     failures = 0

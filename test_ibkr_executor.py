@@ -475,3 +475,32 @@ def test_starting_cash_rebaseline_accounts_for_realized_pnl(executors, sandbox):
     ex = make_executor(fake)
     executors.append(ex)
     assert ex.starting_cash == 5000.0   # 5050 - 50, not 5050
+
+
+# ---------------------------------------------------------------------------
+# Live-cash snapshot persisted in ibkr_state.json (for offline report readers)
+# ---------------------------------------------------------------------------
+
+def test_save_state_persists_live_cash(executors, sandbox):
+    # Offline readers (paper_report / unified_dashboard) show cash from
+    # ibkr_state.json — save_state must write the live TWS cash value.
+    fake = FakeIB(cash=3337.56, net_liq=5000.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+    ex.save_state()
+    with open(sandbox / "ibkr_state.json") as f:
+        state = json.load(f)
+    assert state["cash"] == 3337.56
+
+
+def test_save_state_keeps_last_good_cash_when_disconnected(executors, sandbox):
+    # A save while TWS is unreachable must not overwrite the snapshot with 0.
+    fake = FakeIB(cash=3337.56, net_liq=5000.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+    ex.save_state()                      # good snapshot while connected
+    fake._connected = False              # TWS goes away
+    ex.save_state()                      # save during the outage
+    with open(sandbox / "ibkr_state.json") as f:
+        state = json.load(f)
+    assert state["cash"] == 3337.56      # previous good value preserved

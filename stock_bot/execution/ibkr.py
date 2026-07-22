@@ -130,6 +130,7 @@ class IBKRExecutor(StockExecutorBase):
         self._trade_log: list[PaperTrade] = []
         self._realized_pnl: float = 0.0
         self._starting_cash: float = 0.0
+        self._last_cash: float = 0.0   # last good live-cash reading, persisted for offline readers
         self._daily_loss_limit_pct: float = 0.03
         self._daily_loss_tripped: bool = False
         self._slippage_bps: int = 0        # real broker — kept only for interface parity
@@ -753,6 +754,7 @@ class IBKRExecutor(StockExecutorBase):
                 return False
             self._realized_pnl = realized
             self._starting_cash = starting
+            self._last_cash = float(state.get("cash", 0.0) or 0.0)
             logger.info(
                 "IBKR state restored | realized_pnl=$%.2f | starting_cash=$%.2f",
                 realized, starting,
@@ -763,8 +765,18 @@ class IBKRExecutor(StockExecutorBase):
             return False
 
     def save_state(self) -> None:
+        # Refresh the persisted live-cash snapshot when TWS is reachable; keep
+        # the last good value otherwise so a disconnected save can't write 0.
+        try:
+            if self.is_connected:
+                live = self.cash
+                if live > 0:
+                    self._last_cash = live
+        except Exception:
+            pass
         state = {
             "account": getattr(self, "_account", ""),
+            "cash": round(self._last_cash, 2),
             "realized_pnl": round(self._realized_pnl, 6),
             "starting_cash": round(self._starting_cash, 6),
             "last_updated": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),

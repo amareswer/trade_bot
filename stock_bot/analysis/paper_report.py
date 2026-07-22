@@ -77,8 +77,10 @@ def load_active_book_state() -> dict:
     """
     Position-book account state for the ACTIVE executor (STOCK_EXECUTOR env,
     set inside the bot process): sim → paper_state.json as-is; ibkr →
-    synthesized from ibkr_state.json + ibkr_trades.csv (cash = last fill's
-    cash_remaining, positions = unpaired BUYs — no TWS call). Same dict shape
+    synthesized from ibkr_state.json + ibkr_trades.csv (cash = live snapshot
+    the executor persists in ibkr_state.json each scan cycle, falling back to
+    the last fill's cash_remaining; positions = unpaired BUYs — no TWS call
+    from here). Same dict shape
     either way: {cash, starting_cash, realized_pnl, positions, last_updated}.
     unified_dashboard.py has its own copy of this logic because it runs as a
     subprocess without the bot's env and must read stock_bot/.env itself.
@@ -91,7 +93,9 @@ def load_active_book_state() -> dict:
     trades = _read_trades(_IBKR_CSV)
     _, open_pos = _pair_trades(trades)
     starting = float(ibkr.get("starting_cash", 0.0) or 0.0)
-    cash = float(trades[-1].get("cash_remaining") or 0.0) if trades else starting
+    cash = float(ibkr.get("cash", 0.0) or 0.0)
+    if cash <= 0:
+        cash = float(trades[-1].get("cash_remaining") or 0.0) if trades else starting
     return {
         "cash":          cash,
         "starting_cash": starting,
@@ -258,8 +262,10 @@ def generate_report(
 
     # ── Account info ──────────────────────────────────────────────────────────
     # When the IBKR executor is active its state file exists: the live account
-    # is IBKR (starting cash from state, current cash from the last fill's
-    # cash_remaining — the report makes no network calls so it cannot ask TWS).
+    # is IBKR (starting cash from state; current cash from the live snapshot
+    # the executor persists in ibkr_state.json each scan cycle, falling back
+    # to the last fill's cash_remaining — the report makes no network calls so
+    # it cannot ask TWS itself).
     # Realized P&L stays the combined book: sim realized + IBKR realized.
     ibkr_state   = _read_state(ibkr_state_path)
     ibkr_trades  = _read_trades(ibkr_csv_path)
@@ -269,10 +275,12 @@ def generate_report(
     account_label  = ""
     if ibkr_state:
         starting_cash = ibkr_state.get("starting_cash", starting_cash)
-        if ibkr_trades:
-            current_cash = float(ibkr_trades[-1].get("cash_remaining") or 0.0)
-        else:
-            current_cash = starting_cash
+        current_cash = float(ibkr_state.get("cash", 0.0) or 0.0)
+        if current_cash <= 0:
+            if ibkr_trades:
+                current_cash = float(ibkr_trades[-1].get("cash_remaining") or 0.0)
+            else:
+                current_cash = starting_cash
         realized_pnl = (
             float(state.get("realized_pnl", 0.0) or 0.0)
             + float(ibkr_state.get("realized_pnl", 0.0) or 0.0)
