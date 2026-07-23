@@ -65,12 +65,21 @@ def fetch_research(
         f_news     = ex.submit(fetch_news,     symbol, company_name)
         f_earnings = ex.submit(fetch_earnings, symbol)
 
+        # 2026-07-23: earnings now retries through fetch_with_retry (up to 3
+        # attempts + 2s delay between each, since generic yfinance exceptions
+        # started retrying that day too) — a failing fetch can legitimately
+        # take close to the old 15s budget before giving up, where it used to
+        # fail almost instantly. Give earnings more room so this timeout only
+        # fires for a genuinely stuck fetch, not a normal retry sequence.
+        # news_fetcher doesn't use fetch_with_retry (feedparser, not
+        # yfinance) — its budget is unaffected and stays at 15s.
+        _timeouts = {"news": 15, "earnings": 45}
         for src, future in [
             ("news",     f_news),
             ("earnings", f_earnings),
         ]:
             try:
-                result = future.result(timeout=15)
+                result = future.result(timeout=_timeouts[src])
                 if src == "news":
                     news = result
                 else:

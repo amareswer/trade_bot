@@ -165,7 +165,7 @@ A robust crypto trading system that:
 
 ## Test Suite Manifest (as of 2026-07-03)
 
-Expected total: **323 tests** (as of 2026-07-23). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~6s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
+Expected total: **324 tests** (as of 2026-07-23). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~6s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -205,8 +205,9 @@ Expected total: **323 tests** (as of 2026-07-23). If `pytest --collect-only -q` 
 | `test_ai_engine_timeout.py` | 2 | nvidia_nim AI client is constructed with `timeout=_TIMEOUT_S` (root-cause fix for the 2026-07-22 swing-book hang); empty `completion.choices` degrades to a HOLD verdict instead of raising TypeError |
 | `test_earnings_cache.py` | 4 | Earnings-fetch cache: failures use a short 1h TTL (retry soon) vs successes using the full 24h TTL, boundary behavior for both, concurrent fetches serialized by `_yf_lock` |
 | `test_yf_client_retry.py` | 4 | `fetch_with_retry`: generic exceptions now retried with a short delay (not zero retries), give up after max_attempts, short delay ≠ rate-limit backoff, rate-limit path unchanged |
+| `test_research_aggregator_timeout.py` | 1 | Per-source research-fetch timeout: earnings gets a wider budget (45s, to fit its new retry latency) than news (15s, unaffected — no fetch_with_retry involved) |
 
-Run: `python -m pytest --tb=short -q` — must show **323 passed**.
+Run: `python -m pytest --tb=short -q` — must show **324 passed**.
 
 ---
 
@@ -1952,6 +1953,29 @@ limit), they never got retried at all, despite manual retesting proving them tra
   backoff, rate-limit path itself provably unchanged. `test_ai_engine_timeout.py` gained
   `test_nvidia_nim_empty_choices_falls_back_to_hold_without_crashing`. Suite 318 → 323.
 - **Stock bot needs a restart** to load both fixes.
+
+**Third follow-up same day — the retry fix's own side effect (2026-07-23, 324 tests pass):**
+user restarted and immediately saw a NEW message pattern: "Research fetch timed out for
+HOOD (earnings)" appearing alongside the expected "Fetch failed ... (attempt N/3) —
+retrying in 2s" lines, for the same underlying failures. Self-inflicted regression from the
+retry fix above: `stock_bot/research/aggregator.py`'s `fetch_research()` wraps the earnings
+fetch in its own SEPARATE `future.result(timeout=15)` — completely independent of
+`fetch_with_retry`'s own retry logic. Before the retry fix, a failing earnings fetch gave up
+almost instantly (well under 15s), so this outer timeout essentially never fired. After the
+retry fix, 3 attempts + 2×2s delays can legitimately take close to (or over) 15s, so the
+SAME underlying failure started tripping this second, unrelated timeout too — one failure,
+two log lines, no new information.
+- **Fix:** per-source timeout instead of one blanket 15s for both. Earnings → 45s (comfortable
+  room for 3 attempts + delays even if individual attempts run slow). News stays at 15s —
+  confirmed `news_fetcher.py` doesn't use `fetch_with_retry` at all (feedparser, not
+  yfinance), so its latency profile never changed and doesn't need more room.
+- Tests: `test_research_aggregator_timeout.py` (1, hermetic — fake executor/future capture
+  the actual timeout value passed per source, no real waiting). Suite 323 → 324.
+- **Pattern worth remembering:** a retry/backoff fix at one layer can silently blow through
+  an unrelated timeout at a layer above it that was sized assuming the old, faster-failing
+  behavior. Worth checking for this same shape anywhere else multiple timeout/retry layers
+  stack (none currently known, but not exhaustively audited).
+- **Stock bot needs a restart** to load this fix.
 
 ### Bug fixes applied 2026-06-20
 All critical bugs resolved:
