@@ -373,9 +373,16 @@ class AIEngine:
                 ):
                     raw += part["message"]["content"]
             elif self._provider == "nvidia_nim":
+                # 2026-07-23: this branch never passed timeout= — the OpenAI SDK
+                # silently defaulted to Timeout(read=600, write=600, pool=600),
+                # 30x the intended _TIMEOUT_S=20, plus up to 2 SDK-level retries
+                # on top. Root cause of AI calls observed taking up to ~800s
+                # ("successful", just slow) and of the swing-book thread hang
+                # (2026-07-22) that could freeze for hours with nothing raised.
                 client = self._openai_cls(
                     base_url = self._base_url,
                     api_key  = self._api_key,
+                    timeout  = _TIMEOUT_S,
                 )
                 completion = client.chat.completions.create(
                     model       = self._model,
@@ -385,6 +392,17 @@ class AIEngine:
                     max_tokens  = 1024,
                     stream      = False,
                 )
+                # 2026-07-23: completion.choices can come back None/empty (content
+                # filter, empty generation, provider-side hiccup) — subscripting it
+                # directly raised an opaque "TypeError: 'NoneType' object is not
+                # subscriptable" (seen live on HOOD). Same safe HOLD-fallback
+                # outcome either way, but this makes the cause diagnosable.
+                if not completion.choices:
+                    logger.warning(
+                        "nvidia_nim returned no choices for %s (empty generation "
+                        "or content filter) — treating as unavailable", symbol,
+                    )
+                    return _hold_verdict(symbol, "AI returned empty response")
                 # Extract reasoning if present (ignore it)
                 reasoning = getattr(
                     completion.choices[0].message,

@@ -165,7 +165,7 @@ A robust crypto trading system that:
 
 ## Test Suite Manifest (as of 2026-07-03)
 
-Expected total: **306 tests** (as of 2026-07-21). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~5s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
+Expected total: **323 tests** (as of 2026-07-23). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~6s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -201,8 +201,12 @@ Expected total: **306 tests** (as of 2026-07-21). If `pytest --collect-only -q` 
 | `test_engine_params.py` | 8 | `engine_kwargs_from_cfg` builder: keys accepted by engine.run, ATR keys sourced from cfg, previously-drifted keys present, macd_enabled + Mode A/B entry params sourced from cfg, generic parity test (every StrategyConfig∩IndicatorConfig field reaches the backtest), both validation scripts use the builder |
 | `test_alert_evaluator.py` | 4 | AlertEvaluator EARNINGS_SOON: held-vs-not-held priority/message, live-executor-only held-position source (no static PORTFOLIO tracker) |
 | `test_crypto_telegram.py` | 2 | TelegramAlerter.fill() reason line: included when given, omitted when absent |
+| `test_liveness.py` | 7 | LivenessTracker (bot/alerts/liveness.py): touch/is_alive/staleness boundary, simulated hang between touches |
+| `test_ai_engine_timeout.py` | 2 | nvidia_nim AI client is constructed with `timeout=_TIMEOUT_S` (root-cause fix for the 2026-07-22 swing-book hang); empty `completion.choices` degrades to a HOLD verdict instead of raising TypeError |
+| `test_earnings_cache.py` | 4 | Earnings-fetch cache: failures use a short 1h TTL (retry soon) vs successes using the full 24h TTL, boundary behavior for both, concurrent fetches serialized by `_yf_lock` |
+| `test_yf_client_retry.py` | 4 | `fetch_with_retry`: generic exceptions now retried with a short delay (not zero retries), give up after max_attempts, short delay ≠ rate-limit backoff, rate-limit path unchanged |
 
-Run: `python -m pytest --tb=short -q` — must show **306 passed**.
+Run: `python -m pytest --tb=short -q` — must show **323 passed**.
 
 ---
 
@@ -1651,7 +1655,7 @@ Features A, B, E from the roadmap completed. 168 tests pass.
 |---|---------|-----|--------|
 | I | **IBKR live go-live** | After 30 paper trades + PF ≥ 1.2 on stock bot | Gate-blocked |
 | J | **USD symbol re-screen** | Re-run `screen_universe.py` after any strategy hash change | ~2h |
-| K | **ATR SL experiment for SYN/LINK** | ATR×2.0–2.5 cleared in-sample — needs OOS + per-symbol walk-forward before adding. SOL@ATR×2.0 and BTC@ATR×2.0 OOS both HOLD (2026-07-17). SOL still needs SL-distance sizing + capital-gate preconditions before promotion (new symbol). BTC is live-wired (`ATR_SL_MULT`) — adopting would need a full walk-forward re-run first, not yet decided. SYN/LINK OOS run 2026-07-17: SYN HOLDS at x2.0 and x2.5 (val PF 1.99/1.86, SL ≤ 21%); LINK mixed (x2.0 train FAIL 0.85; x2.5 thin pass) — LINK out, SYN still gate-blocked. ATR-aware sizing built + validated 2026-07-17 (ATR_SIZING_ENABLED, off) | Large |
+| K | **ATR SL experiment for SYN/LINK** | ATR×2.0–2.5 cleared in-sample — needs OOS + per-symbol walk-forward before adding. SOL@ATR×2.0 and BTC@ATR×2.0 OOS both HOLD (2026-07-17). SL-distance-based sizing (`calc_trade_qty_atr_risk()`) is symbol-generic — confirmed 2026-07-21 it needs no new code for SOL/SYN, see "Multi-coin readiness" below for what's actually still needed (CapitalPool config, not sizing code). BTC is live-wired (`ATR_SL_MULT`) — adopting would need a full walk-forward re-run first, not yet decided. SYN/LINK OOS run 2026-07-17: SYN HOLDS at x2.0 and x2.5 (val PF 1.99/1.86, SL ≤ 21%); LINK mixed (x2.0 train FAIL 0.85; x2.5 thin pass) — LINK out, SYN still gate-blocked. ATR-aware sizing built + validated 2026-07-17 (ATR_SIZING_ENABLED, off) | Large |
 
 ### Multi-coin readiness (2026-07-03)
 The live loop is now safe to run with >1 symbol in UNIVERSE_WHITELIST. Single-symbol behavior
@@ -1668,6 +1672,286 @@ is numerically identical; strategy files untouched (hash `659d1c03987b72fd` stil
   initialized at startup (no executor / cold strategy) — it logs and keeps the current symbol.
 - Adding a second coin still requires: walk-forward pass on current strategy code, capital
   ≥ $250, and the capital sizing rules above. The code is ready; the edge and capital are the gates.
+
+### Multi-coin prep work (2026-07-21) — CapitalPool config checklist, no code changes
+User asked to start preparing for multiple crypto coins. BTC/CAD is still 0/15 live fills, so
+no symbol can go live yet (Validation Discipline + Capital Sizing Rules) — this session was
+research/prep only, done ahead of time so the day the gate opens is a clean config change, not
+a scramble. Two findings:
+
+**1. SL-distance position sizing for SOL/SYN is already built — the roadmap note was stale.**
+`AppConfig.calc_trade_qty_atr_risk(cash, price, atr_value, atr_mult, baseline_sl_pct)`
+(`config.py`) takes no symbol-specific inputs — it was built generically 2026-07-17 for the
+BTC ATR-sizing adoption, and `bot/main.py`'s call site (~line 1666) already runs inside the
+per-symbol loop using that symbol's own `ss['executor'].cash` and own ATR series. It would
+work identically for SOL/CAD or SYN/USD the moment either is added to `UNIVERSE_WHITELIST` —
+no new sizing code is needed. The item K roadmap line saying "SOL still needs SL-distance
+sizing" predates this and is now corrected above.
+
+**2. Real remaining gap: `CapitalPool` is currently a single shared slot, not per-symbol capital.**
+`bot/portfolio/capital_pool.py`: `slot_cash = total_capital / max_concurrent` (capped at
+`slot_cap`). Live `.env` right now: `STARTING_CASH=100.0`, `MAX_CONCURRENT_POSITIONS=1`,
+`MAX_SLOT_CASH_CAD=77` → `slot_cash = min(100/1, 77) = 77`, matching BTC's actual slot.
+This is a **shared pool split N ways**, not N independent $100 pools — contrary to how it
+reads in the Capital Sizing Rules section above ("$100 CAD per symbol... trades
+independently"). If a second symbol were added by only bumping `MAX_CONCURRENT_POSITIONS`
+to 2 without also raising `STARTING_CASH`, the math becomes
+`slot_cash = min(100/2, 77) = 50` — **BTC's slot silently shrinks from $77 to $50**, a ~35%
+cut with no deliberate "reduce BTC capital" decision behind it. The two symbols would also be
+competing for slots rather than each guaranteed one, since `can_open_position()` only checks
+`len(self._slots) < max_concurrent`.
+- **The correct sequence when a second symbol's gate actually opens:** raise `STARTING_CASH`
+  by the new symbol's own capital (e.g. $100→$200 for a second $100 slot, or whatever the
+  applicable capital-gate tier requires) **and** `MAX_CONCURRENT_POSITIONS` (1→2) **together,
+  in the same change** — never one without the other. Doing only one half either starves the
+  existing symbol's capital (raise concurrency alone) or leaves the new symbol unable to open
+  a position at all (raise capital alone, pool still has only 1 slot).
+- This mechanical requirement is the same reason the existing "Preconditions for any USD pair
+  promotion" list already demands "Capital ≥ $500 CAD available for the new symbol slot" — it
+  applies identically to a CAD pair like SOL, not just USD pairs; the FX-cost precondition is
+  the USD-specific addition on top.
+- No `.env` change made this session (BTC/CAD gate not open yet) — this is documented so the
+  eventual change is a deliberate two-value edit, not a one-line change that silently dilutes
+  BTC's running capital.
+- `test_capital_pool.py`'s existing 19 tests already correctly pin the underlying
+  `slot_cash = total/max_concurrent` math in isolation — the gap here was operational
+  (which .env values must move together), not a code bug, so no new test was needed.
+
+### Swing book retired (2026-07-22) — `FAST_ENABLED=false`, no code changes
+The swing book (`stock_bot/fast_validator.py`, 1h candles, 48h max hold, separate $1,000
+virtual pool) was live-losing money (9 completed trades, PF 0.53 gross / 0.24 net, -$12.43
+realized) and the question was whether migrating it from raw AI-confidence entries to the
+position book's backtested rule strategy (Mode A/B) would fix it — same treatment the
+position book got 2026-07-10.
+
+**Tested, not guessed:** ran the real Mode A/B strategy + real engine (`stock_bot/backtest/
+engine.py`) against 1h candles for the swing book's own traded symbols (HOOD, MRNA, NCLH,
+AC.TO, RY, AMZN, BNS), first with the wrong risk params (position book's 5%/15% SL/TP —
+gave a false-positive PASS signal), then corrected to the swing book's REAL 1.5%/3.0% SL/TP
+(`FAST_SL_PCT`/`FAST_TP_PCT`). Corrected result: **combined PF 0.76 across 394 backtested
+trades, 64.0% SL-exit rate, only 1/7 symbols (BNS, thin sample) pass the standard gate.**
+That SL-exit rate is within a point of the exact number (63%) that got crypto's 1h
+day-trading experiment ruled out on 2026-07-10 — same failure shape: a 1.5% stop is too
+tight for hourly noise regardless of what triggers the entry (AI or rules). Rule-based
+signals would not have fixed this; the live losing streak (concentrated in HOOD 0-2 and
+MRNA 0-2, per trade-by-trade review) was a symptom of the timeframe/stop-distance mismatch,
+not the AI-trigger architecture specifically.
+
+**Bug found while closing out:** the swing-book worker thread had silently hung mid-cycle
+at 13:24 EDT that day — it successfully sold RY (MAX_HOLD, correctly written to
+`fast_trades.csv`) but never reached `self.state.save()` afterward (likely blocked on an AI
+call that didn't time out cleanly; no exception was raised or logged, so nothing alerted).
+Net effect: BNS went unmonitored (no SL/TP/MAX_HOLD checks) for 5+ hours, and
+`fast_validator_state.json` was stale — still listing RY as open with cash/realized_pnl not
+reflecting its already-completed sale. Not investigated further or fixed in code since the
+book is being retired anyway; a scratch script reconciled the stale RY entry using the
+already-logged CSV values (no duplicate trade written) and closed BNS for real at its
+current live price ($87.57, entry $87.76, -$0.38), through the same `_write_trade()` path
+the bot itself uses. Final swing-book state: flat, 10 completed round-trips, realized P&L
+-$12.71, `FAST_ENABLED=false`.
+- `stock_bot/fast_trades.csv` and `stock_bot/fast_validator_state.json` left in place as the
+  frozen historical record — same precedent as the sim-book freeze at the 2026-07-17 IBKR
+  switch. Do not delete.
+- **Do not re-enable without a fresh walk-forward pass** — same discipline as any other
+  strategy/timeframe change in this project. If revisited, the tight 1.5%/3.0% SL/TP is the
+  first thing to reconsider (an ATR-based stop, same fix that worked for BTC 2026-07-17,
+  is the most likely path to a passing result — untested, not yet researched).
+- No code changed — `FAST_ENABLED=false` in `stock_bot/.env` is the entire mechanism (every
+  call site in `stock_bot/main.py` is already `None`-guarded). Suite unaffected: still 306.
+- **Stock bot needs a restart** to stop the (currently hung) swing-book thread for real.
+
+### Heartbeat blind spot fixed — loop-liveness tracking, both bots (2026-07-22) — 313 tests pass
+Direct follow-up to the swing-book hang discovered while closing it out above. That thread
+froze silently for 5+ hours (no exception, no crash) while `heartbeat-stock` kept pinging
+healthchecks.io the whole time — its `healthy_fn` only checked process-alive; a separate
+`heartbeat-tws` check covers the IBKR socket specifically. Neither, nor the crypto bot's
+heartbeat (no `healthy_fn` at all — pure process-alive), verified the actual work loop was
+still making progress. A hung thread is a process that's technically "running" but frozen —
+exactly the failure class that just happened, and neither bot could have detected it if it
+happened to the loop that actually decides trades instead of the (now-retired) swing book.
+- **New shared module `bot/alerts/liveness.py` — `LivenessTracker`:** thread-safe
+  "when did the monitored loop last make progress" clock. `touch()` marks progress;
+  `is_alive(max_stale_s)` answers whether a touch happened recently enough. Injectable
+  `time_fn` (defaults to `time.monotonic`) keeps it hermetic for tests — no real sleeps.
+- **Crypto (`bot/main.py`):** `_liveness.touch()` once per completed outer-loop tick (right
+  before `time.sleep(cfg.exchange.loop_interval)`, ~30s normally). `heartbeat-crypto`'s
+  `healthy_fn` now requires a touch within the last 10 minutes (600s) — a wide margin over
+  the ~30s normal cadence.
+- **Stock (`stock_bot/main.py`):** `_liveness.touch()` after every symbol's AI-call attempt
+  inside the Phase 3 AI loop (the same structural shape as the swing book's own per-symbol
+  AI call that hung — this is the code path most likely to freeze the same way) **plus** a
+  fallback touch once per full scan cycle regardless of whether AI ran (so the tracker still
+  advances normally if `AI_ENABLED=false` is ever set — the per-symbol AI loop wouldn't run
+  at all in that case). `heartbeat-stock`'s `healthy_fn` requires a touch within the last 30
+  minutes (1800s) — generous because individual AI call latencies as high as ~800s (~13 min)
+  were observed live the same day; `heartbeat-tws` is untouched, still purely about the IBKR
+  socket, deliberately kept separate ("TWS logged off" vs "bot died" must stay distinguishable).
+- Tests: `test_liveness.py` (7, hermetic — injectable clock, includes a test that explicitly
+  simulates the 2026-07-22 incident shape: normal touches, then a long gap with none, staleness
+  correctly detected). Suite 306 → 313.
+- **Both bots need a restart** to load this — the currently-running processes (already
+  restarted after the swing-book retirement above) predate this fix.
+
+### Swing-book hang root cause found + fixed — nvidia_nim client missing timeout= (2026-07-23) — 314 tests pass
+Root-caused the 2026-07-22 hang properly instead of leaving it as an unexplained workaround.
+`stock_bot/ai/ai_engine.py` defines `_TIMEOUT_S = 20`, clearly intended to bound every AI
+provider's calls at 20 seconds — and it's correctly wired for the `openrouter`/`ollama_local`
+path (`timeout=_TIMEOUT_S` on the request). **The `nvidia_nim` branch — the one actually
+active (`AI_PROVIDER=nvidia_nim`) — never passed `timeout=` to the OpenAI client at all.**
+Checked what the SDK falls back to when omitted: `Timeout(connect=5.0, read=600, write=600,
+pool=600)` — a 600-second read timeout, 30x longer than intended, plus up to 2 SDK-level
+retries on top of that by default. This is exactly why AI verdicts were being logged as
+"successful" at latencies of 219s and 797s earlier the same day (2026-07-22) — those weren't
+network flukes, that's what the *real* (600s+) timeout looks like in practice. It also fully
+explains the swing-book thread hang: a stalled connection on this path can block for many
+minutes to hours with nothing ever raised, because the intended 20s guard was never applied.
+- **Not swing-book-specific** — the position book's own AI-advisory calls in `bot/main.py`'s
+  equivalent Phase 3 use the identical `analyze()` method and the same broken path. The
+  swing book happened to hit it first (and is now retired), but the live position book was
+  equally exposed before this fix.
+- **Fix:** one line — `timeout=_TIMEOUT_S` added to the `nvidia_nim` client constructor in
+  `stock_bot/ai/ai_engine.py`. Retry count left at the SDK default (2) — deliberately not
+  changed, since `timeout=20` alone already bounds the worst case to a reasonable ~60s
+  (3 attempts × 20s) and AI is advisory-only, so a little retry resilience against a
+  transient blip is a reasonable trade, not a risk.
+- Last night's liveness fix (previous entry) would have caught this specific hang shape
+  going forward even without this root-cause fix — but that's a symptom-detector, not a
+  cure. Both are now in place: the timeout keeps a stalled AI call from ever blocking a loop
+  for more than ~60s, and the liveness tracker catches it if some *other* unanticipated hang
+  ever occurs anyway.
+- Tests: `test_ai_engine_timeout.py` (1, hermetic — fake OpenAI client class records its
+  constructor kwargs, no network calls) pins that `timeout=_TIMEOUT_S` reaches the client.
+  Suite 313 → 314.
+- **Stock bot needs a restart** to load this fix.
+
+### NVIDIA_MODEL research + switch (2026-07-23) — .env only, no code changes
+Same-day follow-up: the timeout fix above made every nvidia_nim call fail *fast* (~41-42s to
+exhaust 3 retries) rather than hang for hours, but `openai/gpt-oss-120b` was still failing
+100% of the time — confirmed via direct API test (`requests.post` straight to
+`integrate.api.nvidia.com/v1/chat/completions`, same key, same account) that this was
+model-specific, not an account/auth/quota/outage issue: a different model on the identical
+key returned in 0.6s. First unblocked with `meta/llama-3.1-8b-instruct` (confirmed working),
+then researched the account's full model catalog (`GET /v1/models`, 119 models listed) to
+find the best real option rather than settling for the first thing that worked.
+- **Most of the catalog isn't actually usable on this account.** `writer/palmyra-fin-70b-32k`
+  (a finance-specialized model — would have been the obvious first choice), `nvidia/llama-3.1-
+  nemotron-70b-instruct`, `gemma-3-12b-it`, `phi-3.5-moe-instruct`, `granite-3.0-8b-instruct`,
+  `mistral-nemo-12b-instruct`, and `mistral-7b-instruct-v0.3` all returned 404 "not found for
+  account" — present in the catalog listing but not entitled on this key/tier.
+- **The timeout failure isn't a "big model" problem specifically.** `meta/llama-3.1-70b-
+  instruct`, `meta/llama-3.3-70b-instruct`, `nvidia/llama-3.3-nemotron-super-49b-v1.5`, and
+  `qwen/qwen3-next-80b-a3b-instruct` all timed out account-wide — but so did
+  `meta/llama-3.2-3b-instruct`, a 3B model. Per-model infra load/availability, not size.
+- **`nvidia/nvidia-nemotron-nano-9b-v2` is a reasoning model** — output goes to a
+  `reasoning`/`reasoning_content` field with `content: null`, incompatible with this bot's
+  direct-JSON-response parsing without code changes. Not pursued (out of scope — would be
+  new work, not a swap).
+- **Quality-tested the models that actually work**, not just speed: ran the real
+  `build_prompt()` output for both a clearly bullish and a clearly bearish test scenario
+  (RSI 78 + earnings miss + negative sentiment + Fear index), twice each, checking whether
+  the signal direction was even correct, not just whether it responded.
+  `meta/llama-3.1-8b-instruct` returned HOLD both times on the bearish scenario (missed it);
+  `google/gemma-2-2b-it` was fastest (1.2-1.4s) and correctly said SELL both times but with
+  suspicious 80→95% confidence for a 2B model; `mistralai/mixtral-8x7b-instruct-v0.1` was
+  correct and consistent (SELL/60 both times) but 15-19s — too slow for the sequential
+  per-symbol scan loop; `mistralai/mistral-small-4-119b-2603` (119B params despite the
+  "small" name) read both scenarios reasonably (BUY on bullish; HOLD→SELL on bearish) with
+  moderate, not overconfident, confidence, at 1.7-3.1s.
+- **Adopted: `NVIDIA_MODEL=mistralai/mistral-small-4-119b-2603`** (user's choice from the
+  three real candidates presented). Verified end-to-end through the actual `AIEngine` class
+  (not just raw HTTP) — 5.2s, valid verdict, no timeout. Full suite still 314/314 (config-only
+  change, no code touched).
+- **Stock bot needs a restart** to load the new model.
+
+### Earnings-fetch failure cache fixed — was silently disabling the earnings blackout for a full day (2026-07-23) — 317 tests pass
+Investigated a batch of yfinance warnings user pasted ("No earnings dates found, symbol may
+be delisted", "Fetch failed X:earnings: ['Earnings Date']") rather than dismissing them as
+routine noise — found one is genuinely cosmetic, the other was a real bug with a safety-
+feature consequence.
+- **"No earnings dates found, symbol may be delisted" is yfinance's own internal message,
+  not ours, and not a real problem.** yfinance exposes earnings data two ways: `.calendar`
+  (a dict — has the actual date) and `.earnings_dates` (a DataFrame from a separate, less
+  reliable Yahoo endpoint). When `.earnings_dates` is empty, yfinance itself prints that
+  alarming line — even when `.calendar` has perfectly good data. Confirmed directly: a fresh
+  call for NVDA and RY (both had just logged this warning) returned correct dates via
+  `.calendar` (Aug 26 / Aug 27) moments later. NVDA is obviously not delisted.
+- **"Fetch failed X:earnings: ['Earnings Date']" is real** (our own `yf_client.py` logging
+  an actual exception from inside `_fetch_earnings()`) **but transient** — the same
+  NVDA/RY retest that proved the first message harmless also proved this one non-persistent:
+  both fetched cleanly with zero exception on retry.
+- **The actual bug:** `stock_bot/research/earnings.py` cached a fetch *failure* for the same
+  24-hour TTL as a real success. `EarningsInfo.next_earnings_date` stays `None` on any
+  failure, and the earnings blackout feature (`_is_earnings_blackout()` in `stock_bot/
+  main.py`, blocks BUY within `EARNINGS_BLACKOUT_DAYS` of earnings) depends entirely on that
+  field being populated — so one transient yfinance hiccup was silently disabling that
+  protection for the affected symbol for the rest of the day, even though the data was
+  fetchable again within seconds.
+- **Fix:** `_earnings_cache` now stores a success flag alongside each entry; failures use a
+  new `_EARNINGS_FAILURE_TTL = 3600` (1 hour) instead of the full `_EARNINGS_TTL = 86400`
+  (24 hours) that successes still get. A transient blip now retries within the hour instead
+  of blinding the safety feature for a full day.
+- Tests: `test_earnings_cache.py` (3, hermetic — `fetch_with_retry` mocked, injectable clock,
+  no network) — failure retried after the short TTL, failure NOT retried before it expires,
+  success correctly still gets the long TTL (not accidentally shortened). Suite 314 → 317.
+- **Stock bot needs a restart** to load this fix.
+
+**Follow-up same day — added the missing lock, the one structural gap found (2026-07-23,
+318 tests pass):** user asked to dig further into the still-occurring "Fetch failed
+X:earnings: ['Earnings Date']" warnings after the TTL fix landed. Found `stock_bot/research/
+earnings.py` is the one of three yfinance call sites in the repo with **no lock** —
+`stock_bot/data/price_feed.py` (`_yf_download_lock`) and `stock_bot/fast_validator.py`
+(`_yf_lock`) both already serialize their calls for this exact class of problem, but
+earnings fetches run through `main.py`'s research phase with `ThreadPoolExecutor(max_workers
+=5)` — up to 5 concurrent, totally unserialized `yf.Ticker(...).calendar` /
+`.earnings_dates` calls. Tried to force a deterministic reproduction first (isolated single
+calls, then matched 5-way concurrency in a standalone script) — both came back 100% clean,
+consistent with this being a low, probabilistic per-call failure rate (roughly 8 failures
+observed against several hundred attempts that day) rather than a guaranteed trigger, not
+something a couple of manual test runs would reliably reproduce.
+- **Fix:** added `_yf_lock = threading.Lock()` to `earnings.py`, wrapping the `yf.Ticker`
+  construction + `.calendar`/`.earnings_dates` access inside `_fetch_earnings()` — same
+  pattern as the two sibling modules, one lock per module (not a new shared global lock,
+  matching the existing convention). Serializes the research phase's 5 concurrent earnings
+  fetches into sequential ones; cheap since results are cached 24h (1h on failure), so the
+  overhead only touches the first fetch per symbol per day, not every cycle.
+- Honest framing: this could not be proven to be *the* root cause with certainty (no forced
+  repro succeeded either way) — it closes a real, structural inconsistency (present in 2 of 3
+  modules, absent in the third) that can only reduce yfinance contention, never increase it.
+- Tests: `test_earnings_cache.py` gained `test_concurrent_fetches_are_serialized_by_the_lock`
+  — spins 5 real threads against a fake `yf.Ticker` that tracks concurrent entries via a
+  shared counter, asserts max concurrency seen is exactly 1. Suite 317 → 318.
+- **Stock bot needs a restart** to load this fix.
+
+**Second follow-up same day — the real fix (2026-07-23, 323 tests pass):** user reported the
+earnings failures were still happening minutes after the lock-fix restart (5 failures in the
+first 3 minutes) — an honest signal the lock wasn't the actual fix. Investigated the retry
+logic itself and found the real gap: `fetch_with_retry()` (`stock_bot/data/yf_client.py`,
+the shared retry helper used by every yfinance call site in the repo, not just earnings)
+only retries on `YFRateLimitError` — **any other exception gets zero retries, immediate
+give-up.** Since these earnings failures throw something else (not classified as a rate
+limit), they never got retried at all, despite manual retesting proving them transient
+(succeeding within seconds moments later, repeatedly, throughout this investigation).
+- **Fix:** generic (non-rate-limit) exceptions now get retried too, up to the same
+  `max_attempts` (default 3), with a new short fixed `_GENERIC_RETRY_DELAY_S = 2` — much
+  shorter than the rate-limit ladder (5/15/30s escalating), since the server isn't actually
+  throttling here, just occasionally glitching. Rate-limit handling itself is completely
+  unchanged (own except branch, own backoff, own circuit breaker).
+- This is the shared retry point for the WHOLE stock bot's yfinance usage (price fetches,
+  earnings, universe scans, IPO checks, sector lookups — every caller listed in
+  `fetch_with_retry`'s own module docstring), so this improves resilience broadly, not just
+  for earnings specifically.
+- **Second, separate bug found and fixed in the same investigation:** `nvidia_nim FULL ERROR
+  for HOOD: TypeError: 'NoneType' object is not subscriptable` — `stock_bot/ai/ai_engine.py`
+  subscripted `completion.choices[0]` without checking whether `choices` came back `None`
+  (empty generation / content filter / provider hiccup). Already safely degraded to a HOLD
+  verdict via the outer exception handler either way (never crashed the bot), but the error
+  was opaque. Added an explicit `if not completion.choices:` guard before the subscript,
+  with a clear log message and the same safe HOLD fallback — same outcome, diagnosable cause.
+- Tests: `test_yf_client_retry.py` (4, hermetic, no network) — generic exception retried and
+  can still succeed, gives up after max_attempts, uses the short delay not the rate-limit
+  backoff, rate-limit path itself provably unchanged. `test_ai_engine_timeout.py` gained
+  `test_nvidia_nim_empty_choices_falls_back_to_hold_without_crashing`. Suite 318 → 323.
+- **Stock bot needs a restart** to load both fixes.
 
 ### Bug fixes applied 2026-06-20
 All critical bugs resolved:

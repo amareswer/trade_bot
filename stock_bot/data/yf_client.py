@@ -21,6 +21,14 @@ logger = logging.getLogger(__name__)
 # Unix timestamp after which fetches are allowed again.  0 = not active.
 _rate_limit_until: float = 0
 
+# 2026-07-23: non-rate-limit exceptions (e.g. "Fetch failed X:earnings:
+# ['Earnings Date']") previously got ZERO retries — one glitch and the whole
+# fetch gave up immediately, even though manual retesting showed these are
+# usually transient and succeed within seconds. Rate limits get a long,
+# escalating backoff (5/15/30s) because the server is actively throttling;
+# this is a short, fixed retry for everything else, since it isn't throttling.
+_GENERIC_RETRY_DELAY_S = 2
+
 
 def is_rate_limited() -> bool:
     """Return True while the circuit breaker cooldown is active."""
@@ -98,7 +106,16 @@ def fetch_with_retry(
                 trip_circuit_breaker()
                 return None
         except Exception as exc:
-            logger.warning("Fetch failed %s: %s", label, exc)
-            return None
+            if attempt < max_attempts - 1:
+                logger.warning(
+                    "Fetch failed %s (attempt %d/%d): %s — retrying in %ds",
+                    label, attempt + 1, max_attempts, exc, _GENERIC_RETRY_DELAY_S,
+                )
+                time.sleep(_GENERIC_RETRY_DELAY_S)
+            else:
+                logger.warning(
+                    "Fetch failed %s after %d attempts: %s", label, max_attempts, exc,
+                )
+                return None
 
     return None

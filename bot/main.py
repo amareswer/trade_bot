@@ -1121,11 +1121,21 @@ def run():
         )
 
     # ── Heartbeat ping thread (dead-man's switch — see bot/alerts/heartbeat.py) ──
+    # healthy_fn requires the main loop to have completed a full tick within
+    # the last 10 minutes — a hung thread (2026-07-22 incident: the stock
+    # bot's swing-book thread froze silently for 5+ hours with no exception)
+    # is technically "running" but makes no progress; process-alive alone
+    # can't detect that. _liveness.touch() is called once per completed tick
+    # below (LOOP_INTERVAL is normally 30s — 10 minutes is a wide safety margin).
     from bot.alerts.heartbeat import start_heartbeat_thread
+    from bot.alerts.liveness import LivenessTracker
+    _liveness = LivenessTracker()
+    _LIVENESS_MAX_STALE_S = 600
     start_heartbeat_thread(
         os.getenv("HEARTBEAT_URL", ""),
         interval_s=int(os.getenv("HEARTBEAT_INTERVAL_S", "60")),
         name="heartbeat-crypto",
+        healthy_fn=lambda: _liveness.is_alive(_LIVENESS_MAX_STALE_S),
     )
 
     _halt_file_active = False
@@ -1918,6 +1928,7 @@ def run():
                 _render_dashboard(final_signal.value, rsi_val, trend_val)
 
         # ── End of per-symbol loop ────────────────────────────────────
+        _liveness.touch()
         time.sleep(cfg.exchange.loop_interval)
         _now_utc = datetime.now(_tz.utc)
         # Fire exactly once per UTC day — date-change check instead of a

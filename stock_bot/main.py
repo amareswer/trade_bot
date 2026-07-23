@@ -744,14 +744,22 @@ def run() -> None:
     notifier.start_weekly_summary()
 
     # ── Heartbeat pings (dead-man's switch — see bot/alerts/heartbeat.py) ──
-    # HEARTBEAT_URL: process alive. HEARTBEAT_TWS_URL: pinged only while the
-    # IBKR connection is up, so "TWS logged off" alerts separately from
-    # "bot died". Both off when unset.
+    # HEARTBEAT_URL: process alive AND the main scan loop is still making
+    # progress (2026-07-22 incident: the swing-book thread hung silently for
+    # 5+ hours with no exception — process-alive alone can't catch that;
+    # _liveness.touch() is called after every symbol's AI call and once per
+    # full cycle as a fallback — see bot/alerts/liveness.py).
+    # HEARTBEAT_TWS_URL: pinged only while the IBKR connection is up, so
+    # "TWS logged off" alerts separately from "bot died".  Both off when unset.
     from bot.alerts.heartbeat import start_heartbeat_thread
+    from bot.alerts.liveness import LivenessTracker
+    _liveness = LivenessTracker()
+    _LIVENESS_MAX_STALE_S = 1800   # 30 min — AI calls have been observed taking ~13 min
     _hb_interval = int(os.getenv("HEARTBEAT_INTERVAL_S", "60"))
     start_heartbeat_thread(
         os.getenv("HEARTBEAT_URL", ""),
         interval_s=_hb_interval,
+        healthy_fn=lambda: _liveness.is_alive(_LIVENESS_MAX_STALE_S),
         name="heartbeat-stock",
     )
     if hasattr(executor, "is_connected"):
@@ -1025,6 +1033,7 @@ def run() -> None:
                     )
                 except Exception as exc:
                     logger.warning("AI failed for %s: %s", sym, exc)
+                _liveness.touch()
         _ai_elapsed    = time.time() - _ai_start
         _ai_nvidia_n   = sum(1 for v in ai_verdicts.values() if v.provider == "nvidia_nim")
         _ai_fallback_n = sum(1 for v in ai_verdicts.values() if v.provider == "openrouter")
@@ -1430,6 +1439,7 @@ def run() -> None:
             logger.warning("Dashboard render failed: %s", exc)
 
         print()
+        _liveness.touch()   # safety net — fires every full cycle even if AI is disabled
         time.sleep(cfg.loop_interval)
     except KeyboardInterrupt:
         print("\n⛔ Stock Bot stopped. Goodbye!")
