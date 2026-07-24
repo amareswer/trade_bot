@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 import ccxt
 
 from bot.execution.executor import Order, OrderSide, OrderStatus, Portfolio
+from bot.exchanges.retry import fetch_with_retry
 from config import cfg
 
 logger = logging.getLogger(__name__)
@@ -423,7 +424,10 @@ class LiveExecutor:
             Halves the tick offset and retries without consuming a timeout retry slot.
             Falls back to market if tick_pct drops below 0.000001.
 
-        Any other ccxt exception: falls back to market immediately.
+        Any other ccxt exception: retried once (2026-07-24 — the July 6/15
+        incidents both started with a single transient depth-fetch error
+        cascading straight into a market-order fallback), then falls back
+        to market if the retry also fails.
 
         Returns the raw ccxt order dict of the final order. Market-fallback
         paths return the immediate create_order response, which on Kraken can
@@ -438,7 +442,10 @@ class LiveExecutor:
         while timeout_attempts < max_attempts:
             # Fetch orderbook and compute limit price — network errors fall back immediately.
             try:
-                book = self._exchange.fetch_order_book(self.symbol, limit=5)
+                book = fetch_with_retry(
+                    lambda: self._exchange.fetch_order_book(self.symbol, limit=5),
+                    attempts=2, delay_s=1.5, label=f"order book fetch [{self.symbol}]",
+                )
                 if side == "buy":
                     bid           = float(book["bids"][0][0])
                     limit_price_f = bid * (1.0 + tick_pct)

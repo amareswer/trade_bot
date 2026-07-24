@@ -67,6 +67,7 @@ from bot.strategy.threshold_strategy import ThresholdStrategy, Signal
 from bot.strategy.indicator_strategy import IndicatorStrategy, IndicatorConfig
 from bot.execution.executor import PaperExecutor, OrderStatus, OrderSide
 from bot.execution.live_executor import LiveExecutor
+from bot.exchanges.retry import fetch_with_retry
 from bot.risk.risk_manager import RiskManager, RiskConfig
 from bot.risk.correlation import fetch_correlation, CORRELATION_THRESHOLD
 from bot.state.trade_state import TradingStateMachine
@@ -199,7 +200,10 @@ def _fetch_completed_candle(
     """
     _sym = symbol if symbol is not None else cfg.exchange.symbol
     try:
-        raw = exchange.fetch_ohlcv(_sym, timeframe=timeframe, limit=2)
+        raw = fetch_with_retry(
+            lambda: exchange.fetch_ohlcv(_sym, timeframe=timeframe, limit=2),
+            label=f"candle fetch [{_sym}]",
+        )
     except Exception as exc:
         logger.warning("live candle fetch error: %s", exc)
         return None, None
@@ -1188,7 +1192,10 @@ def run():
             # ── 1. Fetch live price ───────────────────────────────────
             if live_exchange is not None:
                 try:
-                    price = float(live_exchange.fetch_ticker(sym)['last'])
+                    price = float(fetch_with_retry(
+                        lambda: live_exchange.fetch_ticker(sym)['last'],
+                        label=f"price fetch [{sym}]",
+                    ))
                     ss['last_price'] = price
                     ss['err_count'] = 0
                 except Exception as exc:

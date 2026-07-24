@@ -165,7 +165,7 @@ A robust crypto trading system that:
 
 ## Test Suite Manifest (as of 2026-07-03)
 
-Expected total: **324 tests** (as of 2026-07-23). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~6s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
+Expected total: **328 tests** (as of 2026-07-24). If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~6s — if it takes minutes, a test is reading live `.env` config (see hermeticity note under Execution hardening).
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -206,8 +206,9 @@ Expected total: **324 tests** (as of 2026-07-23). If `pytest --collect-only -q` 
 | `test_earnings_cache.py` | 4 | Earnings-fetch cache: failures use a short 1h TTL (retry soon) vs successes using the full 24h TTL, boundary behavior for both, concurrent fetches serialized by `_yf_lock` |
 | `test_yf_client_retry.py` | 4 | `fetch_with_retry`: generic exceptions now retried with a short delay (not zero retries), give up after max_attempts, short delay ≠ rate-limit backoff, rate-limit path unchanged |
 | `test_research_aggregator_timeout.py` | 1 | Per-source research-fetch timeout: earnings gets a wider budget (45s, to fit its new retry latency) than news (15s, unaffected — no fetch_with_retry involved) |
+| `test_kraken_retry.py` | 4 | `bot/exchanges/retry.fetch_with_retry`: succeeds without retrying, retries on failure and can recover, raises the last exception after exhausting attempts, custom attempts/delay respected |
 
-Run: `python -m pytest --tb=short -q` — must show **324 passed**.
+Run: `python -m pytest --tb=short -q` — must show **328 passed**.
 
 ---
 
@@ -1976,6 +1977,77 @@ two log lines, no new information.
   behavior. Worth checking for this same shape anywhere else multiple timeout/retry layers
   stack (none currently known, but not exhaustively audited).
 - **Stock bot needs a restart** to load this fix.
+
+### Large-cap screen (2026-07-23) — 4 new RULE_WHITELIST symbols, no code changes
+Goal: widen the stock-bot symbol funnel further (user asked for "a good portfolio" of stock
+symbols to make more progress toward the Phase A gate). Ran `stock_backtest.py` (same
+4-window gate, strategy hash `659d1c03987b72fd` unchanged) on 20 untested, liquid, well-known
+large-caps spanning tech/financials/consumer/healthcare/industrials — none previously
+screened. Report: `logs/stock_backtest_20260723.md`.
+- **PASS + whitelisted (4): CAT** (full PF 3.41, range 3.41–14.44 across all 4 windows,
+  SL-exit ≤ 37% everywhere — the strongest pass on record for this whitelist),
+  **GOOGL** (full PF 3.50, range 3.50–10.90, SL-exit ≤ 30%), **WMT** (full PF 1.69, range
+  1.69–3.71, SL-exit ≤ 33%), **MSFT** (full PF 2.23, but 500d window SL-exit rate hit
+  66.7% — passes the letter of the gate, weakest of the four).
+- **FAIL (16):** AAPL (close — full PF 1.20/17 trades, but 750d 0.70 and 500d 0.72 both
+  dip below 1.2), JPM, V, MA, COST, HD, JNJ (full PF 1.18, just under the bar despite great
+  PF in smaller windows), UNH, PG, MCD, ORCL, ADBE, CRM, AVGO (close — full PF 1.88 but
+  500d window 1.14 < 1.2), DE, IBM.
+- User approved adding all 4 PASS symbols. `stock_bot/.env`: WATCHLIST and RULE_WHITELIST
+  both gained `CAT,GOOGL,WMT,MSFT`.
+- **Stock bot needs a restart** to pick up the new .env.
+- **Unrelated ops note surfaced during this session:** `logs/stock_bot.log` showed the live
+  stock bot's IBKR/TWS connection dropped ~18:54 ET today with `ConnectionRefusedError` on
+  every reconnect attempt since (ops alert already fired at 19:05 for the 10+ minute
+  disconnect, per the 2026-07-17 TWS monitor). TWS likely needs to be relaunched/logged back
+  into before the stock bot (including these 4 new symbols) can trade again.
+
+### Root-caused why BTC/CAD is still 0/15 + Kraken call retry resilience added (2026-07-24) — 328 tests pass, strategy hash unchanged
+User pushed back on "we've been at 0/15 for weeks, is this ever going to happen" — instead of
+re-asserting patience, did a forensic pass over the actual log/trade history to find out
+whether the strategy is really this quiet or something is silently eating trades.
+
+**Finding: the strategy fired BUY twice in the visible log window (since 2026-07-05), not
+zero times.** Both failed to become a recorded trade — but for execution reasons, not entry-
+rule reasons:
+- **2026-07-06 20:00 UTC:** clean BUY signal (RSI 66, ADX 27.8, spread 0.87%). Kraken's
+  order-book depth endpoint threw a network error, `_place_limit_order` fell back to a market
+  order, and the code at the time (pre-dating the 2026-07-15 fix below) had no polling/retry
+  logic — it read `filled=0` once and gave up. Cross-checked against position-drift alerts:
+  no drift appeared for this order (the one drift near this date, 0.000085 BTC, was already
+  independently confirmed 2026-07-10 as an unrelated manual purchase). So this specific order
+  most likely never filled at Kraken at all — a lost opportunity, not a lost fill.
+- **2026-07-15 12:00 UTC:** same pattern (BUY signal clean, depth-fetch network error, market
+  fallback) — except this one **did** fill (0.000169 BTC appeared minutes later as a drift
+  alert) and the unpolled `filled=0` response caused the fill to go unrecorded. This is the
+  exact incident `test_limit_chase_recovery.py` was already built to fix (shipped same day,
+  2026-07-15) — verified the fix is real by reading `bot/execution/live_executor.py`'s
+  poll-and-recover logic (comment cites this exact order ID) and re-running that suite:
+  `test_limit_chase_recovery.py` + `test_fill_recording.py` — 14/14 pass.
+- **Conclusion:** 0/15 reflects a strategy that trades roughly every 1–3 weeks (consistent
+  with backtest frequency) losing its first two real chances to execution fragility, not
+  entry rules that never fire. One of the two failure modes was already fixed; this session
+  addressed the shared root cause of both.
+
+**Fix — retry resilience on transient Kraken calls, added same session:** new
+`bot/exchanges/retry.py` (`fetch_with_retry`) — retries a zero-arg callable on any exception
+with a short fixed delay, raises the last exception if every attempt fails (callers keep
+their existing except/fallback logic unchanged, they just see fewer transient blips reach
+it). Wired into the three call sites implicated above and in today's live log (Kraken
+`price fetch failed` / `live candle fetch error` warnings at 10:23–10:26 UTC):
+- `bot/execution/live_executor.py` `_place_limit_order`'s order-book depth fetch (2 attempts,
+  1.5s delay) — the call directly responsible for both July incidents; a single transient
+  blip here no longer cascades straight into a market-order fallback.
+- `bot/main.py` `_fetch_completed_candle`'s `fetch_ohlcv` call (3 attempts, 2.0s delay).
+- `bot/main.py`'s per-tick `fetch_ticker` live-price call (3 attempts, 2.0s delay).
+- Tests: `test_kraken_retry.py` (4, hermetic — `time.sleep` mocked, no network): succeeds
+  without retrying, retries on failure and recovers, raises after exhausting attempts,
+  custom attempts/delay respected. Full suite re-run: 328/328 pass, no existing test broke
+  (checked specifically — no test sets `fetch_order_book.side_effect` to an exception, so
+  none relied on the old zero-retry behavior).
+- Not a strategy change — `bot/strategy/*.py` untouched, hash `659d1c03987b72fd` still valid.
+- **Crypto bot needs a restart** to pick this up — both `bot/main.py` and
+  `bot/execution/live_executor.py` changed and it's a long-running process.
 
 ### Bug fixes applied 2026-06-20
 All critical bugs resolved:
