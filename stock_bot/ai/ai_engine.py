@@ -280,7 +280,11 @@ class AIEngine:
         if self._provider == "openrouter":
             time.sleep(4)
         elif self._provider == "nvidia_nim":
-            time.sleep(3.0)  # 40 rpm = 1 per 1.5s; 3s stays under burst window
+            # 2026-07-27: raised from 3.0s after mistral-nemotron hit repeated
+            # RateLimitError 429s at 3s spacing (69 of 103 failures in one
+            # session were 429s) — 40rpm nominal cap wasn't leaving enough
+            # headroom in practice. 6s keeps a 26-symbol pass under ~7rpm.
+            time.sleep(6.0)
 
     def _fallback_to_openrouter(self) -> None:
         api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -380,9 +384,15 @@ class AIEngine:
                 # ("successful", just slow) and of the swing-book thread hang
                 # (2026-07-22) that could freeze for hours with nothing raised.
                 client = self._openai_cls(
-                    base_url = self._base_url,
-                    api_key  = self._api_key,
-                    timeout  = _TIMEOUT_S,
+                    base_url    = self._base_url,
+                    api_key     = self._api_key,
+                    timeout     = _TIMEOUT_S,
+                    # 2026-07-27: SDK default retries (2) fire immediately on
+                    # 429/500 with their own short backoff, bypassing our
+                    # _rate_limit_sleep pacing entirely — effectively bursting
+                    # 3 requests where we intended 1. Disabled so every retry
+                    # decision goes through our own spacing.
+                    max_retries = 0,
                 )
                 completion = client.chat.completions.create(
                     model       = self._model,
@@ -448,6 +458,12 @@ class AIEngine:
                     "nvidia_nim FULL ERROR for %s: %s: %s",
                     symbol, type(exc).__name__, str(exc),
                 )
+                # 2026-07-27: this branch used to return with no sleep at all —
+                # a failure (often itself a 429) removed the pacing gap instead
+                # of widening it, so the very next symbol's call fired
+                # immediately into the same rate limit. Root cause of observed
+                # back-to-back RateLimitError bursts (CSCO/T/WMT within 15s).
+                self._rate_limit_sleep()
                 return _hold_verdict(symbol, "AI unavailable")
             else:
                 logger.warning("AI API call failed for %s [%s]: %s", symbol, self._provider, exc)
