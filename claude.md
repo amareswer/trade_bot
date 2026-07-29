@@ -247,10 +247,33 @@ CANDLE_MINUTES=240            # 4h — the only validated live timeframe (1h FAI
 RISK_PER_TRADE_PCT=0.10       # capital-allocation dial, NOT % risked — combined with SL% the real
                               # dollar risk per trade is ~0.15% of cash (see history 2026-07-20 audit)
 STOP_LOSS_PCT=0.015           # fallback only — ATR_SL_MULT=2.0 takes priority whenever ATR is
-                              # available at entry (bot/main.py:1813)
+                              # available at entry (bot/main.py:1855-1870)
 TAKE_PROFIT_PCT=0.10
 ORDER_TYPE=limit / LIMIT_ORDER_ENABLED=true   # BUY entries limit-chase for maker rate;
                               # ALL SL/TP exits forced to market via urgent=True
+```
+
+### Risk-gate config (live — RiskManager, `bot/risk/risk_manager.py`)
+```
+RISK_MAX_POSITION_PCT=0.20    # BUY blocked if it would push position above 20% of slot value
+                              # (module default is 5% — .env overrides it 4x looser; slot is
+                              # capped at $77 by MAX_SLOT_CASH_CAD so absolute exposure stays small)
+RISK_DAILY_LOSS_LIMIT=0.01    # halt new BUYs if portfolio down >1% from today's UTC-midnight open
+                              # (SELL always allowed — breaker never blocks exits)
+RISK_MAX_DRAWDOWN=0.05        # halt new BUYs if portfolio down >5% from all-time peak
+                              # (SELL always allowed — breaker never blocks exits)
+RISK_MAX_TRADES_PER_DAY=5     # hard cap on BUY fills per calendar day (per-symbol when
+                              # multi-symbol; SELL fills are not capped)
+COOLDOWN_TICKS=6              # state-machine cooldown between a fill and the next signal
+                              # evaluation (bot/strategy state machine, not RiskManager itself)
+RISK_HALT_BLOCKS_STOPS=false  # NOT set in .env — using the config.py default (false).
+                              # Toggles whether the manual HALT flag (logs/HALT) also blocks
+                              # SL/TP exits. Default false = SL/TP exits still fire during a
+                              # manual halt; only BUYs and strategy-signal SELLs are blocked
+                              # (matches the _check_halt_flag() alert text: "BUY and strategy
+                              # SELL blocked; SL/TP exits still fire"). Set true only if you
+                              # want a manual halt to freeze exits too — not recommended, since
+                              # it would leave open positions exposed with no stop.
 ```
 
 ### How to verify the config is active
