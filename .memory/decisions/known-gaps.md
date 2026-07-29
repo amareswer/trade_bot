@@ -340,3 +340,41 @@ violating that rule — a safe mitigation if it becomes a real problem would be 
 leak is actually a live problem rather than one day's normal call volume).
 
 **Tests:** 332/332 PASS (328 → 332, the 4 new tests above). No strategy files touched.
+
+## 12. Swing book ATR-stop research — FAILED 2026-07-28, corrects the 2026-07-22 diagnosis
+
+**Not a bug — a pre-registered research result.** Logged here (not just
+`CLAUDE_HISTORY.md`) because it corrects a prior conclusion and carries a standing
+constraint on future work in this area.
+
+**Background:** the swing book (`stock_bot/fast_validator.py`, 1h candles) was retired
+2026-07-22 at combined PF 0.76 across 394 trades, 64.0% SL-exit rate. That entry concluded
+the fixed 1.5% stop was "too tight for hourly noise... not the AI-trigger architecture" —
+but no stop-mechanism fix had actually been tested at the time; the conclusion was inferred
+from the SL-exit-rate shape matching crypto's 1h day-trading failure, not verified directly.
+
+**Tested 2026-07-28:** pre-registered experiment (`swing_atr_walkforward.py`, hypothesis +
+4 pass criteria committed before running anything, same 7 symbols, real
+data-availability check before choosing the IS/OOS split) — ATR×2.0 stop (the exact fix
+that worked for BTC 2026-07-17), run once, no grid search. **FAILED all 4 criteria:**
+combined PF 0.54 in-sample / 0.35 OOS (worse than the 0.76 baseline, not better), 0/7 and
+1/7 symbols passing, SL-exit rate 53.0%/56.2% (barely moved from 64%, still fails the <50%
+bar). Full table and reasoning: `CLAUDE_HISTORY.md` "Swing book ATR-stop research
+(2026-07-28)".
+
+**Correction:** the 2026-07-22 "not the AI-trigger architecture" conclusion is now flagged
+as unconfirmed / possibly wrong. Widening the stop made things worse with no win-rate
+improvement (RY 21.4%, AMZN 37.5% in-sample) — that pattern points toward the entry signal
+(Mode A/B on 1h candles) lacking edge, not stop distance being the problem.
+
+**Standing note — applies to any future swing-book work:** do not re-attempt a
+stop-mechanism fix (ATR or otherwise) for the swing book without first testing entry-signal
+edge independent of exit rules. A fixed-SL/fixed-TP (or same-candle-close) isolation test
+that measures whether Mode A/B's raw BUY/SELL timing has any edge on 1h stock candles,
+before touching the stop mechanism again, is the correct next step if this is revisited —
+not another stop-multiplier sweep.
+
+**What this doesn't change:** swing book stays retired (`FAST_ENABLED=false`,
+`stock_bot/.env` untouched by the experiment). No live code touched
+(`stock_bot/fast_validator.py`, `stock_bot/backtest/engine.py` both untouched — the ATR
+variant is a standalone copy in `swing_atr_walkforward.py`). Suite unaffected, 332/332.

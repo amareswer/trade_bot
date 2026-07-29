@@ -1281,6 +1281,12 @@ crypto's 1h day-trading experiment ruled out on 2026-07-10 — same failure shap
 is too tight for hourly noise regardless of what triggers the entry. Rule-based signals
 would not have fixed this; the live losing streak (concentrated in HOOD 0-2 and MRNA 0-2)
 was a symptom of the timeframe/stop-distance mismatch, not the AI-trigger architecture.
+**CORRECTION (2026-07-28, see entry below):** this "stop-distance mismatch, not the
+AI-trigger architecture" conclusion was never actually tested against the timeframe/stop
+mismatch it names — no ATR-stop experiment had been run yet. Widening the stop to ATR×2.0
+(2026-07-28) made combined PF *worse* (0.54, not better), which points toward the entry
+signal (Mode A/B on 1h) being the more likely root cause after all. Treat the original
+"not the AI-trigger architecture" framing as unconfirmed, possibly wrong — not settled.
 
 **Bug found while closing out:** the swing-book worker thread had silently hung mid-cycle at
 13:24 EDT that day — successfully sold RY (MAX_HOLD, correctly written to `fast_trades.csv`)
@@ -1292,9 +1298,11 @@ RY entry and closed BNS for real through the normal `_write_trade()` path. Final
 state: flat, 10 completed round-trips, realized P&L -$12.71.
 - `stock_bot/fast_trades.csv` and `stock_bot/fast_validator_state.json` left in place as the
   frozen historical record.
-- **Do not re-enable without a fresh walk-forward pass.** If revisited, an ATR-based stop
+- **Do not re-enable without a fresh walk-forward pass.** ~~If revisited, an ATR-based stop
   (same fix that worked for BTC 2026-07-17) is the most likely path to a passing result —
-  untested, not yet researched.
+  untested, not yet researched.~~ **Tested 2026-07-28 — FAILED, see entry below.** Do not
+  re-attempt a stop-mechanism fix here without first testing entry-signal edge independent
+  of exit rules (standing note, `.memory/decisions/known-gaps.md` gap #12).
 - No code changed — `FAST_ENABLED=false` in `stock_bot/.env` is the entire mechanism.
 
 ### Heartbeat blind spot fixed — loop-liveness tracking, both bots (2026-07-22) — 313 tests pass
@@ -1501,6 +1509,55 @@ three call sites implicated above:
 - Tests: `test_kraken_retry.py` (4, hermetic). Full suite re-run: 328/328 pass, no existing
   test broke.
 - Not a strategy change — `bot/strategy/*.py` untouched, hash `659d1c03987b72fd` still valid.
+
+### Swing book ATR-stop research (2026-07-28) — FAILED, corrects the 2026-07-22 diagnosis
+Pre-registered experiment (`swing_atr_walkforward.py`, research-only, `stock_bot/.env` and
+`stock_bot/fast_validator.py` untouched throughout) testing whether the ATR×2.0 stop-loss
+that fixed BTC's 1h problem (2026-07-17) would also fix the swing book's 1h problem
+(retired 2026-07-22 at combined PF 0.76, 64.0% SL-exit rate, diagnosed then as "1.5% fixed
+stop too tight for hourly noise, not an entry-signal problem").
+
+**Pre-registered, before running anything:** hypothesis (ATR×2.0 stop, TP unchanged at
+3.0%, raises combined PF above 1.0 on the same 7 symbols without materially raising the
+SL-exit rate) and 4 pass criteria (in-sample combined PF ≥ 1.2, ≥4/7 symbols PF ≥ 1.0,
+SL-exit rate < 50%, holds on a genuinely separate out-of-sample window — same 7 symbols:
+HOOD, MRNA, NCLH, AC.TO, RY, AMZN, BNS). Checked real yfinance 1h data availability first
+(consistent ~2023-09-01 → 2026-07-28 across all 7, yfinance's ~730-day 1h cap) before fixing
+the split — IN-SAMPLE 2023-09-01→2026-01-28, OUT-OF-SAMPLE 2026-01-28→2026-07-28 — decided
+from data availability alone, before seeing any PF numbers.
+
+**Result: FAILED all 4 criteria, run once at ATR×2.0, no grid search.**
+| Window | Combined PF | Symbols PF≥1.0 | SL-exit rate | Trades |
+|---|---|---|---|---|
+| In-sample | 0.54 | 0/7 | 53.0% | 287 |
+| Out-of-sample | 0.35 | 1/7 (BNS) | 56.2% | 73 |
+
+Combined PF got **worse** than the 0.76 fixed-SL baseline, not better, and the SL-exit rate
+barely moved (53% vs. 64%, still fails the <50% bar) while PF collapsed anyway — losing
+trades that still hit SL got bigger, not fewer trades hit SL. Zero of 7 symbols clear
+PF≥1.0 in-sample; BNS is the only symbol ever positive, only in a 7-trade OOS slice.
+
+**This does not replicate the BTC mechanism.** On BTC a tight stop was whipsawing a real
+entry edge; widening it let winners run. Here widening the stop mostly let losers lose more
+before exiting, with no offsetting win-rate improvement (RY 21.4% win rate in-sample, AMZN
+37.5%) — consistent with the entry signal itself (Mode A/B on 1h candles), not stop
+distance, being the more likely root cause. **This corrects the 2026-07-22 entry's "not the
+AI-trigger architecture" conclusion** — that was asserted, not tested, at the time.
+
+**Standing note (also `.memory/decisions/known-gaps.md` gap #12): do not re-attempt a
+stop-mechanism fix for the swing book without first testing entry-signal edge independent
+of exit rules.** A fixed-SL/fixed-TP sanity check (or even a same-candle-close exit) that
+isolates whether Mode A/B's raw BUY/SELL timing has any edge on 1h stock candles, before
+touching the stop mechanism again, would tell us which side of this is actually broken.
+
+- Verified the ATR value feeding the stop uses already-validated candle data (same
+  `fetch_candles()` sanity gauntlet as live), and reuses the unmodified crypto
+  `IndicatorStrategy` (Mode A/B) + `stock_bot/backtest/engine.py`'s cost model
+  (`BacktestTrade`, `BacktestResult`, IBKR commission function) — same engine as the
+  original 0.76 PF finding, only the SL calculation swapped.
+- `swing_atr_walkforward.py` left at repo root as the reusable script for any future
+  ATR-multiplier or entry-isolation follow-up experiment.
+- Suite unaffected (332/332, no source files touched — this is a standalone script).
 
 ### Bug fixes applied 2026-06-20
 All critical bugs resolved (this is the earliest recorded bulk cleanup):
