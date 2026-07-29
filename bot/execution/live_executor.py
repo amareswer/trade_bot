@@ -895,6 +895,11 @@ class LiveExecutor:
                     "not deducting (manual reconciliation needed)",
                     fee_cost, fee_currency, quote,
                 )
+                self._alerter.error(
+                    f"FEE CURRENCY MISMATCH [{self.symbol}]: fee={fee_cost:.6f} "
+                    f"{fee_currency} but quote={quote} — not deducted, cash ledger "
+                    f"will silently drift from the exchange balance until reconciled manually"
+                )
             else:
                 self._portfolio.cash -= fee_cost
                 self._fees_paid      += fee_cost

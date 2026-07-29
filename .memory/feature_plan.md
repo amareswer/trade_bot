@@ -11,11 +11,31 @@ Running log of feature decisions. Most recent first.
 
 ---
 
+## 2026-07-29 (cont'd) — Deferred-Item Cleanup Pass (BUILT ✓)
+
+Worked through gap #9's remaining deferred items plus the stale tech-debt table, one at a
+time with full-suite + strategy-hash checks between each. Fixed: `mkdtemp()` → `tmp_path`
+in the last 3 test files with the leak (`test_fast_validator_exits.py`,
+`test_paper_report.py`, `test_live_executor.py`'s `_make()` default), including repairing
+3 legacy manual `__main__` test runners that would have silently broken from the
+`tmp_path`-fixture change; fee-currency-mismatch cash drift now alerts to Telegram, not
+just log (`bot/execution/live_executor.py`), with a new test. Confirmed-clean, no code
+change needed: the "5 pre-existing failing crypto tests" tech-debt entry was stale (all 5
+already pass); risk-gate `.env` keys were already documented in CLAUDE.md; the
+`None.reject_reason` crash path in `bot/main.py` is provably unreachable (traced
+`LiveExecutor.execute()` fully — every `quantity<=0` path returns `None`, never a FILLED
+order); the stock bot's FX sizing quirk is unchanged and still bounded by the
+exposure/sector caps (left deferred, as instructed — no fix). 332 → 333 tests (one new
+alert test), strategy hash unchanged `659d1c03987b72fd` throughout. Full detail:
+`.memory/decisions/known-gaps.md` gap #14.
+
+---
+
 ## Deferred / Tech Debt
 
 | Item | Detail |
 |---|---|
-| Fix 5 pre-existing failing crypto bot tests | `test_halt_blocks_all_signals` (risk_manager), `test_fetch_order_polling_timeout_uses_partial_fill`, `test_state_save_load_roundtrip`, `test_sync_cash_uses_exchange_free_balance`, `test_restart_recovery_seeds_position_manager` (all in live_executor). All are balance-sync / mock issues in the test environment — live bot unaffected. Fix when test suite is next touched. |
+| FX sizing quirk (stock bot) | `PAPER_RISK_PCT` allocation computed in CAD, US share prices are USD, no FX conversion applied — single-position exposure can overshoot target by ~35%. Exposure/sector caps still self-consistently bound it (re-verified 2026-07-29, see known-gaps.md gap #14). Deliberately not fixed — sizing change = measurement change; revisit before live. |
 
 ---
 

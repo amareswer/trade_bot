@@ -11,7 +11,6 @@ Run: python -m pytest test_paper_report.py -v
 from __future__ import annotations
 
 import os
-import tempfile
 
 from stock_bot.analysis.paper_report import (
     _expectancy_stats,
@@ -66,8 +65,8 @@ def test_expectancy_none_without_pairs():
     assert _expectancy_stats([]) is None
 
 
-def test_generate_report_renders_expectancy_section():
-    tmp = tempfile.mkdtemp()
+def test_generate_report_renders_expectancy_section(tmp_path):
+    tmp = str(tmp_path)
     trades_csv = os.path.join(tmp, "paper_trades.csv")
     fast_csv   = os.path.join(tmp, "fast_trades.csv")   # absent — must not crash
     with open(trades_csv, "w", encoding="utf-8") as f:
@@ -92,11 +91,11 @@ def test_generate_report_renders_expectancy_section():
 _CSV_HEADER = "timestamp,symbol,side,shares,price,total_value,cash_remaining,reason,confidence\n"
 
 
-def test_position_book_merges_paper_and_ibkr_csvs():
+def test_position_book_merges_paper_and_ibkr_csvs(tmp_path):
     # The Phase A gate counts strategy trades across the 2026-07-17 executor
     # switch: pairs completed in the sim book AND pairs filled via IBKR must
     # both appear, in timestamp order.
-    tmp = tempfile.mkdtemp()
+    tmp = str(tmp_path)
     paper_csv = os.path.join(tmp, "paper_trades.csv")
     ibkr_csv  = os.path.join(tmp, "ibkr_trades.csv")
     with open(paper_csv, "w", encoding="utf-8") as f:
@@ -121,9 +120,9 @@ def test_position_book_merges_paper_and_ibkr_csvs():
     assert len(solo) == 2
 
 
-def test_generate_report_shows_ibkr_account_when_state_exists():
+def test_generate_report_shows_ibkr_account_when_state_exists(tmp_path):
     import json
-    tmp = tempfile.mkdtemp()
+    tmp = str(tmp_path)
     paper_csv  = os.path.join(tmp, "paper_trades.csv")
     ibkr_csv   = os.path.join(tmp, "ibkr_trades.csv")
     ibkr_state = os.path.join(tmp, "ibkr_state.json")
@@ -151,12 +150,12 @@ def test_generate_report_shows_ibkr_account_when_state_exists():
     assert "995.30" in report
 
 
-def test_load_active_book_state_ibkr_branch():
+def test_load_active_book_state_ibkr_branch(tmp_path):
     # ibkr mode synthesizes the paper_state.json shape from ibkr files:
     # cash from the last fill's cash_remaining, positions from unpaired BUYs.
     import json
     import stock_bot.analysis.paper_report as pr
-    tmp = tempfile.mkdtemp()
+    tmp = str(tmp_path)
     ibkr_csv   = os.path.join(tmp, "ibkr_trades.csv")
     ibkr_state = os.path.join(tmp, "ibkr_state.json")
     with open(ibkr_csv, "w", encoding="utf-8") as f:
@@ -188,13 +187,13 @@ def test_load_active_book_state_ibkr_branch():
     assert state["positions"] == {"KO": {"shares": 2.0, "avg_cost": 80.0}}
 
 
-def test_ibkr_cash_prefers_live_state_snapshot_over_csv():
+def test_ibkr_cash_prefers_live_state_snapshot_over_csv(tmp_path):
     # The fill CSV's cash_remaining can be a stale/transient snapshot (e.g. the
     # 2026-07-20 reset-window fill recorded $6,000). When ibkr_state.json holds
     # a live "cash" value the report and active-book state must prefer it.
     import json
     import stock_bot.analysis.paper_report as pr
-    tmp = tempfile.mkdtemp()
+    tmp = str(tmp_path)
     paper_csv  = os.path.join(tmp, "paper_trades.csv")
     ibkr_csv   = os.path.join(tmp, "ibkr_trades.csv")
     ibkr_state = os.path.join(tmp, "ibkr_state.json")
@@ -235,7 +234,17 @@ def test_ibkr_cash_prefers_live_state_snapshot_over_csv():
 
 
 if __name__ == "__main__":
+    import pathlib
+    import shutil
     import sys
+    import tempfile
+
+    _NEEDS_TMP_PATH = {
+        test_generate_report_renders_expectancy_section,
+        test_position_book_merges_paper_and_ibkr_csvs,
+        test_generate_report_shows_ibkr_account_when_state_exists,
+        test_load_active_book_state_ibkr_branch,
+    }
     failures = 0
     for t in [
         test_commission_us_minimum_applies,
@@ -248,10 +257,18 @@ if __name__ == "__main__":
         test_generate_report_shows_ibkr_account_when_state_exists,
         test_load_active_book_state_ibkr_branch,
     ]:
+        # Standalone runner has no pytest tmp_path fixture — build an
+        # equivalent per-test dir and clean it up manually.
+        fake_tmp_path = pathlib.Path(tempfile.mkdtemp())
         try:
-            t()
+            if t in _NEEDS_TMP_PATH:
+                t(fake_tmp_path)
+            else:
+                t()
             print(f"  PASS  {t.__name__}")
         except AssertionError as e:
             print(f"  FAIL  {t.__name__}: {e}")
             failures += 1
+        finally:
+            shutil.rmtree(fake_tmp_path, ignore_errors=True)
     sys.exit(failures)

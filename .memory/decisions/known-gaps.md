@@ -448,3 +448,88 @@ they're the same class of leak and worth the same fix in a future pass.
 
 **Verification:** full suite 332/332 pass after both fixes. Strategy hash unchanged,
 `659d1c03987b72fd` (test-file and `conftest.py` changes only, no `bot/strategy/*` touched).
+
+## 14. Follow-up pass on remaining deferred items — RESOLVED/CONFIRMED 2026-07-29
+
+Worked through the full deferred list from gap #9 and the feature_plan tech-debt table,
+one item at a time, full suite + hash check after each (per the "one change at a time"
+project rule). Six items; four already-clean, two real fixes.
+
+**Item — "5 pre-existing failing crypto tests" — STALE, not a real gap**
+`test_halt_blocks_all_signals`, `test_fetch_order_polling_timeout_uses_partial_fill`,
+`test_state_save_load_roundtrip`, `test_sync_cash_uses_exchange_free_balance`,
+`test_restart_recovery_seeds_position_manager_and_state_machine` (the last one had been
+renamed with a `_and_state_machine` suffix since the tech-debt note was written, which is
+likely why it looked unresolved). All 5 pass individually and as part of the full suite —
+confirmed twice this session. The `feature_plan.md` deferred-table entry was simply never
+cleaned up after whatever earlier session actually fixed this; removed below.
+
+**Item — mkdtemp() cleanup finished — RESOLVED**
+`test_fast_validator_exits.py` (1 instance), `test_paper_report.py` (5 instances),
+`test_live_executor.py`'s `_make()` default `state_path` (1 instance) — all converted to
+pytest's `tmp_path` fixture, same pattern as gap #13. `_make()` and `_make_validator()` now
+take `tmp_path` (optional/positional respectively) instead of calling `tempfile.mkdtemp()`
+directly.
+**Side effect caught and fixed:** three of these files (`test_live_executor.py`,
+`test_paper_report.py`, `test_fast_validator_exits.py`) have legacy `if __name__ ==
+"__main__":` manual-runner blocks (not used by pytest, not referenced anywhere else in the
+repo, but present in 13 test files as a repo-wide convention) that called the now-`tmp_path`-
+requiring functions with no arguments — this would have silently broken direct invocation
+(`python test_X.py`). Fixed by building a throwaway `pathlib.Path(tempfile.mkdtemp())` in
+each `__main__` block and passing it through, with manual cleanup via `shutil.rmtree` after
+each test (the pytest auto-clean benefit doesn't apply outside pytest, but at least direct
+invocation still runs and still cleans up after itself). One subtlety: for
+`@patch`-decorated tests, the `tmp_path` substitute must be passed as a **keyword** arg
+(`t(tmp_path=fake_tmp_path)`), not positional — `unittest.mock.patch`'s wrapper appends its
+own injected mocks *after* whatever positional args the caller supplies, so a positional
+`tmp_path` lands in the wrong (`mock_cfg`) parameter slot and raises `AttributeError`.
+Confirmed via `test_fetch_order_polling_resolves_on_close` failing this way, then fixed.
+**Verified:** all three files' pytest suites pass, and all three manual `__main__` runners
+(`python test_live_executor.py`, `python test_paper_report.py`,
+`python test_fast_validator_exits.py`) also run clean end-to-end.
+
+**Item — fee-currency-mismatch alert — RESOLVED**
+`bot/execution/live_executor.py`, the `fee_currency != quote` branch (~line 892, inside
+`execute()`'s fee-deduction block). Was warning-only. Added `self._alerter.error(...)`
+alongside the existing `logger.warning(...)`, same pattern as every other hardened alert
+path from gap #9 — `self._alerter` was already built in `__init__` for exactly this
+purpose. New test `test_fee_currency_mismatch_alerts_telegram` in `test_live_executor.py`
+patches `ex._alerter.error` and asserts it fires with the fee/currency/quote detail on a
+BTC-denominated-fee fill.
+
+**Item — undocumented risk-gate .env keys — ALREADY DONE, no action needed**
+`RISK_MAX_POSITION_PCT`, `RISK_DAILY_LOSS_LIMIT`, `RISK_MAX_DRAWDOWN`,
+`RISK_MAX_TRADES_PER_DAY`, `COOLDOWN_TICKS`, `RISK_HALT_BLOCKS_STOPS` are all already
+documented in `CLAUDE.md`'s "Risk-gate config" section (values, defaults, one-line
+description each). This matches what `feature_plan.md`'s 2026-07-28 "Crypto Execution/Risk
+Audit" entry already said was done — the "Deferred" note inside this gap's own item #9 text
+body (above) was just never cleaned up after the fact. No CLAUDE.md change needed this pass.
+
+**Item — None.reject_reason crash path — CONFIRMED provably unreachable, no code change**
+Traced `LiveExecutor.execute()` (`bot/execution/live_executor.py:597-917`) fully. The one
+place that can produce `quantity<=0` after a fill attempt (the `if quantity <= 0:` block at
+~line 784) has every branch either recover a positive quantity or explicitly `return None`
+— there is no fall-through to the `Order(status=FILLED, ...)` construction with
+`quantity<=0`. The dry-run path is separately guarded upstream (BUY quantity≤0 and
+SELL-with-no-position both `return None` before dry-run fill logic runs). So
+`bot/main.py`'s `order.status == FILLED and order.quantity <= 0` branch (~line 1829) is
+checking a state `execute()` can never actually produce. The gap-#10 None-safe
+`reject_reason`/`side` fallback stays in place as cheap defense-in-depth against a future
+change to `execute()` breaking this invariant — not because it's currently reachable.
+
+**Item — FX sizing quirk (stock bot) — RE-VERIFIED still contained, no fix (as instructed)**
+Full detail of the original quirk: `CLAUDE_HISTORY.md` 2026-07-17 entry ("Known FX sizing
+quirk"). Re-checked this pass: `git log` shows no commits have touched `check_exposure()`,
+`_MAX_PER_SECTOR`, or the sizing line (`stock_bot/main.py` ~1264-1265) since 2026-07-17.
+Live `stock_bot/.env` still has `PAPER_RISK_PCT=0.20` (matches the "20% target" the quirk
+was originally measured against) and no `PAPER_MAX_EXPOSURE_PCT` override (still the
+config.py default 0.25). `check_exposure()` uses the same unconverted USD price basis for
+both the sizing calc and the exposure-cap check, so the cap still self-consistently bounds
+cumulative exposure the same way it did when documented. Stock bot currently has 0 open
+positions — nothing live to worry about. Not fixed, per explicit instruction — still
+deliberately deferred to "revisit before live."
+
+**Strategy hash:** unchanged, `659d1c03987b72fd`, confirmed after every one of the above
+changes (only `bot/execution/live_executor.py` and test files touched — no `bot/strategy/*`).
+**Tests:** 332 → 333 (one new test, `test_fee_currency_mismatch_alerts_telegram`). Final
+count: **333/333 PASS**.

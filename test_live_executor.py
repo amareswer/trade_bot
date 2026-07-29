@@ -41,10 +41,16 @@ def _make(
     balance:        dict  = None,
     state_path:     str   = None,
     order_type:     str   = "market",
+    tmp_path        = None,
 ) -> tuple[LiveExecutor, MagicMock]:
     """
     Build a LiveExecutor with a fully mocked ccxt exchange.
     Returns (executor, mock_exchange).
+
+    tmp_path is pytest's built-in per-test fixture (auto-cleaned) — pass your
+    test's own tmp_path fixture through. Falls back to tempfile.mkdtemp() only
+    when called outside pytest (e.g. the __main__ runner at the bottom of this
+    file), which does not have a tmp_path fixture available.
     """
     mock_ex = MagicMock()
     mock_ex.load_markets.return_value = _DEFAULT_MARKETS if markets is None else markets
@@ -54,7 +60,10 @@ def _make(
 
     if state_path is None:
         # Use a temp path that doesn't exist — clean slate for each test
-        state_path = os.path.join(tempfile.mkdtemp(), "live_state.json")
+        if tmp_path is not None:
+            state_path = str(tmp_path / "live_state.json")
+        else:
+            state_path = os.path.join(tempfile.mkdtemp(), "live_state.json")
 
     with patch.object(le_mod.ccxt, "kraken") as mock_cls:
         mock_cls.return_value = mock_ex
@@ -75,8 +84,8 @@ def _make(
 # Test 1: dry-run BUY fills portfolio without touching create_order
 # ---------------------------------------------------------------------------
 
-def test_dry_run_buy_fills_portfolio():
-    ex, mock_ex = _make(dry_run=True, starting_cash=1000.0)
+def test_dry_run_buy_fills_portfolio(tmp_path):
+    ex, mock_ex = _make(dry_run=True, starting_cash=1000.0, tmp_path=tmp_path)
     price = 90_000.0
     qty   = 0.001   # $90 — well above minimums
 
@@ -104,8 +113,8 @@ def test_dry_run_buy_fills_portfolio():
 # Test 2: validation rejects order below minimum amount
 # ---------------------------------------------------------------------------
 
-def test_validation_rejects_below_min_amount():
-    ex, _ = _make(dry_run=True, starting_cash=1000.0)
+def test_validation_rejects_below_min_amount(tmp_path):
+    ex, _ = _make(dry_run=True, starting_cash=1000.0, tmp_path=tmp_path)
     # Kraken minimum is 0.00005 BTC; send 0.00001
     order = ex.execute(Signal.BUY, 90_000.0, 0.00001)
 
@@ -126,7 +135,7 @@ def test_validation_rejects_below_min_amount():
 # Test 3: validation rejects order below minimum cost
 # ---------------------------------------------------------------------------
 
-def test_validation_rejects_below_min_cost():
+def test_validation_rejects_below_min_cost(tmp_path):
     # Set only a cost minimum so the amount check doesn't fire first
     markets = {
         "BTC/CAD": {
@@ -136,7 +145,7 @@ def test_validation_rejects_below_min_cost():
             }
         }
     }
-    ex, _ = _make(dry_run=True, markets=markets)
+    ex, _ = _make(dry_run=True, markets=markets, tmp_path=tmp_path)
     # 0.00005 BTC × $90k = $4.50 < $10 minimum
     order = ex.execute(Signal.BUY, 90_000.0, 0.00005)
 
@@ -149,8 +158,8 @@ def test_validation_rejects_below_min_cost():
 # Test 4: live BUY updates portfolio correctly (using filled from response)
 # ---------------------------------------------------------------------------
 
-def test_live_buy_updates_portfolio():
-    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0)
+def test_live_buy_updates_portfolio(tmp_path):
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
 
     # Simulate exchange: create_order returns immediate close
     raw = {
@@ -181,8 +190,8 @@ def test_live_buy_updates_portfolio():
 # Test 5: live SELL updates portfolio and computes PnL
 # ---------------------------------------------------------------------------
 
-def test_live_sell_updates_portfolio():
-    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0)
+def test_live_sell_updates_portfolio(tmp_path):
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
 
     # BUY setup
     buy_raw = {
@@ -221,9 +230,9 @@ def test_live_sell_updates_portfolio():
 
 @patch("time.sleep")
 @patch("bot.execution.live_executor.cfg")
-def test_fetch_order_polling_resolves_on_close(mock_cfg, mock_sleep):
+def test_fetch_order_polling_resolves_on_close(mock_cfg, mock_sleep, tmp_path):
     mock_cfg.exchange.limit_order_enabled = False  # force market-order path so range(1,10) poll loop runs
-    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
 
     # create_order returns 'open' (not yet filled)
     mock_ex.create_order.return_value = {
@@ -253,10 +262,10 @@ def test_fetch_order_polling_resolves_on_close(mock_cfg, mock_sleep):
 
 @patch("time.sleep")
 @patch("bot.execution.live_executor.cfg")
-def test_fetch_order_polling_timeout_uses_partial_fill(mock_cfg, mock_sleep, caplog):
+def test_fetch_order_polling_timeout_uses_partial_fill(mock_cfg, mock_sleep, caplog, tmp_path):
     import logging
     mock_cfg.exchange.limit_order_enabled = False  # force market-order path so range(1,10) poll loop runs
-    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
 
     mock_ex.create_order.return_value = {
         "id": "order-003", "status": "open", "filled": 0.0,
@@ -286,8 +295,8 @@ def test_fetch_order_polling_timeout_uses_partial_fill(mock_cfg, mock_sleep, cap
 # Test 8: fee in quote currency is deducted; wrong-currency fee is not
 # ---------------------------------------------------------------------------
 
-def test_fee_deducted_when_quote_currency():
-    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0)
+def test_fee_deducted_when_quote_currency(tmp_path):
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
 
     raw = {
         "id": "order-004", "status": "closed",
@@ -303,9 +312,9 @@ def test_fee_deducted_when_quote_currency():
     assert abs(ex.cash - 909.10) < 0.01
 
 
-def test_fee_wrong_currency_not_deducted(caplog):
+def test_fee_wrong_currency_not_deducted(caplog, tmp_path):
     import logging
-    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
 
     raw = {
         "id": "order-005", "status": "closed",
@@ -321,6 +330,29 @@ def test_fee_wrong_currency_not_deducted(caplog):
     # Cash: no fee deducted — only fill cost
     assert abs(ex.cash - (1000.0 - 90.0)) < 0.01
     assert any("mismatch" in r.message for r in caplog.records)
+
+
+def test_fee_currency_mismatch_alerts_telegram(tmp_path):
+    """A fee-currency mismatch must alert, not just log — silent cash drift
+    is the whole risk this guards against."""
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+    raw = {
+        "id": "order-006", "status": "closed",
+        "filled": 0.001, "average": 90_000.0,
+        "fee": {"cost": 0.000001, "currency": "BTC"},  # fee in BTC — wrong currency
+    }
+    mock_ex.create_order.return_value = raw
+    mock_ex.fetch_order.return_value  = raw
+
+    with patch.object(ex._alerter, "error") as mock_alert:
+        ex.execute(Signal.BUY, 90_000.0, 0.001)
+
+    mock_alert.assert_called_once()
+    alert_msg = mock_alert.call_args[0][0]
+    assert "FEE CURRENCY MISMATCH" in alert_msg
+    assert "BTC" in alert_msg
+    assert "CAD" in alert_msg
 
 
 # ---------------------------------------------------------------------------
@@ -369,8 +401,8 @@ def test_state_save_load_roundtrip():
 # Test 10: _sync_cash returns exchange balance (live mode)
 # ---------------------------------------------------------------------------
 
-def test_sync_cash_uses_exchange_free_balance():
-    ex, mock_ex = _make(dry_run=False, starting_cash=100.0, balance={"free": {"CAD": 150.75}})
+def test_sync_cash_uses_exchange_free_balance(tmp_path):
+    ex, mock_ex = _make(dry_run=False, starting_cash=100.0, balance={"free": {"CAD": 150.75}}, tmp_path=tmp_path)
     # After __init__, cash should be the exchange balance (_sync_cash + _sync_position both call fetch_balance)
     assert abs(ex.cash - 150.75) < 0.01
     assert mock_ex.fetch_balance.call_count >= 1
@@ -406,8 +438,8 @@ def test_sync_cash_falls_back_on_error(caplog):
 # Test 11: reset() restores starting_cash and clears history
 # ---------------------------------------------------------------------------
 
-def test_reset_restores_starting_cash():
-    ex, mock_ex = _make(dry_run=True, starting_cash=500.0)
+def test_reset_restores_starting_cash(tmp_path):
+    ex, mock_ex = _make(dry_run=True, starting_cash=500.0, tmp_path=tmp_path)
     ex.execute(Signal.BUY, 90_000.0, 0.001)
 
     assert ex.cash     != 500.0
@@ -531,10 +563,10 @@ def _ob():
 
 @patch("time.sleep")
 @patch("bot.execution.live_executor.cfg")
-def test_limit_order_fills_on_first_attempt(mock_cfg, mock_sleep):
+def test_limit_order_fills_on_first_attempt(mock_cfg, mock_sleep, tmp_path):
     """Limit order closed immediately by exchange — FILLED, maker fee deducted."""
     _limit_cfg(mock_cfg, enabled=True, timeout_s=30)
-    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
 
     mock_ex.fetch_order_book.return_value  = _ob()
     mock_ex.price_to_precision.return_value = "90009.0"
@@ -565,10 +597,10 @@ def test_limit_order_fills_on_first_attempt(mock_cfg, mock_sleep):
 
 @patch("time.sleep")
 @patch("bot.execution.live_executor.cfg")
-def test_limit_order_reprices_after_timeout(mock_cfg, mock_sleep):
+def test_limit_order_reprices_after_timeout(mock_cfg, mock_sleep, tmp_path):
     """First attempt times out (timeout=0 skips poll loop), cancel called, second attempt fills."""
     _limit_cfg(mock_cfg, enabled=True, timeout_s=0, max_retries=3)
-    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
 
     mock_ex.fetch_order_book.return_value   = _ob()
     mock_ex.price_to_precision.return_value = "90009.0"
@@ -596,11 +628,11 @@ def test_limit_order_reprices_after_timeout(mock_cfg, mock_sleep):
 
 @patch("time.sleep")
 @patch("bot.execution.live_executor.cfg")
-def test_limit_order_falls_back_to_market_after_max_retries(mock_cfg, mock_sleep, caplog):
+def test_limit_order_falls_back_to_market_after_max_retries(mock_cfg, mock_sleep, caplog, tmp_path):
     """All limit attempts time out → market order placed → WARNING containing 'falling back'."""
     import logging
     _limit_cfg(mock_cfg, enabled=True, timeout_s=0, max_retries=2)
-    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
 
     mock_ex.fetch_order_book.return_value   = _ob()
     mock_ex.price_to_precision.return_value = "90009.0"
@@ -635,10 +667,10 @@ def test_limit_order_falls_back_to_market_after_max_retries(mock_cfg, mock_sleep
 
 @patch("time.sleep")
 @patch("bot.execution.live_executor.cfg")
-def test_limit_order_disabled_uses_market(mock_cfg, mock_sleep):
+def test_limit_order_disabled_uses_market(mock_cfg, mock_sleep, tmp_path):
     """LIMIT_ORDER_ENABLED=false → existing market path used, create_order called with type='market'."""
     _limit_cfg(mock_cfg, enabled=False)
-    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
 
     raw = {
         "id":      "mkt-002",
@@ -662,10 +694,10 @@ def test_limit_order_disabled_uses_market(mock_cfg, mock_sleep):
 
 @patch("time.sleep")
 @patch("bot.execution.live_executor.cfg")
-def test_limit_order_po_rejection_retries_with_tighter_offset(mock_cfg, mock_sleep):
+def test_limit_order_po_rejection_retries_with_tighter_offset(mock_cfg, mock_sleep, tmp_path):
     """ccxt.InvalidOrder on first create_order → halves tick_pct, second attempt fills. No market fallback."""
     _limit_cfg(mock_cfg, enabled=True, timeout_s=30, max_retries=3, tick_pct=0.0001)
-    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
 
     mock_ex.fetch_order_book.return_value   = _ob()
     mock_ex.price_to_precision.return_value = "90009.0"
@@ -697,10 +729,10 @@ def test_limit_order_po_rejection_retries_with_tighter_offset(mock_cfg, mock_sle
 
 @patch("time.sleep")
 @patch("bot.execution.live_executor.cfg")
-def test_order_type_limit_buy_uses_post_only_and_bid_price(mock_cfg, mock_sleep):
+def test_order_type_limit_buy_uses_post_only_and_bid_price(mock_cfg, mock_sleep, tmp_path):
     """BUY with order_type='limit' must use price*0.998 and timeInForce=PO."""
     mock_cfg.exchange.limit_order_enabled = False  # use simple path, not limit-chase
-    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, order_type="limit")
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, order_type="limit", tmp_path=tmp_path)
 
     fill_price = round(90_000.0 * 0.998, 2)  # 89_820.0
     raw = {
@@ -734,10 +766,10 @@ def test_order_type_limit_buy_uses_post_only_and_bid_price(mock_cfg, mock_sleep)
 
 @patch("time.sleep")
 @patch("bot.execution.live_executor.cfg")
-def test_order_type_limit_sell_falls_through_to_market(mock_cfg, mock_sleep):
+def test_order_type_limit_sell_falls_through_to_market(mock_cfg, mock_sleep, tmp_path):
     """SELL must always be a market order even when order_type='limit'."""
     mock_cfg.exchange.limit_order_enabled = False
-    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, order_type="limit")
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, order_type="limit", tmp_path=tmp_path)
 
     # Seed a position
     buy_raw = {
@@ -776,12 +808,12 @@ def test_order_type_limit_sell_falls_through_to_market(mock_cfg, mock_sleep):
 
 @patch("time.sleep")
 @patch("bot.execution.live_executor.cfg")
-def test_urgent_sell_bypasses_limit_chase(mock_cfg, mock_sleep):
+def test_urgent_sell_bypasses_limit_chase(mock_cfg, mock_sleep, tmp_path):
     """SL/TP exit path passes urgent=True: even with LIMIT_ORDER_ENABLED=true
     the order must be a plain market order — a stop must never sit in the
     chase repricing while price runs away."""
     _limit_cfg(mock_cfg, enabled=True, timeout_s=30)
-    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
 
     # Seed a bot-owned position directly
     ex._portfolio.position    = 0.001
@@ -809,6 +841,8 @@ def test_urgent_sell_bypasses_limit_chase(mock_cfg, mock_sleep):
 
 
 if __name__ == "__main__":
+    import pathlib
+    import shutil
     import sys
     import traceback
     tests = [
@@ -824,12 +858,25 @@ if __name__ == "__main__":
     ]
     failures = 0
     for t in tests:
+        # Standalone runner has no pytest tmp_path fixture — build an
+        # equivalent per-test dir and clean it up manually.
+        fake_tmp_path = pathlib.Path(tempfile.mkdtemp())
         try:
-            t()
+            # test_state_save_load_roundtrip manages its own TemporaryDirectory
+            # internally and takes no tmp_path arg.
+            if t is test_state_save_load_roundtrip:
+                t()
+            else:
+                # Keyword, not positional — @patch-decorated tests append their
+                # injected mocks after positional args, which would shift
+                # fake_tmp_path into the wrong (mock_cfg) parameter slot.
+                t(tmp_path=fake_tmp_path)
             print(f"  PASS  {t.__name__}")
         except Exception as e:
             print(f"  FAIL  {t.__name__}: {e}")
             traceback.print_exc()
             failures += 1
+        finally:
+            shutil.rmtree(fake_tmp_path, ignore_errors=True)
     print(f"\n{len(tests) - failures}/{len(tests)} passed.")
     sys.exit(failures)
