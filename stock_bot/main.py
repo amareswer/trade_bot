@@ -1006,6 +1006,10 @@ def run() -> None:
                 tick, type(exc).__name__, exc,
             )
             print(f"  ⚠️  cycle {tick} failed during price fetch: {exc} — skipping to next cycle")
+            notifier.ops_alert(
+                "Price-fetch cycle failed",
+                f"Cycle {tick} raised {type(exc).__name__}: {exc}",
+            )
             time.sleep(cfg.loop_interval)
             continue
 
@@ -1015,6 +1019,10 @@ def run() -> None:
                 tick, len(cycle_symbols),
             )
             print(f"  ⚠️  cycle {tick} failed: 0/{len(cycle_symbols)} symbols returned data — skipping cycle")
+            notifier.ops_alert(
+                "Price-fetch cycle failed",
+                f"Cycle {tick}: 0/{len(cycle_symbols)} symbols returned data — likely a total fetch outage",
+            )
             time.sleep(cfg.loop_interval)
             continue
 
@@ -1299,6 +1307,10 @@ def run() -> None:
                                         print(f"                 Cash remaining: ${executor.cash:,.2f}")
                                     else:
                                         print(f"  📄 REJECTED:   {symbol} — {order.reject_reason}")
+                                        notifier.ops_alert(
+                                            "Order rejected",
+                                            f"BUY {symbol} — {order.reject_reason}",
+                                        )
                     else:  # SELL
                         held = executor.position(symbol)
                         if held > 0:
@@ -1331,6 +1343,17 @@ def run() -> None:
                                 print(f"                 @ ${execution_price:,.2f} = ${proceeds:,.2f}")
                                 print(f"                 Realized P&L: {trade_pnl:+.2f} ({pnl_pct:+.1f}%)")
                                 print(f"                 Cash remaining: ${executor.cash:,.2f}")
+                            else:
+                                print(f"  📄 REJECTED:   {symbol} — {order.reject_reason}")
+                                logger.warning(
+                                    "SELL REJECTED %s — %s (position remains open, %.4f sh)",
+                                    symbol, order.reject_reason, held,
+                                )
+                                notifier.ops_alert(
+                                    "Order rejected",
+                                    f"SELL {symbol} — {order.reject_reason} "
+                                    f"— position remains open ({held:.4f} sh)",
+                                )
                 elif (
                     executor is not None
                     and verdict is not None
