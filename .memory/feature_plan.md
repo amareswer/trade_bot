@@ -19,6 +19,24 @@ Running log of feature decisions. Most recent first.
 
 ---
 
+## 2026-07-28 — Crypto Execution/Risk Audit (BUILT ✓)
+
+Line-by-line review of `live_executor.py`, `risk_manager.py`, `retry.py`, and the
+`bot/main.py` call sites. Fixed: limit-chase cancel-race double-fill risk (unverifiable
+post-cancel state now always aborts the re-place); rejected orders now alert to Telegram,
+not just console; `_sync_cash`/`_sync_position` `fetch_balance()` wrapped in
+`fetch_with_retry` + alert on persistent failure; `_sync_position`'s cost_basis reseed no
+longer writes a fabricated 0.0 on a ticker-fetch failure (was silently overstating
+realized P&L); guarded a latent `None.reject_reason` crash in the rejected-order branch;
+documented previously-undocumented risk-gate `.env` keys (`RISK_MAX_POSITION_PCT`,
+`RISK_DAILY_LOSS_LIMIT`, `RISK_MAX_DRAWDOWN`, `RISK_MAX_TRADES_PER_DAY`, `COOLDOWN_TICKS`,
+`RISK_HALT_BLOCKS_STOPS`) in CLAUDE.md; fixed a stale ATR SL line citation
+(`bot/main.py:1813` → `1855-1870`). 328/328 tests passing throughout; strategy hash
+`659d1c03987b72fd` unchanged (execution/risk files only). Full detail:
+`.memory/decisions/known-gaps.md` gaps #9–#10.
+
+---
+
 ## 2026-06-24 (continued) — Crypto Hardening + Stock Bot Stability (BUILT ✓)
 
 ### Limit order post-only chase with PO rejection retry (BUILT ✓)

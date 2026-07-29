@@ -5,7 +5,55 @@ metadata:
   type: project
 ---
 
-**Status as of 2026-07-10 (Session 10 complete):**
+**Status as of 2026-07-28 (Crypto Execution/Risk Audit complete):**
+
+## Session 2026-07-28 — Crypto Execution/Risk Audit (COMPLETE ✅)
+
+### Review
+- Line-by-line review of `live_executor.py`, `risk_manager.py`, `retry.py`, and the
+  `bot/main.py` call sites, cross-checked against `.memory/decisions/known-gaps.md` and
+  CLAUDE.md so nothing already-RESOLVED got re-flagged. Findings applied across three
+  follow-up passes the same session.
+
+### Fixes shipped (execution/risk layer only — no strategy files touched)
+- **Limit-chase cancel-race double-fill risk** (`live_executor.py` `_place_limit_order`):
+  a post-cancel `fetch_order` verification failure now always aborts the re-place instead
+  of only aborting when `cancel_order` itself had failed — closes a window where an
+  unverified cancelled order could get re-placed and double-fill.
+- **Rejected orders now alert to Telegram** (`bot/main.py`): `alerter.error(...)` added
+  alongside `display.reject(...)` — a rejected SL/TP exit (insufficient funds, exchange
+  minimums, exchange errors) no longer fails silently to console only.
+- **Startup balance/position sync hardened** (`live_executor.py` `_sync_cash` /
+  `_sync_position`): `fetch_balance()` now goes through the existing `fetch_with_retry`;
+  persistent failure after retries also fires `alerter.error()` (new `TelegramAlerter`
+  instance on `LiveExecutor`, since it's built before main.py's own alerter exists) on top
+  of the existing console FALLBACK print. Closes a gap where a startup blip could silently
+  mis-size the whole capital pool (`_pool_total = _first_exec.cash`).
+- **cost_basis=0.0 silent fallback fixed** (`live_executor.py` `_sync_position` reseed
+  branch): a ticker-fetch failure during position reseed no longer writes a fabricated
+  0.0 (was overstating realized P&L on the next SELL by the full sale proceeds) — now
+  logs a warning and leaves cost_basis at the saved value; reseed only happens on success.
+- **None.reject_reason crash guarded** (`bot/main.py`): the qty<=0-after-FILLED edge case
+  sets `order = None`, which would have crashed on `None.reject_reason` in the
+  newly-added reject-alert path. Now falls back to a clear internal message + `final_signal`
+  for the side, so a future edge case alerts cleanly instead of crashing the trading loop.
+- **Risk-gate config documented in CLAUDE.md**: `RISK_MAX_POSITION_PCT`,
+  `RISK_DAILY_LOSS_LIMIT`, `RISK_MAX_DRAWDOWN`, `RISK_MAX_TRADES_PER_DAY`, `COOLDOWN_TICKS`,
+  `RISK_HALT_BLOCKS_STOPS` — all live risk-gate knobs read in code but absent from every
+  config table. `RISK_HALT_BLOCKS_STOPS` documented as defaulting to false (manual HALT
+  does not block SL/TP exits).
+- **Stale line citation fixed**: ATR SL priority-logic pointer in CLAUDE.md corrected from
+  `bot/main.py:1813` (drifted to `display.state_line(...)` after prior edits) to the actual
+  current location, `bot/main.py:1855-1870`.
+
+### Verification
+- **328/328 tests passing throughout** — full suite re-run after each code change.
+- **Strategy hash unchanged: `659d1c03987b72fd`** — confirmed via
+  `bot/strategy/fingerprint.compute_strategy_hash()` after every change (execution/risk
+  files only, no `bot/strategy/*` touched — no walk-forward re-run needed).
+- Full detail in `.memory/decisions/known-gaps.md` gaps #9 and #10.
+
+---
 
 ## Session 2026-07-09/10 (Session 10) — Day-Trading Ruled Out + Held-Position Visibility Fixes (COMPLETE ✅)
 
