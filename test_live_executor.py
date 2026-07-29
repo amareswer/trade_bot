@@ -384,7 +384,8 @@ def test_sync_cash_falls_back_on_error(caplog):
 
     with tempfile.TemporaryDirectory() as tmpdir:
         state_path = os.path.join(tmpdir, "state.json")
-        with patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        with patch.object(le_mod.ccxt, "kraken") as mock_cls, \
+             patch("bot.exchanges.retry.time.sleep"):
             mock_cls.return_value = mock_ex
             with caplog.at_level(logging.WARNING, logger="bot.execution.live_executor"):
                 ex = LiveExecutor(

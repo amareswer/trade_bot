@@ -144,3 +144,114 @@ clarifying this is a legacy fallback never reached at runtime. The file logs/liv
     only after N consecutive drift checks (then counter resets). Drift resolution logs info + resets counter.
 **Tests:** 11 new tests — all PASS. `test_fill_recording.py` (5 tests), `test_drift_escalation.py` (6 tests)
   Total suite: 110 PASS.
+
+## 9. Execution/risk-layer audit findings — 3 RESOLVED 2026-07-28, 2 deferred
+
+Full line-by-line review of `live_executor.py`, `risk_manager.py`, `retry.py`, and the
+`bot/main.py` call sites. Three issues fixed same-day; two deferred to a separate pass.
+
+**Issue A — RESOLVED 2026-07-28: cancel-race double-fill risk in limit chase**
+- **Where:** `bot/execution/live_executor.py` `_place_limit_order()`, cancel-timeout branch (~510-548)
+- **Bug:** After a limit order timed out and was cancelled, the code verified the order's
+  fate via `fetch_order` before re-placing — but only aborted the retry if `cancel_order`
+  itself had failed. If `cancel_order` succeeded and the *verification* `fetch_order` call
+  then failed (a second, independent network blip), the code fell through and placed a
+  brand-new order for the same quantity without ever confirming whether the cancelled order
+  caught a fill in the race window — real double-fill risk on the live `ORDER_TYPE=limit`
+  path (used for BUY entries and non-urgent strategy SELLs).
+- **Fix:** `except Exception as post_exc` now always aborts the chase (`return raw`)
+  regardless of `cancel_ok` — any unverifiable post-cancel state is treated as "may still be
+  live," same as the failed-cancel case, and left for `execute()`'s poll loop to settle.
+- **Tests:** no new test added (would require simulating two independent mocked failures in
+  the same retry loop); existing `test_limit_chase_recovery.py` suite still passes unchanged.
+
+**Issue B — RESOLVED 2026-07-28: order rejections never reached Telegram**
+- **Where:** `bot/main.py` execute block, rejected-order branch (~1905-1908)
+- **Bug:** `display.reject(...)` only printed to console. `ccxt.InsufficientFunds`, exchange
+  minimum-size violations, and generic `ccxt.BaseError` rejections — including a rejected
+  SL/TP exit — produced zero Telegram signal, contradicting the "full alert coverage" state
+  from [[project_alerting_gap_and_heartbeat_2026-07-17]].
+- **Fix:** added `alerter.error(f"ORDER REJECTED [{sym}] {order.side.value}: {reason}")`
+  alongside `display.reject(...)`, covering both BUY and SELL rejections.
+- **Note (not fixed, flagged for a future pass):** while editing this branch, found a
+  pre-existing latent bug a few lines up — if `order.status == FILLED and order.quantity <= 0`
+  the code sets `order = None`, and the subsequent `else: display.reject(order.reject_reason...)`
+  would then call `.reject_reason` on `None` and raise `AttributeError`. Only reachable if
+  `LiveExecutor.execute()` ever returns a FILLED order with qty<=0 — the internal qty=0 guard
+  (see gap #8 above) is supposed to prevent this by returning `None` from `execute()` instead,
+  so the crash path may be unreachable in practice, but the two guards are inconsistent.
+  Left untouched per explicit scope instruction.
+
+**Issue 3 — RESOLVED 2026-07-28: startup balance/position sync had no retry, no alert**
+- **Where:** `bot/execution/live_executor.py` `_sync_cash()` (~157) and `_sync_position()` (~193)
+- **Bug:** Both call `self._exchange.fetch_balance()` directly with no retry, unlike every
+  other exchange call hardened in the 2026-07-24 retry pass (order book, candle, ticker —
+  see [[project_rescreen_and_crypto_research_2026-07-16]] context / CLAUDE.md operational
+  status). A single transient blip on these two calls silently degrades to `starting_cash`
+  fallback / stale on-disk state, console-print only — and `_sync_cash`'s result on the
+  *first* executor becomes `capital_pool.total_capital` (`bot/main.py` `_pool_total =
+  _first_exec.cash`), so a startup blip could mis-size every symbol's slot.
+- **Fix:** both calls now go through the existing `fetch_with_retry` import (3 attempts,
+  2s delay, matching the retry.py default). On persistent failure after retries, both methods
+  now call a new `self._alerter.error(...)` (a `TelegramAlerter` instance constructed in
+  `LiveExecutor.__init__` from `cfg.alerts.*`, since `LiveExecutor` is built before `main.py`'s
+  own `alerter` exists) in addition to the existing console FALLBACK print.
+- **Test suite side-effect:** `test_sync_cash_falls_back_on_error` (`test_live_executor.py`)
+  exercises the failure path and was now hitting `fetch_with_retry`'s real `time.sleep()`
+  between attempts (~8s added, suite went 6s→14s). Fixed by patching
+  `bot.exchanges.retry.time.sleep` in that test, same pattern already used in
+  `test_kraken_retry.py`. Suite back to ~6s.
+
+**Deferred (explicitly out of scope for this pass):**
+- Config-documentation gaps (`RISK_MAX_POSITION_PCT`, `RISK_DAILY_LOSS_LIMIT`,
+  `RISK_MAX_DRAWDOWN`, `RISK_MAX_TRADES_PER_DAY`, `COOLDOWN_TICKS`, `RISK_HALT_BLOCKS_STOPS`
+  live in `.env`/`config.py` but absent from CLAUDE.md's config tables). Not touched.
+- Fee-currency-mismatch silent cash drift (`live_executor.py` ~852-858, warning-only, no
+  alert). Not touched — lower severity, no capital-pool sizing impact.
+
+**Strategy hash:** unchanged, `659d1c03987b72fd` — confirmed via
+`bot/strategy/fingerprint.compute_strategy_hash()` after all three fixes (execution/risk
+files only, no `bot/strategy/*` touched).
+**Tests:** 328/328 PASS after each of the three changes; suite runtime back to ~6.5s.
+
+## 10. Issue 2 (cost_basis=0.0 silent fallback) + None.reject_reason crash — RESOLVED 2026-07-28
+
+Follow-up pass on the two items explicitly deferred from gap #9.
+
+**Issue 2 — `_sync_position` reseed branch silently zeroed cost_basis on fetch failure**
+- **Where:** `bot/execution/live_executor.py`, "Bot opened this position on a prior run —
+  reseed cost_basis" branch (originally ~264-268, now ~286-315 after the gap-#9 line shift)
+- **Bug:** `except Exception: current_price = 0.0` had zero logging (the only silent handler
+  in the file) and wrote a fabricated `_cost_basis = 0.0`. The next SELL would then compute
+  `pnl = (fill_price - 0.0) * quantity`, overstating realized P&L by the full sale proceeds.
+- **Fix:** split into `try/except Exception as exc/else`. On failure: log a warning naming
+  the exchange error and the saved `cost_basis` value being left in place, print a matching
+  console line ("POSITION RESEED SKIPPED... verify manually"), and do **not** write to
+  `_portfolio._cost_basis` at all — it stays whatever `_load_state()` restored from disk
+  rather than being overwritten with a wrong number. On success, reseed as before (unchanged
+  behavior, now inside the `else` clause).
+  Confirmed `_sync_position` is called exactly once, from `__init__` at startup — there is no
+  "current tick" price in scope in the caller to fall back to (it's not part of the per-tick
+  loop), so per the audit instruction the reseed is skipped entirely on failure rather than
+  substituting an approximate price.
+
+**None.reject_reason crash — bot/main.py rejected-order branch**
+- **Where:** `bot/main.py` execute block (~1826-1910)
+- **Bug:** flagged in gap #9. `order` is reassigned to `None` a few lines up when
+  `order.status == FILLED and order.quantity <= 0` (the qty=0-after-fill guard). The
+  subsequent `else: display.reject(order.reject_reason...)` — and the gap-#9
+  `alerter.error(...)` added alongside it — would then raise `AttributeError` on
+  `None.reject_reason` if that guard ever actually fires (believed unreachable in practice
+  since `LiveExecutor.execute()`'s internal qty=0 guard is supposed to return `None` before
+  reaching this point, but the two guards were inconsistent).
+- **Fix:** both `display.reject(...)` and `alerter.error(...)` now read from
+  `_reject_reason = order.reject_reason if order else "internal: FILLED order returned
+  qty<=0 — see log for detail"` and `_reject_side = order.side.value if order else
+  final_signal.value` (the signal already in scope from the execute() call). A future
+  qty<=0 edge case now alerts cleanly with a diagnosable message instead of crashing the
+  trading loop.
+
+**Strategy hash:** unchanged, `659d1c03987b72fd` — confirmed via
+`bot/strategy/fingerprint.compute_strategy_hash()` (execution-layer files only, no
+`bot/strategy/*` touched).
+**Tests:** 328/328 PASS.

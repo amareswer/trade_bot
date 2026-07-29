@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 
 import ccxt
 
+from bot.alerts.telegram import TelegramAlerter
 from bot.execution.executor import Order, OrderSide, OrderStatus, Portfolio
 from bot.exchanges.retry import fetch_with_retry
 from config import cfg
@@ -67,6 +68,11 @@ class LiveExecutor:
         self._rejects:    list[Order]  = []
         self._fees_paid:           float = 0.0
         self._bot_opened_position: bool  = False
+        self._alerter = TelegramAlerter(
+            cfg.alerts.telegram_bot_token,
+            cfg.alerts.telegram_chat_id,
+            enabled=cfg.alerts.telegram_enabled,
+        )
 
         exchange_cls = getattr(ccxt, exchange_id.lower())
         self._exchange = exchange_cls({
@@ -155,7 +161,10 @@ class LiveExecutor:
         """
         quote = self.symbol.split("/")[1]
         try:
-            balance = self._exchange.fetch_balance()
+            balance = fetch_with_retry(
+                self._exchange.fetch_balance,
+                label=f"balance sync [{self.symbol}]",
+            )
             free    = balance.get("free", {})
             if quote not in free:
                 available = sorted(k for k, v in free.items() if v and float(v or 0) > 0)
@@ -171,6 +180,11 @@ class LiveExecutor:
         except Exception as exc:
             msg = str(exc)
             logger.warning("_sync_cash failed: %s — using starting_cash=%.2f", msg, self._starting_cash)
+            self._alerter.error(
+                f"LiveExecutor startup balance sync FAILED for {self.symbol} after retries: {msg}"
+                f" — falling back to starting_cash=${self._starting_cash:.2f}."
+                f" Verify real exchange balance manually."
+            )
             return self._starting_cash, msg
 
     def _sync_position(self, symbol: str) -> None:
@@ -190,11 +204,20 @@ class LiveExecutor:
         """
         base = symbol.split("/")[0]
         try:
-            balance        = self._exchange.fetch_balance()
+            balance        = fetch_with_retry(
+                self._exchange.fetch_balance,
+                label=f"position sync [{symbol}]",
+            )
             exchange_free  = float(balance.get("free",  {}).get(base, 0.0))
             exchange_total = float(balance.get("total", {}).get(base, 0.0))
         except Exception as exc:
             logger.warning("_sync_position: fetch_balance failed — %s", exc)
+            self._alerter.error(
+                f"LiveExecutor startup position sync FAILED for {symbol} after retries: {exc}"
+                f" — managed position left at last saved state (external-holdings guard"
+                f" and drift detection were skipped this startup)."
+                f" Verify real exchange position manually."
+            )
             return
 
         # prev_position is what _load_state() set from the on-disk state file.
@@ -261,22 +284,38 @@ class LiveExecutor:
                     self._portfolio._cost_basis = 0.0
                     return
                 # Bot opened this position on a prior run — reseed cost_basis.
+                # On fetch failure, do NOT write a fabricated 0.0 (that would
+                # overstate realized P&L on the next SELL by the full proceeds) —
+                # leave cost_basis at whatever _load_state() restored and warn.
                 try:
                     current_price = float(self._exchange.fetch_ticker(symbol)["last"])
-                except Exception:
-                    current_price = 0.0
-                self._portfolio._cost_basis = current_price
-                logger.warning(
-                    "STATE MISMATCH: exchange holds %.6f %s but saved position=0."
-                    " Reseeded cost_basis at current price %.2f",
-                    exchange_total, base, current_price,
-                )
-                print(
-                    f"  POSITION RESEEDED: {exchange_total:.6f} {base}"
-                    f" @ ${current_price:,.2f}"
-                    f" (exchange vs saved-state mismatch)",
-                    flush=True,
-                )
+                except Exception as exc:
+                    logger.warning(
+                        "STATE MISMATCH [%s]: exchange holds %.6f %s but saved"
+                        " position=0, and fetch_ticker failed (%s) — cost_basis"
+                        " NOT reseeded, left at saved value %.2f. Verify manually.",
+                        self.symbol, exchange_total, base, exc, self._portfolio._cost_basis,
+                    )
+                    print(
+                        f"  POSITION RESEED SKIPPED [{self.symbol}]:"
+                        f" exchange {exchange_total:.6f} {base} vs saved-state"
+                        f" mismatch, but fetch_ticker failed — cost_basis left at"
+                        f" ${self._portfolio._cost_basis:,.2f} (verify manually).",
+                        flush=True,
+                    )
+                else:
+                    self._portfolio._cost_basis = current_price
+                    logger.warning(
+                        "STATE MISMATCH: exchange holds %.6f %s but saved position=0."
+                        " Reseeded cost_basis at current price %.2f",
+                        exchange_total, base, current_price,
+                    )
+                    print(
+                        f"  POSITION RESEEDED: {exchange_total:.6f} {base}"
+                        f" @ ${current_price:,.2f}"
+                        f" (exchange vs saved-state mismatch)",
+                        flush=True,
+                    )
             else:
                 logger.warning(
                     "Position confirmed from exchange: %.6f %s (free=%.6f)",
@@ -533,17 +572,17 @@ class LiveExecutor:
                     return post_cancel
             except Exception as post_exc:
                 logger.warning("post-cancel fetch_order %s failed: %s", order_id, post_exc)
-                if not cancel_ok:
-                    # Cancel failed AND we cannot verify the order's fate — the
-                    # order may still be live. Re-placing risks a double fill;
-                    # return the unresolved dict and let execute()'s poll loop
-                    # settle it.
-                    logger.error(
-                        "LIMIT %s %s: cancel failed and state unverifiable — "
-                        "aborting chase without re-placing.",
-                        side.upper(), order_id,
-                    )
-                    return raw
+                # Whether cancel_order itself failed, or it succeeded but this
+                # verification call failed, we cannot confirm the order's fate —
+                # it may still be live or may have caught a fill in the cancel
+                # race. Re-placing risks a double fill; return the unresolved
+                # dict and let execute()'s poll loop settle it.
+                logger.error(
+                    "LIMIT %s %s: state unverifiable after cancel (cancel_ok=%s) — "
+                    "aborting chase without re-placing.",
+                    side.upper(), order_id, cancel_ok,
+                )
+                return raw
 
             timeout_attempts += 1
 

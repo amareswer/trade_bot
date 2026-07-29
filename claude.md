@@ -274,12 +274,26 @@ EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-0
 - Stamp after each passing walk-forward: `python stamp_strategy.py` → `logs/validated_strategy_hash`
 - If the bot or backtest prints `STRATEGY CODE DIFFERS`, re-run walk-forward before trusting any PF numbers
 
-### Current operational status (as of 2026-07-25)
+### Current operational status (as of 2026-07-28)
 - **Crypto bot:** live on Kraken, BTC/CAD only, $77 slot cap, capital gate at 0/15 fills
   (strategy trades ~every 1–3 weeks; two BUY signals fired since 2026-07-05, both lost to
   execution fragility that's now fixed — see history 2026-07-24 entry). ATR SL 2.0 +
   ATR sizing both live. Telegram (t.me/amaresh_tradebot) + healthchecks.io heartbeat live.
-  Retry resilience added on Kraken depth/candle/ticker fetches 2026-07-24.
+  Retry resilience added on Kraken depth/candle/ticker fetches 2026-07-24; extended to
+  startup balance/position sync (`fetch_balance` in `_sync_cash`/`_sync_position`) 2026-07-28,
+  which also now alerts to Telegram on persistent failure instead of console-only. Order
+  rejections (insufficient funds, exchange minimums, exchange errors) also now alert to
+  Telegram, not just console — closes a gap where a rejected SL/TP exit could leave a
+  position open with no notification. Limit-chase cancel-race verification also hardened:
+  an unverifiable post-cancel state now always aborts the re-place instead of only doing so
+  when `cancel_order` itself failed — closes a double-fill risk window. `_sync_position`'s
+  cost_basis reseed no longer writes a fabricated 0.0 on a ticker-fetch failure (was silently
+  overstating realized P&L on the next SELL) — it now warns and leaves cost_basis at the
+  saved value instead. A related `None.reject_reason` crash risk in the rejected-order branch
+  (bot/main.py) is also fixed — a future qty<=0 edge case now alerts cleanly instead of
+  crashing the loop. Full detail in `.memory/decisions/known-gaps.md` (gaps #9, #10).
+  Still deliberately deferred: several risk-gate `.env` keys undocumented in CLAUDE.md, and
+  fee-currency-mismatch silent cash drift (see gap #9).
 - **Stock bot:** live on IBKR paper (DUQ273338, reset to $5,000 CAD 2026-07-20). Swing book
   retired (`FAST_ENABLED=false`) — position book (rule-based, Mode A/B) is the only active
   book. TSX symbols are **permanently** advisory-only — CIRO regulation blocks API orders on

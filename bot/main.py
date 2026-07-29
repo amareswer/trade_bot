@@ -1903,7 +1903,19 @@ def run():
                                           + (f" — {filter_reason}" if filter_reason else ""),
                         )
                     else:
-                        display.reject(order.reject_reason or "")
+                        # order can be None here (see the qty<=0-after-FILLED guard
+                        # above) — guard against .reject_reason on None instead of
+                        # crashing the loop.
+                        _reject_reason = (
+                            order.reject_reason if order
+                            else "internal: FILLED order returned qty<=0 — see log for detail"
+                        )
+                        _reject_side = order.side.value if order else final_signal.value
+                        display.reject(_reject_reason or "")
+                        alerter.error(
+                            f"ORDER REJECTED [{sym}] {_reject_side}: "
+                            f"{_reject_reason or 'unknown reason'}"
+                        )
 
             # ── 10. Position summary ──────────────────────────────────
             display.position_line(
