@@ -554,6 +554,28 @@ def _check_open_positions_sl_tp(executor, cfg, notifier=None) -> None:
                                   reason="take profit")
 
 
+def _mark_positions_to_market(executor, price_data: dict[str, dict | None]) -> None:
+    """
+    Re-mark open positions to this scan cycle's live prices, before any
+    buy/sell decision runs.
+
+    Without this, the daily-loss breaker (_is_daily_loss_tripped) checks
+    drawdown against whatever price was current at the last fill — stale
+    for days between trades — and can miss real intraday drawdown on a held
+    position that moves with no new fill this cycle. price_data is Phase 1's
+    {symbol: _fetch_symbol_data(...) result} map, which already covers held
+    positions (they're always included in cycle_symbols).
+    """
+    if executor is None:
+        return
+    live_price_map = {
+        sym: pd["price"]
+        for sym, pd in price_data.items()
+        if isinstance(pd, dict) and pd.get("price")
+    }
+    executor.refresh_position_marks(live_price_map)
+
+
 def _run_news_scan(symbols: list[str]) -> None:
     """
     Lightweight pre/after-hours news scan — no prices, no AI, no trades.
@@ -976,6 +998,8 @@ def run() -> None:
             s for s in cycle_symbols
             if isinstance(price_data.get(s), dict) and not price_data[s].get("screened")
         ]
+
+        _mark_positions_to_market(executor, price_data)
 
         # ── Phase 2: research (active symbols only, parallel) ──────────────
         research_data: dict[str, ResearchReport] = {}

@@ -618,6 +618,11 @@ class IBKRExecutor(StockExecutorBase):
     def set_daily_loss_limit(self, pct: float) -> None:
         self._daily_loss_limit_pct = pct
 
+    def refresh_position_marks(self, prices: dict[str, float]) -> None:
+        """No-op — _is_daily_loss_tripped() always marks live via
+        _net_liquidation(). Kept for interface parity with StockPaperExecutor."""
+        pass
+
     def _is_daily_loss_tripped(self) -> bool:
         if self._daily_loss_tripped:
             return True

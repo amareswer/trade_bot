@@ -137,7 +137,8 @@ class StockPaperExecutor(StockExecutorBase):
     def _update_position_value(self, prices: dict[str, float]) -> None:
         """
         Recalculate cached mark-to-market value of all open positions.
-        Called after every fill. Uses provided prices for known symbols;
+        Called after every fill, and once per scan cycle via
+        refresh_position_marks(). Uses provided prices for known symbols;
         falls back to avg_cost for others to avoid stale-price API calls.
         """
         total = 0.0
@@ -145,6 +146,19 @@ class StockPaperExecutor(StockExecutorBase):
             px = prices.get(sym, avg_cost)
             total += shares * px
         self._open_position_value = total
+
+    def refresh_position_marks(self, prices: dict[str, float]) -> None:
+        """
+        Re-mark open positions to current scan-cycle prices.
+
+        _open_position_value is otherwise only refreshed inside buy()/sell()
+        at fill time, so between fills the daily-loss breaker
+        (_is_daily_loss_tripped) was checking drawdown against a stale mark —
+        a held position that moves significantly with no new fill wouldn't
+        be reflected until the next trade. Call this once per scan cycle,
+        before any buy()/sell() decisions, so the breaker sees live prices.
+        """
+        self._update_position_value(prices)
 
     def buy(
         self,
