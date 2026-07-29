@@ -19,6 +19,25 @@ Running log of feature decisions. Most recent first.
 
 ---
 
+## 2026-07-28 (cont'd) — Stock Bot Breaker Staleness + Stall Investigation (BUILT ✓)
+
+Fixed: `StockPaperExecutor`'s daily-loss breaker used a stale position mark between fills
+(only refreshed at `buy()`/`sell()` time) — added `refresh_position_marks()` +
+`_mark_positions_to_market()`, called once per scan cycle in `stock_bot/main.py` right after
+Phase 1 prices are fetched, so the breaker sees live prices even with zero fills that cycle;
+`IBKRExecutor` gets a no-op version for parity. Verified the feeding price is already
+sanity-checked inside `fetch_candles()` (bounds, duplicate-price, outlier, TSX cross-check)
+before it reaches the mark-to-market call. Also fixed: Phase 1's price-fetch now logs
+`"cycle N failed: <reason>"` on total fetch failure instead of silently completing an empty
+cycle. Separately investigated an apparent ~6h stock-bot scan-loop stall (restarted, new PID
+25877) that turned out to most likely be normal `AFTER_HOURS`-mode silence rather than a real
+hang — corrected that diagnosis after further checking rather than letting it stand. Session
+audit confirmed no session-leak bug in `price_feed.py` (yfinance manages its own sessions by
+design, per the documented hard rule). 4 new tests (`test_stock_position_mark_refresh.py`),
+328/328 → 332/332 passing throughout. Full detail: `.memory/decisions/known-gaps.md` gap #11.
+
+---
+
 ## 2026-07-28 — Crypto Execution/Risk Audit (BUILT ✓)
 
 Line-by-line review of `live_executor.py`, `risk_manager.py`, `retry.py`, and the

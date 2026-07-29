@@ -977,22 +977,46 @@ def run() -> None:
         reset_price_cache()
 
         # ── Phase 1: prices + indicators (all symbols, parallel) ───────────
+        # Per-symbol fetch failures are already logged individually below.
+        # These two guards catch cycle-level failure: the fetch phase itself
+        # raising (ThreadPoolExecutor/orchestration failure), and a "clean"
+        # completion where every symbol failed (total outage / global rate
+        # limit) — previously both left the loop silently completing an
+        # empty cycle and going back to sleep, undetectable without lsof.
         price_data: dict[str, dict | None] = {}
-        with ThreadPoolExecutor(max_workers=10) as ex:
-            futs = {
-                ex.submit(
-                    _fetch_symbol_data, sym, cfg, screener, watchlist_set,
-                    market_status,
-                ): sym
-                for sym in cycle_symbols
-            }
-            for fut in as_completed(futs):
-                sym = futs[fut]
-                try:
-                    price_data[sym] = fut.result()
-                except Exception as exc:
-                    logger.warning("Price fetch failed for %s: %s", sym, exc)
-                    price_data[sym] = None
+        try:
+            with ThreadPoolExecutor(max_workers=10) as ex:
+                futs = {
+                    ex.submit(
+                        _fetch_symbol_data, sym, cfg, screener, watchlist_set,
+                        market_status,
+                    ): sym
+                    for sym in cycle_symbols
+                }
+                for fut in as_completed(futs):
+                    sym = futs[fut]
+                    try:
+                        price_data[sym] = fut.result()
+                    except Exception as exc:
+                        logger.warning("Price fetch failed for %s: %s", sym, exc)
+                        price_data[sym] = None
+        except Exception as exc:
+            logger.error(
+                "cycle %d failed: price-fetch phase raised %s: %s",
+                tick, type(exc).__name__, exc,
+            )
+            print(f"  ⚠️  cycle {tick} failed during price fetch: {exc} — skipping to next cycle")
+            time.sleep(cfg.loop_interval)
+            continue
+
+        if cycle_symbols and not any(v is not None for v in price_data.values()):
+            logger.error(
+                "cycle %d failed: 0/%d symbols returned data — likely a total fetch outage",
+                tick, len(cycle_symbols),
+            )
+            print(f"  ⚠️  cycle {tick} failed: 0/{len(cycle_symbols)} symbols returned data — skipping cycle")
+            time.sleep(cfg.loop_interval)
+            continue
 
         active_symbols = [
             s for s in cycle_symbols

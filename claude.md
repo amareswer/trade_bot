@@ -172,9 +172,9 @@ need the full narrative behind any decision below.
 
 ---
 
-## Test Suite Manifest (as of 2026-07-24)
+## Test Suite Manifest (as of 2026-07-28)
 
-Expected total: **328 tests**. If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~6s — if it takes minutes, a test is reading live `.env` config.
+Expected total: **332 tests**. If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~6s — if it takes minutes, a test is reading live `.env` config.
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -216,8 +216,9 @@ Expected total: **328 tests**. If `pytest --collect-only -q` reports a lower num
 | `test_yf_client_retry.py` | 4 | `fetch_with_retry`: generic exceptions now retried with a short delay (not zero retries), give up after max_attempts, short delay ≠ rate-limit backoff, rate-limit path unchanged |
 | `test_research_aggregator_timeout.py` | 1 | Per-source research-fetch timeout: earnings gets a wider budget (45s) than news (15s) |
 | `test_kraken_retry.py` | 4 | `bot/exchanges/retry.fetch_with_retry`: succeeds without retrying, retries on failure and can recover, raises the last exception after exhausting attempts, custom attempts/delay respected |
+| `test_stock_position_mark_refresh.py` | 4 | Stock-bot daily-loss breaker staleness fix: tests REAL `_mark_positions_to_market()` from stock_bot.main via a mocked `_fetch_symbol_data` — breaker trips from a price move alone (no fill), stays silent within limit, no-ops when executor is None, source-inspection guard confirms `run()` still calls it |
 
-Run: `python -m pytest --tb=short -q` — must show **328 passed**.
+Run: `python -m pytest --tb=short -q` — must show **332 passed**.
 
 ---
 
@@ -321,7 +322,13 @@ EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-0
   retired (`FAST_ENABLED=false`) — position book (rule-based, Mode A/B) is the only active
   book. TSX symbols are **permanently** advisory-only — CIRO regulation blocks API orders on
   Canadian exchanges (never re-add `.TO` symbols to RULE_WHITELIST). AI provider `nvidia_nim`,
-  model `mistralai/mistral-small-4-119b-2603`.
+  model `mistralai/mistral-small-4-119b-2603`. Daily-loss breaker now marks open positions to
+  live scan-cycle prices every cycle (`refresh_position_marks()`), not just at fill time —
+  was previously stale between fills, could under-detect real intraday drawdown. Restarted
+  2026-07-28 (PID 25877) after an apparent ~6h scan-loop stall turned out most likely to be
+  normal `AFTER_HOURS`-mode silence (see `.memory/decisions/known-gaps.md` gap #11) — either
+  way, Phase 1's price-fetch now logs a clear `"cycle N failed: ..."` line on total fetch
+  failure instead of completing an empty cycle silently.
 - **Both bots:** crash-alert + atomic state writes + SIGTERM graceful shutdown + liveness
   tracking (detects hung loops, not just dead processes) all live.
 

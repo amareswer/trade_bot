@@ -255,3 +255,88 @@ Follow-up pass on the two items explicitly deferred from gap #9.
 `bot/strategy/fingerprint.compute_strategy_hash()` (execution-layer files only, no
 `bot/strategy/*` touched).
 **Tests:** 328/328 PASS.
+
+## 11. Stock bot: daily-loss breaker staleness, apparent stall, silent cycle failure — RESOLVED 2026-07-28
+
+Three related stock-bot findings from one session: a real bug (fixed + tested), an
+operational incident that turned out to most likely be a misdiagnosis (corrected), and a
+genuine observability gap (fixed).
+
+**Bug — RESOLVED: daily-loss breaker used a stale position mark between fills**
+- **Where:** `stock_bot/execution/paper.py` `StockPaperExecutor._open_position_value`
+- **Root cause:** only refreshed inside `buy()`/`sell()` at fill time. Between fills — which
+  can be days apart on this book's cadence — `_is_daily_loss_tripped()` checked drawdown
+  against whatever price was current at the last fill, so a held position that moved
+  significantly with **no new fill** was invisible to the breaker. (Distinct from the
+  2026-07-04 cash-only-baseline bug in `test_stock_breaker.py`'s docstring — that one was
+  already fixed; this is a second, narrower gap in the same breaker.)
+- **Fix:** added `StockPaperExecutor.refresh_position_marks(prices)` (thin wrapper over the
+  existing `_update_position_value`) and a new module-level `_mark_positions_to_market(executor,
+  price_data)` in `stock_bot/main.py`, called once per scan cycle right after Phase 1 prices
+  are fetched and before any buy/sell decision runs. `IBKRExecutor` gets a no-op
+  `refresh_position_marks()` for interface parity (its breaker already marks live via
+  `_net_liquidation()`).
+- **Verified the price value feeding this is already sanity-checked**, not raw feed output:
+  `price_data[sym]["price"]` is `fetch_candles()`'s validated `closes[-1]` — bounds checks,
+  `_is_duplicate_price()` (holiday-corruption detection), outlier-vs-batch-median check, and
+  (`.TO` only) a fast_info currency-mismatch cross-check all run inside `fetch_candles()`
+  before it can return non-`None`. A rejected price yields `price_data[sym] = None`, which
+  `_mark_positions_to_market`'s filter skips — degrades to "stale one more cycle," never to
+  "corrupted number used." The separate `price_sanity_pct` guard (`main.py` ~1183) validates
+  a *different*, later-fetched `live_price` against this same already-validated candle close
+  — it doesn't gate the mark-to-market value at all, so there's no ordering issue.
+- **Tests:** `test_stock_position_mark_refresh.py` (4 new) — imports and calls the real
+  `_mark_positions_to_market()` from `stock_bot.main` (not a reimplementation) via a mocked
+  `_fetch_symbol_data`, proves the breaker trips from a price move alone with zero
+  `buy()`/`sell()` calls, plus a source-inspection test guarding that `run()` still wires the
+  call up (the other 3 tests wouldn't catch someone deleting just the call site). Verified
+  both failure modes for real by temporarily reverting each half of the fix and confirming
+  the corresponding test fails, then restoring.
+
+**Operational — apparent ~6h scan-loop stall, restarted, root cause probably misdiagnosed**
+- **Symptom:** stock bot (PID 95757, alive since prior Monday) showed no `__main__` scan-cycle
+  log activity in `logs/stock_bot.log` from `15:59:32` to `~21:51` — no `"Alerts: N triggered
+  this cycle"`, `stock_dashboard.html` mtime frozen at `15:59`, file byte-identical across an
+  8s window — while `ib_async.wrapper`'s IBKR portfolio-update ping kept firing every ~3min,
+  keeping `ps` showing it as healthy.
+- **Investigated:** `sample`/`lsof` showed the main thread genuinely in `time.sleep()` (not
+  deadlocked), 59 sockets to `*.ycpi.vip.dca.yahoo.com` stuck in `CLOSE_WAIT`. Restarted
+  (new PID 25877) rather than debug further live, given the ambiguity.
+- **Correction (caught one turn later, before over-reacting further):** `15:59:32` lines up
+  almost exactly with NYSE close (4:00pm ET). `AFTER_HOURS` mode's loop body
+  (`_run_news_scan()` + `time.sleep(1800)` + `continue`) never touches yfinance and only logs
+  at `debug` level in its per-symbol failure path — below the file handler's INFO threshold —
+  so hours of file-log silence after market close is likely **normal, by-design behavior**,
+  not a hang. The 59 `CLOSE_WAIT` sockets most likely accumulated over the full LIVE trading
+  day's yfinance call volume (hundreds+ calls), not during a silent stall. Session-audit
+  conclusion (below) supports "no bug found" on the socket-leak side specifically.
+  **Not fully resolved either way** — the restart means the original process can't be
+  re-examined; flagging so a future occurrence isn't immediately assumed benign either.
+
+**Observability gap — RESOLVED: total fetch failure was silent**
+- **Where:** `stock_bot/main.py`, Phase 1 price-fetch block in `run()`
+- **Root cause:** per-symbol fetch failures were already logged
+  (`"Price fetch failed for %s: %s"`), but two cycle-level failure modes had no signal at
+  all: the fetch phase itself raising (orchestration failure, not per-symbol), and a "clean"
+  completion where literally every symbol failed (total outage / global rate limit) — both
+  left the loop silently finishing an empty cycle and going back to sleep, undetectable
+  without `lsof`/`sample`.
+- **Fix:** wrapped the Phase 1 block in a try/except logging
+  `"cycle %d failed: price-fetch phase raised %s: %s"` on an orchestration exception, and
+  added a check logging `"cycle %d failed: 0/%d symbols returned data — likely a total fetch
+  outage"` when every symbol returns `None`. Both `continue` to the next iteration (mirrors
+  the existing `PRE_MARKET`/`AFTER_HOURS`/`WEEKEND` `sleep+continue` pattern) instead of
+  silently completing the cycle.
+
+**Session-audit finding (no fix needed):** confirmed `stock_bot/data/price_feed.py` never
+creates or holds a yfinance session — all 3 call sites (`yf.Ticker(sym).info`,
+`yf.download(...)`, `yf.Ticker(symbol).fast_info`) use yfinance's own default session
+management, no `session=` passed anywhere, consistent with the hard rule in
+`.memory/core.md` #6 ("Never add session management to yfinance") and enforced by yfinance
+1.5.1 itself (raises if you try). If the `CLOSE_WAIT` leak recurs, it's inside
+yfinance/curl_cffi's own connection lifecycle, not fixable from this codebase without
+violating that rule — a safe mitigation if it becomes a real problem would be an explicit
+`gc.collect()` once per Phase 1 batch (not implemented — not asked for, and unconfirmed the
+leak is actually a live problem rather than one day's normal call volume).
+
+**Tests:** 332/332 PASS (328 → 332, the 4 new tests above). No strategy files touched.

@@ -5,7 +5,59 @@ metadata:
   type: project
 ---
 
-**Status as of 2026-07-28 (Crypto Execution/Risk Audit complete):**
+**Status as of 2026-07-28 (Stock Bot Breaker Staleness + Stall Investigation complete):**
+
+## Session 2026-07-28 (cont'd) — Stock Bot Breaker Staleness + Stall Investigation (COMPLETE ✅)
+
+### Fix: daily-loss breaker staleness between fills
+- `StockPaperExecutor._open_position_value` was only refreshed inside `buy()`/`sell()` at
+  fill time — between fills (can be days apart on this book) the breaker checked drawdown
+  against a stale mark, missing real intraday drawdown on a held position that moved with no
+  new trade. Distinct from the 2026-07-04 cash-only-baseline bug (already fixed).
+- Added `StockPaperExecutor.refresh_position_marks()` + module-level
+  `_mark_positions_to_market(executor, price_data)` in `stock_bot/main.py`, called once per
+  scan cycle right after Phase 1 prices are fetched, before any buy/sell decision.
+  `IBKRExecutor` gets a no-op version for parity (already marks live via `_net_liquidation()`).
+- Verified the feeding price is already sanity-checked (bounds, duplicate-price/holiday-
+  corruption, outlier-vs-batch-median, TSX fast_info cross-check — all inside
+  `fetch_candles()`) before `_mark_positions_to_market` ever sees it; a rejected price just
+  skips that symbol's mark for the cycle rather than corrupting the breaker calc.
+- **Tests:** `test_stock_position_mark_refresh.py` (4 new) — calls the REAL
+  `_mark_positions_to_market()` via a mocked `_fetch_symbol_data`, proves the breaker trips
+  from a price move alone (zero fills), plus a source-inspection wiring guard. Verified both
+  failure modes for real (temporarily reverted each half of the fix, confirmed the matching
+  test fails, restored).
+
+### Operational: apparent ~6h scan-loop stall → restarted → likely misdiagnosed
+- Stock bot (PID 95757) showed zero `__main__` scan-cycle activity from `15:59:32` to
+  `~21:51` — no "Alerts: N triggered" line, dashboard mtime frozen, file not growing — while
+  IBKR's portfolio-ping kept firing, making `ps` show it as healthy.
+- `sample`/`lsof`: main thread genuinely in `time.sleep()` (not deadlocked); 59 sockets to
+  `*.ycpi.vip.dca.yahoo.com` stuck in `CLOSE_WAIT`. Restarted (new PID 25877) given the
+  ambiguity rather than debug further live.
+- **Self-correction one turn later:** `15:59:32` lines up almost exactly with NYSE close
+  (4:00pm ET). `AFTER_HOURS` mode's loop body never touches yfinance and only logs at
+  `debug` level — below the file handler's threshold — so hours of file-log silence after
+  close is likely **normal by-design behavior**, not a hang. The 59 `CLOSE_WAIT` sockets
+  most likely accumulated over the full LIVE trading day's call volume, not a silent stall.
+  Flagged as not fully resolved either way (can't re-examine the original process) rather
+  than declared safe.
+
+### Fix: silent total-fetch-failure in Phase 1
+- Two cycle-level failure modes had zero log signal: the fetch phase itself raising, and a
+  clean completion where every symbol failed (total outage). Both left the loop silently
+  finishing an empty cycle. Now both log `"cycle N failed: <reason>"` and `continue` to the
+  next iteration (mirrors the existing mode-branch `sleep+continue` pattern).
+
+### Session-audit: yfinance session handling (no bug found)
+- Confirmed `stock_bot/data/price_feed.py` never creates/holds a session — all 3 yfinance
+  call sites use yfinance's own default session management, consistent with the documented
+  hard rule (never pass `session=`). If `CLOSE_WAIT` recurs, it's inside yfinance/curl_cffi's
+  own connection lifecycle, not fixable here without violating that rule.
+
+**Tests:** 332/332 PASS (328 → 332). Full detail: `.memory/decisions/known-gaps.md` gap #11.
+
+---
 
 ## Session 2026-07-28 — Crypto Execution/Risk Audit (COMPLETE ✅)
 
