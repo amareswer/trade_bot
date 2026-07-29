@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -128,9 +127,12 @@ def test_resolution_clears_acknowledgment():
 
 # ── (d) Post-fill convergence: executor position == 0 after SELL fill ─────────
 
-def _make_live_executor_with_position(position: float = 0.000378) -> tuple[LiveExecutor, MagicMock]:
-    tmpdir = tempfile.mkdtemp()
-    state_path = os.path.join(tmpdir, "live_state_BTC_CAD.json")
+def _make_live_executor_with_position(
+    tmp_path, position: float = 0.000378
+) -> tuple[LiveExecutor, MagicMock]:
+    """tmp_path is pytest's built-in per-test fixture (auto-cleaned) — pass
+    your test's own tmp_path fixture through."""
+    state_path = str(tmp_path / "live_state_BTC_CAD.json")
     with open(state_path, "w") as f:
         json.dump({
             "symbol": "BTC/CAD", "cash": 100.0, "position": position,
@@ -162,13 +164,13 @@ def _make_live_executor_with_position(position: float = 0.000378) -> tuple[LiveE
     return exc, mock_ex
 
 
-def test_post_fill_executor_position_converges():
+def test_post_fill_executor_position_converges(tmp_path):
     """
     After a SELL fills with correct quantity, executor.position must be 0.
     This verifies the BUG 1 + BUG 2 combined fix: correct fill qty leads to
     correct position update, so the drift check fires 0 drift.
     """
-    exc, mock_ex = _make_live_executor_with_position(position=0.000378)
+    exc, mock_ex = _make_live_executor_with_position(tmp_path, position=0.000378)
 
     # Exchange returns filled=0.000378 on the closed order (normal happy path)
     mock_ex.create_order.return_value = {
@@ -201,12 +203,12 @@ def test_post_fill_executor_position_converges():
     )
 
 
-def test_post_fill_fallback_executor_position_converges():
+def test_post_fill_fallback_executor_position_converges(tmp_path):
     """
     After a SELL fills with filled=0 (but status=closed, amount=0.000378),
     the fallback recovers the correct qty and executor.position converges to 0.
     """
-    exc, mock_ex = _make_live_executor_with_position(position=0.000378)
+    exc, mock_ex = _make_live_executor_with_position(tmp_path, position=0.000378)
 
     mock_ex.create_order.return_value = {
         "id":      "ORDER_FALLBACK",

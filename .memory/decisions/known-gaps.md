@@ -378,3 +378,73 @@ not another stop-multiplier sweep.
 `stock_bot/.env` untouched by the experiment). No live code touched
 (`stock_bot/fast_validator.py`, `stock_bot/backtest/engine.py` both untouched — the ATR
 variant is a standalone copy in `swing_atr_walkforward.py`). Suite unaffected, 332/332.
+
+## 13. Test suite firing real Telegram alerts — RESOLVED 2026-07-29 (was investigated as a possible security incident — it wasn't one)
+
+**Read this before re-investigating "unexplained Telegram alerts" or a "second bot
+instance" as a security scare.** This is exactly that symptom, fully explained and fixed.
+
+**Symptom:** two Telegram alerts (balance/position sync failures, fallback to
+`starting_cash`) arrived 16 minutes apart with no matching entry in
+`logs/startup_timestamps.txt`, no matching `bot.main` process restart, and no trace in
+`logs/trade_bot.log`. Investigated as a possible rogue process / leaked API key
+(`screen`/`tmux`/`cron`/`launchctl`/duplicate `.env` files/shell history — all came back
+clean; see session transcript 2026-07-29 for the full sweep).
+
+**Root cause:** `bot/execution/live_executor.py`'s `LiveExecutor.__init__()` builds
+`self._alerter = TelegramAlerter(cfg.alerts.telegram_bot_token, cfg.alerts.telegram_chat_id,
+enabled=cfg.alerts.telegram_enabled)` from the real module-level `cfg` singleton (added as
+part of gap #9's retry/alert hardening). `TELEGRAM_ENABLED=true` in the real `.env`. Four
+test files construct real `LiveExecutor` instances without ever mocking Telegram:
+`test_live_executor.py`, `test_external_holdings.py`, `test_limit_chase_recovery.py`,
+`test_fill_recording.py`. `test_live_executor.py::test_sync_cash_falls_back_on_error`
+deliberately makes `fetch_balance()` raise to test the fallback path — which also hits the
+gap-#9 `self._alerter.error(...)` calls in both `_sync_cash()` and `_sync_position()`.
+`TelegramAlerter._send_async()` spawns a daemon thread that does a real
+`requests.post("https://api.telegram.org/bot<TOKEN>/sendMessage", ...)` — fire-and-forget,
+never raises, so the test itself never fails or shows anything unusual.
+
+**Why it left no trace anywhere we looked:** pytest never calls `bot.main.run()`, so
+`_setup_logging()`'s `RotatingFileHandler` (pointed at `logs/trade_bot.log`) is never
+attached — these `LiveExecutor` instances log through pytest's own capture, not the real
+log file. And a pytest worker process exits within seconds of the suite finishing, long
+before anyone runs `ps aux` — no new PID, no restart recorded in
+`startup_timestamps.txt` (that's only written by `bot.main.run()`'s crash-loop detector).
+Every full-suite run after gap #9 landed (roughly 8-10+ runs this session) very likely sent
+2 real alerts.
+
+**Fix 1 — can't recur, any test, ever:** new repo-root `conftest.py`, autouse
+session-wide fixture patching `TelegramAlerter._send` (the one method that calls
+`requests.post`) to a no-op for every test. Chosen over patching the whole class so that
+`test_crash_hardening.py` and `test_crypto_telegram.py` — which deliberately test
+`TelegramAlerter`'s own formatting/dispatch logic via `patch.object(instance, "_send")` —
+keep working unchanged; an instance-level patch shadows the class-level default for the
+duration of their own `with` block.
+
+**Fix 2 — leaked tmp directories:** the same 4 `LiveExecutor`-constructing test files used
+`tempfile.mkdtemp()` for their state-file sandbox, which never auto-cleans (unlike
+`tempfile.TemporaryDirectory()`). 618 leftover `.../T/tmpXXXXXXXX/live_state_BTC_CAD.json`
+directories had accumulated across this session's many full-suite runs — this volume is
+what made the investigation take "duplicate file on disk" seriously as a possible
+second-checkout scenario. Converted all 4 files' helper functions
+(`_make_executor`, `_make_live_executor` ×2, `_make_live_executor_with_position`) to accept
+pytest's built-in `tmp_path` fixture instead of calling `mkdtemp()` themselves — every
+calling test function now passes its own `tmp_path` through. `tmp_path` is auto-cleaned by
+pytest's own retention policy (keeps the last few `pytest-N` sessions, prunes older ones
+automatically) — verified post-fix: the 19 test functions across these 4 files now produce
+directories under `pytest-of-<user>/pytest-N/<testname>0/`, not raw `/T/tmpXXXXXXXX/`.
+One-time cleanup of the pre-existing 306 verified-orphaned raw-mkdtemp directories (each
+confirmed to contain nothing but the one expected json file before deletion) — removed,
+0 failures. The real `logs/live_state_BTC_CAD.json` is untouched (different code path).
+
+**Not fixed (named scope was these 4 files only) — same `mkdtemp()` gap still present in:**
+`test_fast_validator_exits.py` (`fast_trades.csv` sandbox), `test_paper_report.py` (5
+instances), `test_live_executor.py:57`'s own `_make()` default `state_path` (filename
+`live_state.json`, no `BTC_CAD` suffix — this one doesn't construct a real `TelegramAlerter`
+risk since `_make()` isn't used by the risky fallback test, but still leaks a directory per
+call). None of these produce the `live_state_BTC_CAD.json` filename this investigation
+searched for, so they weren't part of what made this look like a duplicate checkout — but
+they're the same class of leak and worth the same fix in a future pass.
+
+**Verification:** full suite 332/332 pass after both fixes. Strategy hash unchanged,
+`659d1c03987b72fd` (test-file and `conftest.py` changes only, no `bot/strategy/*` touched).

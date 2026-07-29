@@ -56,13 +56,15 @@ _DEFAULT_MARKETS = {
 
 
 def _make_live_executor(
+    tmp_path,
     position: float = 0.000378,
     starting_cash: float = 100.0,
     order_type: str = "market",
 ) -> tuple[LiveExecutor, MagicMock]:
-    """Build a LiveExecutor with a pre-existing position; all exchange calls mocked."""
-    tmpdir = tempfile.mkdtemp()
-    state_path = os.path.join(tmpdir, "live_state_BTC_CAD.json")
+    """Build a LiveExecutor with a pre-existing position; all exchange calls
+    mocked. tmp_path is pytest's built-in per-test fixture (auto-cleaned) —
+    pass your test's own tmp_path fixture through."""
+    state_path = str(tmp_path / "live_state_BTC_CAD.json")
     with open(state_path, "w") as f:
         json.dump({
             "symbol":       "BTC/CAD",
@@ -102,12 +104,12 @@ def _make_live_executor(
 
 # ── (a) closed market SELL, filled present → uses filled ─────────────────────
 
-def test_sell_uses_filled_when_present(caplog):
+def test_sell_uses_filled_when_present(caplog, tmp_path):
     """
     Initial create_order response has filled=0, but fetch_order (poll) returns
     filled=0.000378.  The executor must use filled, not amount.
     """
-    exc, mock_ex = _make_live_executor(position=0.000378, order_type="market")
+    exc, mock_ex = _make_live_executor(tmp_path, position=0.000378, order_type="market")
 
     mock_ex.create_order.return_value = {
         "id": "ORD_A", "status": "open",
@@ -139,13 +141,13 @@ def test_sell_uses_filled_when_present(caplog):
 
 # ── (b) closed limit order, filled=0.7*amount → poll loop records partial ────
 
-def test_sell_limit_partial_fill_recorded_correctly(caplog):
+def test_sell_limit_partial_fill_recorded_correctly(caplog, tmp_path):
     """
     Limit order closes with a 70% partial fill.
     Poll loop sets filled_qty = 0.70 * amount; guard code is NOT reached (qty > 0).
     The amount (100%) must NOT be used.
     """
-    exc, mock_ex = _make_live_executor(position=0.000378, order_type="limit")
+    exc, mock_ex = _make_live_executor(tmp_path, position=0.000378, order_type="limit")
 
     _partial = round(0.000378 * 0.70, 9)   # 0.0002646
 
@@ -178,12 +180,12 @@ def test_sell_limit_partial_fill_recorded_correctly(caplog):
 
 # ── (c) filled absent on closed market order → falls back to amount + warning ─
 
-def test_sell_market_closed_filled_absent_falls_back_to_amount(caplog):
+def test_sell_market_closed_filled_absent_falls_back_to_amount(caplog, tmp_path):
     """
     Market SELL is closed but all polls report filled=0 (exchange timing artifact).
     Executor must fall back to amount with a logged warning; must NOT return None.
     """
-    exc, mock_ex = _make_live_executor(position=0.000378, order_type="market")
+    exc, mock_ex = _make_live_executor(tmp_path, position=0.000378, order_type="market")
 
     mock_ex.create_order.return_value = {
         "id": "ORD_C", "status": "open",
@@ -214,12 +216,12 @@ def test_sell_market_closed_filled_absent_falls_back_to_amount(caplog):
 
 # ── (d) limit order closed, filled=0 → returns None (no amount inference) ────
 
-def test_sell_limit_closed_filled_zero_returns_none(caplog):
+def test_sell_limit_closed_filled_zero_returns_none(caplog, tmp_path):
     """
     Limit order shows status=closed but filled=0.  Limit orders may cancel with
     0 fill, so we must NOT infer from amount.  Executor must return None.
     """
-    exc, mock_ex = _make_live_executor(position=0.000378, order_type="limit")
+    exc, mock_ex = _make_live_executor(tmp_path, position=0.000378, order_type="limit")
 
     mock_ex.create_order.return_value = {
         "id": "ORD_D", "status": "open",
@@ -247,12 +249,12 @@ def test_sell_limit_closed_filled_zero_returns_none(caplog):
 
 # ── (e) market order still open after all polls → returns None ───────────────
 
-def test_sell_market_still_open_after_polls_returns_none(caplog):
+def test_sell_market_still_open_after_polls_returns_none(caplog, tmp_path):
     """
     Market SELL never reaches 'closed' status in 9 polls.
     Executor must return None — not infer from amount of an open order.
     """
-    exc, mock_ex = _make_live_executor(position=0.000378, order_type="market")
+    exc, mock_ex = _make_live_executor(tmp_path, position=0.000378, order_type="market")
 
     mock_ex.create_order.return_value = {
         "id": "ORD_E", "status": "open",

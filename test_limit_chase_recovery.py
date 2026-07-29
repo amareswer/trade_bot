@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -56,11 +55,13 @@ _PRICE = 92002.90
 
 
 def _make_live_executor(
+    tmp_path,
     position: float = 0.0,
     starting_cash: float = 77.0,
 ) -> tuple[LiveExecutor, MagicMock]:
-    tmpdir = tempfile.mkdtemp()
-    state_path = os.path.join(tmpdir, "live_state_BTC_CAD.json")
+    """tmp_path is pytest's built-in per-test fixture (auto-cleaned) — pass
+    your test's own tmp_path fixture through."""
+    state_path = str(tmp_path / "live_state_BTC_CAD.json")
     with open(state_path, "w") as f:
         json.dump({
             "symbol":       "BTC/CAD",
@@ -120,11 +121,11 @@ def _unresolved(order_id: str, otype: str = "market") -> dict:
 
 # ── 1. Incident regression: market fallback resolves via polling ─────────────
 
-def test_market_fallback_unresolved_fill_recovered_by_polling(caplog):
+def test_market_fallback_unresolved_fill_recovered_by_polling(caplog, tmp_path):
     """Orderbook fetch fails → market fallback returns status=None/filled=0.
     execute() must poll fetch_order and record the real fill (the 2026-07-15
     incident returned None here and lost a $7.73 fill)."""
-    exc, mock_ex = _make_live_executor()
+    exc, mock_ex = _make_live_executor(tmp_path)
 
     mock_ex.fetch_order_book.side_effect = le_mod.ccxt.NetworkError("Depth fetch failed")
     mock_ex.create_order.return_value = _unresolved("OFIPRK-N6JMC-IRHKMX")
@@ -143,11 +144,11 @@ def test_market_fallback_unresolved_fill_recovered_by_polling(caplog):
 
 # ── 2. Actual order type drives the amount inference ─────────────────────────
 
-def test_market_fallback_closed_filled_zero_infers_from_amount(caplog):
+def test_market_fallback_closed_filled_zero_infers_from_amount(caplog, tmp_path):
     """Fallback market order closes but every poll reports filled=0 (timing
     artifact). ORDER_TYPE=limit is configured, but the ACTUAL order was market
     — the amount inference must fire instead of the limit-order guard."""
-    exc, mock_ex = _make_live_executor()
+    exc, mock_ex = _make_live_executor(tmp_path)
 
     mock_ex.fetch_order_book.side_effect = le_mod.ccxt.NetworkError("Depth fetch failed")
     mock_ex.create_order.return_value = _unresolved("ORD_MF")
@@ -165,9 +166,9 @@ def test_market_fallback_closed_filled_zero_infers_from_amount(caplog):
 
 # ── 3. Genuinely unfilled fallback still returns None ────────────────────────
 
-def test_market_fallback_never_fills_returns_none(caplog):
+def test_market_fallback_never_fills_returns_none(caplog, tmp_path):
     """Fallback order stays unresolved through every poll — no phantom row."""
-    exc, mock_ex = _make_live_executor()
+    exc, mock_ex = _make_live_executor(tmp_path)
 
     mock_ex.fetch_order_book.side_effect = le_mod.ccxt.NetworkError("Depth fetch failed")
     mock_ex.create_order.return_value = _unresolved("ORD_NF")
@@ -185,10 +186,10 @@ def test_market_fallback_never_fills_returns_none(caplog):
 
 # ── 4. Cancel race: fill during cancel is recorded, never re-placed ──────────
 
-def test_chase_timeout_fill_during_cancel_race_recorded_not_replaced():
+def test_chase_timeout_fill_during_cancel_race_recorded_not_replaced(tmp_path):
     """Chase order times out, cancel raises because the order just filled.
     The fill must be recorded and NO second order placed (double-fill guard)."""
-    exc, mock_ex = _make_live_executor()
+    exc, mock_ex = _make_live_executor(tmp_path)
 
     mock_ex.fetch_order_book.return_value = {
         "bids": [[_PRICE - 10.0, 1.0]],
@@ -214,10 +215,10 @@ def test_chase_timeout_fill_during_cancel_race_recorded_not_replaced():
 
 # ── 5. Clean timeout-cancel with no fill still retries the chase ─────────────
 
-def test_chase_timeout_clean_cancel_retries():
+def test_chase_timeout_clean_cancel_retries(tmp_path):
     """Cancel succeeds and the post-cancel check shows filled=0 — the chase
     must keep retrying as before (no behavior regression from the race guard)."""
-    exc, mock_ex = _make_live_executor()
+    exc, mock_ex = _make_live_executor(tmp_path)
 
     mock_ex.fetch_order_book.return_value = {
         "bids": [[_PRICE - 10.0, 1.0]],
@@ -250,11 +251,11 @@ def test_chase_timeout_clean_cancel_retries():
 
 # ── 6. Cancel fails AND unverifiable → abort chase, resolve in execute() ─────
 
-def test_chase_cancel_unverifiable_aborts_without_replacing(caplog):
+def test_chase_cancel_unverifiable_aborts_without_replacing(caplog, tmp_path):
     """Cancel fails (network) and the verification fetch also fails — the
     chase must NOT re-place (double-fill risk). execute()'s poll loop then
     resolves the order; here it turns out to have filled."""
-    exc, mock_ex = _make_live_executor()
+    exc, mock_ex = _make_live_executor(tmp_path)
 
     mock_ex.fetch_order_book.return_value = {
         "bids": [[_PRICE - 10.0, 1.0]],

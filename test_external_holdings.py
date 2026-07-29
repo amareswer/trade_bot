@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -18,16 +17,17 @@ from bot.strategy.threshold_strategy import Signal
 
 
 def _make_executor(
+    tmp_path,
     state_position: float = 0.0,
     state_bot_opened: bool = False,
     adopt: bool = False,
 ) -> tuple[LiveExecutor, str]:
     """
     Build a LiveExecutor with a pre-written state file in a temp directory.
-    Returns (executor, state_path).
+    Returns (executor, state_path). tmp_path is pytest's built-in per-test
+    fixture (auto-cleaned) — pass your test's own tmp_path fixture through.
     """
-    tmpdir = tempfile.mkdtemp()
-    state_path = os.path.join(tmpdir, "live_state_BTC_CAD.json")
+    state_path = str(tmp_path / "live_state_BTC_CAD.json")
 
     if state_position > 0 or state_bot_opened:
         with open(state_path, "w") as f:
@@ -71,12 +71,12 @@ def _make_executor(
 
 # ── Test (a): balance > state-file → managed qty = state qty + warning ────────
 
-def test_external_holdings_caps_at_state_qty(caplog):
+def test_external_holdings_caps_at_state_qty(caplog, tmp_path):
     """
     Exchange holds 0.000378 BTC, state-file shows 0.000000.
     Managed position must stay at 0. Warning must be logged.
     """
-    exc, _ = _make_executor(state_position=0.0, state_bot_opened=False, adopt=False)
+    exc, _ = _make_executor(tmp_path, state_position=0.0, state_bot_opened=False, adopt=False)
 
     exc._exchange.fetch_balance.return_value = {
         "free":  {"BTC": 0.000378, "CAD": 100.0},
@@ -90,12 +90,12 @@ def test_external_holdings_caps_at_state_qty(caplog):
     assert "EXTERNAL HOLDINGS DETECTED" in caplog.text
 
 
-def test_external_excess_over_existing_state_position(caplog):
+def test_external_excess_over_existing_state_position(caplog, tmp_path):
     """
     Exchange holds 0.000931 BTC; state-file shows 0.000553.
     Managed qty should be capped at 0.000553.
     """
-    exc, _ = _make_executor(state_position=0.000553, state_bot_opened=True, adopt=False)
+    exc, _ = _make_executor(tmp_path, state_position=0.000553, state_bot_opened=True, adopt=False)
 
     exc._exchange.fetch_balance.return_value = {
         "free":  {"BTC": 0.000931, "CAD": 100.0},
@@ -154,13 +154,13 @@ def test_no_state_file_and_balance_present_no_adoption(caplog, tmp_path):
 
 # ── Test (c): SELL is sized to managed quantity only ─────────────────────────
 
-def test_sell_uses_managed_qty_not_exchange_total(caplog):
+def test_sell_uses_managed_qty_not_exchange_total(caplog, tmp_path):
     """
     After external holdings detection (state=0, exchange=0.000378),
     a SELL signal must not attempt to sell the external balance.
     execute(SELL) should raise or return quantity=0 (position is 0).
     """
-    exc, _ = _make_executor(state_position=0.0, state_bot_opened=False, adopt=False)
+    exc, _ = _make_executor(tmp_path, state_position=0.0, state_bot_opened=False, adopt=False)
 
     exc._exchange.fetch_balance.return_value = {
         "free":  {"BTC": 0.000378, "CAD": 100.0},
@@ -180,12 +180,12 @@ def test_sell_uses_managed_qty_not_exchange_total(caplog):
 
 # ── Test (d): adopt=True restores old behavior ───────────────────────────────
 
-def test_adopt_external_holdings_true_adopts_balance(caplog):
+def test_adopt_external_holdings_true_adopts_balance(caplog, tmp_path):
     """
     With ADOPT_EXTERNAL_HOLDINGS=true, the exchange balance is fully adopted
     even if the state file shows 0 and bot_opened=False.
     """
-    exc, _ = _make_executor(state_position=0.0, state_bot_opened=True, adopt=True)
+    exc, _ = _make_executor(tmp_path, state_position=0.0, state_bot_opened=True, adopt=True)
 
     exc._exchange.fetch_balance.return_value = {
         "free":  {"BTC": 0.000378, "CAD": 100.0},
@@ -204,11 +204,11 @@ def test_adopt_external_holdings_true_adopts_balance(caplog):
 
 # ── Test (e): no warning when exchange matches state exactly ─────────────────
 
-def test_no_external_warning_when_exchange_matches_state(caplog):
+def test_no_external_warning_when_exchange_matches_state(caplog, tmp_path):
     """
     Exchange holds exactly what the state file recorded — no external holdings.
     """
-    exc, _ = _make_executor(state_position=0.000553, state_bot_opened=True, adopt=False)
+    exc, _ = _make_executor(tmp_path, state_position=0.000553, state_bot_opened=True, adopt=False)
 
     exc._exchange.fetch_balance.return_value = {
         "free":  {"BTC": 0.000553, "CAD": 60.0},
