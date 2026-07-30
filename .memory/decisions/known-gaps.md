@@ -533,3 +533,59 @@ deliberately deferred to "revisit before live."
 changes (only `bot/execution/live_executor.py` and test files touched — no `bot/strategy/*`).
 **Tests:** 332 → 333 (one new test, `test_fee_currency_mismatch_alerts_telegram`). Final
 count: **333/333 PASS**.
+
+## 15. validate_symbol.py hand-listed engine.run() kwargs — same drift class as macd_enabled/Mode A/B — RESOLVED 2026-07-30
+
+**Where:** `validate_symbol.py`'s `_CFG` dict (the script's "Validated strategy config —
+do not change without re-running validation" block).
+
+**This is the third occurrence of the exact bug class `bot/backtest/params.py`'s docstring
+was written to prevent** (macd_enabled drift 2026-07-20, seven Mode A/B entry-param drift,
+same day). `validate_symbol.py` was never converted when `engine_kwargs_from_cfg()` was
+introduced — it kept hand-listing its own snapshot of the strategy config, silently
+missing two live changes:
+- `macd_enabled=True` — live (and the canonical fingerprint) since 2026-07-20; the script
+  hardcoded `False`.
+- `ATR_SL_MULT=2.0` + ATR sizing — live since 2026-07-17; the script never passed
+  `atr_sl_mult`/`atr_risk_sizing` at all, so it silently ran the old fixed-1.5%-SL-only
+  model.
+
+**Real-world impact — not theoretical:** every multi-symbol screen this script had ever
+produced (including the 2026-07-30 batch earlier the same day, see
+`.memory/feature_plan.md`) validated candidates against a stricter/older strategy shape
+than what actually trades. Rescreening the same 10 symbols after the fix
+(`logs/multi_symbol_rescreen_20260730.md`) produced **3 verdict-category flips**: SOL and
+ATOM went BLOCKED→WATCHLIST (PF materially improved with the ATR stop + MACD gate), and —
+notably — **LINK went WATCHLIST→BLOCKED**, reversing a conclusion reached earlier the same
+session that LINK's old "permanently excluded" verdict was stale and worth revisiting. That
+conclusion had itself been produced by the same broken script; on the corrected config LINK
+does not clear the bar. Two more symbols (POL, UNI) stayed BLOCKED but moved from clear
+fails to near-misses. This is exactly the "one .env edit away from repeating the incident
+undetected" risk `params.py`'s docstring warns about, except here it wasn't an .env edit —
+it was a second script simply never having been migrated in the first place.
+
+**Fix:** `validate_symbol.py` now calls `engine_kwargs_from_cfg(cfg)` (same shared builder
+`backtest.py`/`walkforward.py` use) inside `run_backtest_window()`, overriding only
+`symbol`/`timeframe` (per-candidate, not from `.env`) and `strategy_mode="indicator"`
+(pinned regardless of whatever `cfg.strategy.mode` happens to be). The old 33-line hardcoded
+`_CFG` dict is gone; the CLI banner and Binance-fetch section now read `cfg.*` directly
+(plus two script-local constants, `_CANDLES_FULL` and the liquidity-gate thresholds, which
+aren't strategy params and correctly stay local). Banner now also displays MACD/ATR status
+so the config actually being tested is visible, matching `walkforward.py`'s
+`_config_summary()` convention.
+
+**Side effect, disclosed not hidden:** full builder adoption also changed `starting_cash`
+from a hardcoded $10,000 research baseline to `cfg.portfolio.starting_cash` (live, $100) —
+matching what `walkforward.py`/`atr_walkforward.py` already use. No verdict in the rescreen
+batch appeared to hinge on this, but it's a real behavior change from the fix, not just the
+MACD/ATR keys, and is called out in the rescreen report.
+
+**Guard against a fourth recurrence:** `test_engine_params.py::test_validation_scripts_use_the_builder()`
+now checks `validate_symbol.py` alongside `backtest.py`/`walkforward.py` — asserts
+`engine_kwargs_from_cfg` appears in its source. No new test function needed; extended the
+existing loop.
+
+**Strategy hash:** unchanged, `659d1c03987b72fd` (`validate_symbol.py` and
+`test_engine_params.py` only — no `bot/strategy/*`, `.env`, or live-trading path touched).
+**Tests:** 344/344 PASS (no new test count change — existing parity test extended, not a
+new test added).

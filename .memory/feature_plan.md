@@ -11,6 +11,158 @@ Running log of feature decisions. Most recent first.
 
 ---
 
+## 2026-07-30 (cont'd) — Grid Crash-Period Stress Test (RESEARCH ONLY, no live change)
+
+Follow-up on the grid/DCA experiment (2026-07-29): the wide-range grid (`wide_35pct` —
+range_pct=0.35, grid_levels=14, floor_buffer_pct=0.05) passed the standard 3-window
+trailing walk-forward with **zero losing round trips and the floor stop never
+triggering** in any window. That result never sampled a real multi-month crash. New
+standalone script `grid_stress_test.py` (+ `test_grid_stress_test.py`, 14 hermetic tests)
+runs the SAME config, pulled by name from `grid_dca_experiment.GRID_CONFIGS` (not
+retyped, so it can't silently drift from what actually passed), against two real,
+non-overlapping BTC/USDT-via-Binance periods the walk-forward never touched. Also added
+`floor_stop_pnls` to `GridResult` in `grid_dca_experiment.py` — a small additive field
+(existing `pnls`/`floor_stops` behavior unchanged) needed to report the circuit breaker's
+own cumulative damage separately from ordinary grid round trips.
+
+**Result — the "zero losses" finding does NOT hold up, and the failure mode is
+period-shape-dependent, not uniform:**
+- **2022 Crash (2021-11-01 → 2022-12-31, BTC ~$69k → ~$15.5k, ~-77%, slow grind):
+  FAILED.** PF 0.19, 36 trades, floor stop triggered **3 times** (cumulative floor-stop
+  loss -$323.75), total grid P&L -$262.41 — a 26.2% loss on the $1000 research capital,
+  past the 20% severe-loss bar. (Buy-and-hold BTC over the same period lost even more,
+  -$733.07 — the floor stop's damage-limitation worked relative to doing nothing, but the
+  strategy itself still failed outright on its own terms.)
+- **COVID Crash (2020-01-01 → 2020-12-31, includes the ~-50%-in-weeks March 2020 crash):
+  PASS.** PF inf, 76 trades, floor stop never triggered, grid P&L +$193.68. The sharp,
+  V-shaped recovery meant price never spent long enough outside the anchored ±35% range to
+  breach the floor. (Buy-and-hold vastly outperformed in raw dollars, +$2956.64 — 2020 was
+  a huge up year for BTC overall — but that's a different question from whether the grid
+  itself held up, which it did.)
+
+**Takeaway:** the wide grid's walk-forward PASS was real but incomplete evidence — it
+survives a fast, V-shaped crash but fails a slow grinding one, which is exactly the shape
+the 3 trailing windows never sampled. Same-config re-test on real crash history, not a
+retuned "better" config — nothing here should be read as "the grid needs wider parameters,"
+just that this exact config's clean walk-forward record doesn't generalize to every crash
+shape.
+
+359 tests (344 → 359: 1 new floor_stop_pnls test extending the existing floor-stop coverage
++ 14 new tests in `test_grid_stress_test.py`), strategy hash unchanged `659d1c03987b72fd`
+(no `bot/strategy/*`, `.env`, or live-trading path touched — `grid_dca_experiment.py`,
+`grid_stress_test.py`, and their test files only). No promotion, no whitelist change.
+
+---
+
+## 2026-07-30 (cont'd) — validate_symbol.py Config-Drift Fix + Rescreen (BUILT ✓, research results only)
+
+**Fixed a real correctness bug**, not research: `validate_symbol.py` hand-listed its own
+`engine.run()` config instead of using `bot/backtest/params.py`'s `engine_kwargs_from_cfg()`
+builder — third occurrence of the exact drift class documented there (macd_enabled and
+Mode A/B entry-param drift, both 2026-07-20). It was missing `macd_enabled=True` (live
+since 2026-07-20) and the live ATR×2.0 stop-loss (live since 2026-07-17), so every screen
+this script ever ran — including the one earlier the same day — validated a stricter/older
+strategy than what actually trades. Fixed: now calls `engine_kwargs_from_cfg(cfg)`,
+overriding only `symbol`/`timeframe`/`strategy_mode`. `test_engine_params.py`'s existing
+`test_validation_scripts_use_the_builder()` extended to also check `validate_symbol.py`.
+Full detail: `.memory/decisions/known-gaps.md` gap #15.
+
+**Rescreened all 10 symbols from the earlier same-day batch** with the corrected script
+(`logs/multi_symbol_rescreen_20260730.md`). **3 verdict-category flips:**
+- SOL/CAD: BLOCKED → WATCHLIST (PF 0.78/0.78/0.66 → 1.62/1.70/1.22 — held at WATCHLIST only
+  because the 1000c window has 6 trades, under the 10-trade floor)
+- ATOM/CAD: BLOCKED → WATCHLIST (PF 0.76/0.85 → 1.30/1.34, same reason — 1000c thin)
+- **LINK/CAD: WATCHLIST → BLOCKED** — reverses the conclusion from earlier the same session
+  that LINK's 2026-06-11 "permanently excluded" verdict was stale (pre-Mode-A/B) and worth
+  revisiting. That earlier re-test used the same broken `validate_symbol.py` config. On the
+  corrected config LINK does not clear the bar (PF 0.80/0.94/0.50). The Mode A/B staleness
+  reasoning was correct; the number it produced wasn't, because the script itself was stale
+  in an unrelated way.
+
+POL and UNI stayed BLOCKED but moved from clear fails to near-misses (PF ~0.94-1.14 on 2 of
+3 windows each). ADA/AVAX/DOT/LTC/MATIC held their prior verdicts with PF shifting in both
+directions — no single consistent effect from the fix, confirming it was a real correctness
+issue rather than a formality. **Nothing APPROVED** — Kraken still only lists SOL/CAD from
+this batch, and SOL isn't a clean pass (sample size, not PF). No `.env` or
+`UNIVERSE_WHITELIST` change.
+
+344 tests (no count change — extended an existing test, added none), strategy hash
+unchanged `659d1c03987b72fd` (`validate_symbol.py` + `test_engine_params.py` only).
+
+---
+
+## 2026-07-30 — Multi-Symbol Screen (RESEARCH ONLY, no whitelist change)
+
+Ran the existing `validate_symbol.py` (liquidity + 3-window walk-forward, unmodified) against
+9 candidate coins (SOL, ADA, LINK, AVAX, DOT, MATIC, POL, LTC, ATOM, UNI). Full table:
+`logs/multi_symbol_screen_20260730.md`.
+
+**Result: nothing APPROVED.** Kraken only has 11 CAD pairs total — SOL/CAD is the only
+requested symbol actually listed, and it fails the walk-forward (PF 0.78/0.78/0.66). Every
+other symbol either has no Kraken CAD market or fails walk-forward outright (ADA, AVAX, DOT,
+POL, LTC, ATOM, UNI all BLOCKED — PF well under 1.0). MATIC landed WATCHLIST on an
+insufficient sample (Binance history only goes back to the Sept 2024 MATIC→POL rebrand,
+4 trades per window).
+
+**Real finding: LINK's "permanently excluded" verdict was stale, not structural.**
+`.memory/decisions/multi-symbol-validation.md` (2026-06-11) called LINK permanently excluded
+on the OLD pre-Mode-A/B strategy. Mode A/B landed 2026-06-27→2026-07-02, after that verdict.
+Re-tested on current code: LINK **passes all 3 windows** (PF 1.18/1.91/1.03, all with ≥10
+trades) — same failure pattern as the documented XRP incident (a stale verdict outliving a
+strategy redesign). Held at WATCHLIST rather than APPROVED only because LINK/CAD doesn't
+exist on Kraken — no path to live today regardless of the walk-forward result.
+
+**Also found, not fixed (out of scope per instruction):** `validate_symbol.py` hand-lists
+its `engine.run()` kwargs instead of using `bot/backtest/params.py`'s
+`engine_kwargs_from_cfg()` builder, and is missing two live config changes — `macd_enabled`
+(hardcoded False; live has run True since 2026-07-20) and ATR SL (defaults to 0, live runs
+ATR×2.0 since 2026-07-17). Every verdict in this screen reflects the entry-signal logic
+correctly (Mode A/B's 7 params default-match live) but not current exit management — a
+future pass should route this script through the shared builder like every other validation
+script already does.
+
+No `.env` or `UNIVERSE_WHITELIST` change. 344 tests, strategy hash unchanged
+`659d1c03987b72fd` (no new code — `validate_symbol.py` untouched, only invoked repeatedly).
+
+---
+
+## 2026-07-29 (cont'd) — Grid / DCA Experiment (RESEARCH ONLY, no live change)
+
+New standalone script `grid_dca_experiment.py` (+ `test_grid_dca_experiment.py`, 11
+hermetic tests, synthetic candles). Answers: would a grid or DCA strategy pass this
+project's own PF >= 1.0 / >=10-trades 3-window walk-forward bar on BTC/CAD? Deliberately
+NOT built on `bot/backtest/engine.py` — that engine's SL/TP-at-close model doesn't fit
+grid/DCA's tick-sensitive fills, so this uses its own candle high/low fill checks (see the
+script's own docstring for the full reasoning). Grid's non-negotiable floor stop-loss
+(5% below range low, close-triggered, closes everything and halts until price re-enters)
+is implemented as required. Fee 0.8% (live Kraken finding), 3-window walk-forward
+(5000/3000/1000c, BTC/USDT-via-Binance proxy, same convention every other validation
+script in this repo uses).
+
+**Result (full table in `logs/grid_dca_experiment_20260729.md`):**
+- Grid tight (±10%) and medium (±20%) ranges: **FAILED** — repeated floor-stop breaches
+  (1-4 per window) drag PF well below 1.0 in most windows, despite very high win rates
+  (89-100%) on the surviving oscillation trades. A few floor-stop losses dominate many
+  small grid wins — same shape as any strategy with a fat left tail.
+- Grid wide (±35%) range: **PASS** — all 3 windows PF >= 1.0 (all showed PF=inf, i.e. zero
+  losing round trips, no floor stop ever tripped in any window at this width over
+  2024-04→2026-07).
+- DCA conservative and DCA aggressive: **both FAILED**, badly, in every window (PF
+  0.15-0.82). High win rate (93-99%) but PF far below 1.0 is the DCA-specific failure
+  mode this script's caveats section warns about: a handful of deep, still-open cycles
+  marked-to-market negative at window end swamp many small take-profit wins.
+
+**No promotion, no live-code or .env change** — this confirms the PASS bar was cleared by
+exactly one of five configs tested (wide-range grid only), which is informative but does
+NOT itself authorize anything; the full Validation Discipline workflow in CLAUDE.md would
+still be required before any live consideration, and that hasn't been started.
+
+344 tests total (333 → 344), strategy hash unchanged `659d1c03987b72fd` (no
+`bot/strategy/*`, `bot/main.py`, `.env`, `CapitalPool`, or executor files touched).
+No `known-gaps.md` entry — this is a research result, not a code defect.
+
+---
+
 ## 2026-07-29 (cont'd) — Deferred-Item Cleanup Pass (BUILT ✓)
 
 Worked through gap #9's remaining deferred items plus the stale tech-debt table, one at a

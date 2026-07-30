@@ -26,41 +26,25 @@ import ccxt
 
 logging.basicConfig(level=logging.WARNING)
 
-# ── Validated strategy config — do not change without re-running validation ──
-# Matches the settings in CLAUDE.md (validated 2026-06-27 on BTC/USDT).
-_CFG = dict(
-    timeframe            = "4h",
-    candles_full         = 5000,
-    starting_cash        = 10_000.0,
-    fee_pct              = 0.008,          # 0.8% Kraken taker
-    risk_per_trade_pct   = 0.10,
-    cooldown_ticks       = 6,
-    # Strategy
-    rsi_period           = 14,
-    rsi_oversold         = 30.0,
-    rsi_overbought       = 70.0,
-    fast_ema_period      = 9,
-    slow_ema_period      = 21,
-    adx_period           = 14,
-    adx_threshold        = 18.0,           # validated
-    min_ema_spread_pct   = 0.004,          # validated 2026-06-27
-    max_ema_spread_pct   = 0.0,
-    rsi_filter_enabled   = True,           # validated: OFF drops PF 1.38→1.19
-    macd_enabled         = False,
-    # Risk
-    max_position_pct     = 0.20,
-    daily_loss_limit_pct = 0.01,
-    max_drawdown_pct     = 0.25,
-    max_trades_per_day   = 5,
-    # Exits
-    stop_loss_pct        = 0.015,
-    take_profit_pct      = 0.10,
-    trail_stop_pct       = 0.05,
-    trail_stop_activation_pct = 0.03,
-    volume_k             = 0.0,
-)
+from config import cfg
+from bot.backtest.params import engine_kwargs_from_cfg
 
-# Liquidity gates
+# ── Strategy config — sourced from engine_kwargs_from_cfg(cfg), NOT hand-listed ──
+# 2026-07-30: this script used to hardcode its own "validated" config block,
+# the exact failure class bot/backtest/params.py's docstring documents for
+# backtest.py/walkforward.py (macd_enabled drift 2026-07-20, Mode A/B
+# entry-param drift same day) — it had silently missed macd_enabled=True
+# (live since 2026-07-20) and the live ATR×2.0 stop-loss (live since
+# 2026-07-17) ever since. Every prior screen run by this script validated a
+# stricter/older strategy shape than what actually trades. Fixed by routing
+# through the same shared builder every other validation script uses — see
+# run_backtest_window() below. Only `symbol`/`timeframe` (per-candidate, not
+# from .env) and `strategy_mode` (pinned to "indicator" regardless of
+# whatever cfg.strategy.mode happens to be) are overridden after the fact.
+
+# Constants specific to THIS script — window/gate shape, not strategy params,
+# so they stay local rather than moving into the shared builder.
+_CANDLES_FULL = 5000
 _MIN_VOL_CAD  = 50_000.0    # CAD
 _MAX_SPREAD   = 0.0015      # 0.15%
 _MIN_TRADES   = 10          # per window — below this, PF is unreliable
@@ -179,38 +163,12 @@ def run_backtest_window(candles, window_size: int, symbol: str, timeframe: str) 
         return dict(candles=0, trades=0, pf=0.0, win_rate=0.0,
                     ret_pct=0.0, max_dd=0.0, error="no candles")
 
-    result = engine.run(
-        candles              = sliced,
-        symbol               = symbol,
-        timeframe            = timeframe,
-        strategy_mode        = "indicator",
-        starting_cash        = _CFG["starting_cash"],
-        risk_per_trade_pct   = _CFG["risk_per_trade_pct"],
-        fee_pct              = _CFG["fee_pct"],
-        cooldown_ticks       = _CFG["cooldown_ticks"],
-        rsi_period           = _CFG["rsi_period"],
-        rsi_oversold         = _CFG["rsi_oversold"],
-        rsi_overbought       = _CFG["rsi_overbought"],
-        fast_ema_period      = _CFG["fast_ema_period"],
-        slow_ema_period      = _CFG["slow_ema_period"],
-        adx_period           = _CFG["adx_period"],
-        adx_threshold        = _CFG["adx_threshold"],
-        min_ema_spread_pct   = _CFG["min_ema_spread_pct"],
-        max_ema_spread_pct   = _CFG["max_ema_spread_pct"],
-        rsi_filter_enabled   = _CFG["rsi_filter_enabled"],
-        macd_enabled         = _CFG["macd_enabled"],
-        buy_threshold        = 0.0,
-        sell_threshold       = 0.0,
-        max_position_pct     = _CFG["max_position_pct"],
-        daily_loss_limit_pct = _CFG["daily_loss_limit_pct"],
-        max_drawdown_pct     = _CFG["max_drawdown_pct"],
-        max_trades_per_day   = _CFG["max_trades_per_day"],
-        stop_loss_pct        = _CFG["stop_loss_pct"],
-        take_profit_pct      = _CFG["take_profit_pct"],
-        trail_stop_pct       = _CFG["trail_stop_pct"],
-        trail_stop_activation_pct = _CFG["trail_stop_activation_pct"],
-        volume_k             = _CFG["volume_k"],
-    )
+    # Full live config (MACD, ATR SL, Mode A/B entry params, everything) —
+    # only the per-candidate symbol/timeframe and the pinned strategy_mode
+    # are overridden. See module docstring / 2026-07-30 note above.
+    kwargs = engine_kwargs_from_cfg(cfg)
+    kwargs.update(symbol=symbol, timeframe=timeframe, strategy_mode="indicator")
+    result = engine.run(candles=sliced, **kwargs)
 
     m = metrics_mod.compute(result)
     trades = len([f for f in result.fills if f.side == "SELL"])
@@ -233,14 +191,14 @@ def run_walkforward(base: str, timeframe: str) -> list[dict]:
     usdt_symbol = f"{base}/USDT"
     print(f"\n  {_bold('Stage 2 — Walk-forward')}  (Binance {usdt_symbol}, {timeframe})")
     print(f"  {'─'*54}")
-    print(f"  Fetching {_CFG['candles_full']} × {timeframe} candles …", end="", flush=True)
+    print(f"  Fetching {_CANDLES_FULL} × {timeframe} candles …", end="", flush=True)
 
     try:
         candles = fetch_candles_paginated(
             exchange_id = "binance",
             symbol      = usdt_symbol,
             timeframe   = timeframe,
-            total_limit = _CFG["candles_full"],
+            total_limit = _CANDLES_FULL,
         )
     except Exception as exc:
         print(f"\n  {_fail('ERROR')}: could not fetch Binance data — {exc}")
@@ -409,8 +367,8 @@ def main():
     )
     parser.add_argument("symbol", help="Base currency (e.g. ADA, SOL, MATIC)")
     parser.add_argument(
-        "--timeframe", default=_CFG["timeframe"],
-        help=f"Backtest timeframe (default: {_CFG['timeframe']})",
+        "--timeframe", default=cfg.backtest.timeframe,
+        help=f"Backtest timeframe (default: {cfg.backtest.timeframe})",
     )
     parser.add_argument(
         "--skip-liquidity", action="store_true",
@@ -424,10 +382,15 @@ def main():
     bar = "═" * 54
     print(f"\n  {_bold(bar)}")
     print(f"  {_bold('Symbol Validation Pipeline')}")
+    sl_str = (f"ATRx{cfg.backtest.atr_sl_mult:g}" if cfg.backtest.atr_sl_mult > 0
+              else f"{cfg.backtest.stop_loss_pct*100:.1f}%")
     print(f"  Base: {base}  |  Timeframe: {timeframe}")
-    print(f"  Config: ADX≥{_CFG['adx_threshold']}  EMA≥{_CFG['min_ema_spread_pct']*100:.1f}%"
-          f"  RSI=on  SL={_CFG['stop_loss_pct']*100:.1f}%  TP={_CFG['take_profit_pct']*100:.0f}%"
-          f"  fee={_CFG['fee_pct']*100:.1f}%")
+    print(f"  Config: ADX≥{cfg.strategy.adx_threshold:g}  "
+          f"EMA≥{cfg.strategy.min_ema_spread_pct*100:.1f}%"
+          f"  RSI={'on' if cfg.strategy.rsi_filter_enabled else 'off'}"
+          f"  MACD={'on' if cfg.strategy.macd_enabled else 'off'}"
+          f"  SL={sl_str}  TP={cfg.backtest.take_profit_pct*100:.0f}%"
+          f"  fee={cfg.backtest.fee_pct*100:.1f}%")
     print(f"  {_bold(bar)}")
 
     # Stage 1 — Kraken liquidity

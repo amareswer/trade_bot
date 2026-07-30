@@ -195,8 +195,13 @@ def test_every_shared_strategy_field_reaches_the_backtest():
 
 
 def test_validation_scripts_use_the_builder():
-    """backtest.py and walkforward.py must not regrow hand-listed arg drift."""
-    for script in ("backtest.py", "walkforward.py"):
+    """backtest.py, walkforward.py, and validate_symbol.py must not regrow
+    hand-listed arg drift. validate_symbol.py joined this list 2026-07-30
+    after being found hand-listing its own config block — missing
+    macd_enabled=True (live since 2026-07-20) and the live ATR×2.0 SL (live
+    since 2026-07-17), the same drift class documented above for the other
+    two scripts. So a fourth script can't reopen this gap silently."""
+    for script in ("backtest.py", "walkforward.py", "validate_symbol.py"):
         source = (REPO_ROOT / script).read_text()
         assert "engine_kwargs_from_cfg" in source, (
             f"{script} no longer uses engine_kwargs_from_cfg() — "
