@@ -589,3 +589,19 @@ existing loop.
 `test_engine_params.py` only — no `bot/strategy/*`, `.env`, or live-trading path touched).
 **Tests:** 344/344 PASS (no new test count change — existing parity test extended, not a
 new test added).
+
+## 16. Housekeeping — stray empty root-level trades.db, RESOLVED 2026-07-30
+
+A 0-byte `trades.db` at the repo root (distinct from the real `logs/trades.db` every
+reader — `bot/data/trade_log.py`, `live_stats.py`, `reconcile_ledger.py`,
+`deploy/smoke_check.py` — actually points at) was found during a live-status check. Origin:
+`git log` shows it was accidentally swept into commit `b356a93` ("Add grid stress test
+script and unit tests for validation," 2026-07-30) as a committed empty blob — likely a
+`sqlite3.connect('trades.db')` diagnostic one-liner run from repo root created it
+untracked, then a broad `git add` picked it up alongside that session's real work. Verified
+0 rows / no `fills` table, verified no code references the bare root path (only
+`logs/trades.db` and pytest `tmpdir` fixtures in tests), then `rm`'d. Left unstaged — it
+was git-tracked, so the deletion needs its own `git add`/commit to persist; not done here
+per this project's "user handles git" convention. `.gitignore` covers `logs/trades.db` via
+the `logs/` pattern but has no bare root-level `trades.db` rule, so this could quietly
+reappear the same way — flagged, not added, a one-line judgment call for the user.
