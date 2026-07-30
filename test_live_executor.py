@@ -155,6 +155,83 @@ def test_validation_rejects_below_min_cost(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Pre-trade minimum-size guard (2026-07-30): warns before a BUY whose
+# computed qty is within MIN_SIZE_SAFETY_MARGIN of amt_min. _DEFAULT_MARKETS
+# has amount.min=0.00005, cost.min=5.0; default margin is 1.5x -> threshold
+# 0.000075.
+# ---------------------------------------------------------------------------
+
+def test_min_size_guard_fires_below_safety_margin(caplog, tmp_path):
+    import logging
+    ex, mock_ex = _make(dry_run=True, starting_cash=1000.0, tmp_path=tmp_path)
+
+    with patch.object(ex._alerter, "error") as mock_alert, \
+         caplog.at_level(logging.WARNING, logger="bot.execution.live_executor"):
+        # 0.00006 clears amt_min (0.00005) and cost_min ($5.4 >= $5) so the
+        # order itself still fills — but sits inside the 1.5x margin
+        # (threshold 0.000075), so the guard must fire.
+        order = ex.execute(Signal.BUY, 90_000.0, 0.00006)
+
+    assert order is not None
+    assert order.status == OrderStatus.FILLED, "guard must not block the order"
+    mock_alert.assert_called_once()
+    alert_msg = mock_alert.call_args[0][0]
+    assert "MIN-SIZE GUARD" in alert_msg
+    assert "0.00006000" in alert_msg
+    assert "0.00005000" in alert_msg
+    assert any("MIN-SIZE GUARD" in r.message for r in caplog.records)
+
+
+def test_min_size_guard_silent_above_safety_margin(tmp_path):
+    ex, mock_ex = _make(dry_run=True, starting_cash=1000.0, tmp_path=tmp_path)
+
+    with patch.object(ex._alerter, "error") as mock_alert:
+        # 0.001 BTC is well above the 0.000075 threshold.
+        order = ex.execute(Signal.BUY, 90_000.0, 0.001)
+
+    assert order is not None
+    assert order.status == OrderStatus.FILLED
+    mock_alert.assert_not_called()
+
+
+def test_min_size_guard_never_alters_quantity_sent(tmp_path):
+    """The guard is alert-only — it must never round the quantity up, even
+    when it fires. Silently increasing size would break the ATR risk cap
+    the sizing exists to enforce."""
+    ex, mock_ex = _make(dry_run=True, starting_cash=1000.0, tmp_path=tmp_path)
+
+    requested_qty = 0.00006
+    with patch.object(ex._alerter, "error"):
+        order = ex.execute(Signal.BUY, 90_000.0, requested_qty)
+
+    assert order is not None
+    assert order.status == OrderStatus.FILLED
+    assert order.quantity == pytest.approx(requested_qty, abs=1e-12)
+    assert abs(ex.position - requested_qty) < 1e-12
+
+
+def test_min_size_guard_margin_is_env_configurable(tmp_path):
+    """MIN_SIZE_SAFETY_MARGIN is read into a module-level constant — prove
+    the guard's math actually uses it (amt_min * margin), not a hardcoded
+    1.5, by overriding it to a value that changes the outcome for the same
+    quantity."""
+    ex, mock_ex = _make(dry_run=True, starting_cash=1000.0, tmp_path=tmp_path)
+
+    # 0.00008 is above the default 1.5x threshold (0.000075) but below a
+    # tighter 1.0x-margin threshold would still pass — use a WIDER margin
+    # (3.0x -> threshold 0.00015) so the same qty that was silent by default
+    # now trips the guard.
+    with patch.object(le_mod, "_MIN_SIZE_SAFETY_MARGIN", 3.0):
+        with patch.object(ex._alerter, "error") as mock_alert:
+            order = ex.execute(Signal.BUY, 90_000.0, 0.00008)
+
+    assert order is not None
+    assert order.status == OrderStatus.FILLED
+    mock_alert.assert_called_once()
+    assert "3.00" in mock_alert.call_args[0][0]
+
+
+# ---------------------------------------------------------------------------
 # Test 4: live BUY updates portfolio correctly (using filled from response)
 # ---------------------------------------------------------------------------
 

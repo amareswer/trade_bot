@@ -33,6 +33,13 @@ _DEFAULT_STATE_PATH = os.path.join(
     "logs", "live_state.json",
 )
 
+# Pre-trade minimum-size guard (2026-07-30): the ATR-risk-capped BUY sizer
+# can land close to the exchange's amt_min at high price / wide ATR — this
+# margin decides how close is "close enough to warn about" before an order
+# is even placed. Read directly here rather than via config.py — this
+# guard's scope is live_executor.py + tests only.
+_MIN_SIZE_SAFETY_MARGIN = float(os.getenv("MIN_SIZE_SAFETY_MARGIN", "1.5"))
+
 
 class LiveExecutor:
     """
@@ -410,6 +417,18 @@ class LiveExecutor:
 
     # ── Validation ────────────────────────────────────────────────────
 
+    def _lookup_amt_min(self) -> float | None:
+        """Best-effort amt_min lookup for the pre-trade min-size guard.
+        Mirrors _validate_order()'s own lookup but never raises — returns
+        None (guard no-ops) if markets aren't loaded or the symbol is
+        missing, same as _validate_order()'s own soft-fail behavior there."""
+        if self._markets is None:
+            return None
+        market = self._markets.get(self.symbol)
+        if not market:
+            return None
+        return market.get("limits", {}).get("amount", {}).get("min")
+
     def _validate_order(self, side: OrderSide, quantity: float, price: float) -> None:
         """Check order against exchange minimums. Raises ValueError with a self-explanatory message."""
         if self._markets is None:
@@ -624,6 +643,30 @@ class LiveExecutor:
 
         quantity = self._portfolio.position if side == OrderSide.SELL else quantity
         ts       = datetime.now(timezone.utc)
+
+        # Pre-trade minimum-size guard: warn BEFORE placing the order if the
+        # computed BUY qty is within MIN_SIZE_SAFETY_MARGIN of amt_min —
+        # losing a signal to a hard rejection here costs a full signal cycle
+        # (~3 weeks) and 1/15 of the capital gate. Alert only — never
+        # auto-round the quantity up, which would silently break the ATR
+        # risk cap this sizing exists to enforce. The order still proceeds
+        # (or fails _validate_order below) exactly as it would without this
+        # guard; it changes nothing about what gets sent.
+        if side == OrderSide.BUY:
+            _amt_min = self._lookup_amt_min()
+            if _amt_min and _amt_min > 0 and quantity < _amt_min * _MIN_SIZE_SAFETY_MARGIN:
+                _headroom = quantity / _amt_min
+                logger.warning(
+                    "MIN-SIZE GUARD [%s]: computed BUY qty %.8f is within the "
+                    "%.2fx safety margin of amt_min %.8f — headroom %.2fx",
+                    self.symbol, quantity, _MIN_SIZE_SAFETY_MARGIN, _amt_min, _headroom,
+                )
+                self._alerter.error(
+                    f"MIN-SIZE GUARD [{self.symbol}]: computed BUY qty {quantity:.8f} "
+                    f"vs amt_min {_amt_min:.8f} — headroom {_headroom:.2f}x "
+                    f"(safety margin {_MIN_SIZE_SAFETY_MARGIN:.2f}x). A price rise or "
+                    f"wider stop could push the next signal below the exchange minimum."
+                )
 
         # Validate against exchange minimums in both dry-run and live mode.
         # Dry-run must exercise the rejection path — that is the point of dry-run.
