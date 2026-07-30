@@ -34,6 +34,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from bot.exchanges.retry import fetch_with_retry
+
 # ── Settings ——————————————————————————————————————————————————————————————————
 # Defaults match live Kraken config (CLAUDE.md). Override with env vars if needed.
 # MONITOR_SYMBOLS: comma-separated traded symbols; falls back to MONITOR_SYMBOL for compatibility.
@@ -376,7 +378,10 @@ def _check_doge_liquidity(exchange, now_str: str) -> None:
     print("  " + "─" * (w + 40))
 
     try:
-        ticker   = exchange.fetch_ticker(DOGE_SYMBOL)
+        ticker   = fetch_with_retry(
+            lambda: exchange.fetch_ticker(DOGE_SYMBOL),
+            label=f"{DOGE_SYMBOL} ticker",
+        )
         last     = ticker.get("last") or 0.0
         vol_base = ticker.get("baseVolume")          # volume in DOGE
         vol_cad  = (vol_base * last) if vol_base else None
@@ -428,7 +433,10 @@ def _check_symbol(exchange, symbol: str, now_str: str) -> bool:
     )
 
     try:
-        raw = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=FETCH_LIMIT)
+        raw = fetch_with_retry(
+            lambda: exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=FETCH_LIMIT),
+            label=f"{symbol} OHLCV",
+        )
     except Exception as exc:
         print(f"  ERROR fetching candles for {symbol}: {exc}")
         return False
