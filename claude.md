@@ -365,11 +365,14 @@ EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-0
 - Screen tooling: `screen_universe.py`, run monthly via the in-bot `rescreen.py` scheduler (never auto-changes whitelists — flags decay/new-qualifiers only).
 
 ### Current stock bot RULE_WHITELIST
-`MRNA,AMD,RY,PLTR,GLD,TD,CM,CSCO,KO,T,CAT,GOOGL,WMT,MSFT` — all US-listed/API-tradeable
+`MRNA,AMD,RY,PLTR,GLD,TD,CM,CSCO,KO,T,CAT,GOOGL,WMT,MSFT,GM,CVX` — all US-listed/API-tradeable
 (no `.TO` symbols — see TSX API block below). Watchlist is a superset including AC.TO,
 SHOP.TO, BNS, SU (advisory-only, never rule-buyable). Adding a symbol requires a fresh
 `stock_backtest.py` PASS on the current strategy hash — never by hand. Full screen history
 (affordable-symbol screen, large-cap screen, metals/currency screen) is in `CLAUDE_HISTORY.md`.
+GM,CVX added 2026-07-31 from a 20-candidate batch screen (`logs/stock_backtest_20260731.md`,
+2/20 passed — GM PF 1.31-1.94, CVX PF 1.43-inf). The other 18 (JPM, V, MA, PG, JNJ, SBUX,
+NKE, ORCL, IBM, QCOM, TXN, PYPL, UPS, PEP, VZ, ABBV, MO, F) failed and are not whitelisted.
 
 ---
 

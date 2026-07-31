@@ -56,9 +56,13 @@ class FakeIB:
     Minimal ib_async.IB stand-in.
 
     fill_mode:
-      "instant"     — orders fill immediately at `fill_price`
-      "never"       — orders never fill (executor should time out + cancel)
-      "on_cancel"   — order fills the moment cancelOrder is called (race)
+      "instant"              — orders fill immediately at `fill_price`
+      "never"                — orders never fill (executor should time out + cancel)
+      "on_cancel"            — order fills the moment cancelOrder is called (race)
+      "flicker_cancel_then_fill" — order reads 'Cancelled' with zero fill the
+                             instant it's placed (IBKR Error 10349 quirk), then
+                             resubmits and fills on its own a moment later —
+                             no cancelOrder() call from us at all
     """
 
     def __init__(self, accounts=("DUQ273338",), cash=100_000.0,
@@ -105,6 +109,14 @@ class FakeIB:
         self.placed.append((contract, order, trade))
         if self.fill_mode == "instant":
             self._fill(trade, order)
+        elif self.fill_mode == "flicker_cancel_then_fill":
+            trade.orderStatus.status = "Cancelled"
+
+            async def _delayed_fill():
+                await asyncio.sleep(0.4)
+                self._fill(trade, order)
+
+            asyncio.ensure_future(_delayed_fill())
         return trade
 
     def cancelOrder(self, order):
@@ -308,6 +320,25 @@ def test_fill_racing_cancel_is_recorded(executors):
     assert order.status == OrderStatus.FILLED    # fill won the race → recorded
     assert order.price == 59.9
     assert len(fake.cancelled) == 1
+
+
+def test_flicker_cancel_then_fill_is_recorded(executors):
+    # RY, 2026-07-31: IBKR's Error 10349 ("Order TIF was set to DAY based on
+    # order preset") flips the order to 'Cancelled' with zero fill the
+    # instant it's placed, then silently resubmits and fills for real ~1s
+    # later — with nothing initiated by us. Before this fix, the executor
+    # trusted the first 'Cancelled' reading, logged/alerted the order as
+    # REJECTED, and the real fill that followed was never recorded anywhere
+    # (no CSV row, no order status update) even though the broker genuinely
+    # held the position.
+    fake = FakeIB(fill_mode="flicker_cancel_then_fill", fill_price=210.55)
+    ex = make_executor(fake, fill_timeout_s=2.0)
+    executors.append(ex)
+    order = ex.buy("RY", 4, 210.0, reason="test")
+    assert order.status == OrderStatus.FILLED
+    assert order.price == 210.55
+    assert order.quantity == 4
+    assert fake.cancelled == []    # never initiated a cancel ourselves
 
 
 # ---------------------------------------------------------------------------

@@ -345,6 +345,22 @@ class IBKRExecutor(StockExecutorBase):
             cancel_deadline = self._loop.time() + 15.0
             while not trade.isDone() and self._loop.time() < cancel_deadline:
                 await asyncio.sleep(0.25)
+        elif (trade.orderStatus.status in ("Cancelled", "ApiCancelled")
+                and not trade.fills and float(trade.orderStatus.filled or 0.0) <= 0):
+            # IBKR can report an unprompted, transient 'Cancelled' status (e.g.
+            # Error 10349 "Order TIF was set to DAY based on order preset")
+            # before silently resubmitting the same order, which then fills
+            # normally a moment later (RY, 2026-07-31: order read 'Cancelled'
+            # with zero fill, logged/alerted as rejected, then filled 4sh
+            # @ $210.55 ~700ms afterward with nothing left recording it).
+            # Don't trust an unfilled 'Cancelled' at face value — give it a
+            # short grace window to reveal whether it's actually still alive.
+            grace_deadline = self._loop.time() + 5.0
+            while (trade.orderStatus.status in ("Cancelled", "ApiCancelled")
+                    and not trade.fills
+                    and float(trade.orderStatus.filled or 0.0) <= 0
+                    and self._loop.time() < grace_deadline):
+                await asyncio.sleep(0.25)
 
         status = trade.orderStatus.status
         filled_qty = float(trade.orderStatus.filled or 0.0)
