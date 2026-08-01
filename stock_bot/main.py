@@ -31,7 +31,10 @@ import pytz as _pytz
 from datetime import datetime, date, timedelta
 
 from stock_bot.config import load
-from stock_bot.data.price_feed    import fetch_candles, reset_price_cache, get_sector
+from stock_bot.data.price_feed    import (
+    fetch_candles, reset_price_cache, get_sector,
+    get_usd_cad_rate, is_cad_symbol,
+)
 from stock_bot.data.yf_client     import fetch_with_retry
 from stock_bot.data.intraday_price import get_live_price
 from stock_bot.data.universe  import StockUniverse, _FALLBACK_SYMBOLS as _UNIVERSE_FALLBACK
@@ -1259,16 +1262,32 @@ def run() -> None:
                             elif len(executor.positions_snapshot()) >= cfg.paper_max_positions:
                                 print(f"  📄 SKIP: {symbol} — max {cfg.paper_max_positions} positions reached")
                             else:
+                                # Account cash/exposure figures are CAD (the account's base
+                                # currency — IBKRExecutor.cash reads IBKR's BASE/CAD row).
+                                # US-listed share prices are USD. Without converting, a USD
+                                # buy's target allocation was being spent as if $1 USD == $1
+                                # CAD, silently running ~15-35% over the intended risk_pct
+                                # (found live 2026-07-31 on RY: $842 USD spent against a
+                                # $1,002 CAD target — actually ~$1,150+ CAD, ~23% not 20%).
+                                fx_rate = get_usd_cad_rate()
                                 snap    = executor.positions_snapshot()
-                                pos_val = sum(sh * co for sh, co in snap.values())
+                                pos_val = sum(
+                                    sh * co * (1.0 if is_cad_symbol(sym) else fx_rate)
+                                    for sym, (sh, co) in snap.items()
+                                )
+                                price_cad = (
+                                    execution_price if is_cad_symbol(symbol)
+                                    else execution_price * fx_rate
+                                )
                                 alloc   = (executor.cash + pos_val) * cfg.paper_risk_pct
-                                shares  = int(alloc / execution_price) if execution_price > 0 else 0
+                                shares  = int(alloc / price_cad) if price_cad > 0 else 0
                                 if shares == 0 and execution_price > 0:
                                     logger.info(
-                                        "SIZE_SKIP: %s — target allocation $%.2f "
-                                        "(%.0f%% of $%.2f) buys 0 shares @ $%.2f",
+                                        "SIZE_SKIP: %s — target allocation $%.2f CAD "
+                                        "(%.0f%% of $%.2f CAD) buys 0 shares @ $%.2f "
+                                        "(%.2f CAD)",
                                         symbol, alloc, cfg.paper_risk_pct * 100,
-                                        executor.cash + pos_val, execution_price,
+                                        executor.cash + pos_val, execution_price, price_cad,
                                     )
                                     print(
                                         f"  📄 SKIP: {symbol} — ${alloc:.2f} allocation "

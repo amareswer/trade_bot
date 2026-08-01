@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from stock_bot.data.price_feed import get_sector
+from stock_bot.data.price_feed import get_sector, get_usd_cad_rate, is_cad_symbol
 from stock_bot.execution.base import (
     OrderSide, OrderStatus, StockExecutorBase, StockOrder,
 )
@@ -381,9 +381,15 @@ class StockPaperExecutor(StockExecutorBase):
             total += (px - cost) * shares
         return round(total, 2)
 
+    @staticmethod
+    def _price_in_cad(sym: str, price: float) -> float:
+        """self._cash is the CAD-denominated account balance — convert a
+        USD-listed symbol's native price before mixing it into a CAD total."""
+        return price if is_cad_symbol(sym) else price * get_usd_cad_rate()
+
     def total_value(self, prices: dict[str, float]) -> float:
         pos_value = sum(
-            prices.get(sym, prices.get(sym.lower(), cost)) * shares
+            self._price_in_cad(sym, prices.get(sym, prices.get(sym.lower(), cost))) * shares
             for sym, (shares, cost) in self._positions.items()
         )
         return round(self._cash + pos_value, 2)
@@ -578,7 +584,8 @@ class StockPaperExecutor(StockExecutorBase):
         if total <= 0:
             return True
         snap = self.positions_snapshot()
-        pos_val = sum(shares * price_map.get(sym, cost) for sym, (shares, cost) in snap.items())
+        pos_val = sum(shares * self._price_in_cad(sym, price_map.get(sym, cost))
+                      for sym, (shares, cost) in snap.items())
         return (pos_val / total) < self._max_exposure_pct
 
     # ── Internal ─────────────────────────────────────────────────────────────

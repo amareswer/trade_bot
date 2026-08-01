@@ -16,6 +16,7 @@ import asyncio
 import csv
 import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -394,6 +395,52 @@ def test_realized_pnl_persists_across_instances(executors, tmp_path):
     ex2 = make_executor(fake2)
     executors.append(ex2)
     assert ex2.realized_pnl() == pytest.approx(pnl, abs=0.01)
+
+
+# ---------------------------------------------------------------------------
+# FX sizing — total_value / check_exposure must convert USD positions to
+# the account's CAD base currency (2026-07-31 fix)
+# ---------------------------------------------------------------------------
+
+def _ry_position(shares=4, avg_cost=210.55):
+    # Bare NYSE cross-listing: USD, no TSE routing — from_contract() maps
+    # this back to plain "RY", same as the live RY position that exposed
+    # the original bug.
+    return SimpleNamespace(
+        contract=FakeContract("RY", "USD", "NYSE"),
+        position=float(shares),
+        avgCost=avg_cost,
+    )
+
+
+def test_total_value_converts_usd_position_via_fx_rate(executors):
+    fake = FakeIB(positions=[_ry_position(4, 210.55)], cash=2000.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+    with patch("stock_bot.execution.ibkr.get_usd_cad_rate", return_value=1.35):
+        total = ex.total_value({"RY": 210.55})
+    assert total == round(2000.0 + 4 * 210.55 * 1.35, 2)
+
+
+def test_total_value_leaves_cad_position_unconverted(executors):
+    fake = FakeIB(positions=[_cm_position(4, 168.35)], cash=2000.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+    with patch("stock_bot.execution.ibkr.get_usd_cad_rate", return_value=1.35):
+        total = ex.total_value({"CM.TO": 168.35})
+    assert total == round(2000.0 + 4 * 168.35, 2)   # no FX applied — CM.TO is CAD
+
+
+def test_check_exposure_flags_usd_position_understated_without_fx(executors):
+    # $500 USD face value looks like 25% of a $2000 account — but at 1.35
+    # it's really ~$675 CAD, ~29% — must trip a 27% cap that the unconverted
+    # math would have cleared.
+    fake = FakeIB(positions=[_ry_position(shares=2, avg_cost=250.0)], cash=1500.0)
+    ex = make_executor(fake, max_exposure_pct=0.27)
+    executors.append(ex)
+    with patch("stock_bot.execution.ibkr.get_usd_cad_rate", return_value=1.35):
+        under_cap = ex.check_exposure({"RY": 250.0})
+    assert under_cap is False
 
 
 # ---------------------------------------------------------------------------

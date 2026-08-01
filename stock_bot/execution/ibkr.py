@@ -53,7 +53,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-from stock_bot.data.price_feed import get_sector
+from stock_bot.data.price_feed import get_sector, get_usd_cad_rate
 from stock_bot.execution.base import (
     OrderSide, OrderStatus, StockExecutorBase, StockOrder,
 )
@@ -593,9 +593,17 @@ class IBKRExecutor(StockExecutorBase):
             total += (px - cost) * shares
         return round(total, 2)
 
+    def _price_in_cad(self, sym: str, price: float) -> float:
+        """self.cash is CAD (base currency) — convert a USD-listed symbol's
+        native price before mixing it into a CAD total. Non-CAD contracts
+        route as USD in this codebase (see to_contract / _NYSE_CROSS_LISTED)."""
+        if self.to_contract(sym).currency == "CAD":
+            return price
+        return price * get_usd_cad_rate()
+
     def total_value(self, prices: dict[str, float]) -> float:
         pos_value = sum(
-            prices.get(sym, prices.get(sym.lower(), cost)) * shares
+            self._price_in_cad(sym, prices.get(sym, prices.get(sym.lower(), cost))) * shares
             for sym, (shares, cost) in self.positions_snapshot().items()
         )
         return round(self.cash + pos_value, 2)
@@ -670,7 +678,7 @@ class IBKRExecutor(StockExecutorBase):
         if total <= 0:
             return True
         snap = self.positions_snapshot()
-        pos_val = sum(shares * price_map.get(sym, cost)
+        pos_val = sum(shares * self._price_in_cad(sym, price_map.get(sym, cost))
                       for sym, (shares, cost) in snap.items())
         return (pos_val / total) < self._max_exposure_pct
 

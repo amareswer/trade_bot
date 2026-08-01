@@ -66,6 +66,52 @@ def get_sector(symbol: str) -> str:
     return _sector_cache[sym]
 
 
+# USD/CAD rate cache: (rate, fetched_at). TTL keeps it fresh without a network
+# call every scan cycle — FX doesn't move enough intra-day to matter for sizing.
+_fx_cache: tuple[float, float] | None = None
+_FX_TTL = 3600  # 1 hour
+_FX_FALLBACK_RATE = 1.35  # used only if yfinance is unreachable — logged loudly
+
+
+def is_cad_symbol(symbol: str) -> bool:
+    """TSX-listed symbols (.TO suffix) are CAD-denominated; everything else is USD."""
+    return symbol.upper().endswith(".TO")
+
+
+def get_usd_cad_rate() -> float:
+    """
+    Live USD->CAD rate (how many CAD per 1 USD), for converting USD share
+    prices into the account's CAD base currency before sizing a trade.
+    Cached for 1 hour. Falls back to a hardcoded rate (logged as a warning,
+    never silent) if yfinance is unreachable — sizing degrades gracefully
+    to the old un-converted behavior rather than crashing the scan cycle.
+    """
+    global _fx_cache
+    now = time.time()
+    if _fx_cache is not None and now - _fx_cache[1] < _FX_TTL:
+        return _fx_cache[0]
+
+    fi = fetch_with_retry(lambda: yf.Ticker("CAD=X").fast_info, label="USDCAD:fx")
+    rate = None
+    if fi is not None:
+        raw = getattr(fi, "last_price", None) or getattr(fi, "lastPrice", None)
+        if raw is not None:
+            try:
+                rate = float(raw)
+            except (TypeError, ValueError):
+                rate = None
+
+    if rate is None or rate <= 0:
+        logger.warning(
+            "USD/CAD rate unavailable — using fallback %.4f (position sizing "
+            "for USD symbols may be off vs. the live rate)", _FX_FALLBACK_RATE,
+        )
+        rate = _FX_FALLBACK_RATE
+
+    _fx_cache = (rate, now)
+    return rate
+
+
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
