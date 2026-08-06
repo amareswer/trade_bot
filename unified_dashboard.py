@@ -289,7 +289,7 @@ def _read_gate_stats() -> dict:
     the window's BUY fees.
     """
     out = {"sells": 0, "pf": None, "wins": 0, "losses": 0, "shadow": None,
-           "shadow_age_d": None, "realized": 0.0}
+           "shadow_age_d": None, "realized": 0.0, "shadow_na": False}
     try:
         import sqlite3
         con = sqlite3.connect("logs/trades.db")
@@ -330,9 +330,21 @@ def _read_gate_stats() -> dict:
         reports = sorted(glob.glob("logs/shadow_report_*.md"))
         if reports:
             text = open(reports[-1], encoding="utf-8").read()
-            m = re.search(r"Match rate[^0-9]*([0-9]+(?:\.[0-9]+)?)\s*%", text)
-            if m:
-                out["shadow"] = float(m.group(1))
+            # Match strictly within the "Match rate" table row (bounded to
+            # the rest of that line) — must never bleed into an unrelated
+            # number further down the report. Bug found 2026-08-05: when
+            # the row read "N/A" (no comparable candles — that day's Kraken
+            # fetch failed), the old unbounded regex fell through to the
+            # next X.XX% pattern in the document, which happened to be the
+            # unrelated BACKTEST_FEE_PCT assumption — showing a fabricated
+            # "0.8%" fidelity failure instead of "no data, audit failed".
+            row = re.search(r"\|\s*\**Match rate\**\s*\|([^\n]*)", text)
+            if row:
+                num = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%", row.group(1))
+                if num:
+                    out["shadow"] = float(num.group(1))
+                elif "N/A" in row.group(1).upper():
+                    out["shadow_na"] = True
             d = re.search(r"shadow_report_(\d{8})\.md", reports[-1])
             if d:
                 report_day = datetime.strptime(d.group(1), "%Y%m%d").date()
@@ -373,7 +385,14 @@ def _gate_tracker_section() -> str:
     pf_block = _stat_block("Gate 2 · Live PF (net)", pf_val, pf_sub)
 
     if g["shadow"] is None:
-        sh_val, sh_sub = "—", "run python shadow_signal.py"
+        if g["shadow_na"]:
+            sh_val, sh_sub = (
+                "N/A",
+                "today's audit found no comparable data — likely a Kraken "
+                "fetch error, see logs/shadow_signal.log",
+            )
+        else:
+            sh_val, sh_sub = "—", "run python shadow_signal.py"
     else:
         sh_col = "#3fb950" if g["shadow"] >= 95 else "#f85149"
         age = g["shadow_age_d"]

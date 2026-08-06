@@ -174,7 +174,7 @@ need the full narrative behind any decision below.
 
 ## Test Suite Manifest (reconciled 2026-08-05)
 
-Expected total: **465 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~10s — if it takes minutes, a test is reading live `.env` config.
+Expected total: **474 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~10s — if it takes minutes, a test is reading live `.env` config.
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -225,11 +225,13 @@ Expected total: **465 tests** (verified via `pytest --collect-only -q`; table su
 | `test_yf_client_retry.py` | 4 | `fetch_with_retry`: generic exceptions now retried with a short delay (not zero retries), give up after max_attempts, short delay ≠ rate-limit backoff, rate-limit path unchanged |
 | `test_research_aggregator_timeout.py` | 1 | Per-source research-fetch timeout: earnings gets a wider budget (45s) than news (15s) |
 | `test_kraken_retry.py` | 4 | `bot/exchanges/retry.fetch_with_retry`: succeeds without retrying, retries on failure and can recover, raises the last exception after exhausting attempts, custom attempts/delay respected |
+| `test_shadow_signal_retry.py` | 3 | `shadow_signal.shadow_replay` Kraken fetch now wrapped in `fetch_with_retry` (2026-08-05 fix — a single fetch hiccup used to waste the whole day's shadow audit): transient failure recovers, persistent failure still returns `[]` but only after retrying (not a silent single miss), first-try success doesn't retry |
+| `test_unified_dashboard.py` | 6 | `unified_dashboard._read_gate_stats`/`_gate_tracker_section` shadow-match-rate parsing (2026-08-05 fix — an unbounded regex let an "N/A" match-rate row fall through to a fabricated reading pulled from an unrelated number later in the report): passing/failing real percentages still parse correctly, N/A no longer bleeds into the unrelated BACKTEST_FEE_PCT number, N/A renders a distinct message from "never run", latest-by-filename report selection |
 | `test_stock_position_mark_refresh.py` | 4 | Stock-bot daily-loss breaker staleness fix: tests REAL `_mark_positions_to_market()` from stock_bot.main via a mocked `_fetch_symbol_data` — breaker trips from a price move alone (no fill), stays silent within limit, no-ops when executor is None, source-inspection guard confirms `run()` still calls it |
 | `test_grid_stress_test.py` | 14 | `grid_stress_test.py` pure helpers (crypto research tooling, not the live pipeline): crash-period date parsing, buy-and-hold P&L calc, PASS/MARGINAL/FAILED classification. Hermetic — the actual stress run against Binance is a separate manual step |
 | `test_grid_dca_experiment.py` | 12 | `grid_dca_experiment.py` standalone backtest engines (crypto research tooling, not the live pipeline): grid strategy fills/reopens/floor-stop, capital split across slots, fee math on both legs, DCA safety-order averaging + cycle restart, empty-candle edge cases |
 
-Run: `python -m pytest --tb=short -q` — must show **465 passed**.
+Run: `python -m pytest --tb=short -q` — must show **474 passed**.
 
 ---
 
@@ -496,6 +498,16 @@ EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-0
   from the "Trading Bot Master Spec" gap review is now fully closed through P2 — only P3
   (Postgres/Docker rewrite) remains, and that's off the table per the user's own call. See
   conversation history / `.memory/` for the fuller comparison.
+- **Unrelated fix, same day:** `unified_dashboard.py`'s Gate 3 "Shadow Match" briefly showed a
+  fabricated 0.8% — the dashboard's regex fell through an "N/A" match-rate row (that day's
+  shadow audit found 0 comparable candles — a Kraken fetch error) to an unrelated number
+  later in the report (`BACKTEST_FEE_PCT: 0.80%`). Root cause traced to `shadow_signal.py`'s
+  Kraken OHLCV fetch having no retry — one transient hiccup wasted the whole day's audit.
+  Both fixed: `shadow_signal.py` now uses `fetch_with_retry` (same helper as live candle/
+  ticker/depth fetches) on that call, and the dashboard regex is bounded to the "Match rate"
+  table row with an explicit N/A case instead of silently grabbing the next X.XX% it finds.
+  Re-running the audit after the fix showed the real number was 100.0% PASS all along — the
+  underlying strategy fidelity was never actually degraded, only the report generation was.
 - **Both bots:** crash-alert + atomic state writes + SIGTERM graceful shutdown + liveness
   tracking (detects hung loops, not just dead processes) all live.
 

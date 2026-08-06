@@ -44,6 +44,7 @@ from bot.strategy.indicator_strategy import IndicatorStrategy, IndicatorConfig
 from bot.strategy.threshold_strategy import Signal
 from bot.data.historical_feed import Candle
 from bot.strategy.fingerprint import compute_strategy_hash
+from bot.exchanges.retry import fetch_with_retry
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 SHADOW_LOOKBACK = int(os.getenv("SHADOW_LOOKBACK", "100"))
@@ -148,7 +149,14 @@ def shadow_replay(sym: str, exchange) -> list[ShadowRow]:
     total    = warmup_n + SHADOW_LOOKBACK
 
     try:
-        raw = exchange.fetch_ohlcv(sym, timeframe=LIVE_TIMEFRAME, limit=total)
+        # 2026-08-05: a single transient Kraken hiccup here (no retry) wasted
+        # the whole day's shadow audit — the report came back "0 rows" / "N/A"
+        # for a day that would otherwise have passed cleanly. Same retry
+        # helper already used for live candle/ticker/depth fetches elsewhere.
+        raw = fetch_with_retry(
+            lambda: exchange.fetch_ohlcv(sym, timeframe=LIVE_TIMEFRAME, limit=total),
+            label=f"{sym}:shadow_ohlcv",
+        )
     except Exception as exc:
         print(f"  [{sym}] fetch error: {exc}")
         return []
