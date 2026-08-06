@@ -517,17 +517,27 @@ checking a state `execute()` can never actually produce. The gap-#10 None-safe
 `reject_reason`/`side` fallback stays in place as cheap defense-in-depth against a future
 change to `execute()` breaking this invariant — not because it's currently reachable.
 
-**Item — FX sizing quirk (stock bot) — RE-VERIFIED still contained, no fix (as instructed)**
+**Item — FX sizing quirk (stock bot) — RESOLVED 2026-07-31, further hardened 2026-08-05**
 Full detail of the original quirk: `CLAUDE_HISTORY.md` 2026-07-17 entry ("Known FX sizing
-quirk"). Re-checked this pass: `git log` shows no commits have touched `check_exposure()`,
-`_MAX_PER_SECTOR`, or the sizing line (`stock_bot/main.py` ~1264-1265) since 2026-07-17.
-Live `stock_bot/.env` still has `PAPER_RISK_PCT=0.20` (matches the "20% target" the quirk
-was originally measured against) and no `PAPER_MAX_EXPOSURE_PCT` override (still the
-config.py default 0.25). `check_exposure()` uses the same unconverted USD price basis for
-both the sizing calc and the exposure-cap check, so the cap still self-consistently bounds
-cumulative exposure the same way it did when documented. Stock bot currently has 0 open
-positions — nothing live to worry about. Not fixed, per explicit instruction — still
-deliberately deferred to "revisit before live."
+quirk"). This entry previously said "no commits have touched `check_exposure()`... since
+2026-07-17" — that was true when written but is now stale. Two rounds of real fixes have
+landed since:
+- **2026-07-31 (`e8844e6`, "Implement USD/CAD conversion for pricing and exposure
+  calculations"):** `check_exposure()` in both `stock_bot/execution/paper.py` and
+  `ibkr.py` now converts non-CAD symbol prices through `get_usd_cad_rate()`
+  (`_price_in_cad()`) before comparing against `PAPER_MAX_EXPOSURE_PCT` — the "same
+  unconverted USD price basis" this entry described is gone. Found live the same day on
+  RY: a $842 USD spend was being sized against a CAD target as if $1 USD == $1 CAD,
+  running ~23% actual exposure against an intended 20%.
+- **2026-08-05 (this session, punch-list item #7):** `check_exposure()` gained an optional
+  `pending_trade_value` parameter — the FX-converted fix above still only checked exposure
+  *before* a trade, not projected after it, so one oversized single BUY could still blow
+  past the cap in one shot (caught the *next* attempt, not that one). `stock_bot/main.py`
+  now computes the target allocation before the exposure gate and passes it through. See
+  `test_fx_sizing.py`/`test_ibkr_executor.py`'s `check_exposure_*pending_trade_value*` tests.
+
+No further action needed here — both the original quirk and the follow-on precision gap
+are closed and tested.
 
 **Strategy hash:** unchanged, `659d1c03987b72fd`, confirmed after every one of the above
 changes (only `bot/execution/live_executor.py` and test files touched — no `bot/strategy/*`).

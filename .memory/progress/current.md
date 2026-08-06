@@ -5,7 +5,96 @@ metadata:
   type: project
 ---
 
-**Status as of 2026-07-28 (Stock Bot Breaker Staleness + Stall Investigation complete):**
+**Status as of 2026-08-05 (Trading-Spec Punch List P0–P2 Closed + Dashboard/Test-Pollution Fixes complete):**
+
+## Session 2026-08-05 — Trading-Spec Gap Review, Punch List P0–P2, Dashboard/Shadow Bugs (COMPLETE ✅)
+
+### Gap review against an external "Trading Bot Master Spec" the user shared
+Compared the stock bot against the spec section by section. Several described gaps turned
+out already solved or over-satisfied on closer inspection (sector cap, cash-reserve floor)
+— corrected the punch list mid-review rather than building redundant features. Full
+9-item list and section-by-section comparison lives in this session's conversation history.
+
+### P0 (5 items, all closed)
+1. **Sector concentration gate** — already implemented (`_MAX_PER_SECTOR=2`, both
+   executors' `buy()`), just untested. Added coverage, no behavior change.
+2. **ATR-based stop distance + risk-capped sizing** — opt-in, `PAPER_ATR_SIZING_ENABLED`
+   default **false**. `StockConfig.calc_shares_atr_risk()` mirrors the crypto bot's
+   `calc_trade_qty_atr_risk`; per-position stop % stored via
+   `set_position_stop_pct()`/`get_position_stop_pct()` so entry sizing and the actual SL/TP
+   watcher trigger agree. RY/CM live behavior unaffected until a `stock_backtest.py`
+   walk-forward PASS.
+3. **Breaker tiers expanded 1 → 4** — daily (existing) + weekly/drawdown-halt/kill-switch
+   (new). Kill-switch sticky + persisted (`ibkr_state.json`/`paper_state.json`), survives
+   restart, never auto-clears. All tiers block BUYs only, never SELL.
+4. **Correlation gate** — `stock_bot/risk/correlation.py`, reuses `bot/risk/correlation.py`'s
+   Pearson math unchanged. Zero extra network calls (unlike the crypto version) — reuses
+   candle closes the scan cycle already fetched. Active by default (only tightens BUYs).
+5. **Macro event blackout** — `stock_bot/risk/macro_calendar.py`. Jobs-report dates computed
+   algorithmically (first Friday/month, zero maintenance). FOMC/CPI/GDP dates are
+   user-maintained via `MACRO_EVENT_DATES` and ship **empty** — did not fabricate dates for
+   a timeline I can't verify. Active by default.
+
+### P1 (1 real fix — 2 items investigated, 1 was already by-design)
+- DCA/long-term bucket: confirmed by-design (two-bucket policy keeps it manual, not a gap).
+- Cash-reserve floor: already over-satisfied (`PAPER_MAX_EXPOSURE_PCT=0.25` = 75%+ floor).
+  Real gap found on closer look: `check_exposure()` checked current state only, not the
+  pending trade — a single oversized BUY could blow past the cap in one shot before the
+  *next* attempt got caught. Fixed: optional `pending_trade_value` param (defaults 0.0,
+  backward compatible); `stock_bot/main.py` now computes target allocation before the gate.
+
+### P2 (2 items closed)
+- **VIX crisis mode** — `stock_bot/risk/vix_crisis.py`, `^VIX >= 35` blocks all new BUYs
+  market-wide, shares the SPY regime filter's `_regime_ok` gate rather than a second path.
+- **Settlement date + FX-rate tax record-keeping** — minimal scope by explicit choice (data
+  capture only, no ACB/gain computation, no CRA-compliant report — descoped as its own
+  undertaking). `paper_trades.csv`/`ibkr_trades.csv` (frozen 9-col schema) **untouched** —
+  new fields go into separate `*_trades_settlement.csv` files, joined by
+  `(timestamp, symbol, side)`.
+
+### Unrelated bugs found and fixed the same session (user asked to check the dashboard)
+- **`unified_dashboard.py` Shadow Match showed a fabricated 0.8%** — unbounded regex fell
+  through an "N/A" match-rate row (that day's shadow audit found 0 comparable candles — a
+  Kraken fetch error) to an unrelated number later in the report (`BACKTEST_FEE_PCT:
+  0.80%`). Fixed: regex bounded to the "Match rate" row, explicit N/A case.
+- **`shadow_signal.py` had no retry on its Kraken OHLCV fetch** — one transient hiccup
+  wasted the whole day's audit. Wired through the existing `fetch_with_retry` helper. Real
+  number after the fix: 100.0% PASS, same as the prior 4 days — fidelity was never actually
+  degraded, only the report generation broke once.
+
+### Test-pollution incident (caught by the user noticing an unfamiliar CSV mid-commit)
+Adding the settlement CSV feature broke test isolation — 4 pre-existing test files'
+`sandbox` fixtures predated `_SETTLEMENT_CSV` and were never updated, so every suite run
+silently wrote fake RY/CM.TO/KO rows into the REAL `stock_bot/*_trades_settlement.csv`.
+Confirmed zero real trades were mixed in (frozen CSVs untouched since 07-31/07-17) before
+resetting both to header-only. Fixed at two levels: the 4 fixtures now redirect it
+explicitly, AND `conftest.py` gained a new autouse fixture
+(`_block_real_stock_bot_file_writes`) redirecting every known paper/ibkr file-path global to
+a tmp default for every test — same shape as the existing `_block_real_telegram_sends`
+fixture there (2026-07-29 incident, same root cause class). Files were also committed to
+git before being caught (clean/header-only, no pollution reached history) — untracked via
+`git rm --cached` + added to `.gitignore`.
+
+### Post-session housekeeping pass (user asked to research the wider codebase for gaps)
+- `known-gaps.md`'s "FX sizing quirk (stock bot)" entry was stale — claimed unfixed as of
+  2026-07-17, but was actually resolved by the 07-31 USD/CAD conversion commit and further
+  hardened by the `pending_trade_value` fix above. Corrected.
+- `requirements.txt`'s test-count comment updated 168 → 474.
+- `logs/live_state.json` (dead legacy fallback, confirmed inert since 2026-07-02, never
+  actually deleted) — deleted. `unified_dashboard.py`'s per-symbol state file
+  (`live_state_BTC_CAD.json`) is the only one actually read; verified dashboard still
+  regenerates clean without it.
+- `.gitignore` gap for a stray root-level `trades.db` (flagged in gap #16, never added,
+  "could quietly reappear the same way" as the settlement-CSV issue above) — added.
+- Checked for other instances of the same "unbounded regex across a whole document" bug
+  class that caused the dashboard issue — none found; every other regex in
+  `unified_dashboard.py` operates per-line, not per-document.
+
+**Tests:** 332 → 474 (142 new tests this session). Manifest reconciled in CLAUDE.md after
+every addition (checked table sum == `pytest --collect-only -q` count each time).
+**Strategy hash unchanged** — no `bot/strategy/*` or `stock_bot/strategy/*` files touched.
+
+---
 
 ## Session 2026-07-28 (cont'd) — Stock Bot Breaker Staleness + Stall Investigation (COMPLETE ✅)
 

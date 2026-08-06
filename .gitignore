@@ -31,6 +31,12 @@ ENV/
 *.log
 logs/
 
+# Stray root-level trades.db (the real one is logs/trades.db, covered by logs/
+# above) — a diagnostic sqlite3.connect('trades.db') one-liner run from repo
+# root creates this untracked; a broad `git add` swept it into a commit once
+# before (2026-07-30, see .memory/decisions/known-gaps.md #16). Never real data.
+/trades.db
+
 # Test cache
 .pytest_cache/
 .coverage

@@ -16,4 +16,4 @@ pytz>=2023.3         # timezone-aware market hours handling (stock bot)
 # numpy>=1.26         # numerical strategies
 
 # Dev / test
-pytest>=7.0          # test suite runner (168 tests — see CLAUDE.md manifest)
+pytest>=7.0          # test suite runner (474 tests — see CLAUDE.md manifest)
