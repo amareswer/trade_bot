@@ -90,3 +90,46 @@ def test_na_case_renders_distinct_message_from_never_run(sandbox):
     (sandbox / "logs" / "shadow_report_20260805.md").unlink()
     html_never_run = ud._gate_tracker_section()
     assert "run python shadow_signal.py" in html_never_run
+
+
+# ── _crypto_card: STALE badge vs "no fills, bot alive" (fixed 2026-08-06) ───
+#
+# Bug: the badge only looked at state-file age (saved_at, which only updates
+# on a fill or a restart). BTC/CAD trades every 1-3 weeks, so a perfectly
+# healthy bot with zero fills for a week showed the same red "STALE" alarm
+# as an actually-hung bot. Fix: cross-check logs/trade_bot.log freshness (the
+# same signal the "Crypto Bot" heartbeat card uses) — a fresh log means the
+# scan loop is alive and this is just "no fills," not a stall.
+
+def _old_state(hours_old: float) -> dict:
+    from datetime import datetime, timedelta, timezone
+    saved_at = (datetime.now(timezone.utc) - timedelta(hours=hours_old)).isoformat()
+    return {"symbol": "BTC/CAD", "cash": 77.0, "position": 0.0, "cost_basis": 0.0,
+            "realized_pnl": 0.0, "fees_paid": 0.0, "saved_at": saved_at}
+
+
+def test_old_state_with_fresh_log_shows_no_fills_not_stale(monkeypatch):
+    monkeypatch.setattr(ud, "_fetch_crypto_price", lambda sym: "$90,000.00")
+    monkeypatch.setattr(ud, "_file_age_h", lambda path: 0.5)   # log touched 30 min ago
+    html = ud._crypto_card("BTC/CAD", _old_state(hours_old=7 * 24))
+    assert "NO FILLS · 7d" in html
+    assert "bot alive" in html
+    assert "STALE" not in html
+
+
+def test_old_state_with_stale_log_still_shows_stale(monkeypatch):
+    monkeypatch.setattr(ud, "_fetch_crypto_price", lambda sym: "$90,000.00")
+    monkeypatch.setattr(ud, "_file_age_h", lambda path: 72.0)   # log itself untouched 3 days
+    html = ud._crypto_card("BTC/CAD", _old_state(hours_old=7 * 24))
+    assert "STALE · 7d old" in html
+    assert "check the bot" in html
+    assert "NO FILLS" not in html
+
+
+def test_fresh_state_shows_live_regardless_of_log_age(monkeypatch):
+    monkeypatch.setattr(ud, "_fetch_crypto_price", lambda sym: "$90,000.00")
+    monkeypatch.setattr(ud, "_file_age_h", lambda path: 72.0)
+    html = ud._crypto_card("BTC/CAD", _old_state(hours_old=1))
+    assert "LIVE · BTC/CAD" in html
+    assert "STALE" not in html
+    assert "NO FILLS" not in html

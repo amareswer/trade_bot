@@ -174,7 +174,7 @@ need the full narrative behind any decision below.
 
 ## Test Suite Manifest (reconciled 2026-08-05)
 
-Expected total: **474 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~10s — if it takes minutes, a test is reading live `.env` config.
+Expected total: **486 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~11s — if it takes minutes, a test is reading live `.env` config.
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -226,12 +226,13 @@ Expected total: **474 tests** (verified via `pytest --collect-only -q`; table su
 | `test_research_aggregator_timeout.py` | 1 | Per-source research-fetch timeout: earnings gets a wider budget (45s) than news (15s) |
 | `test_kraken_retry.py` | 4 | `bot/exchanges/retry.fetch_with_retry`: succeeds without retrying, retries on failure and can recover, raises the last exception after exhausting attempts, custom attempts/delay respected |
 | `test_shadow_signal_retry.py` | 3 | `shadow_signal.shadow_replay` Kraken fetch now wrapped in `fetch_with_retry` (2026-08-05 fix — a single fetch hiccup used to waste the whole day's shadow audit): transient failure recovers, persistent failure still returns `[]` but only after retrying (not a silent single miss), first-try success doesn't retry |
-| `test_unified_dashboard.py` | 6 | `unified_dashboard._read_gate_stats`/`_gate_tracker_section` shadow-match-rate parsing (2026-08-05 fix — an unbounded regex let an "N/A" match-rate row fall through to a fabricated reading pulled from an unrelated number later in the report): passing/failing real percentages still parse correctly, N/A no longer bleeds into the unrelated BACKTEST_FEE_PCT number, N/A renders a distinct message from "never run", latest-by-filename report selection |
+| `test_unified_dashboard.py` | 9 | `unified_dashboard._read_gate_stats`/`_gate_tracker_section` shadow-match-rate parsing (2026-08-05 fix — an unbounded regex let an "N/A" match-rate row fall through to a fabricated reading pulled from an unrelated number later in the report): passing/failing real percentages still parse correctly, N/A no longer bleeds into the unrelated BACKTEST_FEE_PCT number, N/A renders a distinct message from "never run", latest-by-filename report selection; `_crypto_card` STALE-vs-NO-FILLS badge (2026-08-06 fix — state-file age alone flagged a healthy week-quiet bot as STALE): old state + fresh trade_bot.log → "NO FILLS · Nd — bot alive", old state + stale log → still "STALE ... check the bot", fresh state → "LIVE" regardless of log age |
 | `test_stock_position_mark_refresh.py` | 4 | Stock-bot daily-loss breaker staleness fix: tests REAL `_mark_positions_to_market()` from stock_bot.main via a mocked `_fetch_symbol_data` — breaker trips from a price move alone (no fill), stays silent within limit, no-ops when executor is None, source-inspection guard confirms `run()` still calls it |
+| `test_sl_tp_watcher_audit_log.py` | 9 | First behavioral coverage of `_check_open_positions_sl_tp` (previously untested) plus the 2026-08-06 INFO-level "N/M positions priced" audit log — added after a yfinance outage broke the main scan loop for a full day with no direct evidence either way on whether this separate `get_live_price()` path (fast_info, independent thread) was also blind. Covers full/partial/total pricing failure counts, no-log-when-no-positions, zero-share exclusion, None-executor no-op, and basic STOP_LOSS/TAKE_PROFIT trigger sanity |
 | `test_grid_stress_test.py` | 14 | `grid_stress_test.py` pure helpers (crypto research tooling, not the live pipeline): crash-period date parsing, buy-and-hold P&L calc, PASS/MARGINAL/FAILED classification. Hermetic — the actual stress run against Binance is a separate manual step |
 | `test_grid_dca_experiment.py` | 12 | `grid_dca_experiment.py` standalone backtest engines (crypto research tooling, not the live pipeline): grid strategy fills/reopens/floor-stop, capital split across slots, fee math on both legs, DCA safety-order averaging + cycle restart, empty-candle edge cases |
 
-Run: `python -m pytest --tb=short -q` — must show **474 passed**.
+Run: `python -m pytest --tb=short -q` — must show **486 passed**.
 
 ---
 
@@ -522,6 +523,24 @@ EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-0
   — same shape of fix as the existing `_block_real_telegram_sends` fixture there, which exists
   for the identical reason (2026-07-29 incident: a test forgetting to mock Telegram sent a
   real message). A future new persisted-file addition can't repeat this by omission again.
+- **Stock bot yfinance outage, 2026-08-05, and dashboard fixes found while checking it
+  (2026-08-06):** the main scan loop's `yf.download()` (Phase 1 price fetch) failed for the
+  entire NYSE trading session (09:30–16:00+ ET, 174 consecutive "0/28 symbols returned data"
+  cycles) — yfinance returned "possibly delisted" for real large caps (CVX, GM, etc.),
+  characteristic of a Yahoo-side rate-limit/block, not actual delistings. The bot's own
+  detection worked correctly (logged clearly, fired a Telegram OPS ALERT every cycle) and
+  yfinance was confirmed working again by the next check. Two follow-on fixes: (1)
+  `unified_dashboard.py`'s BTC/CAD "STALE" badge only looked at crypto state-file age
+  (which only updates on a fill/restart) — a perfectly healthy bot quiet for a week showed
+  the same red alarm as an actually-hung one; now cross-checks `logs/trade_bot.log`
+  freshness and shows amber "NO FILLS · Nd — bot alive" instead when the bot is confirmed
+  alive but just hasn't traded. (2) `_check_open_positions_sl_tp` (the SL/TP watcher —
+  separate from Phase 1, uses `get_live_price()`/`fast_info`, a different yfinance endpoint,
+  independent 30s thread) had zero log evidence of whether it was also blind during the
+  outage — per-symbol failures only logged at debug, uncaptured by the file handler. Added
+  an always-visible INFO "SL/TP check: N/M positions priced" line every tick so a future
+  outage leaves direct proof instead of requiring after-the-fact code-path inference. Also
+  the first behavioral test coverage `_check_open_positions_sl_tp` has ever had.
 - **Both bots:** crash-alert + atomic state writes + SIGTERM graceful shutdown + liveness
   tracking (detects hung loops, not just dead processes) all live.
 

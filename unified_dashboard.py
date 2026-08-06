@@ -948,10 +948,24 @@ def _crypto_card(symbol: str, state: dict) -> str:
 
     age = _hours_old(state.get("saved_at"))
     if age is not None and age > STALE_AFTER_H:
-        badge = (
-            f'<span class="pf-card-badge" style="background:#f8514922;color:#f85149;'
-            f'border-color:#f8514955">STALE · {age/24:.0f}d old</span>'
-        )
+        # saved_at only updates on a fill or a restart (LiveExecutor._save_state()
+        # call sites) — a strategy that trades every 1-3 weeks can easily leave
+        # this file untouched for days while the bot is completely healthy. Cross-
+        # check log freshness (same signal the "Crypto Bot" heartbeat card uses)
+        # before calling it STALE, so "no fills" and "bot might be down" don't
+        # render as the same red alarm (found 2026-08-06 — a week of BTC/CAD
+        # silence with zero fills read as a false-positive staleness warning).
+        log_age = _file_age_h("logs/trade_bot.log")
+        if log_age is not None and log_age < 8:
+            badge = (
+                f'<span class="pf-card-badge" style="background:#d2992222;color:#d29922;'
+                f'border-color:#d2992255">NO FILLS · {age/24:.0f}d — bot alive</span>'
+            )
+        else:
+            badge = (
+                f'<span class="pf-card-badge" style="background:#f8514922;color:#f85149;'
+                f'border-color:#f8514955">STALE · {age/24:.0f}d old — check the bot</span>'
+            )
     else:
         badge = (
             f'<span class="pf-card-badge" style="background:#1f6feb22;color:#58a6ff;'

@@ -579,13 +579,17 @@ def _check_open_positions_sl_tp(executor, cfg, notifier=None) -> None:
     """
     if executor is None:
         return
+    _checked = 0
+    _priced  = 0
     for symbol, (shares, avg_cost) in list(executor.positions_snapshot().items()):
         if shares <= 0:
             continue
+        _checked += 1
         live = get_live_price(symbol)
         if live is None:
             logger.debug("SL/TP check: skipping %s — no live price", symbol)
             continue
+        _priced += 1
         pct_change = (live - avg_cost) / avg_cost
         # Per-position ATR stop overrides the flat baseline when one was set
         # at entry (PAPER_ATR_SIZING_ENABLED) — must match what sizing used,
@@ -611,6 +615,18 @@ def _check_open_positions_sl_tp(executor, cfg, notifier=None) -> None:
                     notifier.fill("SELL", symbol, shares, live, shares * live,
                                   pnl=round((live - avg_cost) * shares, 2),
                                   reason="take profit")
+
+    # INFO-level (not debug) on purpose — added 2026-08-06 after a yfinance
+    # outage (fetch_candles/yf.download, "possibly delisted" for real tickers)
+    # broke the main scan loop for a full trading day and there was no direct
+    # evidence either way whether this watcher's separate get_live_price()
+    # path (fast_info, a different yfinance endpoint) was also blind — only
+    # per-symbol failures logged, at debug, which isn't captured anywhere.
+    # This one line, every 30s during market hours, is the audit trail: if a
+    # future outage shows 0/N priced here, that's the smoking gun; a steady
+    # N/N proves this watcher stayed healthy independent of Phase 1's fate.
+    if _checked > 0:
+        logger.info("SL/TP check: %d/%d positions priced", _priced, _checked)
 
 
 def _mark_positions_to_market(executor, price_data: dict[str, dict | None]) -> None:
