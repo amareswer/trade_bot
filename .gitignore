@@ -57,3 +57,5 @@ stock_bot/universe_cache.json
 stock_bot/archive/
 stock_bot/ibkr_trades.csv
 stock_bot/ibkr_state.json
+stock_bot/paper_trades_settlement.csv
+stock_bot/ibkr_trades_settlement.csv
