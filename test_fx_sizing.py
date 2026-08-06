@@ -90,6 +90,8 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(paper_mod, "_RESET_FLAG", str(tmp_path / ".reset"))
     price_feed._sector_cache["RY"] = "financial services"
     price_feed._sector_cache["CM.TO"] = "financial services"
+    price_feed._sector_cache["TD"] = "financial services"
+    price_feed._sector_cache["KO"] = "consumer defensive"
     return tmp_path
 
 
@@ -126,3 +128,67 @@ def test_check_exposure_accounts_for_fx_on_usd_position(sandbox):
         under_cap = ex.check_exposure({"RY": 125.0})
     # True value: (2*125*1.35) / total_value — must exceed the 30% cap
     assert under_cap is False
+
+
+# ── StockPaperExecutor: check_exposure projects the PENDING trade too ───────
+# (added 2026-08-05, punch-list item #7 — closes the gap where a single
+# large BUY could blow past the cap in one shot since the old check only
+# looked at current state, not the trade about to happen.)
+
+def test_check_exposure_pending_trade_value_defaults_to_current_state_only(sandbox):
+    ex = StockPaperExecutor(starting_cash=1000.0, max_exposure_pct=0.25)
+    # No positions open — current exposure is 0%, well under the cap.
+    assert ex.check_exposure({}) is True
+    # Omitting pending_trade_value preserves the old (pre-2026-08-05) behavior.
+    assert ex.check_exposure({}, pending_trade_value=0.0) is True
+
+
+def test_check_exposure_catches_a_single_oversized_buy():
+    ex = StockPaperExecutor(starting_cash=1000.0, max_exposure_pct=0.25)
+    # Nothing held yet, so a current-state-only check would pass (0% < 25%) —
+    # but a $400 pending BUY would be 40% of the account, over the cap.
+    assert ex.check_exposure({}) is True                                    # old behavior: allowed
+    assert ex.check_exposure({}, pending_trade_value=400.0) is False        # projected: correctly blocked
+
+
+def test_check_exposure_allows_pending_trade_that_stays_under_cap():
+    ex = StockPaperExecutor(starting_cash=1000.0, max_exposure_pct=0.25)
+    assert ex.check_exposure({}, pending_trade_value=200.0) is True   # 20% < 25%
+
+
+# ── StockPaperExecutor: sector concentration gate (_MAX_PER_SECTOR = 2) ─────
+# Previously untested even though the gate is live in the real buy() path
+# (found 2026-08-05).
+
+def test_paper_buy_rejected_when_sector_limit_reached(sandbox):
+    with patch("stock_bot.execution.paper.get_usd_cad_rate", return_value=1.35):
+        ex = StockPaperExecutor(starting_cash=100_000.0)
+        assert ex.buy("RY", 10, 100.0, reason="test").status.value == "FILLED"
+        assert ex.buy("CM.TO", 10, 100.0, reason="test").status.value == "FILLED"
+
+        order = ex.buy("TD", 10, 80.0, reason="test")
+    assert order.status.value == "REJECTED"
+    assert "Sector limit" in order.reject_reason
+    assert "financial services" in order.reject_reason
+
+
+def test_paper_buy_allowed_adding_to_already_held_sector_symbol(sandbox):
+    # The gate only blocks *new* positions in a full sector — topping up a
+    # symbol already held must not be blocked by its own sector count.
+    with patch("stock_bot.execution.paper.get_usd_cad_rate", return_value=1.35):
+        ex = StockPaperExecutor(starting_cash=100_000.0)
+        assert ex.buy("RY", 10, 100.0, reason="test").status.value == "FILLED"
+        assert ex.buy("CM.TO", 10, 100.0, reason="test").status.value == "FILLED"
+
+        order = ex.buy("RY", 5, 100.0, reason="test")
+    assert order.status.value == "FILLED"
+
+
+def test_paper_buy_allowed_different_sector_when_limit_reached(sandbox):
+    with patch("stock_bot.execution.paper.get_usd_cad_rate", return_value=1.35):
+        ex = StockPaperExecutor(starting_cash=100_000.0)
+        assert ex.buy("RY", 10, 100.0, reason="test").status.value == "FILLED"
+        assert ex.buy("CM.TO", 10, 100.0, reason="test").status.value == "FILLED"
+
+        order = ex.buy("KO", 10, 60.0, reason="test")   # not a bank — different sector
+    assert order.status.value == "FILLED"

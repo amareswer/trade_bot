@@ -82,9 +82,15 @@ class StockConfig:
     paper_sell_streak_min_conf: int # SELL verdicts >= this count toward the consecutive-SELL streak
     paper_sell_streak_cycles:   int # consecutive SELL cycles (each >= streak_min_conf) that force an exit
     paper_daily_loss_pct:    float   # daily loss circuit breaker (fraction)
+    paper_weekly_loss_pct:   float   # weekly loss circuit breaker (fraction, from week-open equity) — blocks new BUYs only
+    paper_drawdown_warning_pct: float # non-blocking alert threshold (fraction, from all-time peak equity)
+    paper_drawdown_halt_pct: float   # blocks new BUYs (fraction, from all-time peak equity) — auto-lifts on recovery
+    paper_kill_switch_pct:   float   # blocks new BUYs (fraction, from all-time peak equity) — sticky, survives restart, manual reset only
     paper_slippage_bps:      int     # simulated slippage in basis points
-    paper_stop_loss_pct:   float # stop-loss threshold as a fraction (e.g. 0.05 = -5%)
+    paper_stop_loss_pct:   float # stop-loss threshold as a fraction (e.g. 0.05 = -5%) — the baseline used by every position unless the ATR override below is active for it
     paper_take_profit_pct: float # take-profit threshold as a fraction (e.g. 0.12 = +12%)
+    paper_atr_sizing_enabled: bool  # opt-in (default false): ATR-based per-symbol stop distance + risk-capped share sizing, mirrors the crypto bot's ATR_SIZING_ENABLED. Requires stock_backtest.py validation before enabling live — see CLAUDE.md
+    paper_atr_sl_mult:      float  # ATR multiplier for the stop distance when paper_atr_sizing_enabled=true (e.g. 2.0 = stop at 2x ATR)
     paper_max_exposure_pct: float # max fraction of portfolio value in open positions
     paper_max_positions:   int   # max number of open positions at once
     universe_enabled:      bool  # scan S&P500+TSX60 instead of fixed watchlist
@@ -103,6 +109,8 @@ class StockConfig:
     ai_gate_rsi_max:       float # skip AI call when RSI > this (overbought, e.g. 75)
     ai_gate_adx_min:       float # skip AI call when ADX < this (ranging, e.g. 15)
     earnings_blackout_days: int  # block BUY within N days of next earnings date
+    macro_blackout_days:   int   # block ALL new BUYs within N days (either side) of a jobs-report or user-supplied macro event date
+    macro_event_dates_str: str   # comma-separated ISO dates (FOMC/CPI/GDP) — user-maintained, see stock_bot/risk/macro_calendar.py
     price_sanity_pct:      float # reject live price if it deviates >this from candle close (e.g. 0.05)
     regime_filter_enabled: bool  # block BUY when SPY is not in BULL regime
     regime_ma_period:      int   # slow SMA period for golden/death cross (default 200)
@@ -147,12 +155,27 @@ class StockConfig:
             errors.append("PAPER_SELL_STREAK_CYCLES must be >= 1")
         if not 0 < self.paper_daily_loss_pct <= 0.50:
             errors.append("PAPER_DAILY_LOSS_PCT must be between 0 (exclusive) and 0.50")
+        if not 0 < self.paper_weekly_loss_pct <= 0.75:
+            errors.append("PAPER_WEEKLY_LOSS_PCT must be between 0 (exclusive) and 0.75")
+        if not 0 < self.paper_drawdown_warning_pct <= 0.90:
+            errors.append("PAPER_DRAWDOWN_WARNING_PCT must be between 0 (exclusive) and 0.90")
+        if not 0 < self.paper_drawdown_halt_pct <= 0.90:
+            errors.append("PAPER_DRAWDOWN_HALT_PCT must be between 0 (exclusive) and 0.90")
+        if not 0 < self.paper_kill_switch_pct <= 0.95:
+            errors.append("PAPER_KILL_SWITCH_PCT must be between 0 (exclusive) and 0.95")
+        if not (self.paper_drawdown_warning_pct < self.paper_drawdown_halt_pct < self.paper_kill_switch_pct):
+            errors.append(
+                "Drawdown tiers must be strictly increasing: "
+                "PAPER_DRAWDOWN_WARNING_PCT < PAPER_DRAWDOWN_HALT_PCT < PAPER_KILL_SWITCH_PCT"
+            )
         if self.paper_slippage_bps < 0:
             errors.append("PAPER_SLIPPAGE_BPS must be >= 0")
         if not 0 <= self.paper_stop_loss_pct <= 0.50:
             errors.append("PAPER_STOP_LOSS_PCT must be between 0 and 0.50 (0 = disabled)")
         if not 0 <= self.paper_take_profit_pct <= 1.0:
             errors.append("PAPER_TAKE_PROFIT_PCT must be between 0 and 1.0 (0 = disabled)")
+        if self.paper_atr_sl_mult <= 0:
+            errors.append("PAPER_ATR_SL_MULT must be > 0")
         if not 0 < self.paper_max_exposure_pct <= 1.0:
             errors.append("PAPER_MAX_EXPOSURE_PCT must be between 0 (exclusive) and 1.0")
         if self.paper_max_positions < 1:
@@ -171,6 +194,43 @@ class StockConfig:
                 f"Universe scoring weights must sum to 1.0, got {total_weight:.3f}. "
                 f"Check UNIVERSE_WEIGHT_* in stock_bot/.env"
             )
+
+    def calc_shares_atr_risk(
+        self,
+        cash:            float,
+        price:           float,
+        atr_value:       float,
+        atr_mult:        float,
+        baseline_sl_pct: float,
+    ) -> int:
+        """
+        ATR-aware share sizing with a fixed-SL dollar-risk baseline — mirrors
+        the crypto bot's calc_trade_qty_atr_risk (root config.py), adapted
+        for whole-share stock sizing. Caps share count so a stop placed at
+        atr_mult * ATR away from entry never risks more dollars than the
+        fixed-% baseline stop would (min(), not equality — a tight ATR stop
+        does not size UP past the notional baseline).
+
+        cash, price, and atr_value must already be in the same currency
+        (the caller in stock_bot/main.py converts native-currency price/ATR
+        to CAD before calling this, matching how price_cad is prepared for
+        the existing notional-sizing block).
+
+        Opt-in only (PAPER_ATR_SIZING_ENABLED, default false) — see
+        "Risk-gate config (stock bot)" in CLAUDE.md. Do not enable live
+        without a stock_backtest.py walk-forward PASS first; this changes
+        both entry sizing and (via the paired stop-distance override) the
+        actual SL trigger distance for positions opened while it's active.
+        """
+        base_shares = int((cash * self.paper_risk_pct) / price) if price > 0 else 0
+        if (
+            price <= 0 or cash <= 0 or atr_value <= 0
+            or atr_mult <= 0 or baseline_sl_pct <= 0
+        ):
+            return base_shares
+        sl_distance = atr_value * atr_mult
+        risk_budget = cash * self.paper_risk_pct * baseline_sl_pct
+        return min(base_shares, int(risk_budget / sl_distance))
 
     def log_startup(self) -> None:
         logger.info("─" * 50)
@@ -211,9 +271,15 @@ def load() -> StockConfig:
         paper_sell_streak_min_conf = _int("PAPER_SELL_STREAK_MIN_CONF",  50),
         paper_sell_streak_cycles   = _int("PAPER_SELL_STREAK_CYCLES",    2),
         paper_daily_loss_pct    = _float("PAPER_DAILY_LOSS_PCT",    0.03),
+        paper_weekly_loss_pct   = _float("PAPER_WEEKLY_LOSS_PCT",   0.05),
+        paper_drawdown_warning_pct = _float("PAPER_DRAWDOWN_WARNING_PCT", 0.10),
+        paper_drawdown_halt_pct = _float("PAPER_DRAWDOWN_HALT_PCT", 0.15),
+        paper_kill_switch_pct   = _float("PAPER_KILL_SWITCH_PCT",   0.20),
         paper_slippage_bps      = _int("PAPER_SLIPPAGE_BPS",      15),
         paper_stop_loss_pct    = _float("PAPER_STOP_LOSS_PCT",     0.05),
         paper_take_profit_pct  = _float("PAPER_TAKE_PROFIT_PCT",   0.12),
+        paper_atr_sizing_enabled = _bool("PAPER_ATR_SIZING_ENABLED", False),
+        paper_atr_sl_mult      = _float("PAPER_ATR_SL_MULT",       2.0),
         paper_max_exposure_pct = _float("PAPER_MAX_EXPOSURE_PCT",  0.25),
         paper_max_positions    = _int  ("PAPER_MAX_POSITIONS",     4),
         universe_enabled       = _bool ("UNIVERSE_ENABLED",        False),
@@ -237,6 +303,8 @@ def load() -> StockConfig:
         ai_gate_rsi_max        = _float("AI_GATE_RSI_MAX",         75.0),
         ai_gate_adx_min        = _float("AI_GATE_ADX_MIN",         15.0),
         earnings_blackout_days = _int  ("EARNINGS_BLACKOUT_DAYS",  5),
+        macro_blackout_days   = _int  ("MACRO_BLACKOUT_DAYS",     1),
+        macro_event_dates_str = _str  ("MACRO_EVENT_DATES",       ""),
         price_sanity_pct       = _float("PRICE_SANITY_PCT",        0.05),
         regime_filter_enabled  = _bool ("REGIME_FILTER_ENABLED",   True),
         regime_ma_period       = _int  ("REGIME_MA_PERIOD",        200),

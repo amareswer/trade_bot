@@ -59,6 +59,8 @@ from stock_bot.execution.paper      import StockPaperExecutor
 from stock_bot.execution.base       import OrderStatus
 from stock_bot.execution.exit_policy import ExitPolicy
 from stock_bot.strategy.rules       import rule_signal
+from stock_bot.risk.correlation     import CORRELATION_THRESHOLD, fetch_correlation_from_closes
+from stock_bot.risk.macro_calendar  import is_macro_blackout, parse_user_event_dates
 from stock_bot.fast_validator       import FastValidator
 from stock_bot.analysis.accuracy_tracker import LiveTradingGate
 
@@ -482,6 +484,51 @@ def _check_price_uniformity(scan_results: list) -> bool:
     return True
 
 
+def _check_correlation_gate(
+    symbol: str, executor, price_data: dict,
+) -> tuple[str | None, float | None]:
+    """
+    Returns (peer_symbol, correlation) for the first currently-open position
+    whose 30-day daily-return correlation with `symbol` exceeds
+    CORRELATION_THRESHOLD (0.70) — or (None, None) when nothing crosses it.
+
+    Fail-open, like the crypto bot's equivalent gate: a peer with no candle
+    data in this cycle's price_data (e.g. a held symbol dropped from the
+    watchlist) is skipped rather than blocking the BUY. Zero extra network
+    calls — reuses candle closes this scan cycle already fetched.
+    """
+    my_data = price_data.get(symbol.upper())
+    if not my_data or not my_data.get("candles"):
+        return None, None
+    my_closes = [c.close for c in my_data["candles"]]
+    for peer in executor.positions_snapshot():
+        if peer.upper() == symbol.upper():
+            continue
+        peer_data = price_data.get(peer.upper())
+        if not peer_data or not peer_data.get("candles"):
+            continue
+        peer_closes = [c.close for c in peer_data["candles"]]
+        corr = fetch_correlation_from_closes(my_closes, peer_closes)
+        if corr is not None and corr > CORRELATION_THRESHOLD:
+            return peer, corr
+    return None, None
+
+
+def _is_macro_event_blackout(cfg) -> tuple[bool, date | None]:
+    """
+    Market-wide blackout — unlike earnings blackout, not per-symbol. Blocks
+    ALL new BUYs within cfg.macro_blackout_days of a jobs-report date or a
+    user-supplied FOMC/CPI/GDP date (MACRO_EVENT_DATES in stock_bot/.env).
+    Fail-open on a bad config value, same philosophy as the earnings gate.
+    """
+    try:
+        user_dates = parse_user_event_dates(cfg.macro_event_dates_str)
+        return is_macro_blackout(date.today(), cfg.macro_blackout_days, user_dates)
+    except Exception as exc:
+        logger.warning("Macro event blackout check failed (%s) — allowing trade", exc)
+        return False, None
+
+
 def _is_earnings_blackout(symbol: str, research, cfg) -> bool:
     """
     Returns True if symbol is within earnings_blackout_days of its next earnings date.
@@ -539,7 +586,15 @@ def _check_open_positions_sl_tp(executor, cfg, notifier=None) -> None:
             logger.debug("SL/TP check: skipping %s — no live price", symbol)
             continue
         pct_change = (live - avg_cost) / avg_cost
-        if pct_change <= -abs(cfg.paper_stop_loss_pct):
+        # Per-position ATR stop overrides the flat baseline when one was set
+        # at entry (PAPER_ATR_SIZING_ENABLED) — must match what sizing used,
+        # or the risk cap computed at entry time means nothing at exit time.
+        _effective_stop_pct = (
+            executor.get_position_stop_pct(symbol, cfg.paper_stop_loss_pct)
+            if hasattr(executor, "get_position_stop_pct")
+            else cfg.paper_stop_loss_pct
+        )
+        if pct_change <= -abs(_effective_stop_pct):
             order = executor.sell(symbol, shares, live, reason="STOP_LOSS_HIT")
             if order.status == OrderStatus.FILLED:
                 print(f"  🛑 STOP LOSS triggered: {symbol} @ ${live:.2f} ({pct_change:+.1%})")
@@ -667,6 +722,13 @@ def run() -> None:
     if executor:
         executor.set_daily_loss_limit(cfg.paper_daily_loss_pct)
     if executor:
+        executor.set_weekly_loss_limit(cfg.paper_weekly_loss_pct)
+        executor.set_drawdown_limits(
+            cfg.paper_drawdown_warning_pct,
+            cfg.paper_drawdown_halt_pct,
+            cfg.paper_kill_switch_pct,
+        )
+    if executor:
         executor.set_slippage_bps(cfg.paper_slippage_bps)
     if executor:
         try:
@@ -749,11 +811,35 @@ def run() -> None:
     # Market-hours gated: prices cannot move while markets are closed, and
     # unguarded weekend polling kept the IP permanently yfinance-rate-limited
     # (each 30s retry cycle re-tripped the limiter — observed 2026-07-04).
+    _dd_warning_active = False
+
+    def _check_drawdown_warning() -> None:
+        # Non-blocking tier (10% drawdown from peak by default) — the
+        # blocking tiers (weekly loss, 15% halt, 20% kill switch) live inside
+        # the executor's buy() gate and need no alert wiring here; this is
+        # the one tier that never rejects an order, so it has no reject_reason
+        # to piggyback an alert on and gets its own explicit check instead.
+        nonlocal _dd_warning_active
+        if executor is None or not hasattr(executor, "drawdown_status"):
+            return
+        status = executor.drawdown_status()
+        if status["warning"] and not _dd_warning_active:
+            _dd_warning_active = True
+            notifier.ops_alert(
+                "Drawdown warning",
+                f"Portfolio down {status['drawdown_pct']:.1%} from peak "
+                f"${status['peak_equity']:,.2f} (current ${status['current_equity']:,.2f}). "
+                f"Trading continues — this is a non-blocking warning tier.",
+            )
+        elif not status["warning"]:
+            _dd_warning_active = False
+
     def _sl_tp_watcher() -> None:
         while True:
             try:
                 if _get_market_status()["any_open"]:
                     _check_open_positions_sl_tp(executor, cfg, notifier)
+                    _check_drawdown_warning()
                     time.sleep(30)
                 else:
                     time.sleep(300)   # closed — check the clock, not Yahoo
@@ -1227,6 +1313,21 @@ def run() -> None:
                         else f"AI {verdict.confidence}%" if verdict else "?"
                     )
                     if _act_buy:
+                        _macro_blocked, _macro_event = _is_macro_event_blackout(cfg)
+                        if _macro_blocked:
+                            logger.info(
+                                "MACRO BLACKOUT: %s blocked — event on %s (within %d days)",
+                                symbol, _macro_event, cfg.macro_blackout_days,
+                            )
+                            print(
+                                f"  🚫 MACRO BLACKOUT: {symbol} — "
+                                f"event on {_macro_event} | {_trigger} blocked"
+                            )
+                            print(f"  {'─' * 70}")
+                            # Market-wide, not per-symbol — reuses the earnings-block
+                            # set so the swing book also sits out (see its comment above).
+                            _fv_earnings_blocked.add(symbol.upper())
+                            continue
                         if _is_earnings_blackout(symbol, report, cfg):
                             _ned = report.earnings.next_earnings_date if report else None
                             _days_left = (_ned - date.today()).days if _ned else "?"
@@ -1257,30 +1358,68 @@ def run() -> None:
                             print(f"  📄 SKIP: {symbol} — held in swing book (no double exposure)")
                         elif _regime_ok and executor.position(symbol) == 0:
                             _price_map_now = {r.symbol: r.price for r in scan_results}
-                            if not executor.check_exposure(_price_map_now):
+                            _corr_peer, _corr_val = _check_correlation_gate(symbol, executor, price_data)
+                            # Account cash/exposure figures are CAD (the account's base
+                            # currency — IBKRExecutor.cash reads IBKR's BASE/CAD row).
+                            # US-listed share prices are USD. Without converting, a USD
+                            # buy's target allocation was being spent as if $1 USD == $1
+                            # CAD, silently running ~15-35% over the intended risk_pct
+                            # (found live 2026-07-31 on RY: $842 USD spent against a
+                            # $1,002 CAD target — actually ~$1,150+ CAD, ~23% not 20%).
+                            #
+                            # Computed here (before the exposure gate below), not inside
+                            # the sizing branch, so check_exposure can project exposure
+                            # AFTER this trade rather than only checking current state —
+                            # a current-state-only check can't see a single large BUY
+                            # blow past the cap in one shot; it only catches it on the
+                            # *next* BUY attempt, once already over (found 2026-08-05).
+                            fx_rate = get_usd_cad_rate()
+                            snap    = executor.positions_snapshot()
+                            pos_val = sum(
+                                sh * co * (1.0 if is_cad_symbol(sym) else fx_rate)
+                                for sym, (sh, co) in snap.items()
+                            )
+                            alloc   = (executor.cash + pos_val) * cfg.paper_risk_pct
+                            if not executor.check_exposure(_price_map_now, pending_trade_value=alloc):
                                 print(f"  📄 SKIP: {symbol} — max exposure ({cfg.paper_max_exposure_pct*100:.0f}%) reached")
                             elif len(executor.positions_snapshot()) >= cfg.paper_max_positions:
                                 print(f"  📄 SKIP: {symbol} — max {cfg.paper_max_positions} positions reached")
-                            else:
-                                # Account cash/exposure figures are CAD (the account's base
-                                # currency — IBKRExecutor.cash reads IBKR's BASE/CAD row).
-                                # US-listed share prices are USD. Without converting, a USD
-                                # buy's target allocation was being spent as if $1 USD == $1
-                                # CAD, silently running ~15-35% over the intended risk_pct
-                                # (found live 2026-07-31 on RY: $842 USD spent against a
-                                # $1,002 CAD target — actually ~$1,150+ CAD, ~23% not 20%).
-                                fx_rate = get_usd_cad_rate()
-                                snap    = executor.positions_snapshot()
-                                pos_val = sum(
-                                    sh * co * (1.0 if is_cad_symbol(sym) else fx_rate)
-                                    for sym, (sh, co) in snap.items()
+                            elif _corr_peer is not None:
+                                logger.warning(
+                                    "CORRELATION GATE: %s blocked — correlation %.2f with open %s",
+                                    symbol, _corr_val, _corr_peer,
                                 )
+                                print(f"  📄 SKIP: {symbol} — correlation {_corr_val:.2f} with open {_corr_peer} (> {CORRELATION_THRESHOLD:.2f})")
+                            else:
                                 price_cad = (
                                     execution_price if is_cad_symbol(symbol)
                                     else execution_price * fx_rate
                                 )
-                                alloc   = (executor.cash + pos_val) * cfg.paper_risk_pct
                                 shares  = int(alloc / price_cad) if price_cad > 0 else 0
+                                # ATR-aware sizing (opt-in, PAPER_ATR_SIZING_ENABLED):
+                                # cap shares so a stop at atr_sl_mult*ATR away never
+                                # risks more $ than the flat-% baseline stop would,
+                                # and remember that same ATR stop distance for THIS
+                                # position so the exit check (below) uses it instead
+                                # of the flat baseline — sizing and the actual stop
+                                # must agree, or the risk cap here is meaningless.
+                                _atr_stop_pct = None
+                                if cfg.paper_atr_sizing_enabled:
+                                    _atr_now = data.get("atr") if data else None
+                                    if _atr_now and _atr_now > 0 and execution_price > 0:
+                                        _atr_cad = (
+                                            _atr_now if is_cad_symbol(symbol)
+                                            else _atr_now * fx_rate
+                                        )
+                                        shares = cfg.calc_shares_atr_risk(
+                                            executor.cash + pos_val, price_cad,
+                                            _atr_cad, cfg.paper_atr_sl_mult,
+                                            cfg.paper_stop_loss_pct,
+                                        )
+                                        _atr_stop_pct = min(
+                                            (_atr_now * cfg.paper_atr_sl_mult) / execution_price,
+                                            0.50,   # sanity cap — never a >50% stop
+                                        )
                                 if shares == 0 and execution_price > 0:
                                     logger.info(
                                         "SIZE_SKIP: %s — target allocation $%.2f CAD "
@@ -1320,6 +1459,9 @@ def run() -> None:
                                         total = round(shares * execution_price, 2)
                                         print(f"  📄 PAPER BUY:  {symbol}  {shares} shares")
                                         print(f"                 @ ${execution_price:,.2f} = ${total:,.2f}")
+                                        if _atr_stop_pct is not None:
+                                            executor.set_position_stop_pct(symbol, _atr_stop_pct)
+                                            print(f"                 ATR stop: {_atr_stop_pct:.1%} (vs flat {cfg.paper_stop_loss_pct:.1%})")
                                         notifier.fill("BUY", symbol, shares,
                                                       execution_price, total,
                                                       reason=reason)

@@ -288,6 +288,51 @@ def test_buy_allowed_low_equity_cad_security(executors):
     assert order.status == OrderStatus.FILLED
 
 
+# ---------------------------------------------------------------------------
+# Sector concentration gate (_MAX_PER_SECTOR = 2) — previously untested even
+# though the gate is live in the real trading path (found 2026-08-05).
+# ---------------------------------------------------------------------------
+
+def _bank_sector(sym: str) -> str:
+    # CM's held position snapshots back as "CM.TO" (TSE/CAD contract mapping).
+    return "financial services" if sym.upper() in ("RY", "CM", "CM.TO", "TD") else "other"
+
+
+def test_buy_rejected_when_sector_limit_reached(executors, monkeypatch):
+    monkeypatch.setattr(ibkr_mod, "get_sector", _bank_sector)
+    fake = FakeIB(positions=[_ry_position(), _cm_position()])   # 2 banks already open
+    ex = make_executor(fake)
+    executors.append(ex)
+
+    order = ex.buy("TD", 1, 80.0, reason="test")
+    assert order.status == OrderStatus.REJECTED
+    assert "Sector limit" in order.reject_reason
+    assert "financial services" in order.reject_reason
+    assert fake.placed == []              # never reached the broker
+
+
+def test_buy_allowed_adding_to_already_held_sector_symbol(executors, monkeypatch):
+    # The gate only blocks *new* positions in a full sector — topping up a
+    # symbol already held must not be blocked by its own sector count.
+    monkeypatch.setattr(ibkr_mod, "get_sector", _bank_sector)
+    fake = FakeIB(positions=[_ry_position(), _cm_position()], fill_price=210.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+
+    order = ex.buy("RY", 1, 210.0, reason="test")
+    assert order.status == OrderStatus.FILLED
+
+
+def test_buy_allowed_different_sector_when_limit_reached(executors, monkeypatch):
+    monkeypatch.setattr(ibkr_mod, "get_sector", _bank_sector)
+    fake = FakeIB(positions=[_ry_position(), _cm_position()], fill_price=60.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+
+    order = ex.buy("KO", 1, 60.0, reason="test")   # not a bank — different sector
+    assert order.status == OrderStatus.FILLED
+
+
 def test_buy_rejected_on_fill_timeout(executors):
     fake = FakeIB(fill_mode="never")
     ex = make_executor(fake, fill_timeout_s=0.5)
@@ -444,6 +489,37 @@ def test_check_exposure_flags_usd_position_understated_without_fx(executors):
 
 
 # ---------------------------------------------------------------------------
+# check_exposure projects the PENDING trade too (added 2026-08-05,
+# punch-list item #7 — closes the gap where a single large BUY could blow
+# past the cap in one shot since the old check only looked at current state).
+# ---------------------------------------------------------------------------
+
+def test_check_exposure_pending_trade_value_defaults_to_current_state_only(executors):
+    fake = FakeIB(net_liq=1000.0, cash=1000.0)
+    ex = make_executor(fake, max_exposure_pct=0.25)
+    executors.append(ex)
+    assert ex.check_exposure({}) is True
+    assert ex.check_exposure({}, pending_trade_value=0.0) is True
+
+
+def test_check_exposure_catches_a_single_oversized_buy(executors):
+    fake = FakeIB(net_liq=1000.0, cash=1000.0)
+    ex = make_executor(fake, max_exposure_pct=0.25)
+    executors.append(ex)
+    # No positions held, so a current-state-only check would pass — but a
+    # $400 pending BUY on a $1000 account is 40%, over the 25% cap.
+    assert ex.check_exposure({}) is True
+    assert ex.check_exposure({}, pending_trade_value=400.0) is False
+
+
+def test_check_exposure_allows_pending_trade_that_stays_under_cap(executors):
+    fake = FakeIB(net_liq=1000.0, cash=1000.0)
+    ex = make_executor(fake, max_exposure_pct=0.25)
+    executors.append(ex)
+    assert ex.check_exposure({}, pending_trade_value=200.0) is True   # 20% < 25%
+
+
+# ---------------------------------------------------------------------------
 # Reconnect probe (TWS monitor leg — 2026-07-18)
 # ---------------------------------------------------------------------------
 
@@ -582,3 +658,124 @@ def test_save_state_keeps_last_good_cash_when_disconnected(executors, sandbox):
     with open(sandbox / "ibkr_state.json") as f:
         state = json.load(f)
     assert state["cash"] == 3337.56      # previous good value preserved
+
+
+# ---------------------------------------------------------------------------
+# Weekly loss / drawdown-from-peak breaker tiers (added 2026-08-05).
+# net_liq=1000 at connect seeds both peak_equity and week_open_equity at
+# $1000; mutating fake._net_liq before a call simulates a portfolio move
+# (accountValues() re-reads it live on every _net_liquidation() call).
+# ---------------------------------------------------------------------------
+
+def _make_breaker_executor(executors, net_liq=1000.0) -> tuple:
+    fake = FakeIB(net_liq=net_liq, cash=net_liq)
+    ex = make_executor(fake)
+    executors.append(ex)
+    ex.set_daily_loss_limit(0.99)   # isolate the new tiers from the (tighter) daily breaker
+    ex.set_weekly_loss_limit(0.05)
+    ex.set_drawdown_limits(0.10, 0.15, 0.20)
+    assert ex._peak_equity == pytest.approx(1000.0)
+    return ex, fake
+
+
+def test_ibkr_weekly_loss_blocks_buy_without_tripping_halt_or_kill(executors):
+    ex, fake = _make_breaker_executor(executors)
+    fake._net_liq = 940.0   # 6% down — between the 5% weekly and 15% halt tiers
+    order = ex.buy("KO", 1, 60.0, reason="test")
+    assert order.status == OrderStatus.REJECTED
+    assert "Weekly loss limit" in order.reject_reason
+    assert not ex._is_kill_switch_tripped(940.0)
+
+
+def test_ibkr_drawdown_halt_blocks_buy_and_auto_lifts_on_recovery(executors):
+    ex, fake = _make_breaker_executor(executors)
+    fake._net_liq = 830.0   # 17% down — between the 15% halt and 20% kill tiers
+    order = ex.buy("KO", 1, 60.0, reason="test")
+    assert order.status == OrderStatus.REJECTED
+    assert "Drawdown halt" in order.reject_reason
+
+    fake._net_liq = 1000.0   # fully recovers
+    assert not ex._is_drawdown_halted()
+
+
+def test_ibkr_kill_switch_blocks_buy_never_blocks_sell(executors):
+    ex, fake = _make_breaker_executor(executors)
+    fake._positions = [_cm_position(10, 100.0)]   # position to sell once kill switch trips
+    fake._net_liq = 700.0   # 30% down — past the 20% kill-switch threshold
+
+    buy_order = ex.buy("KO", 1, 60.0, reason="test")
+    assert buy_order.status == OrderStatus.REJECTED
+    assert "KILL SWITCH" in buy_order.reject_reason
+
+    sell_order = ex.sell("CM.TO", 10, 100.0, reason="test")
+    assert sell_order.status == OrderStatus.FILLED
+
+
+def test_ibkr_kill_switch_persists_across_restart(executors, sandbox):
+    ex, fake = _make_breaker_executor(executors)
+    fake._net_liq = 700.0   # 30% down
+    assert ex._is_kill_switch_tripped(700.0)   # evaluates + latches the sticky flag, saves state
+
+    fake2 = FakeIB(net_liq=1000.0, cash=1000.0)   # fresh connection, fully recovered equity
+    ex2 = make_executor(fake2)
+    executors.append(ex2)
+    assert ex2._kill_switch_tripped is True
+    order = ex2.buy("KO", 1, 60.0, reason="test")
+    assert order.status == OrderStatus.REJECTED
+    assert "KILL SWITCH" in order.reject_reason
+
+
+def test_ibkr_peak_equity_persists_across_restart(executors, sandbox):
+    ex, fake = _make_breaker_executor(executors)
+    fake._net_liq = 1300.0
+    ex._update_breaker_marks(1300.0)
+    assert ex._peak_equity == pytest.approx(1300.0)
+
+    fake2 = FakeIB(net_liq=1000.0, cash=1000.0)   # fresh connection at a lower live value
+    ex2 = make_executor(fake2)
+    executors.append(ex2)
+    assert ex2._peak_equity == pytest.approx(1300.0)   # peak survived the restart
+
+
+def test_ibkr_drawdown_status_warning_flag_tracks_threshold(executors):
+    ex, fake = _make_breaker_executor(executors)
+    assert ex.drawdown_status()["warning"] is False
+
+    fake._net_liq = 890.0   # 11% down — past the 10% warning tier
+    status = ex.drawdown_status()
+    assert status["warning"] is True
+    assert status["drawdown_pct"] == pytest.approx(0.11, abs=0.001)
+
+
+# ---------------------------------------------------------------------------
+# Per-position ATR stop-loss override (opt-in ATR sizing, added 2026-08-05).
+# ---------------------------------------------------------------------------
+
+def test_ibkr_position_stop_pct_defaults_to_baseline(executors):
+    fake = FakeIB()
+    ex = make_executor(fake)
+    executors.append(ex)
+    assert ex.get_position_stop_pct("KO", 0.05) == 0.05
+
+
+def test_ibkr_position_stop_pct_override_and_persistence(executors, sandbox):
+    fake = FakeIB()
+    ex = make_executor(fake)
+    executors.append(ex)
+    ex.set_position_stop_pct("KO", 0.08)
+    assert ex.get_position_stop_pct("KO", 0.05) == 0.08
+
+    fake2 = FakeIB()
+    ex2 = make_executor(fake2)
+    executors.append(ex2)
+    assert ex2.get_position_stop_pct("KO", 0.05) == 0.08
+
+
+def test_ibkr_position_stop_pct_cleared_on_full_close(executors):
+    fake = FakeIB(positions=[_cm_position(10, 100.0)], fill_price=110.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+    ex.set_position_stop_pct("CM.TO", 0.08)
+    order = ex.sell("CM.TO", 10, 110.0, reason="test")
+    assert order.status == OrderStatus.FILLED
+    assert ex.get_position_stop_pct("CM.TO", 0.05) == 0.05

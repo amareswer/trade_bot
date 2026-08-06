@@ -134,6 +134,25 @@ class IBKRExecutor(StockExecutorBase):
         self._daily_loss_limit_pct: float = 0.03
         self._daily_loss_tripped: bool = False
         self._slippage_bps: int = 0        # real broker — kept only for interface parity
+
+        # Weekly loss / drawdown-from-peak breaker tiers (overridden by config
+        # via set_weekly_loss_limit / set_drawdown_limits). Unlike the daily
+        # breaker (connection-lifetime only), peak_equity/week_open_equity/
+        # kill_switch_tripped are persisted — a restart must not silently
+        # reset the all-time peak or un-trip the kill switch.
+        self._weekly_loss_limit_pct: float = 0.05
+        self._drawdown_warning_pct: float = 0.10
+        self._drawdown_halt_pct: float = 0.15
+        self._kill_switch_pct: float = 0.20
+        self._peak_equity: float = 0.0
+        self._week_open_equity: float | None = None
+        self._week_start_iso: str | None = None
+        self._kill_switch_tripped: bool = False
+
+        # Per-position stop-loss % override (ATR-based sizing, opt-in via
+        # PAPER_ATR_SIZING_ENABLED). Symbols not present here use the flat
+        # cfg.paper_stop_loss_pct baseline — see get_position_stop_pct().
+        self._position_stop_pct: dict[str, float] = {}
         self._state_lock = threading.Lock()
         self._reconnect_lock = threading.Lock()
 
@@ -174,6 +193,8 @@ class IBKRExecutor(StockExecutorBase):
         elif net_liq > 0:
             self._rebaseline_if_external_change(net_liq)
         self._session_start_value = net_liq
+        if net_liq > 0:
+            self._update_breaker_marks(net_liq)
 
         self._ensure_csv_header()
         logger.info(
@@ -420,6 +441,33 @@ class IBKRExecutor(StockExecutorBase):
                 f"Daily loss limit ({self._daily_loss_limit_pct:.0%}) reached — no new buys today",
             )
 
+        # One live net-liq fetch, reused across all three drawdown-based tiers
+        # below (and to refresh the peak/week-open marks) instead of one
+        # IB round-trip per tier.
+        _net_liq_now = self._net_liquidation()
+        if _net_liq_now > 0:
+            self._update_breaker_marks(_net_liq_now)
+
+        if self._is_kill_switch_tripped(_net_liq_now):
+            return self._reject(
+                sym, OrderSide.BUY, int(shares) if isinstance(shares, (int, float)) else 0, price,
+                f"KILL SWITCH active: {self._drawdown_from_peak_pct(_net_liq_now):.1%} drawdown "
+                f"from peak — all new BUYs blocked until manually cleared",
+            )
+
+        if self._is_drawdown_halted(_net_liq_now):
+            return self._reject(
+                sym, OrderSide.BUY, int(shares) if isinstance(shares, (int, float)) else 0, price,
+                f"Drawdown halt ({self._drawdown_halt_pct:.0%}) reached: "
+                f"{self._drawdown_from_peak_pct(_net_liq_now):.1%} down from peak — no new buys until recovery",
+            )
+
+        if self._is_weekly_loss_tripped(_net_liq_now):
+            return self._reject(
+                sym, OrderSide.BUY, int(shares) if isinstance(shares, (int, float)) else 0, price,
+                f"Weekly loss limit ({self._weekly_loss_limit_pct:.0%}) reached — no new buys this week",
+            )
+
         if not isinstance(price, (int, float)):
             return self._reject(sym, OrderSide.BUY, 0, 0.0,
                                 f"Invalid price type: {type(price)}")
@@ -521,6 +569,10 @@ class IBKRExecutor(StockExecutorBase):
         pnl = round((fill_px - held_cost) * filled_qty, 2)
         with self._state_lock:
             self._realized_pnl += pnl
+
+        if filled_qty >= held_shares - 1e-9 and sym in self._position_stop_pct:   # full close
+            self._position_stop_pct.pop(sym, None)
+            self.save_state()
 
         order.quantity = filled_qty
         order.price = fill_px
@@ -642,6 +694,16 @@ class IBKRExecutor(StockExecutorBase):
     def set_daily_loss_limit(self, pct: float) -> None:
         self._daily_loss_limit_pct = pct
 
+    def set_weekly_loss_limit(self, pct: float) -> None:
+        """Configure the weekly loss circuit breaker (fraction, e.g. 0.05 = 5%)."""
+        self._weekly_loss_limit_pct = pct
+
+    def set_drawdown_limits(self, warning_pct: float, halt_pct: float, kill_switch_pct: float) -> None:
+        """Configure the three drawdown-from-peak tiers (fractions, increasing severity)."""
+        self._drawdown_warning_pct = warning_pct
+        self._drawdown_halt_pct = halt_pct
+        self._kill_switch_pct = kill_switch_pct
+
     def refresh_position_marks(self, prices: dict[str, float]) -> None:
         """No-op — _is_daily_loss_tripped() always marks live via
         _net_liquidation(). Kept for interface parity with StockPaperExecutor."""
@@ -666,6 +728,104 @@ class IBKRExecutor(StockExecutorBase):
             return True
         return False
 
+    # ── Weekly loss / drawdown-from-peak breaker tiers ─────────────────────
+    # current_value is optional so callers that already fetched net_liq this
+    # cycle (buy() does, once) can reuse it instead of paying another IB
+    # round-trip per tier; omit it to fetch fresh (e.g. from tests).
+
+    @staticmethod
+    def _current_week_iso() -> str:
+        year, week, _ = datetime.now(timezone.utc).isocalendar()
+        return f"{year}-W{week:02d}"
+
+    def _update_breaker_marks(self, current_value: float) -> None:
+        """Update all-time peak equity and the week-open reference point from
+        a live net-liquidation value. Persisted immediately on change so a
+        restart can't silently reset either baseline."""
+        if current_value <= 0:
+            return
+        if current_value > self._peak_equity:
+            self._peak_equity = current_value
+            self.save_state()
+        this_week = self._current_week_iso()
+        if self._week_start_iso != this_week:
+            self._week_start_iso = this_week
+            self._week_open_equity = current_value
+            logger.info("New trading week — weekly-loss baseline reset | week_open=$%.2f", current_value)
+            self.save_state()
+        elif self._week_open_equity is None:
+            self._week_open_equity = current_value
+            self.save_state()
+
+    def _is_weekly_loss_tripped(self, current_value: float | None = None) -> bool:
+        """Blocks new BUYs only (mirrors daily loss). Auto-recovers if equity
+        climbs back above the week-open threshold — resets fresh next week regardless."""
+        if not self._week_open_equity or self._week_open_equity <= 0:
+            return False
+        current = current_value if current_value is not None else self._net_liquidation()
+        if current <= 0:
+            return False
+        loss_pct = (self._week_open_equity - current) / self._week_open_equity
+        return loss_pct >= self._weekly_loss_limit_pct
+
+    def _drawdown_from_peak_pct(self, current_value: float | None = None) -> float:
+        if self._peak_equity <= 0:
+            return 0.0
+        current = current_value if current_value is not None else self._net_liquidation()
+        if current <= 0:
+            return 0.0
+        return max(0.0, (self._peak_equity - current) / self._peak_equity)
+
+    def _is_drawdown_halted(self, current_value: float | None = None) -> bool:
+        """Blocks new BUYs only. Not sticky — auto-lifts as soon as the
+        drawdown recovers below the halt threshold (unlike the kill switch)."""
+        return self._drawdown_from_peak_pct(current_value) >= self._drawdown_halt_pct
+
+    def _is_kill_switch_tripped(self, current_value: float | None = None) -> bool:
+        """Blocks new BUYs only — SELL/exits are never blocked by any breaker
+        tier. Sticky: once tripped it stays tripped (persisted to disk) until
+        someone manually clears kill_switch_tripped in ibkr_state.json — a
+        20% all-time drawdown should force a human decision, not self-heal."""
+        if self._kill_switch_tripped:
+            return True
+        dd = self._drawdown_from_peak_pct(current_value)
+        if dd >= self._kill_switch_pct:
+            self._kill_switch_tripped = True
+            logger.error(
+                "KILL SWITCH TRIPPED: %.1f%% drawdown from peak $%.2f — "
+                "all new BUYs blocked until manually cleared in ibkr_state.json",
+                dd * 100, self._peak_equity,
+            )
+            self.save_state()
+            return True
+        return False
+
+    def drawdown_status(self) -> dict:
+        """Public snapshot for the non-blocking warning-tier alert, which is
+        sent from stock_bot/main.py (the executor doesn't own alert delivery)."""
+        current = self._net_liquidation()
+        dd = self._drawdown_from_peak_pct(current)
+        return {
+            "peak_equity":    self._peak_equity,
+            "current_equity": current,
+            "drawdown_pct":   dd,
+            "warning":        dd >= self._drawdown_warning_pct,
+        }
+
+    # ── Per-position ATR stop-loss override (opt-in ATR sizing) ────────────
+
+    def set_position_stop_pct(self, symbol: str, pct: float) -> None:
+        """Record a per-position stop-loss % that overrides the flat
+        cfg.paper_stop_loss_pct baseline for this symbol's open position.
+        Call once, right after a BUY fill, when PAPER_ATR_SIZING_ENABLED."""
+        self._position_stop_pct[symbol.upper()] = pct
+        self.save_state()
+
+    def get_position_stop_pct(self, symbol: str, default: float) -> float:
+        """Effective stop-loss % for this symbol's open position — the ATR
+        override if one was set at entry, else the flat baseline."""
+        return self._position_stop_pct.get(symbol.upper(), default)
+
     def get_sector_exposure(self) -> dict[str, int]:
         counts: dict[str, int] = {}
         for sym in self.positions_snapshot():
@@ -673,14 +833,21 @@ class IBKRExecutor(StockExecutorBase):
             counts[sector] = counts.get(sector, 0) + 1
         return counts
 
-    def check_exposure(self, price_map: dict[str, float]) -> bool:
+    def check_exposure(self, price_map: dict[str, float], pending_trade_value: float = 0.0) -> bool:
+        """
+        Return True if PROJECTED position value — current + pending_trade_value
+        (a candidate BUY's approximate dollar size, CAD) — stays under the max
+        exposure threshold. pending_trade_value defaults to 0.0 (current-state-
+        only, the old behavior) — see StockPaperExecutor.check_exposure for the
+        full rationale (both executors implement this identically).
+        """
         total = self.total_value(price_map)
         if total <= 0:
             return True
         snap = self.positions_snapshot()
         pos_val = sum(shares * self._price_in_cad(sym, price_map.get(sym, cost))
                       for sym, (shares, cost) in snap.items())
-        return (pos_val / total) < self._max_exposure_pct
+        return ((pos_val + pending_trade_value) / total) < self._max_exposure_pct
 
     def build_paper_summary(self, scan_results: list) -> PaperSummary:
         price_map    = {r.symbol.upper(): r.price    for r in scan_results}
@@ -784,6 +951,20 @@ class IBKRExecutor(StockExecutorBase):
             self._realized_pnl = realized
             self._starting_cash = starting
             self._last_cash = float(state.get("cash", 0.0) or 0.0)
+            self._peak_equity          = float(state.get("peak_equity", 0.0) or 0.0)
+            _week_open                 = state.get("week_open_equity")
+            self._week_open_equity     = float(_week_open) if _week_open is not None else None
+            self._week_start_iso       = state.get("week_start_iso")
+            self._kill_switch_tripped  = bool(state.get("kill_switch_tripped", False))
+            # Not filtered against live positions here (unlike paper.py) —
+            # IBKR has no local position cache to check against at load time;
+            # sell()'s full-close cleanup keeps this from accumulating stale
+            # entries in practice, and a stale entry only affects sizing for
+            # a symbol that would need to be re-bought from flat anyway.
+            self._position_stop_pct    = {
+                sym.upper(): float(pct)
+                for sym, pct in (state.get("position_stop_pct") or {}).items()
+            }
             logger.info(
                 "IBKR state restored | realized_pnl=$%.2f | starting_cash=$%.2f",
                 realized, starting,
@@ -808,6 +989,11 @@ class IBKRExecutor(StockExecutorBase):
             "cash": round(self._last_cash, 2),
             "realized_pnl": round(self._realized_pnl, 6),
             "starting_cash": round(self._starting_cash, 6),
+            "peak_equity": round(self._peak_equity, 6),
+            "week_open_equity": self._week_open_equity,
+            "week_start_iso": self._week_start_iso,
+            "kill_switch_tripped": self._kill_switch_tripped,
+            "position_stop_pct": self._position_stop_pct,
             "last_updated": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         }
         try:

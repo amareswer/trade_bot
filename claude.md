@@ -172,23 +172,27 @@ need the full narrative behind any decision below.
 
 ---
 
-## Test Suite Manifest (as of 2026-07-28)
+## Test Suite Manifest (reconciled 2026-08-05)
 
-Expected total: **332 tests**. If `pytest --collect-only -q` reports a lower number, a file has an import error, was deleted, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~6s — if it takes minutes, a test is reading live `.env` config.
+Expected total: **446 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~10s — if it takes minutes, a test is reading live `.env` config.
 
 | File | Tests | What it covers |
 |------|-------|----------------|
 | `test_indicators.py` | 28 | RSI, EMA, ADX, MACD, ATR calculations |
-| `test_live_executor.py` | 22 | LiveExecutor: dry-run, market/limit orders, urgent-exit bypass, fee deduction, state save/load |
+| `test_live_executor.py` | 27 | LiveExecutor: dry-run, market/limit orders, urgent-exit bypass, fee deduction, state save/load, pre-trade min-size guard, restart recovery (seeds position manager + state machine) |
 | `test_capital_pool.py` | 19 | CapitalPool: slot allocation, slot cap, release, edge cases |
 | `test_correlation.py` | 17 | Pearson correlation, pct_returns, fetch_correlation |
+| `test_stock_correlation.py` | 5 | `stock_bot/risk/correlation.py`: `fetch_correlation_from_closes` — no-network wrapper reusing bot/risk/correlation.py's pearson/pct_returns unchanged |
+| `test_stock_correlation_gate.py` | 8 | `stock_bot.main._check_correlation_gate`: blocks on >0.70 correlation with an open position, allows when uncorrelated/no positions/adding to self-held symbol, fails open on missing candle data (candidate or peer), case-insensitive symbol matching, source-inspection guard confirms `run()` still calls it and blocks on a hit |
+| `test_stock_macro_calendar.py` | 14 | `stock_bot/risk/macro_calendar.py`: `jobs_report_dates` (12 Fridays/year, first week, invariant-checked not hardcoded), `parse_user_event_dates` (valid/empty/invalid-skipped/whitespace), `is_macro_blackout` (exact-date/before/after/boundary-inclusive, disabled at 0 or negative, jobs-report-alone triggers, nearest-event-wins when multiple in window) |
+| `test_stock_macro_blackout_gate.py` | 5 | `stock_bot.main._is_macro_event_blackout` config-reading wrapper: blocks on user-supplied date, disabled at 0, fails open on bad config value, jobs-report-alone still checked with empty user dates, source-inspection guard confirms `run()` calls it market-wide before the per-symbol earnings check |
 | `test_risk_manager.py` | 20 | RiskManager: halt gate, daily loss, position size, SL/TP bypass, state persistence, per-symbol caps, aggregate account breakers |
 | `test_fill_recording.py` | 8 | BUG 1: qty=0 fill — filled priority, amount fallback, guard, TradeLog guard |
 | `test_external_holdings.py` | 6 | External-holdings guard in _sync_position (adopt=false/true) |
 | `test_executor.py` | 6 | PaperExecutor: BUY/SELL, insufficient cash, history |
 | `test_drift_escalation.py` | 8 | Drift: tests REAL `_evaluate_drift()` from bot.main — escalation, ack (no re-alert on unchanged drift), changed-amount re-alert, resolution reset |
 | `test_tsx_validation.py` | 5 | Stock-bot TSX price sanity check |
-| `test_stock_breaker.py` | 3 | Stock-bot daily-loss breaker: restart baseline includes position marks |
+| `test_stock_breaker.py` | 14 | Stock-bot circuit breakers (StockPaperExecutor): daily-loss restart baseline includes position marks; weekly-loss/drawdown-halt/kill-switch tiers — reject-on-trip, halt auto-lifts on recovery, kill switch stays sticky through recovery and across restart, SELL never blocked, peak-equity persistence, drawdown_status() warning flag; per-position ATR stop-pct override — defaults to baseline, persists across restart, clears on full close, survives a partial close |
 | `test_candle_watchdog.py` | 5 | Candle watchdog: timing, alert, no double-fire |
 | `test_halt_flag.py` | 5 | Manual halt kill-switch: logs/HALT flag file engage/lift, ownership guard |
 | `test_orphaned_positions.py` | 5 | Startup orphan check: open position outside this run's symbol list alerts (removed-from-whitelist safety) |
@@ -201,10 +205,12 @@ Expected total: **332 tests**. If `pytest --collect-only -q` reports a lower num
 | `test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last (forming candle), determinism, validated-parameter pin |
 | `test_audit_scheduler.py` | 14 | In-bot audit scheduler: tests REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, monthly 1st-anchored (re-screen), missed-run catch-up |
 | `test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
-| `test_ibkr_executor.py` | 29 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping (.TO↔TSE/CAD, bare NYSE cross-listings→NYSE), broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe (redial/never-raise/no-op), low-equity FX/margin-minimum guard (CAD exempt), starting_cash auto-rebaseline on external reset/deposit, live-cash snapshot persisted + preserved across disconnect |
+| `test_ibkr_executor.py` | 48 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping (.TO↔TSE/CAD, bare NYSE cross-listings→NYSE), broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe (redial/never-raise/no-op), low-equity FX/margin-minimum guard (CAD exempt), starting_cash auto-rebaseline on external reset/deposit, live-cash snapshot persisted + preserved across disconnect, sector-concentration gate (reject 3rd same-sector position, allow add-on to already-held symbol, allow different sector), weekly-loss/drawdown-halt/kill-switch tiers (reject-on-trip, halt auto-lifts, kill switch sticky + persists across restart, SELL never blocked, peak-equity persistence, warning-status flag), per-position ATR stop-pct override (default/persistence/cleared-on-full-close), check_exposure projected (pending-trade-value) exposure — defaults to current-state-only, catches an oversized single BUY, allows one that stays under cap |
+| `test_fx_sizing.py` | 14 | USD/CAD sizing fix (2026-07-31): `is_cad_symbol`, `get_usd_cad_rate` (fetch/fallback/cache), StockPaperExecutor mixed-currency `total_value`/`check_exposure`, sector-concentration gate (reject 3rd same-sector position, allow add-on to already-held symbol, allow different sector), check_exposure projected (pending-trade-value) exposure — defaults to current-state-only, catches an oversized single BUY, allows one that stays under cap |
 | `test_heartbeat.py` | 8 | Heartbeat pings (bot/alerts/heartbeat.py): URL-off, success/failure never raise, healthy_fn gate |
 | `test_tws_monitor.py` | 6 | TwsConnectionMonitor state machine: blip tolerance, alert-once per outage, recovery notice |
 | `test_atr_sizing.py` | 7 | calc_trade_qty_atr_risk: dollar-risk-at-stop == fixed-SL baseline, tight-stop cap, fallbacks |
+| `test_stock_atr_sizing.py` | 7 | Stock-bot analog: `StockConfig.calc_shares_atr_risk` (whole-share sizing) — same invariant, opt-in via PAPER_ATR_SIZING_ENABLED (default false) |
 | `test_stock_telegram.py` | 7 | Stock→Telegram relay: root-.env credential sourcing, ops_alert/fill forwarding, HIGH-only filter, channel-off no-ops |
 | `test_crash_hardening.py` | 9 | atomic_write_json (valid/replace/no-tmp/parents/old-file-preserved), send_now sync + disabled, crash-alert helpers never raise |
 | `test_engine_params.py` | 8 | `engine_kwargs_from_cfg` builder: keys accepted by engine.run, ATR keys sourced from cfg, previously-drifted keys present, macd_enabled + Mode A/B entry params sourced from cfg, generic parity test (every StrategyConfig∩IndicatorConfig field reaches the backtest), both validation scripts use the builder |
@@ -217,8 +223,10 @@ Expected total: **332 tests**. If `pytest --collect-only -q` reports a lower num
 | `test_research_aggregator_timeout.py` | 1 | Per-source research-fetch timeout: earnings gets a wider budget (45s) than news (15s) |
 | `test_kraken_retry.py` | 4 | `bot/exchanges/retry.fetch_with_retry`: succeeds without retrying, retries on failure and can recover, raises the last exception after exhausting attempts, custom attempts/delay respected |
 | `test_stock_position_mark_refresh.py` | 4 | Stock-bot daily-loss breaker staleness fix: tests REAL `_mark_positions_to_market()` from stock_bot.main via a mocked `_fetch_symbol_data` — breaker trips from a price move alone (no fill), stays silent within limit, no-ops when executor is None, source-inspection guard confirms `run()` still calls it |
+| `test_grid_stress_test.py` | 14 | `grid_stress_test.py` pure helpers (crypto research tooling, not the live pipeline): crash-period date parsing, buy-and-hold P&L calc, PASS/MARGINAL/FAILED classification. Hermetic — the actual stress run against Binance is a separate manual step |
+| `test_grid_dca_experiment.py` | 12 | `grid_dca_experiment.py` standalone backtest engines (crypto research tooling, not the live pipeline): grid strategy fills/reopens/floor-stop, capital split across slots, fee math on both legs, DCA safety-order averaging + cycle restart, empty-candle edge cases |
 
-Run: `python -m pytest --tb=short -q` — must show **332 passed**.
+Run: `python -m pytest --tb=short -q` — must show **446 passed**.
 
 ---
 
@@ -277,6 +285,95 @@ RISK_HALT_BLOCKS_STOPS=false  # NOT set in .env — using the config.py default 
                               # it would leave open positions exposed with no stop.
 ```
 
+### Risk-gate config (stock bot — `StockPaperExecutor` / `IBKRExecutor`, both in `stock_bot/execution/`)
+Both executors implement the same tiers independently (accepted duplication — same pattern
+as the sector-concentration gate). All tiers block new BUYs only; SELL/exits are never
+blocked by any breaker (mirrors the crypto RiskManager's hard rule above).
+```
+PAPER_DAILY_LOSS_PCT=0.03          # (default; not set in stock_bot/.env) halt new BUYs if
+                                    # portfolio down >3% from session start. Session-lifetime,
+                                    # not calendar-day — resets on process restart, not at UTC
+                                    # midnight (a real difference from the crypto RiskManager;
+                                    # not yet unified — see roadmap)
+PAPER_WEEKLY_LOSS_PCT=0.05         # added 2026-08-05. Halt new BUYs if portfolio down >5%
+                                    # from this ISO-week's opening equity. Resets Monday-anchored.
+PAPER_DRAWDOWN_WARNING_PCT=0.10    # added 2026-08-05. Non-blocking — ops_alert only (sent from
+                                    # stock_bot/main.py's SL/TP watcher loop, not the executor).
+                                    # Trading continues.
+PAPER_DRAWDOWN_HALT_PCT=0.15       # added 2026-08-05. Halt new BUYs if portfolio down >15% from
+                                    # all-time peak equity. NOT sticky — auto-lifts the moment
+                                    # equity recovers above the threshold.
+PAPER_KILL_SWITCH_PCT=0.20         # added 2026-08-05. Halt new BUYs if portfolio down >20% from
+                                    # all-time peak equity. Sticky — persisted to
+                                    # paper_state.json/ibkr_state.json, survives restart, does
+                                    # NOT auto-clear on recovery. Requires manually editing
+                                    # kill_switch_tripped to false in the state file to resume BUYs.
+```
+peak_equity and week_open_equity are also persisted (unlike the pre-existing daily-loss
+baseline) — a crash-restart must not silently reset the all-time peak or re-arm a tripped
+kill switch. Config validation enforces `warning < halt < kill_switch` strictly increasing.
+Added to close punch-list item #3 (only one breaker tier existed) from the trading-spec
+gap review — see `.memory/` for the fuller comparison against that spec.
+
+### ATR-based stop distance + risk-capped sizing (stock bot — opt-in, closes punch-list #2)
+```
+PAPER_ATR_SIZING_ENABLED=false     # added 2026-08-05. Default OFF — do not enable live
+                                    # without a stock_backtest.py walk-forward PASS first.
+                                    # Live behavior today (RY, CM) is unaffected: flat
+                                    # PAPER_STOP_LOSS_PCT (5%) + flat PAPER_RISK_PCT (20%)
+                                    # notional sizing, identical to before this change.
+PAPER_ATR_SL_MULT=2.0              # added 2026-08-05. Stop distance = ATR(14) * this mult,
+                                    # only used per-position when the flag above is true.
+```
+When enabled: at BUY time, `StockConfig.calc_shares_atr_risk()` (mirrors the crypto bot's
+`calc_trade_qty_atr_risk`) caps share count so a stop at `ATR*mult` away never risks more
+dollars than the flat-5%-baseline would; the resulting ATR stop % is stored per-position via
+`executor.set_position_stop_pct(symbol, pct)` (persisted in paper_state.json/ibkr_state.json,
+cleared on full close, survives a partial close) and the SL/TP watcher
+(`_check_open_positions_sl_tp`) reads it back via `get_position_stop_pct()` instead of the
+flat baseline — sizing and the actual exit trigger must agree, or the risk cap at entry means
+nothing. Positions opened before this feature (or with the flag off) use the flat baseline —
+`get_position_stop_pct()` falls back to it when no override is recorded.
+
+### Correlation gate (stock bot — always on, closes punch-list #4)
+`stock_bot/risk/correlation.py`, wired into the BUY path in `stock_bot/main.py` (`run()`,
+`_check_correlation_gate`). No feature flag — unlike ATR sizing, this only ever makes a BUY
+*more* conservative and never changes exit/stop behavior for existing positions, so it
+shipped active by default (same reasoning as the sector-concentration gate, item #1). Blocks
+a new position when its 30-day daily-return correlation with any already-open position
+exceeds `CORRELATION_THRESHOLD=0.70` (reused unchanged from `bot/risk/correlation.py` — same
+constant, same Pearson math as the crypto gate). Fail-open on missing data (no candles this
+cycle for either symbol → allow the BUY), matching the crypto gate's philosophy. Unlike the
+crypto version, makes **zero extra network calls** — reuses candle closes the scan cycle
+already fetched via yfinance rather than issuing a fresh fetch per open-position pair, since
+stock bot is already yfinance-rate-limit-sensitive (see dashboard log noise re: AC.TO/DLTR).
+
+### Macro economic event blackout (stock bot — always on, closes punch-list #5)
+```
+MACRO_BLACKOUT_DAYS=1               # added 2026-08-05. Symmetric window (days before AND
+                                     # after) around an event date. 0 or negative disables
+                                     # the feature entirely.
+MACRO_EVENT_DATES=                  # added 2026-08-05. Empty by default. Comma-separated
+                                     # ISO dates for FOMC/CPI/GDP — user-maintained, this
+                                     # module does NOT fabricate them (they don't follow a
+                                     # clean weekday rule the way jobs reports do). Add real
+                                     # ones as published:
+                                     #   FOMC: federalreserve.gov/monetarypolicy/fomccalendars.htm
+                                     #   CPI:  bls.gov/schedule/news_release/cpi.htm
+                                     #   GDP:  bea.gov/news/schedule
+                                     # A two-day FOMC meeting needs both days listed.
+```
+`stock_bot/risk/macro_calendar.py`. Two date sources: (1) `jobs_report_dates()` — the U.S.
+Non-Farm Payrolls report is always the first Friday of the month, computed algorithmically
+(same style as `_us_holidays()`/`_ca_holidays()` in `stock_bot/main.py` — no external data,
+no yearly maintenance), so this half of the gate works out of the box with zero config; (2)
+the user-maintained `MACRO_EVENT_DATES` list above for FOMC/CPI/GDP. Market-wide, not
+per-symbol — blocks ALL new BUYs (checked once per symbol in the scan loop via
+`_is_macro_event_blackout(cfg)`, market-wide in effect since it doesn't depend on which
+symbol is being evaluated) before the per-symbol earnings-blackout check. Fail-open on any
+error (bad config value, etc.) — same philosophy as earnings blackout. Shipped active by
+default since, like the correlation gate, it can only make a BUY more conservative.
+
 ### How to verify the config is active
 Run: `EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py`
 Expected (current, since macd_enabled was wired into `engine_kwargs_from_cfg`, 2026-07-20):
@@ -328,7 +425,29 @@ EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-0
   2026-07-28 (PID 25877) after an apparent ~6h scan-loop stall turned out most likely to be
   normal `AFTER_HOURS`-mode silence (see `.memory/decisions/known-gaps.md` gap #11) — either
   way, Phase 1's price-fetch now logs a clear `"cycle N failed: ..."` line on total fetch
-  failure instead of completing an empty cycle silently.
+  failure instead of completing an empty cycle silently. Circuit breakers expanded 2026-08-05
+  from a single daily-loss tier to four (daily/weekly/drawdown-halt/kill-switch — see
+  Risk-gate config above); sector-concentration gate (max 2 positions/sector, already live
+  since before this session) also gained test coverage the same day. ATR-based stop distance
+  + risk-capped sizing added the same day too, opt-in and OFF by default (`PAPER_ATR_SIZING_
+  ENABLED=false`) — RY/CM behavior unaffected until a stock_backtest.py walk-forward PASS.
+  Correlation gate (>0.70, 30-day daily returns, no extra network calls) added the same day
+  and shipped active by default — it can only tighten a BUY, never loosens anything. Macro
+  economic event blackout (FOMC/CPI/GDP/jobs report, market-wide) also added the same day —
+  jobs-report dates are computed algorithmically (always correct, zero maintenance); FOMC/CPI/
+  GDP dates are user-maintained via `MACRO_EVENT_DATES` and ship empty (not fabricated). All
+  five items were found via a gap review against an external "Trading Bot Master Spec" the
+  user shared — punch list is now clear through P0. P1 investigated next: the long-term/DCA
+  bucket item was confirmed by-design (two-bucket policy, not a gap); the cash-reserve item
+  turned out already satisfied (`PAPER_MAX_EXPOSURE_PCT=0.25` default = 75%+ cash floor,
+  already gating BUYs) — the one real precision gap found was `check_exposure()` checking
+  current state only, not the pending trade, so a single large BUY could blow past the cap
+  in one shot before the *next* BUY got caught. Fixed 2026-08-05: both executors'
+  `check_exposure()` now take an optional `pending_trade_value` (defaults to 0.0, so all
+  other callers are unaffected); `stock_bot/main.py` computes the target allocation before
+  the exposure gate (was previously computed after, inside the sizing branch) and passes it
+  through. See conversation history / `.memory/` for the fuller comparison and the P2 items
+  still open (VIX crisis mode, CRA tax fields).
 - **Both bots:** crash-alert + atomic state writes + SIGTERM graceful shutdown + liveness
   tracking (detects hung loops, not just dead processes) all live.
 

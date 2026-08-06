@@ -72,11 +72,31 @@ class StockPaperExecutor(StockExecutorBase):
         self._slippage_bps: int = 15   # 0.15% — override via set_slippage_bps()
         self._open_position_value: float = 0.0
 
+        # Weekly loss / drawdown-from-peak breaker tiers (overridden by config
+        # via set_weekly_loss_limit / set_drawdown_limits). Unlike the daily
+        # breaker (session-lifetime only), peak_equity/week_open_equity/
+        # kill_switch_tripped are persisted — a crash-restart must not
+        # silently erase the all-time peak or un-trip the kill switch.
+        self._weekly_loss_limit_pct: float = 0.05
+        self._drawdown_warning_pct: float = 0.10
+        self._drawdown_halt_pct: float = 0.15
+        self._kill_switch_pct: float = 0.20
+        self._peak_equity: float = 0.0
+        self._week_open_equity: Optional[float] = None
+        self._week_start_iso: Optional[str] = None
+        self._kill_switch_tripped: bool = False
+
+        # Per-position stop-loss % override (ATR-based sizing, opt-in via
+        # PAPER_ATR_SIZING_ENABLED). Symbols not present here use the flat
+        # cfg.paper_stop_loss_pct baseline — see get_position_stop_pct().
+        self._position_stop_pct: dict[str, float] = {}
+
         if os.path.exists(_RESET_FLAG):
             os.remove(_RESET_FLAG)
             self._cash         = self._starting_cash
             self._positions    = {}
             self._realized_pnl = 0.0
+            self._position_stop_pct = {}
             print("📄 Paper state RESET — starting fresh")
             logger.info("Paper state reset via flag file | cash=$%.2f", starting_cash)
         else:
@@ -146,6 +166,106 @@ class StockPaperExecutor(StockExecutorBase):
             px = prices.get(sym, avg_cost)
             total += shares * px
         self._open_position_value = total
+        self._update_breaker_marks()
+
+    # ── Weekly loss / drawdown-from-peak breaker tiers ─────────────────────
+
+    def set_weekly_loss_limit(self, pct: float) -> None:
+        """Configure the weekly loss circuit breaker (fraction, e.g. 0.05 = 5%)."""
+        self._weekly_loss_limit_pct = pct
+
+    def set_drawdown_limits(self, warning_pct: float, halt_pct: float, kill_switch_pct: float) -> None:
+        """Configure the three drawdown-from-peak tiers (fractions, increasing severity)."""
+        self._drawdown_warning_pct = warning_pct
+        self._drawdown_halt_pct = halt_pct
+        self._kill_switch_pct = kill_switch_pct
+
+    @staticmethod
+    def _current_week_iso() -> str:
+        year, week, _ = datetime.now(timezone.utc).isocalendar()
+        return f"{year}-W{week:02d}"
+
+    def _update_breaker_marks(self) -> None:
+        """Update all-time peak equity and the week-open reference point from
+        the current mark-to-market total. Persisted immediately on change so
+        a restart can't silently reset either baseline."""
+        current_total = self._cash + self._open_position_value
+        if current_total > self._peak_equity:
+            self._peak_equity = current_total
+            self.save_state()
+        this_week = self._current_week_iso()
+        if self._week_start_iso != this_week:
+            self._week_start_iso = this_week
+            self._week_open_equity = current_total
+            logger.info("New trading week — weekly-loss baseline reset | week_open=$%.2f", current_total)
+            self.save_state()
+        elif self._week_open_equity is None:
+            self._week_open_equity = current_total
+            self.save_state()
+
+    def _is_weekly_loss_tripped(self) -> bool:
+        """Blocks new BUYs only (mirrors daily loss). Auto-recovers if equity
+        climbs back above the week-open threshold — resets fresh next week regardless."""
+        if not self._week_open_equity or self._week_open_equity <= 0:
+            return False
+        current_total = self._cash + self._open_position_value
+        loss_pct = (self._week_open_equity - current_total) / self._week_open_equity
+        return loss_pct >= self._weekly_loss_limit_pct
+
+    def _drawdown_from_peak_pct(self) -> float:
+        if self._peak_equity <= 0:
+            return 0.0
+        current_total = self._cash + self._open_position_value
+        return max(0.0, (self._peak_equity - current_total) / self._peak_equity)
+
+    def _is_drawdown_halted(self) -> bool:
+        """Blocks new BUYs only. Not sticky — auto-lifts as soon as the
+        drawdown recovers below the halt threshold (unlike the kill switch)."""
+        return self._drawdown_from_peak_pct() >= self._drawdown_halt_pct
+
+    def _is_kill_switch_tripped(self) -> bool:
+        """Blocks new BUYs only — SELL/exits are never blocked by any breaker
+        tier. Sticky: once tripped it stays tripped (persisted to disk) until
+        someone manually clears kill_switch_tripped in the state file — a
+        20% all-time drawdown should force a human decision, not self-heal."""
+        if self._kill_switch_tripped:
+            return True
+        if self._drawdown_from_peak_pct() >= self._kill_switch_pct:
+            self._kill_switch_tripped = True
+            logger.error(
+                "KILL SWITCH TRIPPED: %.1f%% drawdown from peak $%.2f (current $%.2f) — "
+                "all new BUYs blocked until manually cleared in paper_state.json",
+                self._drawdown_from_peak_pct() * 100, self._peak_equity,
+                self._cash + self._open_position_value,
+            )
+            self.save_state()
+            return True
+        return False
+
+    # ── Per-position ATR stop-loss override (opt-in ATR sizing) ────────────
+
+    def set_position_stop_pct(self, symbol: str, pct: float) -> None:
+        """Record a per-position stop-loss % that overrides the flat
+        cfg.paper_stop_loss_pct baseline for this symbol's open position.
+        Call once, right after a BUY fill, when PAPER_ATR_SIZING_ENABLED."""
+        self._position_stop_pct[symbol.upper()] = pct
+        self.save_state()
+
+    def get_position_stop_pct(self, symbol: str, default: float) -> float:
+        """Effective stop-loss % for this symbol's open position — the ATR
+        override if one was set at entry, else the flat baseline."""
+        return self._position_stop_pct.get(symbol.upper(), default)
+
+    def drawdown_status(self) -> dict:
+        """Public snapshot for the non-blocking warning-tier alert, which is
+        sent from stock_bot/main.py (the executor doesn't own alert delivery)."""
+        dd = self._drawdown_from_peak_pct()
+        return {
+            "peak_equity":    self._peak_equity,
+            "current_equity": self._cash + self._open_position_value,
+            "drawdown_pct":   dd,
+            "warning":        dd >= self._drawdown_warning_pct,
+        }
 
     def refresh_position_marks(self, prices: dict[str, float]) -> None:
         """
@@ -194,6 +314,36 @@ class StockPaperExecutor(StockExecutorBase):
             order.status        = OrderStatus.REJECTED
             order.reject_reason = f"Daily loss limit ({self._daily_loss_limit_pct:.0%}) reached — no new buys today"
             logger.warning("PAPER BUY BLOCKED  %s — daily loss circuit breaker active", sym)
+            self._orders.append(order)
+            return order
+
+        if self._is_kill_switch_tripped():
+            order = self._new_order(sym, OrderSide.BUY, shares, price)
+            order.status        = OrderStatus.REJECTED
+            order.reject_reason = (
+                f"KILL SWITCH active: {self._drawdown_from_peak_pct():.1%} drawdown from "
+                f"peak — all new BUYs blocked until manually cleared"
+            )
+            logger.error("PAPER BUY BLOCKED  %s — kill switch active", sym)
+            self._orders.append(order)
+            return order
+
+        if self._is_drawdown_halted():
+            order = self._new_order(sym, OrderSide.BUY, shares, price)
+            order.status        = OrderStatus.REJECTED
+            order.reject_reason = (
+                f"Drawdown halt ({self._drawdown_halt_pct:.0%}) reached: "
+                f"{self._drawdown_from_peak_pct():.1%} down from peak — no new buys until recovery"
+            )
+            logger.warning("PAPER BUY BLOCKED  %s — drawdown halt active", sym)
+            self._orders.append(order)
+            return order
+
+        if self._is_weekly_loss_tripped():
+            order = self._new_order(sym, OrderSide.BUY, shares, price)
+            order.status        = OrderStatus.REJECTED
+            order.reject_reason = f"Weekly loss limit ({self._weekly_loss_limit_pct:.0%}) reached — no new buys this week"
+            logger.warning("PAPER BUY BLOCKED  %s — weekly loss circuit breaker active", sym)
             self._orders.append(order)
             return order
 
@@ -326,6 +476,7 @@ class StockPaperExecutor(StockExecutorBase):
             new_shares       = round(held_shares - shares, 9)
             if new_shares < 1e-9:
                 del self._positions[sym]
+                self._position_stop_pct.pop(sym, None)
             else:
                 self._positions[sym] = (new_shares, held_cost)
             order.status    = OrderStatus.FILLED
@@ -502,6 +653,17 @@ class StockPaperExecutor(StockExecutorBase):
             self._cash         = cash
             self._realized_pnl = realized_pnl
             self._positions    = positions
+            self._peak_equity          = float(state.get("peak_equity", 0.0) or 0.0)
+            self._week_open_equity     = state.get("week_open_equity")
+            if self._week_open_equity is not None:
+                self._week_open_equity = float(self._week_open_equity)
+            self._week_start_iso       = state.get("week_start_iso")
+            self._kill_switch_tripped  = bool(state.get("kill_switch_tripped", False))
+            self._position_stop_pct    = {
+                sym.upper(): float(pct)
+                for sym, pct in (state.get("position_stop_pct") or {}).items()
+                if sym.upper() in positions   # drop stale entries for closed positions
+            }
             print("📄 Paper state restored:")
             print(f"   Cash: ${self._cash:,.2f}")
             print(f"   Positions: {list(self._positions.keys())}")
@@ -525,6 +687,11 @@ class StockPaperExecutor(StockExecutorBase):
                 for sym, (shares, cost) in self._positions.items()
             },
             "realized_pnl": round(self._realized_pnl, 6),
+            "peak_equity": round(self._peak_equity, 6),
+            "week_open_equity": self._week_open_equity,
+            "week_start_iso": self._week_start_iso,
+            "kill_switch_tripped": self._kill_switch_tripped,
+            "position_stop_pct": self._position_stop_pct,
             "last_updated": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         }
         try:
@@ -578,15 +745,26 @@ class StockPaperExecutor(StockExecutorBase):
         """Public view of sector concentration in open positions."""
         return self._sector_count()
 
-    def check_exposure(self, price_map: dict[str, float]) -> bool:
-        """Return True if current position value is under the max exposure threshold."""
+    def check_exposure(self, price_map: dict[str, float], pending_trade_value: float = 0.0) -> bool:
+        """
+        Return True if PROJECTED position value — current + pending_trade_value
+        (a candidate BUY's approximate dollar size, same currency as total_value,
+        i.e. CAD) — stays under the max exposure threshold.
+
+        pending_trade_value defaults to 0.0 (current-state-only check, the old
+        behavior) for callers that just want a snapshot. Passing the actual
+        pending trade size closes a real gap: a current-state-only check can't
+        see a single large BUY that would blow past the cap in one shot — it
+        only catches it on the *next* BUY attempt, once already over (found
+        2026-08-05 while reviewing the punch-list cash-reserve item).
+        """
         total = self.total_value(price_map)
         if total <= 0:
             return True
         snap = self.positions_snapshot()
         pos_val = sum(shares * self._price_in_cad(sym, price_map.get(sym, cost))
                       for sym, (shares, cost) in snap.items())
-        return (pos_val / total) < self._max_exposure_pct
+        return ((pos_val + pending_trade_value) / total) < self._max_exposure_pct
 
     # ── Internal ─────────────────────────────────────────────────────────────
 
