@@ -61,6 +61,7 @@ from stock_bot.execution.exit_policy import ExitPolicy
 from stock_bot.strategy.rules       import rule_signal
 from stock_bot.risk.correlation     import CORRELATION_THRESHOLD, fetch_correlation_from_closes
 from stock_bot.risk.macro_calendar  import is_macro_blackout, parse_user_event_dates
+from stock_bot.risk.vix_crisis      import is_vix_crisis
 from stock_bot.fast_validator       import FastValidator
 from stock_bot.analysis.accuracy_tracker import LiveTradingGate
 
@@ -1020,10 +1021,31 @@ def run() -> None:
                 logger.warning("Regime filter: SPY fetch failed — BUY signals blocked this cycle")
         _cycle_regime = regime(spy_closes, cfg.regime_ma_period, cfg.regime_fast_ma) if spy_closes else "UNKNOWN"
 
+        # Fetch VIX once per cycle for crisis-mode gate (same pattern as SPY above).
+        # A fetch failure fails open (crisis mode off) — same philosophy as every
+        # other gate in this codebase: missing data allows trading, doesn't block it.
+        _vix_now: float | None = None
+        if cfg.vix_crisis_enabled:
+            _vix_raw = fetch_with_retry(
+                lambda: yf.download(
+                    "^VIX", interval="1d", period="5d",
+                    auto_adjust=True, actions=False, progress=False,
+                ),
+                label="VIX:crisis",
+            )
+            if _vix_raw is not None and not _vix_raw.empty:
+                if hasattr(_vix_raw.columns, "nlevels") and _vix_raw.columns.nlevels > 1:
+                    _vix_raw.columns = [c[0] if isinstance(c, tuple) else c for c in _vix_raw.columns]
+                _vix_closes = [float(v) for v in _vix_raw["Close"].dropna().tolist()]
+                _vix_now = _vix_closes[-1] if _vix_closes else None
+        _cycle_crisis_mode = cfg.vix_crisis_enabled and is_vix_crisis(_vix_now, cfg.vix_crisis_threshold)
+
         _regime_icons = {"BULL": "🟢", "BEAR": "🔴", "NEUTRAL": "🟡", "UNKNOWN": "⚪"}
         print(f"  ── Scan #{tick:04d}  {now} {'─' * 30}")
         print(f"  😨 Market: Fear & Greed {fear_greed_data.score} — {fear_greed_data.label}  |  📈 Trends: {market_trends_score}/100")
-        print(f"  Regime: {_cycle_regime} {_regime_icons.get(_cycle_regime, '⚪')}")
+        _vix_str = f"{_vix_now:.1f}" if _vix_now is not None else "n/a"
+        _vix_icon = "🚨" if _cycle_crisis_mode else ("⚪" if _vix_now is None else "🟢")
+        print(f"  Regime: {_cycle_regime} {_regime_icons.get(_cycle_regime, '⚪')}   VIX: {_vix_str} {_vix_icon}")
         print(f"  {'Symbol':<10}  {'Price':>10}  {'RSI':^7}  {'Trend':<10}  {'ADX':^13}  MACD")
         print(f"  {'─'*10}  {'─'*10}  {'─'*7}  {'─'*10}  {'─'*13}  {'─'*30}")
 
@@ -1348,6 +1370,13 @@ def run() -> None:
                         if cfg.regime_filter_enabled and (not spy_closes or _cycle_regime != "BULL"):
                             logger.info("REGIME_SKIP: %s — market is %s", symbol, _cycle_regime)
                             print(f"  📛 REGIME_SKIP: {symbol} — market is {_cycle_regime}")
+                            _regime_ok = False
+                        if _cycle_crisis_mode:
+                            logger.info(
+                                "VIX_CRISIS_SKIP: %s — VIX %.1f >= %.0f",
+                                symbol, _vix_now, cfg.vix_crisis_threshold,
+                            )
+                            print(f"  🚨 VIX CRISIS: {symbol} — VIX {_vix_now:.1f} >= {cfg.vix_crisis_threshold:.0f} — no new BUYs")
                             _regime_ok = False
                         _fv_occupied = fast_validator.state.open_symbols() if fast_validator else set()
                         if symbol.upper() in _fv_occupied:

@@ -23,7 +23,7 @@ import json
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from stock_bot.data.price_feed import get_sector, get_usd_cad_rate, is_cad_symbol
@@ -42,10 +42,33 @@ _TRADES_CSV    = os.path.join(_STOCK_BOT_DIR, "paper_trades.csv")
 _STATE_JSON    = os.path.join(_STOCK_BOT_DIR, "paper_state.json")
 _RESET_FLAG    = os.path.join(_STOCK_BOT_DIR, ".paper_reset")
 
+# Separate file, NOT a change to paper_trades.csv — that 9-column schema is
+# frozen (ConfidenceBandTracker/accuracy pipeline depend on it exactly; see
+# CLAUDE.md hard rules). Settlement date + FX rate at trade time (Canadian
+# tax record-keeping — punch-list item #9) are logged here instead, joined
+# back to the frozen CSV by (timestamp, symbol, side).
+_SETTLEMENT_CSV = os.path.join(_STOCK_BOT_DIR, "paper_trades_settlement.csv")
+_SETTLEMENT_CSV_HEADER = ["timestamp", "symbol", "side", "settlement_date", "fx_rate_at_trade"]
+
 _CSV_HEADER = [
     "timestamp", "symbol", "side", "shares",
     "price", "total_value", "cash_remaining", "reason", "confidence",
 ]
+
+
+def _next_business_day(d: date) -> date:
+    """
+    T+1 settlement, skipping weekends. Deliberate simplification: does NOT
+    account for market holidays (see stock_bot/main.py's _us_holidays()/
+    _ca_holidays() for the real calendar, not wired in here) — this is a
+    minimal data-capture field for later tax work, not a guaranteed-exact
+    clearing date (punch-list item #9, scoped to "capture the fields, not
+    build a tax engine", 2026-08-05).
+    """
+    next_day = d + timedelta(days=1)
+    while next_day.weekday() >= 5:   # Saturday=5, Sunday=6
+        next_day += timedelta(days=1)
+    return next_day
 
 
 class StockPaperExecutor(StockExecutorBase):
@@ -443,6 +466,7 @@ class StockPaperExecutor(StockExecutorBase):
             )
             self._trade_log.append(trade)
             self._log_trade_csv(trade, confidence=confidence)
+            self._log_settlement_csv(trade, sym)
             self.save_state()
             self._update_position_value({sym: fill_px})
 
@@ -494,6 +518,7 @@ class StockPaperExecutor(StockExecutorBase):
             )
             self._trade_log.append(trade)
             self._log_trade_csv(trade)
+            self._log_settlement_csv(trade, sym)
             self.save_state()
             self._update_position_value({sym: fill_px})
 
@@ -710,6 +735,30 @@ class StockPaperExecutor(StockExecutorBase):
                 logger.info("Created paper_trades.csv at %s", _TRADES_CSV)
             except OSError as exc:
                 logger.warning("Could not create paper_trades.csv: %s", exc)
+        if not os.path.exists(_SETTLEMENT_CSV):
+            try:
+                with open(_SETTLEMENT_CSV, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(_SETTLEMENT_CSV_HEADER)
+                logger.info("Created paper_trades_settlement.csv at %s", _SETTLEMENT_CSV)
+            except OSError as exc:
+                logger.warning("Could not create paper_trades_settlement.csv: %s", exc)
+
+    def _log_settlement_csv(self, trade: PaperTrade, sym: str) -> None:
+        """Records T+1 settlement date + the FX rate used for this fill —
+        Canadian tax record-keeping (ACB in CAD, FX gain/loss component).
+        Separate file from paper_trades.csv on purpose — see its header
+        comment. Never blocks or fails a trade — logging-only, best-effort."""
+        try:
+            trade_date = datetime.strptime(trade.timestamp[:10], "%Y-%m-%d").date()
+            settlement = _next_business_day(trade_date)
+            fx_rate = 1.0 if is_cad_symbol(sym) else get_usd_cad_rate()
+            with open(_SETTLEMENT_CSV, "a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow([
+                    trade.timestamp, trade.symbol, trade.side,
+                    settlement.isoformat(), f"{fx_rate:.6f}",
+                ])
+        except (OSError, ValueError) as exc:
+            logger.warning("Could not write to paper_trades_settlement.csv: %s", exc)
 
     def _log_trade_csv(self, trade: PaperTrade, confidence: int = 0) -> None:
         try:

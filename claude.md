@@ -174,7 +174,7 @@ need the full narrative behind any decision below.
 
 ## Test Suite Manifest (reconciled 2026-08-05)
 
-Expected total: **446 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~10s — if it takes minutes, a test is reading live `.env` config.
+Expected total: **465 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~10s — if it takes minutes, a test is reading live `.env` config.
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -186,6 +186,9 @@ Expected total: **446 tests** (verified via `pytest --collect-only -q`; table su
 | `test_stock_correlation_gate.py` | 8 | `stock_bot.main._check_correlation_gate`: blocks on >0.70 correlation with an open position, allows when uncorrelated/no positions/adding to self-held symbol, fails open on missing candle data (candidate or peer), case-insensitive symbol matching, source-inspection guard confirms `run()` still calls it and blocks on a hit |
 | `test_stock_macro_calendar.py` | 14 | `stock_bot/risk/macro_calendar.py`: `jobs_report_dates` (12 Fridays/year, first week, invariant-checked not hardcoded), `parse_user_event_dates` (valid/empty/invalid-skipped/whitespace), `is_macro_blackout` (exact-date/before/after/boundary-inclusive, disabled at 0 or negative, jobs-report-alone triggers, nearest-event-wins when multiple in window) |
 | `test_stock_macro_blackout_gate.py` | 5 | `stock_bot.main._is_macro_event_blackout` config-reading wrapper: blocks on user-supplied date, disabled at 0, fails open on bad config value, jobs-report-alone still checked with empty user dates, source-inspection guard confirms `run()` calls it market-wide before the per-symbol earnings check |
+| `test_stock_vix_crisis.py` | 6 | `stock_bot/risk/vix_crisis.py`: `is_vix_crisis` — at/above/below threshold, None fails open, zero/negative threshold disables |
+| `test_stock_vix_crisis_gate.py` | 2 | Source-inspection guard: `run()` fetches `^VIX`, computes crisis mode via `is_vix_crisis`, and gates new BUYs on it (reuses the same `_regime_ok` flag as the SPY regime filter) |
+| `test_stock_settlement_csv.py` | 11 | Settlement/FX tax record-keeping (Canadian ACB/FX, minimal scope — data capture only, no gain computation): `_next_business_day` T+1-skip-weekends (both paper.py and ibkr.py copies), frozen `paper_trades.csv`/`ibkr_trades.csv` header proven UNCHANGED, new settlement CSV written on BUY and SELL with correct join key (timestamp/symbol/side) back to the frozen CSV, CAD symbol records fx_rate=1.0 |
 | `test_risk_manager.py` | 20 | RiskManager: halt gate, daily loss, position size, SL/TP bypass, state persistence, per-symbol caps, aggregate account breakers |
 | `test_fill_recording.py` | 8 | BUG 1: qty=0 fill — filled priority, amount fallback, guard, TradeLog guard |
 | `test_external_holdings.py` | 6 | External-holdings guard in _sync_position (adopt=false/true) |
@@ -226,7 +229,7 @@ Expected total: **446 tests** (verified via `pytest --collect-only -q`; table su
 | `test_grid_stress_test.py` | 14 | `grid_stress_test.py` pure helpers (crypto research tooling, not the live pipeline): crash-period date parsing, buy-and-hold P&L calc, PASS/MARGINAL/FAILED classification. Hermetic — the actual stress run against Binance is a separate manual step |
 | `test_grid_dca_experiment.py` | 12 | `grid_dca_experiment.py` standalone backtest engines (crypto research tooling, not the live pipeline): grid strategy fills/reopens/floor-stop, capital split across slots, fee math on both legs, DCA safety-order averaging + cycle restart, empty-candle edge cases |
 
-Run: `python -m pytest --tb=short -q` — must show **446 passed**.
+Run: `python -m pytest --tb=short -q` — must show **465 passed**.
 
 ---
 
@@ -374,6 +377,46 @@ symbol is being evaluated) before the per-symbol earnings-blackout check. Fail-o
 error (bad config value, etc.) — same philosophy as earnings blackout. Shipped active by
 default since, like the correlation gate, it can only make a BUY more conservative.
 
+### VIX crisis mode (stock bot — always on, closes punch-list #8)
+```
+VIX_CRISIS_ENABLED=true          # added 2026-08-05. Default ON — only ever blocks BUYs,
+                                  # never loosens anything, same reasoning as the correlation
+                                  # and macro-blackout gates.
+VIX_CRISIS_THRESHOLD=35.0        # added 2026-08-05. CBOE VIX level, matches the spec's
+                                  # "Crisis mode: VIX >35" verbatim. 0 or negative disables.
+```
+`stock_bot/risk/vix_crisis.py` — pure threshold check only (`is_vix_crisis`). VIX data (Yahoo
+Finance `^VIX`) is fetched once per scan cycle in `stock_bot/main.py`, same `fetch_with_retry`
+pattern as the existing SPY regime-filter fetch, right next to it. Market-wide — reuses the
+same `_regime_ok` flag the SPY BULL/BEAR/NEUTRAL filter already uses to gate new BUYs, so
+crisis mode and the regime filter share one code path rather than adding a second parallel
+gate. Fetch failure fails open (`_vix_now=None` → not crisis). Printed every cycle next to the
+regime line (`Regime: BULL 🟢   VIX: 18.4 🟢`) for visibility, same as regime already was. This
+implements "disable aggressive trading" literally as a full BUY block, not partial size
+reduction — consistent with how every other market-wide gate in this codebase (regime filter,
+macro blackout) is a binary block rather than a sizing dial, and is the stricter reading of
+the spec's own language.
+
+### Settlement date + FX-rate tax record-keeping (stock bot — closes punch-list #9)
+Minimal scope, deliberately: captures the missing data fields only — no ACB/capital-gain
+computation, no CRA-compliant report. Full tax reporting (superficial-loss rules, T5008
+matching, professional review) was explicitly descoped 2026-08-05 as its own undertaking,
+separate from a punch-list gap-fill, and the bot is still paper trading (not live/real money)
+so there's nothing to file yet.
+
+**`paper_trades.csv` / `ibkr_trades.csv` are UNCHANGED** — that 9-column schema is frozen (see
+hard rules: `ConfidenceBandTracker`/accuracy pipeline depend on it exactly; "never add,
+remove, or rename columns"). New data goes into a separate file per executor instead:
+`paper_trades_settlement.csv` / `ibkr_trades_settlement.csv`, columns `timestamp, symbol,
+side, settlement_date, fx_rate_at_trade` — joined back to the frozen CSV by
+`(timestamp, symbol, side)`. Written on every BUY and SELL fill, best-effort (a write failure
+never blocks or fails the trade itself). `settlement_date` is T+1, skipping weekends only —
+does NOT account for market holidays (a deliberate simplification; the real holiday calendar
+already exists in `stock_bot/main.py`'s `_us_holidays()`/`_ca_holidays()` but isn't wired in
+here). `fx_rate_at_trade` is `1.0` for CAD-denominated symbols, the live USD/CAD rate
+otherwise — the same `is_cad_symbol()`/`get_usd_cad_rate()` helpers already used for exposure
+sizing, just persisted per-trade now instead of only used transiently.
+
 ### How to verify the config is active
 Run: `EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py`
 Expected (current, since macd_enabled was wired into `engine_kwargs_from_cfg`, 2026-07-20):
@@ -446,8 +489,13 @@ EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-0
   `check_exposure()` now take an optional `pending_trade_value` (defaults to 0.0, so all
   other callers are unaffected); `stock_bot/main.py` computes the target allocation before
   the exposure gate (was previously computed after, inside the sizing branch) and passes it
-  through. See conversation history / `.memory/` for the fuller comparison and the P2 items
-  still open (VIX crisis mode, CRA tax fields).
+  through. P2 closed the same day: VIX crisis mode (`^VIX` >= 35 blocks all new BUYs
+  market-wide, shares the SPY regime filter's gate) and settlement/FX tax record-keeping
+  (T+1 + FX rate per fill in a NEW separate file — `paper_trades.csv`/`ibkr_trades.csv` stay
+  frozen, deliberately scoped to data capture only, not a CRA-compliant report). Punch list
+  from the "Trading Bot Master Spec" gap review is now fully closed through P2 — only P3
+  (Postgres/Docker rewrite) remains, and that's off the table per the user's own call. See
+  conversation history / `.memory/` for the fuller comparison.
 - **Both bots:** crash-alert + atomic state writes + SIGTERM graceful shutdown + liveness
   tracking (detects hung loops, not just dead processes) all live.
 

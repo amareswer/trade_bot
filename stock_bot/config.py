@@ -115,6 +115,8 @@ class StockConfig:
     regime_filter_enabled: bool  # block BUY when SPY is not in BULL regime
     regime_ma_period:      int   # slow SMA period for golden/death cross (default 200)
     regime_fast_ma:        int   # fast SMA period for golden/death cross (default 50)
+    vix_crisis_enabled:    bool  # block ALL new BUYs market-wide when VIX >= vix_crisis_threshold
+    vix_crisis_threshold:  float # CBOE VIX level considered a crisis (default 35, matches spec)
     watchlist:             list[str] = field(init=False)
 
     def __post_init__(self) -> None:
@@ -309,4 +311,6 @@ def load() -> StockConfig:
         regime_filter_enabled  = _bool ("REGIME_FILTER_ENABLED",   True),
         regime_ma_period       = _int  ("REGIME_MA_PERIOD",        200),
         regime_fast_ma         = _int  ("REGIME_FAST_MA",          50),
+        vix_crisis_enabled     = _bool ("VIX_CRISIS_ENABLED",      True),
+        vix_crisis_threshold   = _float("VIX_CRISIS_THRESHOLD",    35.0),
     )

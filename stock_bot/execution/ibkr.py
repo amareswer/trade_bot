@@ -50,7 +50,7 @@ import logging
 import os
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
 from stock_bot.data.price_feed import get_sector, get_usd_cad_rate
@@ -72,6 +72,24 @@ _CSV_HEADER = [
     "timestamp", "symbol", "side", "shares",
     "price", "total_value", "cash_remaining", "reason", "confidence",
 ]
+
+# Separate file, NOT a change to ibkr_trades.csv — that 9-column schema is
+# frozen (ConfidenceBandTracker/accuracy pipeline depend on it exactly; see
+# CLAUDE.md hard rules). Settlement date + FX rate at trade time (Canadian
+# tax record-keeping — punch-list item #9) are logged here instead, joined
+# back to the frozen CSV by (timestamp, symbol, side).
+_SETTLEMENT_CSV = os.path.join(_STOCK_BOT_DIR, "ibkr_trades_settlement.csv")
+_SETTLEMENT_CSV_HEADER = ["timestamp", "symbol", "side", "settlement_date", "fx_rate_at_trade"]
+
+
+def _next_business_day(d: date) -> date:
+    """T+1 settlement, skipping weekends — see StockPaperExecutor's copy of
+    this function for the full rationale (both executors implement this
+    identically, matching the codebase's existing paper/ibkr duplication)."""
+    next_day = d + timedelta(days=1)
+    while next_day.weekday() >= 5:   # Saturday=5, Sunday=6
+        next_day += timedelta(days=1)
+    return next_day
 
 _LIVE_PORTS = {7496, 4001}   # TWS live, IB Gateway live
 _PAPER_ACCOUNT_PREFIX = "DU"
@@ -1012,6 +1030,30 @@ class IBKRExecutor(StockExecutorBase):
                 logger.info("Created ibkr_trades.csv at %s", _TRADES_CSV)
             except OSError as exc:
                 logger.warning("Could not create ibkr_trades.csv: %s", exc)
+        if not os.path.exists(_SETTLEMENT_CSV):
+            try:
+                with open(_SETTLEMENT_CSV, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(_SETTLEMENT_CSV_HEADER)
+                logger.info("Created ibkr_trades_settlement.csv at %s", _SETTLEMENT_CSV)
+            except OSError as exc:
+                logger.warning("Could not create ibkr_trades_settlement.csv: %s", exc)
+
+    def _log_settlement_csv(self, trade: PaperTrade, sym: str) -> None:
+        """Records T+1 settlement date + the FX rate used for this fill —
+        Canadian tax record-keeping (ACB in CAD, FX gain/loss component).
+        Separate file from ibkr_trades.csv on purpose — see its header
+        comment. Never blocks or fails a trade — logging-only, best-effort."""
+        try:
+            trade_date = datetime.strptime(trade.timestamp[:10], "%Y-%m-%d").date()
+            settlement = _next_business_day(trade_date)
+            fx_rate = 1.0 if self.to_contract(sym).currency == "CAD" else get_usd_cad_rate()
+            with open(_SETTLEMENT_CSV, "a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow([
+                    trade.timestamp, trade.symbol, trade.side,
+                    settlement.isoformat(), f"{fx_rate:.6f}",
+                ])
+        except (OSError, ValueError) as exc:
+            logger.warning("Could not write to ibkr_trades_settlement.csv: %s", exc)
 
     def _record_trade(
         self, side: str, sym: str, shares: float, fill_px: float,
@@ -1043,6 +1085,7 @@ class IBKRExecutor(StockExecutorBase):
                 ])
         except OSError as exc:
             logger.warning("Could not write to ibkr_trades.csv: %s", exc)
+        self._log_settlement_csv(trade, sym)
         self.save_state()
 
     # ── internal ─────────────────────────────────────────────────────────────
