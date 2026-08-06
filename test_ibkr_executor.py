@@ -146,6 +146,7 @@ def sandbox(tmp_path, monkeypatch):
     """Redirect state/CSV to tmp and stub sector lookups (no network)."""
     monkeypatch.setattr(ibkr_mod, "_STATE_JSON", str(tmp_path / "ibkr_state.json"))
     monkeypatch.setattr(ibkr_mod, "_TRADES_CSV", str(tmp_path / "ibkr_trades.csv"))
+    monkeypatch.setattr(ibkr_mod, "_SETTLEMENT_CSV", str(tmp_path / "ibkr_settlement.csv"))
     monkeypatch.setattr(ibkr_mod, "get_sector", lambda s: "other")
     return tmp_path
 

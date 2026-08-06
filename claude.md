@@ -508,6 +508,20 @@ EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-0
   table row with an explicit N/A case instead of silently grabbing the next X.XX% it finds.
   Re-running the audit after the fix showed the real number was 100.0% PASS all along — the
   underlying strategy fidelity was never actually degraded, only the report generation was.
+- **Test-pollution incident, same day:** the settlement-CSV feature (P2 #9) broke test
+  isolation — 4 pre-existing test files' `sandbox` fixtures (`test_stock_breaker.py`,
+  `test_fx_sizing.py`, `test_stock_position_mark_refresh.py`, `test_ibkr_executor.py`)
+  predated `_SETTLEMENT_CSV` and were never updated to redirect it, so every suite run
+  silently appended fake RY/CM.TO/KO test rows into the REAL
+  `stock_bot/paper_trades_settlement.csv` / `ibkr_trades_settlement.csv` — caught when the
+  user noticed the file and asked what it was. Confirmed zero real trades were mixed in
+  (frozen `ibkr_trades.csv`/`paper_trades.csv` untouched since 07-31/07-17) before resetting
+  both to header-only. Fixed at two levels: the 4 fixtures now redirect it explicitly, AND
+  `conftest.py` gained a new autouse fixture (`_block_real_stock_bot_file_writes`) that
+  redirects every known paper/ibkr executor file-path global to a tmp default for every test
+  — same shape of fix as the existing `_block_real_telegram_sends` fixture there, which exists
+  for the identical reason (2026-07-29 incident: a test forgetting to mock Telegram sent a
+  real message). A future new persisted-file addition can't repeat this by omission again.
 - **Both bots:** crash-alert + atomic state writes + SIGTERM graceful shutdown + liveness
   tracking (detects hung loops, not just dead processes) all live.
 

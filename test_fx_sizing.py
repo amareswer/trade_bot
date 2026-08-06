@@ -88,6 +88,7 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(paper_mod, "_STATE_JSON", str(tmp_path / "state.json"))
     monkeypatch.setattr(paper_mod, "_TRADES_CSV", str(tmp_path / "trades.csv"))
     monkeypatch.setattr(paper_mod, "_RESET_FLAG", str(tmp_path / ".reset"))
+    monkeypatch.setattr(paper_mod, "_SETTLEMENT_CSV", str(tmp_path / "settlement.csv"))
     price_feed._sector_cache["RY"] = "financial services"
     price_feed._sector_cache["CM.TO"] = "financial services"
     price_feed._sector_cache["TD"] = "financial services"

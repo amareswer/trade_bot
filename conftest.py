@@ -35,3 +35,34 @@ def _noop_send(self, text: str) -> None:
 def _block_real_telegram_sends(monkeypatch):
     from bot.alerts.telegram import TelegramAlerter
     monkeypatch.setattr(TelegramAlerter, "_send", _noop_send)
+
+
+# Same shape of incident as the Telegram one above, found 2026-08-05: adding
+# the settlement/FX tax-record CSV to StockPaperExecutor/IBKRExecutor meant
+# every test file's local `sandbox` fixture needed a NEW monkeypatch line
+# for it — four pre-existing fixtures (test_stock_breaker.py, test_fx_sizing.py,
+# test_stock_position_mark_refresh.py, test_ibkr_executor.py) predated that
+# CSV and were never updated, so every suite run silently appended fake
+# RY/CM.TO/KO test rows into the REAL stock_bot/paper_trades_settlement.csv
+# and stock_bot/ibkr_trades_settlement.csv — exactly the "a test forgets to
+# sandbox X, real files get corrupted" pattern the Telegram fixture above
+# already exists to prevent for outbound messages.
+#
+# This is the same fix, generalized: redirect the file-path module globals
+# to a session-default tmp location for EVERY test automatically, so a
+# future new persisted-file addition can't repeat this by omission. A test's
+# own local `sandbox` fixture (if it requests `tmp_path` itself) still wins
+# for that test — monkeypatch applies fixtures in dependency order, so a
+# test-specific override set up after this one simply replaces it — this is
+# only the fallback for tests that don't set their own.
+@pytest.fixture(autouse=True)
+def _block_real_stock_bot_file_writes(tmp_path, monkeypatch):
+    import stock_bot.execution.paper as _paper_mod
+    import stock_bot.execution.ibkr as _ibkr_mod
+
+    for _mod, _prefix in ((_paper_mod, "paper"), (_ibkr_mod, "ibkr")):
+        for _attr in ("_STATE_JSON", "_TRADES_CSV", "_SETTLEMENT_CSV"):
+            if hasattr(_mod, _attr):
+                monkeypatch.setattr(_mod, _attr, str(tmp_path / f"{_prefix}_{_attr}.default"))
+        if hasattr(_mod, "_RESET_FLAG"):
+            monkeypatch.setattr(_mod, "_RESET_FLAG", str(tmp_path / f"{_prefix}_reset.default"))
