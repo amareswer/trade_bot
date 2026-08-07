@@ -174,18 +174,18 @@ need the full narrative behind any decision below.
 
 ## Test Suite Manifest (reconciled 2026-08-05)
 
-Expected total: **509 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~11s — if it takes minutes, a test is reading live `.env` config.
+Expected total: **518 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~11s — if it takes minutes, a test is reading live `.env` config.
 
 | File | Tests | What it covers |
 |------|-------|----------------|
 | `test_indicators.py` | 28 | RSI, EMA, ADX, MACD, ATR calculations |
-| `test_live_executor.py` | 38 | LiveExecutor: dry-run, market/limit orders, urgent-exit bypass, fee deduction, state save/load, pre-trade min-size guard, restart recovery (seeds position manager + state machine), native stop-loss backstop (placement, cancel, resync, failure alerting, dry-run/flag-off no-ops, restart reconciliation) |
+| `test_live_executor.py` | 44 | LiveExecutor: dry-run, market/limit orders, urgent-exit bypass, fee deduction, state save/load, pre-trade min-size guard, restart recovery (seeds position manager + state machine), native stop-loss backstop (placement, cancel, resync, failure alerting, dry-run/flag-off no-ops, restart reconciliation), slippage guard (BUY/SELL unfavorable trip, within-threshold, favorable-direction, disabled, dry-run no-ops) |
 | `test_capital_pool.py` | 19 | CapitalPool: slot allocation, slot cap, release, edge cases |
 | `test_correlation.py` | 17 | Pearson correlation, pct_returns, fetch_correlation |
 | `test_stock_correlation.py` | 5 | `stock_bot/risk/correlation.py`: `fetch_correlation_from_closes` — no-network wrapper reusing bot/risk/correlation.py's pearson/pct_returns unchanged |
 | `test_stock_correlation_gate.py` | 8 | `stock_bot.main._check_correlation_gate`: blocks on >0.70 correlation with an open position, allows when uncorrelated/no positions/adding to self-held symbol, fails open on missing candle data (candidate or peer), case-insensitive symbol matching, source-inspection guard confirms `run()` still calls it and blocks on a hit |
 | `test_stock_macro_calendar.py` | 14 | `stock_bot/risk/macro_calendar.py`: `jobs_report_dates` (12 Fridays/year, first week, invariant-checked not hardcoded), `parse_user_event_dates` (valid/empty/invalid-skipped/whitespace), `is_macro_blackout` (exact-date/before/after/boundary-inclusive, disabled at 0 or negative, jobs-report-alone triggers, nearest-event-wins when multiple in window) |
-| `test_stock_macro_blackout_gate.py` | 5 | `stock_bot.main._is_macro_event_blackout` config-reading wrapper: blocks on user-supplied date, disabled at 0, fails open on bad config value, jobs-report-alone still checked with empty user dates, source-inspection guard confirms `run()` calls it market-wide before the per-symbol earnings check |
+| `test_stock_macro_blackout_gate.py` | 6 | `stock_bot.main._is_macro_event_blackout` config-reading wrapper: blocks on user-supplied date, disabled at 0, fails open on bad config value, jobs-report-alone still checked with empty user dates, source-inspection guard confirms `run()` calls it market-wide before the per-symbol earnings check, plus a guard that the fixed test date stays clear of real jobs-report Fridays. **Two of these used the real `date.today()` until 2026-08-07 and failed on every actual jobs-report day (~3 days/month, symmetric window) — production code was always correct, the tests were contaminated by the live calendar. Now pinned to a fixed 2026-09-16 reference via a patched `stock_bot.main.date`; mutation-tested to confirm they still fail if the gate itself breaks.** |
 | `test_stock_vix_crisis.py` | 6 | `stock_bot/risk/vix_crisis.py`: `is_vix_crisis` — at/above/below threshold, None fails open, zero/negative threshold disables |
 | `test_stock_vix_crisis_gate.py` | 2 | Source-inspection guard: `run()` fetches `^VIX`, computes crisis mode via `is_vix_crisis`, and gates new BUYs on it (reuses the same `_regime_ok` flag as the SPY regime filter) |
 | `test_stock_settlement_csv.py` | 11 | Settlement/FX tax record-keeping (Canadian ACB/FX, minimal scope — data capture only, no gain computation): `_next_business_day` T+1-skip-weekends (both paper.py and ibkr.py copies), frozen `paper_trades.csv`/`ibkr_trades.csv` header proven UNCHANGED, new settlement CSV written on BUY and SELL with correct join key (timestamp/symbol/side) back to the frozen CSV, CAD symbol records fx_rate=1.0 |
@@ -196,7 +196,7 @@ Expected total: **509 tests** (verified via `pytest --collect-only -q`; table su
 | `test_drift_escalation.py` | 8 | Drift: tests REAL `_evaluate_drift()` from bot.main — escalation, ack (no re-alert on unchanged drift), changed-amount re-alert, resolution reset |
 | `test_tsx_validation.py` | 5 | Stock-bot TSX price sanity check |
 | `test_stock_breaker.py` | 14 | Stock-bot circuit breakers (StockPaperExecutor): daily-loss restart baseline includes position marks; weekly-loss/drawdown-halt/kill-switch tiers — reject-on-trip, halt auto-lifts on recovery, kill switch stays sticky through recovery and across restart, SELL never blocked, peak-equity persistence, drawdown_status() warning flag; per-position ATR stop-pct override — defaults to baseline, persists across restart, clears on full close, survives a partial close |
-| `test_candle_watchdog.py` | 5 | Candle watchdog: timing, alert, no double-fire |
+| `test_candle_watchdog.py` | 7 | Candle watchdog circuit breaker (upgraded 2026-08-07): silent/blocked/no-re-alert-while-stale on the stale side, alert+unblock on recovery, no re-alert once recovered |
 | `test_halt_flag.py` | 5 | Manual halt kill-switch: logs/HALT flag file engage/lift, ownership guard |
 | `test_orphaned_positions.py` | 5 | Startup orphan check: open position outside this run's symbol list alerts (removed-from-whitelist safety) |
 | `test_universe.py` | 4 | Universe screener: scoring, momentum filter, fallback |
@@ -232,7 +232,7 @@ Expected total: **509 tests** (verified via `pytest --collect-only -q`; table su
 | `test_grid_stress_test.py` | 14 | `grid_stress_test.py` pure helpers (crypto research tooling, not the live pipeline): crash-period date parsing, buy-and-hold P&L calc, PASS/MARGINAL/FAILED classification. Hermetic — the actual stress run against Binance is a separate manual step |
 | `test_grid_dca_experiment.py` | 12 | `grid_dca_experiment.py` standalone backtest engines (crypto research tooling, not the live pipeline): grid strategy fills/reopens/floor-stop, capital split across slots, fee math on both legs, DCA safety-order averaging + cycle restart, empty-candle edge cases |
 
-Run: `python -m pytest --tb=short -q` — must show **509 passed**.
+Run: `python -m pytest --tb=short -q` — must show **518 passed**.
 
 ---
 
@@ -356,6 +356,52 @@ degrades to "no backstop, software SL/TP still fully works while the bot is up,"
 crashed trading loop. Tests: `test_live_executor.py`, 11 new cases (placement, cancel,
 resync-on-quantity-change, failure alerting, dry-run/flag-off no-ops, restart reconciliation
 for all three states above).
+
+### Slippage guard (crypto — post-fill alert, on by default)
+```
+MAX_SLIPPAGE_PCT=0.01   # NOT set in .env — using the config.py default (1%). Added
+                        # 2026-08-07, closing the third finding from the same crypto-bot
+                        # research review. 0 = disabled.
+```
+`LiveExecutor.execute()` compares every live fill's actual price against the price the bot
+was evaluating the signal against, direction-aware (only an unfavorable fill counts — paying
+less on a BUY or receiving more on a SELL is never flagged). **Post-fill only, never
+blocks** — unlike every other risk gate in this codebase, there's nothing to block by the
+time slippage is known; the fill has already happened. Every real (non-dry-run) fill logs
+its expected-vs-filled delta at INFO (`Fill vs expected [...] slippage=+X.XXX%`) regardless
+of size, so the audit trail exists even when nothing crosses the threshold; a Telegram alert
+only fires when the unfavorable deviation exceeds `MAX_SLIPPAGE_PCT`. Shipped **on** by
+default (unlike native stop-loss) — it's pure observability, can never change trading
+behavior or place an order, same reasoning as the stock bot's correlation/macro-blackout
+gates shipping active. Threshold picked to sit above ordinary friction (Kraken's own fee is
+0.40–0.80%, BTC/CAD spread is typically well under 0.1%) so it only fires on a genuine
+anomaly — thin liquidity, a bad fill, or a fast-moving market during a multi-minute
+limit-chase — not routine timing drift between signal and fill. Complements, not replaces,
+`shadow_signal.py`'s existing retrospective fidelity check (part of the 15-fill capital-gate
+criteria: "fill prices within 0.5% of signal-candle close") — that one runs once a day
+against candle closes; this one fires immediately against the live decision price, closing
+the gap between a bad fill happening and the next scheduled audit catching it. Tests:
+`test_live_executor.py`, 6 new cases (BUY/SELL unfavorable-direction trip, within-threshold
+no-alert, favorable-direction never alerts regardless of size, disabled-via-zero no-op,
+dry-run no-op).
+
+### Candle watchdog — now a real circuit breaker (crypto — always on)
+Upgraded 2026-08-07, the fourth and last finding from the same crypto-bot research review.
+Previously alert-only: `_check_candle_watchdog()` fired a Telegram notice when no new candle
+had arrived for 2× `CANDLE_MINUTES` (8h at the live 4h setting), then reset its own timer to
+avoid spamming — but a stale feed and a healthy one were otherwise treated identically by the
+strategy. Now it's a real breaker: while the feed is stale, new BUYs are blocked (gate 2g,
+same "BUY-only, SELL always allowed" shape as every other breaker here) — SELL/exits are
+untouched because they read the independent live-tick price feed, not the candle feed, and
+must always be able to close a position. State (`ss['candle_feed_stale']`) persists across
+ticks in-memory (not written to a state file — resets on restart same as `trail_peak`/
+`atr_sl`, appropriate for a per-process feed-health flag); alerts fire once on each
+stale→fresh transition (both directions — a "feed recovered, BUYs re-enabled" notice is new),
+not every tick. No config flag — always on, same reasoning as the correlation/macro gates:
+it only ever makes a BUY more conservative, never loosens anything. Tests:
+`test_candle_watchdog.py`, rewritten for the new `(ss, ...) -> bool` signature — 5 → 7 cases
+(silent/blocked/re-alert-suppressed on the stale side, unchanged; two new: alerts + unblocks
+on recovery, and a recovered feed doesn't re-alert on subsequent fresh ticks).
 
 ### Risk-gate config (stock bot — `StockPaperExecutor` / `IBKRExecutor`, both in `stock_bot/execution/`)
 Both executors implement the same tiers independently (accepted duplication — same pattern
@@ -533,9 +579,13 @@ EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-0
   **off** (`NATIVE_STOP_LOSS_ENABLED=false`) pending live validation before enabling on the
   real $77 slot. Risk-engine tiering upgrade done the same day (see "Risk-gate config" above)
   — crypto's RiskManager gained the weekly-loss/drawdown-warning/kill-switch tiers the stock
-  bot got 2026-08-05, closing the second research finding. Two gaps from that pass remain not
-  yet acted on: no real-time slippage guard on fills, and the candle watchdog alerts on a
-  stale feed but never halts trading on one.
+  bot got 2026-08-05, closing the second research finding. Slippage guard added the same day
+  too (see "Slippage guard" above) — post-fill Telegram alert when a live fill lands >1%
+  worse than the price the signal was evaluated against, shipped **on** by default (alert-
+  only, can't change trading behavior). Candle watchdog upgraded to a real circuit breaker
+  the same day too (see "Candle watchdog" above) — now blocks new BUYs while the feed is
+  stale instead of only alerting, closing the fourth and last finding from that research
+  pass. All four items from the 2026-08-07 crypto-bot gap review are now closed.
 - **Stock bot:** live on IBKR paper (DUQ273338, reset to $5,000 CAD 2026-07-20). Swing book
   retired (`FAST_ENABLED=false`) — position book (rule-based, Mode A/B) is the only active
   book. TSX symbols are **permanently** advisory-only — CIRO regulation blocks API orders on

@@ -99,6 +99,12 @@ class ExchangeConfig:
                                                # down while a position is open). Static: set once per fill at
                                                # whatever SL price the bot already computed, never repriced to
                                                # follow a trailing stop. Default OFF — validate on live before enabling.
+    max_slippage_pct:        float = 0.01     # MAX_SLIPPAGE_PCT — post-fill alert (never blocks — the fill has
+                                               # already happened by the time slippage is known) when a live fill
+                                               # lands worse than this far from the price the bot expected.
+                                               # 0 = disabled. On by default — alert-only, never changes trading
+                                               # behavior, same reasoning as the correlation/macro gates shipping
+                                               # active in the stock bot.
 
     def __post_init__(self):
         if self.feed_mode not in ("live", "simulated"):
@@ -129,6 +135,8 @@ class ExchangeConfig:
             raise ValueError("LIMIT_CHASE_TICK_PCT must be between 0 and 0.01 (1% of price)")
         if self.drift_alert_threshold < 1:
             raise ValueError("DRIFT_ALERT_THRESHOLD must be >= 1")
+        if not 0 <= self.max_slippage_pct <= 0.20:
+            raise ValueError("MAX_SLIPPAGE_PCT must be between 0% and 20% (0 = disabled)")
 
 
 @dataclass
@@ -591,6 +599,7 @@ def _load() -> AppConfig:
             adopt_external_holdings  = _bool ("ADOPT_EXTERNAL_HOLDINGS",  False),
             drift_alert_threshold    = _int  ("DRIFT_ALERT_THRESHOLD",    3),
             native_stop_loss_enabled = _bool ("NATIVE_STOP_LOSS_ENABLED", False),
+            max_slippage_pct         = _float("MAX_SLIPPAGE_PCT",         0.01),
         ),
         strategy=StrategyConfig(
             mode                    = _str  ("STRATEGY_MODE",           "indicator"),

@@ -42,6 +42,7 @@ def _make(
     state_path:     str   = None,
     order_type:     str   = "market",
     native_stop_loss_enabled: bool = False,
+    max_slippage_pct: float = 0.0,
     tmp_path        = None,
 ) -> tuple[LiveExecutor, MagicMock]:
     """
@@ -79,6 +80,7 @@ def _make(
             state_path    = state_path,
             order_type    = order_type,
             native_stop_loss_enabled = native_stop_loss_enabled,
+            max_slippage_pct = max_slippage_pct,
         )
     return ex, mock_ex
 
@@ -918,6 +920,136 @@ def test_urgent_sell_bypasses_limit_chase(mock_cfg, mock_sleep, tmp_path):
         f"urgent SELL should use market order, got '{order_type_used}'"
     )
     mock_ex.fetch_order_book.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Slippage guard (MAX_SLIPPAGE_PCT) — post-fill alert only, never blocks
+# ---------------------------------------------------------------------------
+
+def test_slippage_guard_alerts_on_unfavorable_buy_fill(tmp_path):
+    """BUY filled worse (higher) than expected, past threshold — alerts."""
+    ex, mock_ex = _make(
+        dry_run=False, starting_cash=100_000.0,
+        max_slippage_pct=0.01, tmp_path=tmp_path,
+    )
+    raw = {
+        "id": "order-001", "status": "closed",
+        "filled": 0.001, "average": 91_000.0,   # filled 1.11% above expected
+        "fee": {"cost": 0.0, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = raw
+    mock_ex.fetch_order.return_value  = raw
+
+    with patch.object(ex._alerter, "error") as mock_alert:
+        order = ex.execute(Signal.BUY, 90_000.0, 0.001)
+
+    assert order is not None and order.status == OrderStatus.FILLED
+    mock_alert.assert_called_once()
+    assert "SLIPPAGE WARNING" in mock_alert.call_args[0][0]
+
+
+def test_slippage_guard_alerts_on_unfavorable_sell_fill(tmp_path):
+    """SELL filled worse (lower) than expected, past threshold — alerts."""
+    ex, mock_ex = _make(
+        dry_run=False, starting_cash=100_000.0,
+        max_slippage_pct=0.01, tmp_path=tmp_path,
+    )
+    buy_raw = {
+        "id": "order-buy", "status": "closed",
+        "filled": 0.001, "average": 90_000.0,
+        "fee": {"cost": 0.0, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = buy_raw
+    mock_ex.fetch_order.return_value  = buy_raw
+    ex.execute(Signal.BUY, 90_000.0, 0.001)
+
+    sell_raw = {
+        "id": "order-sell", "status": "closed",
+        "filled": 0.001, "average": 89_000.0,   # filled 1.11% below expected
+        "fee": {"cost": 0.0, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = sell_raw
+    mock_ex.fetch_order.return_value  = sell_raw
+
+    with patch.object(ex._alerter, "error") as mock_alert:
+        order = ex.execute(Signal.SELL, 90_000.0, 0.001)
+
+    assert order is not None and order.status == OrderStatus.FILLED
+    mock_alert.assert_called_once()
+    assert "SLIPPAGE WARNING" in mock_alert.call_args[0][0]
+
+
+def test_slippage_within_threshold_no_alert(tmp_path):
+    """Small deviation under the threshold — no alert."""
+    ex, mock_ex = _make(
+        dry_run=False, starting_cash=100_000.0,
+        max_slippage_pct=0.01, tmp_path=tmp_path,
+    )
+    raw = {
+        "id": "order-001", "status": "closed",
+        "filled": 0.001, "average": 90_090.0,   # 0.1% above expected — within 1% threshold
+        "fee": {"cost": 0.0, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = raw
+    mock_ex.fetch_order.return_value  = raw
+
+    with patch.object(ex._alerter, "error") as mock_alert:
+        ex.execute(Signal.BUY, 90_000.0, 0.001)
+
+    mock_alert.assert_not_called()
+
+
+def test_slippage_favorable_direction_never_alerts(tmp_path):
+    """BUY filled CHEAPER than expected — favorable, must never alert
+    regardless of how large the gap is."""
+    ex, mock_ex = _make(
+        dry_run=False, starting_cash=100_000.0,
+        max_slippage_pct=0.01, tmp_path=tmp_path,
+    )
+    raw = {
+        "id": "order-001", "status": "closed",
+        "filled": 0.001, "average": 80_000.0,   # filled well BELOW expected — a good fill
+        "fee": {"cost": 0.0, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = raw
+    mock_ex.fetch_order.return_value  = raw
+
+    with patch.object(ex._alerter, "error") as mock_alert:
+        ex.execute(Signal.BUY, 90_000.0, 0.001)
+
+    mock_alert.assert_not_called()
+
+
+def test_slippage_guard_disabled_via_zero_threshold(tmp_path):
+    """max_slippage_pct=0.0 (the LiveExecutor default) disables the guard
+    entirely — even a large unfavorable fill must not alert."""
+    ex, mock_ex = _make(
+        dry_run=False, starting_cash=100_000.0,
+        max_slippage_pct=0.0, tmp_path=tmp_path,
+    )
+    raw = {
+        "id": "order-001", "status": "closed",
+        "filled": 0.001, "average": 99_000.0,   # 10% above expected
+        "fee": {"cost": 0.0, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = raw
+    mock_ex.fetch_order.return_value  = raw
+
+    with patch.object(ex._alerter, "error") as mock_alert:
+        ex.execute(Signal.BUY, 90_000.0, 0.001)
+
+    mock_alert.assert_not_called()
+
+
+def test_slippage_guard_dry_run_never_alerts(tmp_path):
+    """Dry-run always fills at exactly the requested price — the guard
+    naturally never has anything to flag, but locked in explicitly."""
+    ex, mock_ex = _make(dry_run=True, starting_cash=100_000.0, max_slippage_pct=0.01, tmp_path=tmp_path)
+
+    with patch.object(ex._alerter, "error") as mock_alert:
+        ex.execute(Signal.BUY, 90_000.0, 0.001)
+
+    mock_alert.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

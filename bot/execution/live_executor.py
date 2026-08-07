@@ -64,6 +64,7 @@ class LiveExecutor:
         order_type:               str   = "market",
         adopt_external_holdings:  bool  = False,
         native_stop_loss_enabled: bool  = False,
+        max_slippage_pct:         float = 0.0,
     ):
         self.symbol                    = symbol
         self.dry_run                   = dry_run
@@ -72,6 +73,7 @@ class LiveExecutor:
         self._state_path               = state_path
         self._adopt_external_holdings  = adopt_external_holdings
         self._native_stop_loss_enabled = native_stop_loss_enabled
+        self._max_slippage_pct         = max_slippage_pct
         self._portfolio                = Portfolio(cash=starting_cash)
         self._fills:      list[Order]  = []
         self._rejects:    list[Order]  = []
@@ -457,14 +459,18 @@ class LiveExecutor:
         self._save_state()
 
     def _place_native_stop(self, quantity: float, stop_price: float) -> None:
+        # Deliberately NO retry on this create_order (unlike the read-path
+        # fetch_with_retry calls elsewhere in this file): if attempt 1 times
+        # out AFTER Kraken accepted the order, a retry would place a second
+        # stop — and only the second would be tracked, leaving the first as
+        # an untracked orphan that could fire later against a future
+        # position. A failed placement alerts below and the software SL/TP
+        # still fully protects the position while the bot is running.
         try:
             _price_str = self._exchange.price_to_precision(self.symbol, stop_price)
-            raw = fetch_with_retry(
-                lambda: self._exchange.create_order(
-                    self.symbol, "market", "sell", quantity,
-                    params={"stopLossPrice": _price_str},
-                ),
-                attempts=2, delay_s=2.0, label=f"native stop placement [{self.symbol}]",
+            raw = self._exchange.create_order(
+                self.symbol, "market", "sell", quantity,
+                params={"stopLossPrice": _price_str},
             )
             self._native_stop_order_id = str(raw.get("id", ""))
             self._native_stop_price    = stop_price
@@ -1073,6 +1079,38 @@ class LiveExecutor:
                 return order
 
         total_value = fill_price * quantity
+
+        # ── Slippage guard (2026-08-07) ──────────────────────────────────
+        # Post-fill only — the fill has already happened by the time slippage
+        # is known, so this can never block a trade, only flag one that
+        # landed unexpectedly worse than the price the bot evaluated the
+        # signal against. Dry-run naturally never trips this (fill_price ==
+        # price exactly, skipped entirely to avoid log noise). Direction-
+        # aware: only an unfavorable fill counts — paying less on a BUY or
+        # receiving more on a SELL is never a problem worth flagging.
+        if not self.dry_run and price > 0:
+            _slippage_pct = (
+                (fill_price - price) / price if side == OrderSide.BUY
+                else (price - fill_price) / price
+            )
+            logger.info(
+                "Fill vs expected [%s]: %s expected=%.2f filled=%.2f slippage=%+.3f%%",
+                self.symbol, side.value, price, fill_price, _slippage_pct * 100,
+            )
+            if self._max_slippage_pct > 0 and _slippage_pct > self._max_slippage_pct:
+                logger.warning(
+                    "SLIPPAGE GUARD [%s]: %s filled %.2f%% worse than expected "
+                    "(expected %.2f, filled %.2f, threshold %.2f%%)",
+                    self.symbol, side.value, _slippage_pct * 100, price, fill_price,
+                    self._max_slippage_pct * 100,
+                )
+                self._alerter.error(
+                    f"SLIPPAGE WARNING [{self.symbol}]: {side.value} filled at "
+                    f"{fill_price:,.2f} vs expected {price:,.2f} — "
+                    f"{_slippage_pct*100:.2f}% worse than expected "
+                    f"(threshold {self._max_slippage_pct*100:.2f}%). The fill already "
+                    f"happened — this is a post-fill alert, not a block."
+                )
 
         if side == OrderSide.BUY:
             prev_cost = self._portfolio._cost_basis * self._portfolio.position

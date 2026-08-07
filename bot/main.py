@@ -547,26 +547,52 @@ def _check_orphaned_positions(
 
 
 # ---------------------------------------------------------------------------
-# Candle watchdog helper (extracted for unit-testability)
+# Candle watchdog — circuit breaker (extracted for unit-testability)
+#
+# Upgraded 2026-08-07: was alert-only before (fired a Telegram notice, reset
+# its own timer to avoid spam, but never changed trading behavior — a stale
+# feed and a healthy one were treated identically by the strategy). Now
+# blocks new BUYs for as long as the feed stays stale, same "BUY-only, SELL
+# always allowed" shape as every other breaker in this codebase — SL/TP
+# exits read the independent live-tick price feed, not the candle feed, and
+# must always be able to close a position regardless of candle staleness.
 # ---------------------------------------------------------------------------
 
 def _check_candle_watchdog(
-    last_candle_time: float,
+    ss: dict,
     candle_minutes: int,
     now: float,
     alerter: "TelegramAlerter",
     symbol: str = "",
-) -> float:
-    """Return updated last_candle_time. Fires alerter.error() if feed is stale."""
-    stale_s = candle_minutes * 60 * 2
-    if now - last_candle_time > stale_s:
-        _sym_label = f" [{symbol}]" if symbol else ""
+) -> bool:
+    """
+    Reads ss['last_candle_time'] (only ever advanced by the real candle-fetch
+    path — untouched here) and transitions ss['candle_feed_stale'] (this
+    breaker's own persistent state). Alerts once per stale->fresh transition,
+    not every tick — the flag itself is what prevents re-alerting while
+    continuously stale, replacing the old "reset the timer" spam guard.
+
+    Returns True if new BUYs should be blocked this tick.
+    """
+    stale_s  = candle_minutes * 60 * 2
+    age_s    = now - ss['last_candle_time']
+    is_stale = age_s > stale_s
+    _sym_label = f" [{symbol}]" if symbol else ""
+
+    if is_stale and not ss['candle_feed_stale']:
+        ss['candle_feed_stale'] = True
         alerter.error(
             f"Candle watchdog{_sym_label}: no new {candle_minutes}min candle "
-            f"for {int((now - last_candle_time) / 60)} minutes — feed may be stale"
+            f"for {int(age_s / 60)} minutes — feed is stale. New BUYs blocked "
+            f"until a fresh candle arrives (SELL/exits unaffected)."
         )
-        return now  # reset so we don't spam every tick
-    return last_candle_time
+    elif not is_stale and ss['candle_feed_stale']:
+        ss['candle_feed_stale'] = False
+        alerter.error(
+            f"Candle watchdog{_sym_label}: feed recovered — new BUYs re-enabled."
+        )
+
+    return ss['candle_feed_stale']
 
 
 # ---------------------------------------------------------------------------
@@ -719,6 +745,7 @@ def run():
                     state_path               = f"logs/live_state_{sym.replace('/', '_')}.json",
                     adopt_external_holdings  = cfg.exchange.adopt_external_holdings,
                     native_stop_loss_enabled = cfg.exchange.native_stop_loss_enabled,
+                    max_slippage_pct         = cfg.exchange.max_slippage_pct,
                 )
                 for sym in _universe_symbols
             }
@@ -740,6 +767,7 @@ def run():
                 state_path               = f"logs/live_state_{_sym0.replace('/', '_')}.json",
                 adopt_external_holdings  = cfg.exchange.adopt_external_holdings,
                 native_stop_loss_enabled = cfg.exchange.native_stop_loss_enabled,
+                max_slippage_pct         = cfg.exchange.max_slippage_pct,
             )
             # Derive slot_cash for new symbols from the first executor's balance
             # so their "ready" log matches the actual pool slot instead of showing
@@ -761,6 +789,7 @@ def run():
                     state_path               = _sp,
                     adopt_external_holdings  = cfg.exchange.adopt_external_holdings,
                     native_stop_loss_enabled = cfg.exchange.native_stop_loss_enabled,
+                    max_slippage_pct         = cfg.exchange.max_slippage_pct,
                 )
         executor = executors[_active_symbol]   # alias for pre-loop header/recovery code
         mode_str = "[DRY RUN] " if (cfg.exchange.dry_run or cfg.paper.paper_mode) else ""
@@ -962,6 +991,7 @@ def run():
                 'partial_done':     False,
                 'atr_sl':           0.0,
                 'native_stop_price': None,        # static native-stop backstop price for the current position
+                'candle_feed_stale': False,       # candle watchdog circuit-breaker state
                 'last_price':       0.0,
                 'err_count':        0,            # consecutive price-fetch failures
                 'drift_count':      0,            # consecutive drift detections
@@ -998,6 +1028,7 @@ def run():
             'partial_done':     False,
             'atr_sl':           0.0,
             'native_stop_price': None,        # static native-stop backstop price for the current position
+            'candle_feed_stale': False,       # candle watchdog circuit-breaker state
             'last_price':       0.0,
             'err_count':        0,
             'drift_count':      0,
@@ -1270,11 +1301,10 @@ def run():
                     print(f"  TICK {tick:04d} | price fetch failed: {exc}")
                     continue
 
-            # ── 1b. Candle watchdog (every symbol, live only) ─────────
+            # ── 1b. Candle watchdog — circuit breaker (every symbol, live only) ──
             if cfg.exchange.feed_mode == "live":
-                ss['last_candle_time'] = _check_candle_watchdog(
-                    ss['last_candle_time'], cfg.exchange.candle_minutes,
-                    time.time(), alerter, symbol=sym,
+                _check_candle_watchdog(
+                    ss, cfg.exchange.candle_minutes, time.time(), alerter, symbol=sym,
                 )
 
             # ── 1c. Position drift reconciliation (every symbol, every 120 ticks, live) ──
@@ -1464,6 +1494,17 @@ def run():
                                     # already-filled order — harmless, logged at
                                     # info level by _cancel_native_stop.
                                     ss['executor'].sync_protective_stop(None)
+                                else:
+                                    # Urgent market SELL only partially filled — a
+                                    # residual position remains. The resting native
+                                    # stop is still sized to the ORIGINAL (larger)
+                                    # quantity, so re-sync it down to what's actually
+                                    # held. Without this the backstop would try to
+                                    # sell more than the position. Same resize the
+                                    # partial-TP and strategy-SELL paths already do.
+                                    ss['executor'].sync_protective_stop(
+                                        ss.get('native_stop_price')
+                                    )
                                 _ic_reason = (
                                     "trail_stop" if (_trail_sl_level > 0 and price <= _trail_sl_level)
                                     else "stop_loss" if _ic_sl
@@ -1589,7 +1630,8 @@ def run():
             # ── Blocked-gate tracking (initialise per-candle) ─────────
             # Records the first gate (in priority order) that blocked a BUY.
             # Priority: trend → RSI → ADX → EMA_spread → MACD → regime
-            #           → state_machine → risk_manager → capital_pool
+            #           → correlation → candle_watchdog → state_machine
+            #           → risk_manager → capital_pool
             _signal_raw_for_csv = raw_signal
             _buy_block_gate: str = ""
             if is_indicator and live_exchange is not None:
@@ -1714,6 +1756,21 @@ def run():
                         print(f"  [{sym}] {_corr_msg}", flush=True)
                         logger.warning(_corr_msg)
                         break
+
+            # ── 2g. Candle watchdog gate ───────────────────────────────
+            # Circuit breaker (upgraded 2026-08-07 — previously alert-only,
+            # see _check_candle_watchdog). A stale feed means the strategy
+            # would be evaluating against data that may no longer reflect
+            # the market — block new BUYs until a fresh candle arrives.
+            # SELL/exits are untouched: they run off the independent
+            # live-tick price feed, not the candle feed, and must always be
+            # allowed to close a position per the standing breaker rule.
+            if raw_signal == Signal.BUY and ss['candle_feed_stale']:
+                raw_signal = Signal.HOLD
+                if not _buy_block_gate:
+                    _buy_block_gate = "candle_watchdog"
+                print(f"  [{sym}] CANDLE WATCHDOG: BUY blocked — feed stale", flush=True)
+                logger.warning("CANDLE WATCHDOG [%s]: BUY blocked — feed stale", sym)
 
             # ── 3. Warmup guard ───────────────────────────────────────
             if is_indicator and not ss['strategy'].is_warmed_up:
