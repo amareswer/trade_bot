@@ -63,6 +63,7 @@ class LiveExecutor:
         state_path:               str   = _DEFAULT_STATE_PATH,
         order_type:               str   = "market",
         adopt_external_holdings:  bool  = False,
+        native_stop_loss_enabled: bool  = False,
     ):
         self.symbol                    = symbol
         self.dry_run                   = dry_run
@@ -70,11 +71,18 @@ class LiveExecutor:
         self._starting_cash            = starting_cash
         self._state_path               = state_path
         self._adopt_external_holdings  = adopt_external_holdings
+        self._native_stop_loss_enabled = native_stop_loss_enabled
         self._portfolio                = Portfolio(cash=starting_cash)
         self._fills:      list[Order]  = []
         self._rejects:    list[Order]  = []
         self._fees_paid:           float = 0.0
         self._bot_opened_position: bool  = False
+        # Resting exchange-side stop-loss order — a backstop that survives the
+        # bot process dying (VPS outage, crash loop, etc.). Static: placed once
+        # per fill at whatever SL price main.py already computed (fixed % or
+        # ATR), never repriced to follow a trailing stop. See sync_protective_stop().
+        self._native_stop_order_id:    str | None   = None
+        self._native_stop_price:       float | None = None
         self._alerter = TelegramAlerter(
             cfg.alerts.telegram_bot_token,
             cfg.alerts.telegram_chat_id,
@@ -113,6 +121,8 @@ class LiveExecutor:
             exchange_cash, sync_error = self._sync_cash()
             self._portfolio.cash = exchange_cash
             self._sync_position(symbol)
+            if self._native_stop_loss_enabled:
+                self._verify_resting_stop_on_startup()
 
             # Unmissable startup line — print() bypasses logging so it always
             # appears in the terminal regardless of log level configuration.
@@ -349,6 +359,154 @@ class LiveExecutor:
 
         self._save_state()
 
+    # ── Native stop-loss (exchange-side backstop) ───────────────────────
+    #
+    # A resting stop order placed directly on Kraken so an open position is
+    # still protected if the bot process itself is unavailable (crash loop,
+    # VPS outage, extended network partition) — the software SL/TP path in
+    # main.py only works while the bot is alive and polling. Deliberately
+    # STATIC: placed once per fill at whatever price main.py already
+    # computed (fixed % or ATR), never repriced to chase a trailing stop.
+    # The software SL/TP/trailing/partial-TP logic is unaffected and keeps
+    # being the primary exit path whenever the bot is running — this order
+    # is pure insurance, cancelled the moment the bot exits the position
+    # itself. Kraken's 'stop-loss' order type triggers as a market order
+    # (same reasoning as urgent=True everywhere else in this file: a stop
+    # exit must never sit in a limit book while price runs away).
+
+    @property
+    def has_resting_stop(self) -> bool:
+        return self._native_stop_order_id is not None
+
+    def _verify_resting_stop_on_startup(self) -> None:
+        """
+        Called once from __init__ (live mode only) after _sync_position.
+        Confirms a stop order recorded in the state file is still open on
+        the exchange; clears the tracked id if it isn't (filled while the
+        bot was down — the whole point of this feature working correctly —
+        or cancelled manually). Never places a new order here: this method
+        only knows the OLD price, and a fresh BUY may have changed the
+        picture; main.py owns deciding what price a replacement should use
+        and calls sync_protective_stop() itself if this leaves a real gap
+        (position open, no resting stop).
+        """
+        if self._portfolio.position <= 0:
+            # No position to protect — any leftover id is stale by definition.
+            if self._native_stop_order_id:
+                self._cancel_native_stop()
+            return
+
+        if not self._native_stop_order_id:
+            logger.warning(
+                "NATIVE STOP GAP [%s]: position=%.6f open but no resting stop "
+                "recorded — main.py startup reconciliation should place one.",
+                self.symbol, self._portfolio.position,
+            )
+            return
+
+        try:
+            open_orders = fetch_with_retry(
+                lambda: self._exchange.fetch_open_orders(self.symbol),
+                label=f"open orders check [{self.symbol}]",
+            )
+            still_open = any(
+                str(o.get("id", "")) == self._native_stop_order_id for o in open_orders
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not verify resting stop %s on startup: %s — leaving "
+                "tracked as-is, will re-check on the next placement/cancel.",
+                self._native_stop_order_id, exc,
+            )
+            return
+
+        if still_open:
+            logger.warning(
+                "Native stop confirmed on restart: %s @ %.2f",
+                self._native_stop_order_id, self._native_stop_price or 0.0,
+            )
+        else:
+            logger.warning(
+                "NATIVE STOP GAP [%s]: tracked order %s is no longer open "
+                "(filled or cancelled while the bot was down) — position=%.6f "
+                "may be unprotected; main.py startup reconciliation should "
+                "place a fresh one.",
+                self.symbol, self._native_stop_order_id, self._portfolio.position,
+            )
+            self._native_stop_order_id = None
+            self._native_stop_price    = None
+            self._save_state()
+
+    def _cancel_native_stop(self) -> None:
+        """Best-effort cancel. A cancel racing an actual trigger (the stop
+        fired right as we're trying to remove it) is expected and fine —
+        either way the position ends up closed, which is what we want."""
+        if not self._native_stop_order_id:
+            return
+        _order_id = self._native_stop_order_id
+        try:
+            self._exchange.cancel_order(_order_id, self.symbol)
+            logger.warning("Native stop cancelled: %s", _order_id)
+        except Exception as exc:
+            logger.info(
+                "Native stop cancel %s: %s (likely already filled/gone — fine)",
+                _order_id, exc,
+            )
+        self._native_stop_order_id = None
+        self._native_stop_price    = None
+        self._save_state()
+
+    def _place_native_stop(self, quantity: float, stop_price: float) -> None:
+        try:
+            _price_str = self._exchange.price_to_precision(self.symbol, stop_price)
+            raw = fetch_with_retry(
+                lambda: self._exchange.create_order(
+                    self.symbol, "market", "sell", quantity,
+                    params={"stopLossPrice": _price_str},
+                ),
+                attempts=2, delay_s=2.0, label=f"native stop placement [{self.symbol}]",
+            )
+            self._native_stop_order_id = str(raw.get("id", ""))
+            self._native_stop_price    = stop_price
+            logger.warning(
+                "Native stop placed [%s]: %.6f @ %.2f (order %s)",
+                self.symbol, quantity, stop_price, self._native_stop_order_id,
+            )
+            self._save_state()
+        except Exception as exc:
+            logger.error("Native stop placement FAILED [%s]: %s", self.symbol, exc)
+            self._alerter.error(
+                f"NATIVE STOP FAILED [{self.symbol}]: could not place backstop "
+                f"stop-loss for {quantity:.6f} @ {stop_price:.2f} — {exc}. "
+                f"Position is UNPROTECTED if the bot goes down. Software SL/TP "
+                f"still works while the bot is running."
+            )
+            self._native_stop_order_id = None
+            self._native_stop_price    = None
+
+    def sync_protective_stop(self, stop_price: float | None) -> None:
+        """
+        Reconcile the resting native stop with the current position. Call
+        after every fill that changes position (BUY, strategy SELL, SL/TP
+        exit, partial TP) and once at startup for a held position with no
+        confirmed resting stop.
+
+        stop_price=None, or position<=0: cancel any existing resting stop,
+            don't replace (position closed — nothing to protect).
+        stop_price>0 and position>0: cancel any existing resting stop (if
+            any) and place a fresh one sized to the CURRENT position.
+            Idempotent and safe to call repeatedly.
+
+        No-op when the feature is disabled or dry-run. Never raises —
+        failures are logged/alerted from the two helpers above, not here;
+        this must never be able to crash the trading loop.
+        """
+        if self.dry_run or not self._native_stop_loss_enabled:
+            return
+        self._cancel_native_stop()
+        if stop_price is not None and stop_price > 0 and self._portfolio.position > 0:
+            self._place_native_stop(self._portfolio.position, stop_price)
+
     # ── State persistence ─────────────────────────────────────────────
 
     def _save_state(self) -> None:
@@ -361,6 +519,8 @@ class LiveExecutor:
             "realized_pnl": self._portfolio.realized_pnl,
             "fees_paid":    self._fees_paid,
             "bot_opened":   self._bot_opened_position,
+            "native_stop_order_id": self._native_stop_order_id,
+            "native_stop_price":    self._native_stop_price,
             "saved_at":     datetime.now(timezone.utc).isoformat(),
         }
         try:
@@ -408,6 +568,9 @@ class LiveExecutor:
         self._portfolio.realized_pnl  = float(state.get("realized_pnl", 0.0))
         self._fees_paid               = float(state.get("fees_paid",     0.0))
         self._bot_opened_position     = bool(state.get("bot_opened",    False))
+        self._native_stop_order_id    = state.get("native_stop_order_id")
+        _nsp                          = state.get("native_stop_price")
+        self._native_stop_price       = float(_nsp) if _nsp is not None else None
         logger.warning(
             "Accounting restored: cost_basis=%.2f pnl=%.2f fees=%.4f (saved %s)",
             self._portfolio._cost_basis, self._portfolio.realized_pnl,

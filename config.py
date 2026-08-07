@@ -94,6 +94,11 @@ class ExchangeConfig:
     limit_chase_tick_pct:    float = 0.0001   # reads LIMIT_CHASE_TICK_PCT — offset as % of price (0.0001 = 0.01%)
     adopt_external_holdings: bool  = False    # ADOPT_EXTERNAL_HOLDINGS — if True, bot manages all exchange balance incl. deposits
     drift_alert_threshold:   int   = 3       # DRIFT_ALERT_THRESHOLD — escalate to alerter.error() after this many consecutive drift detections
+    native_stop_loss_enabled: bool = False    # NATIVE_STOP_LOSS_ENABLED — rest a real stop-loss order on the
+                                               # exchange after every BUY (backstop if the bot process/VPS goes
+                                               # down while a position is open). Static: set once per fill at
+                                               # whatever SL price the bot already computed, never repriced to
+                                               # follow a trailing stop. Default OFF — validate on live before enabling.
 
     def __post_init__(self):
         if self.feed_mode not in ("live", "simulated"):
@@ -555,6 +560,7 @@ def _load() -> AppConfig:
             limit_chase_tick_pct     = _float("LIMIT_CHASE_TICK_PCT",     0.0001),
             adopt_external_holdings  = _bool ("ADOPT_EXTERNAL_HOLDINGS",  False),
             drift_alert_threshold    = _int  ("DRIFT_ALERT_THRESHOLD",    3),
+            native_stop_loss_enabled = _bool ("NATIVE_STOP_LOSS_ENABLED", False),
         ),
         strategy=StrategyConfig(
             mode                    = _str  ("STRATEGY_MODE",           "indicator"),

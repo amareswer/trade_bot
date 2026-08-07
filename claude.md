@@ -291,6 +291,40 @@ RISK_HALT_BLOCKS_STOPS=false  # NOT set in .env — using the config.py default 
                               # it would leave open positions exposed with no stop.
 ```
 
+### Native exchange-side stop-loss (crypto — opt-in, off by default)
+```
+NATIVE_STOP_LOSS_ENABLED=false   # NOT set in .env — using the config.py default (false).
+                                  # Added 2026-08-07 from a gap review against external crypto-
+                                  # bot best-practice research: the software SL/TP path only
+                                  # works while the bot process is alive and polling — a crash
+                                  # loop, VPS outage, or extended network partition left an open
+                                  # position with zero protection until the bot came back.
+```
+When enabled, `bot/execution/live_executor.py`'s `sync_protective_stop()` rests a real
+Kraken stop order (`create_order(..., params={"stopLossPrice": X})`, executes as market on
+trigger — same "never sit in a limit book during a stop" reasoning as `urgent=True`
+elsewhere in this file) after every BUY fill, at whatever SL price `bot/main.py` already
+computed (ATR if available, else flat `STOP_LOSS_PCT`). **Deliberately static** — it does
+NOT track the trailing stop as it rises or reprice mid-trade; it's pure insurance for "the
+bot itself is unreachable," not a second copy of the live SL/TP logic. Cancelled the moment
+the bot closes the position itself (strategy SELL, software SL/TP, partial TP), so under
+normal operation it never fires — Kraken's own trigger only matters when the bot can't get
+there first. Order id/price persist in `logs/live_state_BTC_CAD.json` and are reconciled on
+every restart: a still-open saved order is kept as-is (level never touches down); a
+saved-but-now-gone order (filled while the bot was down — this feature working exactly as
+intended) is cleared; a held position with no resting stop at all (feature just enabled, or
+the bot crashed before it could place one) gets a same-startup fallback at flat
+`STOP_LOSS_PCT` off cost_basis, replaced with the more precise ATR-based level on the next
+real BUY for that symbol. Currently trades one symbol with no trailing-stop/partial-TP
+config active (`TRAILING_STOP_PCT`/`PARTIAL_TP_PCT` both unset → 0 = disabled), so the
+quantity-tracking half of `sync_protective_stop` is defensive/future-proofing rather than
+exercised today. Ships **off** — validate on live with the real $77 slot before flipping on;
+placement/cancel failures alert to Telegram but never raise, so a Kraken-side rejection
+degrades to "no backstop, software SL/TP still fully works while the bot is up," never a
+crashed trading loop. Tests: `test_live_executor.py`, 11 new cases (placement, cancel,
+resync-on-quantity-change, failure alerting, dry-run/flag-off no-ops, restart reconciliation
+for all three states above).
+
 ### Risk-gate config (stock bot — `StockPaperExecutor` / `IBKRExecutor`, both in `stock_bot/execution/`)
 Both executors implement the same tiers independently (accepted duplication — same pattern
 as the sector-concentration gate). All tiers block new BUYs only; SELL/exits are never
@@ -461,6 +495,15 @@ EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-0
   crashing the loop. Full detail in `.memory/decisions/known-gaps.md` (gaps #9, #10).
   Still deliberately deferred: several risk-gate `.env` keys undocumented in CLAUDE.md, and
   fee-currency-mismatch silent cash drift (see gap #9).
+  Native exchange-side stop-loss added 2026-08-07 (see "Native exchange-side stop-loss"
+  above) — closes the top finding from a gap review against external crypto-bot best-practice
+  research: software SL/TP only protects a position while the bot process is alive. Ships
+  **off** (`NATIVE_STOP_LOSS_ENABLED=false`) pending live validation before enabling on the
+  real $77 slot. Same research pass flagged three more gaps not yet acted on: crypto's risk
+  engine still has the old single-tier drawdown/daily-loss shape (no weekly-loss tier, no
+  sticky kill switch — the stock bot got that upgrade 2026-08-05, crypto didn't), no
+  real-time slippage guard on fills, and the candle watchdog alerts on a stale feed but never
+  halts trading on one.
 - **Stock bot:** live on IBKR paper (DUQ273338, reset to $5,000 CAD 2026-07-20). Swing book
   retired (`FAST_ENABLED=false`) — position book (rule-based, Mode A/B) is the only active
   book. TSX symbols are **permanently** advisory-only — CIRO regulation blocks API orders on

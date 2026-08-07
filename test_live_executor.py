@@ -41,6 +41,7 @@ def _make(
     balance:        dict  = None,
     state_path:     str   = None,
     order_type:     str   = "market",
+    native_stop_loss_enabled: bool = False,
     tmp_path        = None,
 ) -> tuple[LiveExecutor, MagicMock]:
     """
@@ -57,6 +58,7 @@ def _make(
     mock_ex.fetch_balance.return_value = (
         {"free": {"CAD": starting_cash}} if balance is None else balance
     )
+    mock_ex.fetch_open_orders.return_value = []
 
     if state_path is None:
         # Use a temp path that doesn't exist — clean slate for each test
@@ -76,6 +78,7 @@ def _make(
             dry_run       = dry_run,
             state_path    = state_path,
             order_type    = order_type,
+            native_stop_loss_enabled = native_stop_loss_enabled,
         )
     return ex, mock_ex
 
@@ -915,6 +918,217 @@ def test_urgent_sell_bypasses_limit_chase(mock_cfg, mock_sleep, tmp_path):
         f"urgent SELL should use market order, got '{order_type_used}'"
     )
     mock_ex.fetch_order_book.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Native stop-loss backstop (NATIVE_STOP_LOSS_ENABLED)
+# ---------------------------------------------------------------------------
+
+def test_native_stop_disabled_by_default_noop(tmp_path):
+    """Feature flag off (the default) — sync_protective_stop never touches the exchange."""
+    ex, mock_ex = _make(dry_run=False, tmp_path=tmp_path)
+    ex._portfolio.position = 0.001
+    ex.sync_protective_stop(88_000.0)
+    mock_ex.create_order.assert_not_called()
+    mock_ex.cancel_order.assert_not_called()
+    assert not ex.has_resting_stop
+
+
+def test_native_stop_dry_run_noop(tmp_path):
+    """Feature enabled but dry_run=True — must never place a real order."""
+    ex, mock_ex = _make(dry_run=True, native_stop_loss_enabled=True, tmp_path=tmp_path)
+    ex._portfolio.position = 0.001
+    ex.sync_protective_stop(88_000.0)
+    mock_ex.create_order.assert_not_called()
+    assert not ex.has_resting_stop
+
+
+def test_native_stop_placed_with_stop_loss_price_param(tmp_path):
+    """Enabled + live: places a market SELL with Kraken's stopLossPrice param,
+    sized to the current position."""
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True, tmp_path=tmp_path)
+    ex._portfolio.position = 0.001
+    mock_ex.price_to_precision.return_value = "88000.0"
+    mock_ex.create_order.return_value = {"id": "stop-001"}
+
+    ex.sync_protective_stop(88_000.0)
+
+    assert ex.has_resting_stop
+    call = mock_ex.create_order.call_args
+    assert call[0][0] == "BTC/CAD"
+    assert call[0][1] == "market"
+    assert call[0][2] == "sell"
+    assert abs(call[0][3] - 0.001) < 1e-9
+    assert call[1]["params"]["stopLossPrice"] == "88000.0"
+
+
+def test_native_stop_cancelled_when_position_closes(tmp_path):
+    """sync_protective_stop(None) cancels an existing resting stop and doesn't replace it."""
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True, tmp_path=tmp_path)
+    ex._portfolio.position = 0.001
+    mock_ex.create_order.return_value = {"id": "stop-001"}
+    ex.sync_protective_stop(88_000.0)
+    assert ex.has_resting_stop
+
+    ex._portfolio.position = 0.0   # position closed by the caller before this call
+    ex.sync_protective_stop(None)
+
+    mock_ex.cancel_order.assert_called_once_with("stop-001", "BTC/CAD")
+    assert not ex.has_resting_stop
+
+
+def test_native_stop_resync_replaces_existing_order(tmp_path):
+    """A second sync_protective_stop call (e.g. after a partial fill changes
+    quantity) cancels the old resting order before placing the new one."""
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True, tmp_path=tmp_path)
+    ex._portfolio.position = 0.001
+    mock_ex.create_order.return_value = {"id": "stop-001"}
+    ex.sync_protective_stop(88_000.0)
+
+    ex._portfolio.position = 0.0005
+    mock_ex.create_order.return_value = {"id": "stop-002"}
+    ex.sync_protective_stop(88_000.0)
+
+    mock_ex.cancel_order.assert_called_once_with("stop-001", "BTC/CAD")
+    assert ex._native_stop_order_id == "stop-002"
+
+
+def test_native_stop_cancel_failure_is_swallowed(tmp_path):
+    """Cancelling an already-filled/gone order raises on Kraken — must not
+    propagate (the whole point: the position closed one way or another)."""
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True, tmp_path=tmp_path)
+    ex._portfolio.position = 0.001
+    mock_ex.create_order.return_value = {"id": "stop-001"}
+    ex.sync_protective_stop(88_000.0)
+
+    mock_ex.cancel_order.side_effect = ccxt.OrderNotFound("already filled")
+    ex._portfolio.position = 0.0
+    ex.sync_protective_stop(None)   # must not raise
+
+    assert not ex.has_resting_stop
+
+
+def test_native_stop_placement_failure_alerts_and_stays_unprotected(tmp_path):
+    """create_order fails — must alert, not raise, and leave has_resting_stop False
+    so the caller/next cycle knows the position is unprotected."""
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True, tmp_path=tmp_path)
+    ex._portfolio.position = 0.001
+    mock_ex.create_order.side_effect = ccxt.BaseError("exchange rejected")
+
+    with patch.object(ex._alerter, "error") as mock_alert:
+        ex.sync_protective_stop(88_000.0)   # must not raise
+
+    assert not ex.has_resting_stop
+    mock_alert.assert_called_once()
+    assert "NATIVE STOP FAILED" in mock_alert.call_args[0][0]
+
+
+def test_native_stop_state_persists_and_restores_across_restart(tmp_path):
+    """Order id/price survive a save/reload cycle, same as every other
+    accounting field."""
+    state_path = str(tmp_path / "state.json")
+    ex, mock_ex = _make(
+        dry_run=False, native_stop_loss_enabled=True,
+        state_path=state_path, tmp_path=tmp_path,
+    )
+    ex._portfolio.position = 0.001
+    mock_ex.create_order.return_value = {"id": "stop-001"}
+    ex.sync_protective_stop(88_000.0)
+
+    with open(state_path) as f:
+        saved = json.load(f)
+    assert saved["native_stop_order_id"] == "stop-001"
+    assert saved["native_stop_price"]    == 88_000.0
+
+
+def test_native_stop_startup_confirms_still_open_order(tmp_path):
+    """Restart with a saved stop id that's still open on the exchange — kept, no re-placement."""
+    state_path = str(tmp_path / "state.json")
+    json.dump({
+        "symbol": "BTC/CAD", "cash": 89.88, "position": 0.001,
+        "cost_basis": 88_870.0, "realized_pnl": 0.0, "fees_paid": 0.0,
+        "native_stop_order_id": "stop-001", "native_stop_price": 88_000.0,
+        "saved_at": "2026-08-01T00:00:00+00:00",
+    }, open(state_path, "w"))
+
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = _DEFAULT_MARKETS
+    mock_ex.fetch_balance.return_value = {
+        "free": {"CAD": 89.88, "BTC": 0.001}, "total": {"CAD": 89.88, "BTC": 0.001},
+    }
+    mock_ex.fetch_open_orders.return_value = [{"id": "stop-001"}]
+
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = mock_ex
+        ex = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=100.0, dry_run=False, state_path=state_path,
+            native_stop_loss_enabled=True,
+        )
+
+    assert ex.has_resting_stop
+    assert ex._native_stop_order_id == "stop-001"
+    mock_ex.create_order.assert_not_called()   # nothing re-placed — already confirmed live
+
+
+def test_native_stop_startup_detects_gap_when_order_gone(tmp_path):
+    """Restart with a saved stop id that's no longer open (cancelled somehow while
+    the bot was down, position still held) — cleared so main.py's fallback can act."""
+    state_path = str(tmp_path / "state.json")
+    json.dump({
+        "symbol": "BTC/CAD", "cash": 89.88, "position": 0.001,
+        "cost_basis": 88_870.0, "realized_pnl": 0.0, "fees_paid": 0.0,
+        "native_stop_order_id": "stop-001", "native_stop_price": 88_000.0,
+        "saved_at": "2026-08-01T00:00:00+00:00",
+    }, open(state_path, "w"))
+
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = _DEFAULT_MARKETS
+    mock_ex.fetch_balance.return_value = {
+        "free": {"CAD": 89.88, "BTC": 0.001}, "total": {"CAD": 89.88, "BTC": 0.001},
+    }
+    mock_ex.fetch_open_orders.return_value = []   # gone
+
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = mock_ex
+        ex = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=100.0, dry_run=False, state_path=state_path,
+            native_stop_loss_enabled=True,
+        )
+
+    assert not ex.has_resting_stop   # cleared — main.py's startup loop will re-place
+
+
+def test_native_stop_startup_position_closed_externally_clears_stale_id(tmp_path):
+    """Position closed while the bot was down (the native stop's whole job) —
+    exchange shows 0, saved stop id is stale and gets cleared. No re-placement:
+    there's no position left to protect."""
+    state_path = str(tmp_path / "state.json")
+    json.dump({
+        "symbol": "BTC/CAD", "cash": 89.88, "position": 0.001,
+        "cost_basis": 88_870.0, "realized_pnl": 0.0, "fees_paid": 0.0,
+        "native_stop_order_id": "stop-001", "native_stop_price": 88_000.0,
+        "saved_at": "2026-08-01T00:00:00+00:00",
+    }, open(state_path, "w"))
+
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = _DEFAULT_MARKETS
+    mock_ex.fetch_balance.return_value = {
+        "free": {"CAD": 89.88, "BTC": 0.0}, "total": {"CAD": 89.88, "BTC": 0.0},
+    }
+
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = mock_ex
+        ex = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=100.0, dry_run=False, state_path=state_path,
+            native_stop_loss_enabled=True,
+        )
+
+    assert ex.position == 0.0
+    assert not ex.has_resting_stop
+    mock_ex.cancel_order.assert_called_once_with("stop-001", "BTC/CAD")
 
 
 if __name__ == "__main__":

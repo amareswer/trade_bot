@@ -718,6 +718,7 @@ def run():
                     order_type               = cfg.exchange.order_type,
                     state_path               = f"logs/live_state_{sym.replace('/', '_')}.json",
                     adopt_external_holdings  = cfg.exchange.adopt_external_holdings,
+                    native_stop_loss_enabled = cfg.exchange.native_stop_loss_enabled,
                 )
                 for sym in _universe_symbols
             }
@@ -738,6 +739,7 @@ def run():
                 order_type               = cfg.exchange.order_type,
                 state_path               = f"logs/live_state_{_sym0.replace('/', '_')}.json",
                 adopt_external_holdings  = cfg.exchange.adopt_external_holdings,
+                native_stop_loss_enabled = cfg.exchange.native_stop_loss_enabled,
             )
             # Derive slot_cash for new symbols from the first executor's balance
             # so their "ready" log matches the actual pool slot instead of showing
@@ -758,6 +760,7 @@ def run():
                     order_type               = cfg.exchange.order_type,
                     state_path               = _sp,
                     adopt_external_holdings  = cfg.exchange.adopt_external_holdings,
+                    native_stop_loss_enabled = cfg.exchange.native_stop_loss_enabled,
                 )
         executor = executors[_active_symbol]   # alias for pre-loop header/recovery code
         mode_str = "[DRY RUN] " if (cfg.exchange.dry_run or cfg.paper.paper_mode) else ""
@@ -817,6 +820,45 @@ def run():
             "Executor cash after pool correction: %s",
             {s: f"${e.cash:.2f}" for s, e in executors.items()},
         )
+
+    # ── Native stop-loss startup reconciliation ─────────────────────────
+    # A held position with no confirmed resting stop after restart (feature
+    # just enabled, or the bot crashed before placing one after a BUY). The
+    # original ATR SL level lived only in the previous run's in-memory state
+    # and is gone — fall back to flat STOP_LOSS_PCT off cost_basis, same
+    # fallback the software SL path itself uses when ATR is unavailable.
+    # Still static once placed: the next real BUY on this symbol replaces it
+    # with a fresh ATR-based level via the normal per-fill sync below.
+    if (
+        cfg.exchange.native_stop_loss_enabled
+        and cfg.exchange.live_trading
+        and not cfg.paper.paper_mode
+        and not cfg.exchange.dry_run
+    ):
+        for _nsl_sym, _nsl_exc in executors.items():
+            if _nsl_exc.position > 0 and not _nsl_exc.has_resting_stop:
+                _fallback_sl = (
+                    _nsl_exc.avg_entry * (1 - cfg.backtest.stop_loss_pct)
+                    if cfg.backtest.stop_loss_pct > 0 and _nsl_exc.avg_entry > 0
+                    else None
+                )
+                if _fallback_sl:
+                    logger.warning(
+                        "NATIVE STOP STARTUP FALLBACK [%s]: placing backstop at "
+                        "%.2f (flat %.1f%% off cost_basis %.2f) — no resting "
+                        "stop survived restart.",
+                        _nsl_sym, _fallback_sl, cfg.backtest.stop_loss_pct * 100,
+                        _nsl_exc.avg_entry,
+                    )
+                    _nsl_exc.sync_protective_stop(_fallback_sl)
+                else:
+                    logger.warning(
+                        "NATIVE STOP STARTUP GAP [%s]: position=%.6f open, no "
+                        "resting stop, and STOP_LOSS_PCT=0 — cannot compute a "
+                        "fallback level. Unprotected until the next software "
+                        "SL/TP evaluation or a manual order.",
+                        _nsl_sym, _nsl_exc.position,
+                    )
 
     risk = RiskManager(
         RiskConfig(
@@ -916,6 +958,7 @@ def run():
                 'trail_peak':       0.0,
                 'partial_done':     False,
                 'atr_sl':           0.0,
+                'native_stop_price': None,        # static native-stop backstop price for the current position
                 'last_price':       0.0,
                 'err_count':        0,            # consecutive price-fetch failures
                 'drift_count':      0,            # consecutive drift detections
@@ -951,6 +994,7 @@ def run():
             'trail_peak':       0.0,
             'partial_done':     False,
             'atr_sl':           0.0,
+            'native_stop_price': None,        # static native-stop backstop price for the current position
             'last_price':       0.0,
             'err_count':        0,
             'drift_count':      0,
@@ -1313,6 +1357,12 @@ def run():
                                     _p_pnl = ss['pm'].on_sell(_p_order.price, _p_order.quantity)
                                     ss['partial_done'] = True
                                     ss['sm'].recover_long(_p_order.price)
+                                    # Resize the native stop backstop to the
+                                    # reduced position (same static price —
+                                    # partial TP changes quantity, not level).
+                                    ss['executor'].sync_protective_stop(
+                                        ss.get('native_stop_price') if ss['pm'].has_position else None
+                                    )
                                     print(f"           📊 PARTIAL TP [{sym}]:  {_p_qty:.6f} @ {price:,.2f}  PnL={_p_pnl:+.2f}", flush=True)
                                     logger.warning("PARTIAL TP [%s]: sold %.6f @ %.2f  pnl=%.2f", sym, _p_qty, price, _p_pnl)
                                     trade_log.log_fill(
@@ -1384,6 +1434,12 @@ def run():
                                 ss['partial_done'] = False
                                 if not ss['pm'].has_position:
                                     capital_pool.release(sym, ss['executor'].cash)
+                                    # Best-effort cancel of the native stop backstop.
+                                    # If the native stop itself fired first (raced
+                                    # this software exit), this call cancels an
+                                    # already-filled order — harmless, logged at
+                                    # info level by _cancel_native_stop.
+                                    ss['executor'].sync_protective_stop(None)
                                 _ic_reason = (
                                     "trail_stop" if (_trail_sl_level > 0 and price <= _trail_sl_level)
                                     else "stop_loss" if _ic_sl
@@ -1868,6 +1924,17 @@ def run():
                                         "ATR SL [%s]: entry=%.2f atr=%.2f sl=%.2f mult=%.1f",
                                         sym, order.price, _atr_val, ss['atr_sl'], cfg.strategy.atr_sl_mult,
                                     )
+                            # Native stop-loss backstop (static — see
+                            # sync_protective_stop docstring): mirrors whatever
+                            # level the software SL just armed for this fill.
+                            ss['native_stop_price'] = (
+                                ss['atr_sl'] if ss['atr_sl'] > 0
+                                else (
+                                    order.price * (1 - cfg.backtest.stop_loss_pct)
+                                    if cfg.backtest.stop_loss_pct > 0 else None
+                                )
+                            )
+                            ss['executor'].sync_protective_stop(ss['native_stop_price'])
                         else:
                             pnl = ss['pm'].on_sell(order.price, order.quantity)
                             ss['trail_peak'] = 0.0
@@ -1875,6 +1942,13 @@ def run():
                             ss['atr_sl'] = 0.0
                             if not ss['pm'].has_position:
                                 capital_pool.release(sym, ss['executor'].cash)
+                                ss['executor'].sync_protective_stop(None)
+                            else:
+                                # Partial fill leaving a residual position (not
+                                # currently reachable with strategy SELLs, which
+                                # always close in full — defensive parity with
+                                # the partial-TP path below).
+                                ss['executor'].sync_protective_stop(ss.get('native_stop_price'))
 
                         display.fill(
                             order.side.value, order.quantity,
