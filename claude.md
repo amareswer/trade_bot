@@ -174,12 +174,12 @@ need the full narrative behind any decision below.
 
 ## Test Suite Manifest (reconciled 2026-08-05)
 
-Expected total: **486 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~11s — if it takes minutes, a test is reading live `.env` config.
+Expected total: **509 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~11s — if it takes minutes, a test is reading live `.env` config.
 
 | File | Tests | What it covers |
 |------|-------|----------------|
 | `test_indicators.py` | 28 | RSI, EMA, ADX, MACD, ATR calculations |
-| `test_live_executor.py` | 27 | LiveExecutor: dry-run, market/limit orders, urgent-exit bypass, fee deduction, state save/load, pre-trade min-size guard, restart recovery (seeds position manager + state machine) |
+| `test_live_executor.py` | 38 | LiveExecutor: dry-run, market/limit orders, urgent-exit bypass, fee deduction, state save/load, pre-trade min-size guard, restart recovery (seeds position manager + state machine), native stop-loss backstop (placement, cancel, resync, failure alerting, dry-run/flag-off no-ops, restart reconciliation) |
 | `test_capital_pool.py` | 19 | CapitalPool: slot allocation, slot cap, release, edge cases |
 | `test_correlation.py` | 17 | Pearson correlation, pct_returns, fetch_correlation |
 | `test_stock_correlation.py` | 5 | `stock_bot/risk/correlation.py`: `fetch_correlation_from_closes` — no-network wrapper reusing bot/risk/correlation.py's pearson/pct_returns unchanged |
@@ -189,7 +189,7 @@ Expected total: **486 tests** (verified via `pytest --collect-only -q`; table su
 | `test_stock_vix_crisis.py` | 6 | `stock_bot/risk/vix_crisis.py`: `is_vix_crisis` — at/above/below threshold, None fails open, zero/negative threshold disables |
 | `test_stock_vix_crisis_gate.py` | 2 | Source-inspection guard: `run()` fetches `^VIX`, computes crisis mode via `is_vix_crisis`, and gates new BUYs on it (reuses the same `_regime_ok` flag as the SPY regime filter) |
 | `test_stock_settlement_csv.py` | 11 | Settlement/FX tax record-keeping (Canadian ACB/FX, minimal scope — data capture only, no gain computation): `_next_business_day` T+1-skip-weekends (both paper.py and ibkr.py copies), frozen `paper_trades.csv`/`ibkr_trades.csv` header proven UNCHANGED, new settlement CSV written on BUY and SELL with correct join key (timestamp/symbol/side) back to the frozen CSV, CAD symbol records fx_rate=1.0 |
-| `test_risk_manager.py` | 20 | RiskManager: halt gate, daily loss, position size, SL/TP bypass, state persistence, per-symbol caps, aggregate account breakers |
+| `test_risk_manager.py` | 32 | RiskManager: halt gate, daily loss, position size, SL/TP bypass, state persistence, per-symbol caps, aggregate account breakers, kill-switch tier (sticky, priority-over-halt, never-blocks-SELL, restart persistence), drawdown-halt tier (not sticky), weekly-loss tier (trip/allow/week-rollover), non-blocking drawdown-warning tier |
 | `test_fill_recording.py` | 8 | BUG 1: qty=0 fill — filled priority, amount fallback, guard, TradeLog guard |
 | `test_external_holdings.py` | 6 | External-holdings guard in _sync_position (adopt=false/true) |
 | `test_executor.py` | 6 | PaperExecutor: BUY/SELL, insufficient cash, history |
@@ -232,7 +232,7 @@ Expected total: **486 tests** (verified via `pytest --collect-only -q`; table su
 | `test_grid_stress_test.py` | 14 | `grid_stress_test.py` pure helpers (crypto research tooling, not the live pipeline): crash-period date parsing, buy-and-hold P&L calc, PASS/MARGINAL/FAILED classification. Hermetic — the actual stress run against Binance is a separate manual step |
 | `test_grid_dca_experiment.py` | 12 | `grid_dca_experiment.py` standalone backtest engines (crypto research tooling, not the live pipeline): grid strategy fills/reopens/floor-stop, capital split across slots, fee math on both legs, DCA safety-order averaging + cycle restart, empty-candle edge cases |
 
-Run: `python -m pytest --tb=short -q` — must show **486 passed**.
+Run: `python -m pytest --tb=short -q` — must show **509 passed**.
 
 ---
 
@@ -275,8 +275,9 @@ RISK_MAX_POSITION_PCT=0.20    # BUY blocked if it would push position above 20% 
                               # capped at $77 by MAX_SLOT_CASH_CAD so absolute exposure stays small)
 RISK_DAILY_LOSS_LIMIT=0.01    # halt new BUYs if portfolio down >1% from today's UTC-midnight open
                               # (SELL always allowed — breaker never blocks exits)
-RISK_MAX_DRAWDOWN=0.05        # halt new BUYs if portfolio down >5% from all-time peak
-                              # (SELL always allowed — breaker never blocks exits)
+RISK_MAX_DRAWDOWN=0.05        # DRAWDOWN-HALT tier — halt new BUYs if portfolio down >5% from
+                              # all-time peak. Not sticky — auto-lifts the moment equity
+                              # recovers. (SELL always allowed — breaker never blocks exits)
 RISK_MAX_TRADES_PER_DAY=5     # hard cap on BUY fills per calendar day (per-symbol when
                               # multi-symbol; SELL fills are not capped)
 COOLDOWN_TICKS=6              # state-machine cooldown between a fill and the next signal
@@ -289,7 +290,38 @@ RISK_HALT_BLOCKS_STOPS=false  # NOT set in .env — using the config.py default 
                               # SELL blocked; SL/TP exits still fire"). Set true only if you
                               # want a manual halt to freeze exits too — not recommended, since
                               # it would leave open positions exposed with no stop.
+RISK_WEEKLY_LOSS_LIMIT=0.05   # NOT set in .env — using the config.py default (5%). Added
+                              # 2026-08-07. Halt new BUYs if portfolio down >5% from this
+                              # ISO-week's UTC-Monday-open value. Not sticky — resets fresh
+                              # every week regardless of a prior trip. SELL always allowed.
+RISK_DRAWDOWN_WARNING=0.03    # NOT set in .env — using the config.py default (3%). Added
+                              # 2026-08-07. Non-blocking — Telegram alert only (fired once
+                              # per episode from bot/main.py's tick loop), trading continues.
+                              # Must be < RISK_MAX_DRAWDOWN.
+RISK_KILL_SWITCH=0.15         # NOT set in .env — using the config.py default (15%). Added
+                              # 2026-08-07. Halt new BUYs if portfolio down >15% from
+                              # all-time peak. STICKY — persisted to logs/risk_state.json,
+                              # survives restart, does NOT auto-clear on recovery. Requires
+                              # manually editing kill_switch_tripped to false in that file to
+                              # resume BUYs. Must be > RISK_MAX_DRAWDOWN. Config validation
+                              # enforces RISK_DRAWDOWN_WARNING < RISK_MAX_DRAWDOWN <
+                              # RISK_KILL_SWITCH strictly increasing.
 ```
+Four-tier breaker upgrade added 2026-08-07, mirroring the stock bot's identical upgrade from
+2026-08-05 — crypto had fallen behind with only a single non-sticky drawdown check even
+though (unlike the stock bot, still paper-only) it trades real money. Crypto's tier
+thresholds are intentionally much tighter than the stock bot's (3%/5%/15% vs the stock bot's
+10%/15%/20%) since the existing `RISK_MAX_DRAWDOWN=0.05` halt tier was already tighter —
+scaled the new warning/kill-switch tiers to match rather than reusing the stock bot's
+numbers verbatim. Check order inside `RiskManager.evaluate()` is now (most severe first):
+HALT → KILL_SWITCH → MAX_DRAWDOWN (halt) → WEEKLY_LOSS → DAILY_TRADE_CAP → DAILY_LOSS →
+POSITION_SIZE — when multiple tiers trip simultaneously the most severe `block_reason` is
+reported, not whichever happened to be checked first historically. `peak_value`,
+`week_open_value`, and `kill_switch_tripped` all persist in `logs/risk_state.json` (existing
+file — old on-disk copies load cleanly, new fields default fresh on first `evaluate()` after
+upgrading). Tests: `test_risk_manager.py`, 12 new cases (kill-switch trip/sticky/persist/
+priority-over-halt/never-blocks-SELL, drawdown-halt now has dedicated tests for the first
+time, weekly-loss trip/allow/week-rollover, warning-tier status + non-blocking confirmation).
 
 ### Native exchange-side stop-loss (crypto — opt-in, off by default)
 ```
@@ -499,11 +531,11 @@ EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-0
   above) — closes the top finding from a gap review against external crypto-bot best-practice
   research: software SL/TP only protects a position while the bot process is alive. Ships
   **off** (`NATIVE_STOP_LOSS_ENABLED=false`) pending live validation before enabling on the
-  real $77 slot. Same research pass flagged three more gaps not yet acted on: crypto's risk
-  engine still has the old single-tier drawdown/daily-loss shape (no weekly-loss tier, no
-  sticky kill switch — the stock bot got that upgrade 2026-08-05, crypto didn't), no
-  real-time slippage guard on fills, and the candle watchdog alerts on a stale feed but never
-  halts trading on one.
+  real $77 slot. Risk-engine tiering upgrade done the same day (see "Risk-gate config" above)
+  — crypto's RiskManager gained the weekly-loss/drawdown-warning/kill-switch tiers the stock
+  bot got 2026-08-05, closing the second research finding. Two gaps from that pass remain not
+  yet acted on: no real-time slippage guard on fills, and the candle watchdog alerts on a
+  stale feed but never halts trading on one.
 - **Stock bot:** live on IBKR paper (DUQ273338, reset to $5,000 CAD 2026-07-20). Swing book
   retired (`FAST_ENABLED=false`) — position book (rule-based, Mode A/B) is the only active
   book. TSX symbols are **permanently** advisory-only — CIRO regulation blocks API orders on

@@ -202,10 +202,26 @@ class RiskConfig:
     risk_per_trade_pct:     float = 0.005  # 0.5% of cash per trade — conservative dynamic sizing
     max_position_pct:       float = 0.03   # never more than 3% of portfolio in one position
     daily_loss_limit_pct:   float = 0.01   # halt new BUYs if down 1% today
-    max_drawdown_pct:       float = 0.05   # halt new BUYs if down 5% from all-time peak
+    max_drawdown_pct:       float = 0.05   # drawdown-HALT tier — halt new BUYs if down 5% from
+                                            # all-time peak. Not sticky — auto-lifts on recovery.
     max_trades_per_day:     int   = 3      # hard cap per calendar day
     cooldown_ticks:         int   = 10     # candles to wait after each trade
     risk_halt_blocks_stops: bool  = False  # when True, manual HALT also blocks SL/TP exits
+    # ── Weekly loss / drawdown-from-peak tiers (added 2026-08-07, mirrors the
+    # stock bot's breaker upgrade 2026-08-05 — crypto had fallen behind with
+    # only a single non-sticky drawdown check even though it trades real money) ──
+    weekly_loss_limit_pct:  float = 0.05   # halt new BUYs if down X% from this ISO-week's
+                                            # UTC-Monday-open value. Not sticky — resets fresh
+                                            # every week regardless of prior trip.
+    drawdown_warning_pct:   float = 0.03   # non-blocking — Telegram alert only, trading
+                                            # continues. Must be < max_drawdown_pct. Tighter
+                                            # than the stock bot's 10% — crypto's halt tier
+                                            # itself is already a tighter 5%, not 15%.
+    kill_switch_pct:        float = 0.10   # halt new BUYs if down X% from all-time peak.
+                                            # STICKY — persists across restart, does not
+                                            # auto-clear on recovery. Requires manually editing
+                                            # kill_switch_tripped to false in logs/risk_state.json.
+                                            # Must be > max_drawdown_pct.
 
     def __post_init__(self):
         errors = []
@@ -228,6 +244,19 @@ class RiskConfig:
             errors.append("RISK_MAX_TRADES_PER_DAY must be >= 1")
         if self.cooldown_ticks < 0:
             errors.append("COOLDOWN_TICKS must be >= 0")
+        if not 0 <= self.weekly_loss_limit_pct <= 0.60:
+            errors.append("RISK_WEEKLY_LOSS_LIMIT must be between 0% and 60%")
+        if self.daily_loss_limit_pct > self.weekly_loss_limit_pct:
+            errors.append("RISK_DAILY_LOSS_LIMIT should not exceed RISK_WEEKLY_LOSS_LIMIT")
+        if not 0 <= self.drawdown_warning_pct <= 0.60:
+            errors.append("RISK_DRAWDOWN_WARNING must be between 0% and 60%")
+        if not 0 < self.kill_switch_pct <= 0.90:
+            errors.append("RISK_KILL_SWITCH must be between 0% and 90%")
+        if not (self.drawdown_warning_pct < self.max_drawdown_pct < self.kill_switch_pct):
+            errors.append(
+                "Must satisfy: RISK_DRAWDOWN_WARNING < RISK_MAX_DRAWDOWN < RISK_KILL_SWITCH "
+                "(strictly increasing severity tiers)"
+            )
         if errors:
             raise ValueError("Config errors:\n" + "\n".join(f"  - {e}" for e in errors))
 
@@ -531,6 +560,7 @@ _KNOWN_STRATEGY_ENV_KEYS: frozenset[str] = frozenset({
     # RISK
     "RISK_PER_TRADE_PCT", "RISK_MAX_POSITION_PCT", "RISK_DAILY_LOSS_LIMIT",
     "RISK_MAX_DRAWDOWN", "RISK_MAX_TRADES_PER_DAY", "RISK_HALT_BLOCKS_STOPS",
+    "RISK_WEEKLY_LOSS_LIMIT", "RISK_DRAWDOWN_WARNING", "RISK_KILL_SWITCH",
     # EMA — none of the recognised keys start with EMA_ (they use MIN_/MAX_/FAST_/SLOW_/REGIME_)
     # so any EMA_* key in .env is unrecognised and will be flagged correctly.
 })
@@ -601,6 +631,9 @@ def _load() -> AppConfig:
             max_trades_per_day     = _int  ("RISK_MAX_TRADES_PER_DAY",  5),
             cooldown_ticks         = _int  ("COOLDOWN_TICKS",           10),
             risk_halt_blocks_stops = _bool ("RISK_HALT_BLOCKS_STOPS",   False),
+            weekly_loss_limit_pct  = _float("RISK_WEEKLY_LOSS_LIMIT",   0.05),
+            drawdown_warning_pct   = _float("RISK_DRAWDOWN_WARNING",    0.03),
+            kill_switch_pct        = _float("RISK_KILL_SWITCH",         0.15),
         ),
         portfolio=PortfolioConfig(
             starting_cash            = _float("STARTING_CASH",            10_000.0),

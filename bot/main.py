@@ -862,10 +862,13 @@ def run():
 
     risk = RiskManager(
         RiskConfig(
-            max_position_pct     = cfg.risk.max_position_pct,
-            daily_loss_limit_pct = cfg.risk.daily_loss_limit_pct,
-            max_drawdown_pct     = cfg.risk.max_drawdown_pct,
-            max_trades_per_day   = cfg.risk.max_trades_per_day,
+            max_position_pct      = cfg.risk.max_position_pct,
+            daily_loss_limit_pct  = cfg.risk.daily_loss_limit_pct,
+            max_drawdown_pct      = cfg.risk.max_drawdown_pct,
+            max_trades_per_day    = cfg.risk.max_trades_per_day,
+            weekly_loss_limit_pct = cfg.risk.weekly_loss_limit_pct,
+            drawdown_warning_pct  = cfg.risk.drawdown_warning_pct,
+            kill_switch_pct       = cfg.risk.kill_switch_pct,
         ),
         # Persist breaker state (drawdown peak, daily counters) across restarts
         # in live mode only — backtests/paper runs stay stateless.
@@ -1056,6 +1059,7 @@ def run():
     tick        = 0
     tick_log:   deque[dict] = deque(maxlen=200)
     _drift_consecutive_failures = 0
+    _dd_warning_active = False   # non-blocking drawdown-warning tier — alert-once-per-episode
     candle_log: deque[dict] = deque(maxlen=50)
 
     def _account_value() -> float:
@@ -1305,6 +1309,26 @@ def run():
                                     " — Kraken BalanceEx may be rate-limited or session expired"
                                 )
                                 _drift_consecutive_failures = 0
+
+            # ── 1d. Drawdown warning (non-blocking, informational) ────
+            # The blocking tiers (kill switch, drawdown halt, weekly loss)
+            # already fire from inside risk.evaluate() at step 7 with no
+            # extra wiring needed — this is the one tier that never blocks
+            # a trade, so it gets its own explicit check + alert-once-per-
+            # episode guard (same pattern as the candle watchdog / drift
+            # detection above, and the stock bot's identically-named tier).
+            if is_indicator and live_exchange is not None:
+                _dd_status = risk.drawdown_status(_account_value())
+                if _dd_status["warning"] and not _dd_warning_active:
+                    _dd_warning_active = True
+                    alerter.error(
+                        f"DRAWDOWN WARNING: portfolio down {_dd_status['drawdown_pct']:.1%} "
+                        f"from peak ${_dd_status['peak_value']:,.2f} "
+                        f"(current ${_dd_status['current_value']:,.2f}). Trading continues — "
+                        f"this is a non-blocking warning tier."
+                    )
+                elif not _dd_status["warning"]:
+                    _dd_warning_active = False
 
             # ── 2. Intra-candle SL/TP + Trailing Stop + Partial TP ───
             # This block is the only SL/TP evaluation path. A second

@@ -62,6 +62,145 @@ def test_resume_lifts_halt():
     result = risk.evaluate(Signal.BUY, 74_000, ex.portfolio, 0.001)
     assert result.approved
 
+
+# ── Kill switch (sticky) — added 2026-08-07 breaker-tiering upgrade ────────
+
+def test_kill_switch_trips_and_blocks_buy():
+    ex, risk = _make(cash=10_000, max_drawdown_pct=0.50, weekly_loss_limit_pct=0.50, kill_switch_pct=0.20)
+    risk.evaluate(Signal.HOLD, 100, ex.portfolio, 1.0)   # seeds peak at $10k
+    ex.portfolio.cash = 7_500   # 25% down — past the 20% kill switch
+    result = risk.evaluate(Signal.BUY, 100, ex.portfolio, 0.001)
+    assert not result
+    assert result.block_reason == BlockReason.KILL_SWITCH
+    assert risk.kill_switch_tripped
+
+def test_kill_switch_never_blocks_sell():
+    ex, risk = _make(cash=10_000, max_drawdown_pct=0.50, weekly_loss_limit_pct=0.50, kill_switch_pct=0.20)
+    risk.evaluate(Signal.HOLD, 100, ex.portfolio, 1.0)
+    ex.portfolio.cash = 7_500
+    result = risk.evaluate(Signal.SELL, 100, ex.portfolio, 1.0)
+    assert result.approved
+
+def test_kill_switch_is_sticky_survives_recovery():
+    ex, risk = _make(cash=10_000, max_drawdown_pct=0.50, weekly_loss_limit_pct=0.50, kill_switch_pct=0.20)
+    risk.evaluate(Signal.HOLD, 100, ex.portfolio, 1.0)
+    ex.portfolio.cash = 7_500
+    tripped = risk.evaluate(Signal.BUY, 100, ex.portfolio, 0.001)
+    assert not tripped
+    ex.portfolio.cash = 10_000   # equity fully recovers back to the peak...
+    result = risk.evaluate(Signal.BUY, 100, ex.portfolio, 0.001)
+    # ...but the kill switch stays tripped regardless — sticky, not auto-lifting.
+    assert not result
+    assert result.block_reason == BlockReason.KILL_SWITCH
+
+def test_kill_switch_persists_across_restart():
+    ex = PaperExecutor("BTC/USDT", quantity=1.0, starting_cash=10_000)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "risk_state.json")
+        cfg = RiskConfig(max_drawdown_pct=0.50, weekly_loss_limit_pct=0.50, kill_switch_pct=0.20)
+        risk = RiskManager(cfg, state_path=path)
+        risk.evaluate(Signal.HOLD, 100, ex.portfolio, 1.0)
+        ex.portfolio.cash = 7_500
+        risk.evaluate(Signal.BUY, 100, ex.portfolio, 0.001)   # trips it
+        assert risk.kill_switch_tripped
+
+        restarted = RiskManager(cfg, state_path=path)
+        assert restarted.kill_switch_tripped   # survives restart — did NOT auto-clear
+
+def test_kill_switch_takes_priority_over_max_drawdown():
+    # Both tiers trip simultaneously — the more severe kill switch must be
+    # the reported block_reason, not the (also-tripped) halt tier.
+    ex, risk = _make(cash=10_000, max_drawdown_pct=0.05, kill_switch_pct=0.10, weekly_loss_limit_pct=0.50)
+    risk.evaluate(Signal.HOLD, 100, ex.portfolio, 1.0)
+    ex.portfolio.cash = 8_500   # 15% down — past both the 5% halt and 10% kill switch
+    result = risk.evaluate(Signal.BUY, 100, ex.portfolio, 0.001)
+    assert not result
+    assert result.block_reason == BlockReason.KILL_SWITCH
+
+
+# ── Max drawdown — halt tier, NOT sticky (previously untested in isolation) ─
+
+def test_max_drawdown_blocks_when_exceeded():
+    ex, risk = _make(cash=10_000, max_drawdown_pct=0.05, weekly_loss_limit_pct=0.50, kill_switch_pct=0.50)
+    risk.evaluate(Signal.HOLD, 100, ex.portfolio, 1.0)   # seeds peak at $10k
+    ex.portfolio.cash = 9_000    # 10% down — past the 5% halt
+    result = risk.evaluate(Signal.BUY, 100, ex.portfolio, 0.001)
+    assert not result
+    assert result.block_reason == BlockReason.MAX_DRAWDOWN
+
+def test_max_drawdown_not_sticky_recovers():
+    ex, risk = _make(cash=10_000, max_drawdown_pct=0.05, weekly_loss_limit_pct=0.50, kill_switch_pct=0.50)
+    risk.evaluate(Signal.HOLD, 100, ex.portfolio, 1.0)
+    ex.portfolio.cash = 9_000
+    tripped = risk.evaluate(Signal.BUY, 100, ex.portfolio, 0.001)
+    assert not tripped
+    ex.portfolio.cash = 10_000   # recovers back to peak
+    result = risk.evaluate(Signal.BUY, 100, ex.portfolio, 0.001)
+    assert result.approved   # not sticky — auto-lifts, unlike the kill switch
+
+
+# ── Weekly loss limit — added 2026-08-07 ────────────────────────────────────
+
+def test_weekly_loss_blocks_when_exceeded():
+    ex, risk = _make(cash=10_000, max_drawdown_pct=0.50, kill_switch_pct=0.50, weekly_loss_limit_pct=0.05)
+    risk.evaluate(Signal.HOLD, 100, ex.portfolio, 1.0)   # seeds week_open at $10k
+    ex.portfolio.cash = 9_000    # 10% down — past the 5% weekly limit
+    result = risk.evaluate(Signal.BUY, 100, ex.portfolio, 0.001)
+    assert not result
+    assert result.block_reason == BlockReason.WEEKLY_LOSS
+
+def test_weekly_loss_allows_within_limit():
+    ex, risk = _make(
+        cash=10_000, max_drawdown_pct=0.50, kill_switch_pct=0.50,
+        weekly_loss_limit_pct=0.05, daily_loss_limit_pct=0.50,
+    )
+    risk.evaluate(Signal.HOLD, 100, ex.portfolio, 1.0)
+    ex.portfolio.cash = 9_600    # 4% down — within the 5% limit
+    result = risk.evaluate(Signal.BUY, 100, ex.portfolio, 0.001)
+    assert result.approved
+
+def test_weekly_loss_resets_on_new_week():
+    ex, risk = _make(cash=10_000, max_drawdown_pct=0.50, kill_switch_pct=0.50, weekly_loss_limit_pct=0.05)
+    risk.evaluate(Signal.HOLD, 100, ex.portfolio, 1.0, candle_date=date(2026, 8, 3))   # Monday
+    ex.portfolio.cash = 9_000
+    tripped = risk.evaluate(Signal.BUY, 100, ex.portfolio, 0.001, candle_date=date(2026, 8, 3))
+    assert not tripped
+    assert tripped.block_reason == BlockReason.WEEKLY_LOSS
+    # Next ISO week — baseline resets fresh off the current (still-down) value,
+    # so the same balance is no longer "down" relative to its own new week-open.
+    result = risk.evaluate(Signal.BUY, 100, ex.portfolio, 0.001, candle_date=date(2026, 8, 10))
+    assert result.approved
+
+
+# ── Non-blocking drawdown-warning tier — added 2026-08-07 ───────────────────
+
+def test_drawdown_status_reports_warning_flag():
+    ex, risk = _make(
+        cash=10_000, drawdown_warning_pct=0.03,
+        max_drawdown_pct=0.50, weekly_loss_limit_pct=0.50, kill_switch_pct=0.50,
+    )
+    risk.evaluate(Signal.HOLD, 100, ex.portfolio, 1.0)   # seeds peak at $10k
+    assert not risk.drawdown_status(10_000)["warning"]
+    status = risk.drawdown_status(9_600)   # 4% down — past the 3% warning threshold
+    assert status["warning"]
+    assert abs(status["drawdown_pct"] - 0.04) < 1e-9
+
+def test_drawdown_status_never_blocks_trades():
+    # Purely informational — evaluate() must still approve a BUY while the
+    # warning tier is active. Only halt/kill-switch/drawdown-halt/weekly-loss
+    # actually block.
+    ex, risk = _make(
+        cash=10_000, drawdown_warning_pct=0.03,
+        max_drawdown_pct=0.50, weekly_loss_limit_pct=0.50, kill_switch_pct=0.50,
+        daily_loss_limit_pct=0.50,
+    )
+    risk.evaluate(Signal.HOLD, 100, ex.portfolio, 1.0)
+    ex.portfolio.cash = 9_600
+    assert risk.drawdown_status(9_600)["warning"]
+    result = risk.evaluate(Signal.BUY, 100, ex.portfolio, 0.001)
+    assert result.approved
+
+
 # ── Check 2: daily trade cap ──────────────────────────────────────────────
 
 def test_daily_trade_cap_blocks_after_limit():
@@ -82,9 +221,13 @@ def test_daily_trade_cap_allows_up_to_limit():
 # ── Check 3: daily loss limit ─────────────────────────────────────────────
 
 def test_daily_loss_limit_blocks_when_exceeded():
-    # max_drawdown_pct=0.50 ensures the drawdown check (Check 2) does not fire
-    # before the daily loss check (Check 4) when cash is drained by 10%.
-    ex, risk = _make(cash=10_000, daily_loss_limit_pct=0.05, max_drawdown_pct=0.50)
+    # max_drawdown_pct/weekly_loss_limit_pct=0.50 ensure the drawdown and
+    # weekly-loss checks (Checks 2-4) do not fire before the daily loss check
+    # (Check 6) when cash is drained by 10%.
+    ex, risk = _make(
+        cash=10_000, daily_loss_limit_pct=0.05,
+        max_drawdown_pct=0.50, weekly_loss_limit_pct=0.50,
+    )
     # Seed the day-open value at full $10k
     risk.evaluate(Signal.HOLD, 100, ex.portfolio, 1.0)
     # Manually drain portfolio cash to simulate a loss > 5%
@@ -140,7 +283,10 @@ def test_per_symbol_trade_cap_is_isolated():
 def test_account_value_drives_daily_loss_breaker():
     # Slot portfolio is flat, but the aggregate account is down 10% — the
     # daily-loss breaker must fire on the account, not the slot.
-    ex, risk = _make(cash=10_000, daily_loss_limit_pct=0.05, max_drawdown_pct=0.50)
+    ex, risk = _make(
+        cash=10_000, daily_loss_limit_pct=0.05,
+        max_drawdown_pct=0.50, weekly_loss_limit_pct=0.50,
+    )
     risk.evaluate(Signal.HOLD, 100, ex.portfolio, 1.0, account_value=10_000.0)
     result = risk.evaluate(Signal.BUY, 100, ex.portfolio, 0.001, account_value=9_000.0)
     assert not result
@@ -262,6 +408,18 @@ if __name__ == "__main__":
         test_account_value_drives_daily_loss_breaker,
         test_position_size_check_stays_per_slot,
         test_per_symbol_fills_persist_across_restart,
+        test_kill_switch_trips_and_blocks_buy,
+        test_kill_switch_never_blocks_sell,
+        test_kill_switch_is_sticky_survives_recovery,
+        test_kill_switch_persists_across_restart,
+        test_kill_switch_takes_priority_over_max_drawdown,
+        test_max_drawdown_blocks_when_exceeded,
+        test_max_drawdown_not_sticky_recovers,
+        test_weekly_loss_blocks_when_exceeded,
+        test_weekly_loss_allows_within_limit,
+        test_weekly_loss_resets_on_new_week,
+        test_drawdown_status_reports_warning_flag,
+        test_drawdown_status_never_blocks_trades,
     ]
     for t in tests:
         t()
