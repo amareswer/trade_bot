@@ -4,7 +4,7 @@ Unit tests for grid_dca_experiment.py's two standalone backtest engines.
 Hermetic — synthetic candle data only, no network. Fee is set to 0 in most
 cases so expected P&L can be hand-computed exactly rather than approximated.
 
-Run: python -m pytest test_grid_dca_experiment.py -v
+Run: python -m pytest tests/crypto/test_grid_dca_experiment.py -v
 """
 from __future__ import annotations
 

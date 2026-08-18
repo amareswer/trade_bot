@@ -16,7 +16,7 @@ Covers:
       coverage until now — test_heartbeat.py and the tests above passed
       unchanged throughout that incident without ever exercising it.
 
-Run: python -m pytest test_drift_escalation.py -v
+Run: python -m pytest tests/crypto/test_drift_escalation.py -v
 """
 from __future__ import annotations
 

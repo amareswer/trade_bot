@@ -17,7 +17,7 @@ Tests:
   (g) TradeLog.log_fill guard: qty < 0 raises ValueError
   (h) TradeLog.log_fill: qty > 0 writes correctly (no regression)
 
-Run: python -m pytest test_fill_recording.py -v
+Run: python -m pytest tests/crypto/test_fill_recording.py -v
 """
 from __future__ import annotations
 

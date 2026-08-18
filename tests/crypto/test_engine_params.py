@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from bot.backtest import engine
 from bot.backtest.params import engine_kwargs_from_cfg
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent  # tests/crypto/ -> repo root
 
 
 def make_fake_cfg(**overrides):

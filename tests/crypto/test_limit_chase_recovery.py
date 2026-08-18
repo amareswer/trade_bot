@@ -14,7 +14,7 @@ Fixes under test:
   3. Chase timeout-cancel verifies the order's fate before re-placing —
      a fill racing the cancel is recorded, never doubled.
 
-Run: python -m pytest test_limit_chase_recovery.py -v
+Run: python -m pytest tests/crypto/test_limit_chase_recovery.py -v
 """
 from __future__ import annotations
 

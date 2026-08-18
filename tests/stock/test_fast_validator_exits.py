@@ -8,7 +8,7 @@ falling back to the guarded live-price helper. Before the fix, a feed gap
 starved ALL exits and positions could be held indefinitely (observed with
 AMZN/HOOD on 2026-07-04).
 
-Run: python -m pytest test_fast_validator_exits.py -v
+Run: python -m pytest tests/stock/test_fast_validator_exits.py -v
 """
 from __future__ import annotations
 

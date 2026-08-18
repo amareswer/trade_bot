@@ -6,7 +6,7 @@ classification.
 Hermetic — no network, no real crash-period data fetched. The actual stress
 run against Binance is a separate, manual step (`python grid_stress_test.py`).
 
-Run: python -m pytest test_grid_stress_test.py -v
+Run: python -m pytest tests/crypto/test_grid_stress_test.py -v
 """
 from __future__ import annotations
 

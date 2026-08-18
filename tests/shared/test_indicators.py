@@ -1,7 +1,7 @@
 """
 Unit tests for bot/indicators/indicators.py and IndicatorStrategy.
 
-Run: python -m pytest test_indicators.py -v
+Run: python -m pytest tests/shared/test_indicators.py -v
 """
 from __future__ import annotations
 import math

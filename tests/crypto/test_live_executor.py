@@ -1,7 +1,7 @@
 """
 Unit tests for LiveExecutor — all exchange calls mocked, no network.
 
-Run: python -m pytest test_live_executor.py -v
+Run: python -m pytest tests/crypto/test_live_executor.py -v
 """
 from __future__ import annotations
 

@@ -6,7 +6,7 @@ what converts the paper book into an income projection. It must be net of
 the IBKR Pro commission model (env-driven) — slippage is already applied to
 fill prices by the paper executor and must NOT be double-counted here.
 
-Run: python -m pytest test_paper_report.py -v
+Run: python -m pytest tests/stock/test_paper_report.py -v
 """
 from __future__ import annotations
 
