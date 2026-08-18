@@ -658,6 +658,73 @@ def _evaluate_drift(
 
 
 # ---------------------------------------------------------------------------
+# Auth-health tracking for the position-drift-check block (extracted
+# 2026-08-18 for unit-testability — this logic previously lived inline in
+# run()'s tick loop with zero direct test coverage, flagged as a known gap
+# after the 2026-08-15 Kraken auth incident; test_drift_escalation.py and
+# test_heartbeat.py passed unchanged throughout that incident without ever
+# exercising these branches).
+# ---------------------------------------------------------------------------
+def _update_auth_health(
+    auth_health: dict,
+    success: bool,
+    consecutive_failures: int,
+    threshold: int,
+    alerter,
+    exc: Exception | None = None,
+) -> int:
+    """One auth-health evaluation, called once per drift-check attempt.
+
+    Tracks whether Kraken's *authenticated* endpoints (balance/position sync)
+    are reachable — separately from the public price/candle feed and from
+    plain liveness (the loop ticking). Added 2026-08-15 after an IP-
+    restriction auth failure went undetected for days: the drift-check
+    failure only ever logged, and the heartbeat's healthy_fn only checked
+    that the loop was ticking — public candle/ticker calls kept succeeding
+    the whole time, so healthchecks.io stayed green.
+
+    Alerts once per ok->failing / failing->ok transition (edge-triggered,
+    not every check) and mutates auth_health['ok'] in place so the
+    heartbeat's healthy_fn (a closure created before the tick loop starts)
+    observes the same flag.
+
+    Returns the new consecutive_failures count: 0 on success, or after
+    `threshold` consecutive failures have just been evaluated (whether or
+    not that evaluation produced a fresh alert).
+    """
+    if success:
+        if not auth_health["ok"]:
+            auth_health["ok"] = True
+            alerter.error(
+                "Kraken auth RECOVERED — position drift check succeeded "
+                "again. BUYs/exits should work normally now."
+            )
+        return 0
+
+    consecutive_failures += 1
+    if consecutive_failures >= threshold:
+        logger.warning(
+            "WARNING: Position drift check: %d consecutive failures"
+            " — Kraken BalanceEx may be rate-limited or session expired",
+            consecutive_failures,
+        )
+        if auth_health["ok"]:
+            auth_health["ok"] = False
+            alerter.error(
+                f"Kraken authenticated API calls failing ({consecutive_failures} "
+                f"consecutive position-drift-check failures): "
+                f"{exc}. Public price/candle data is "
+                "unaffected — this looks like an auth or IP-"
+                "restriction issue, not a network outage. If a BUY "
+                "signal fires while this persists, order placement "
+                "will likely fail the same way. Heartbeat now "
+                "reports unhealthy until this recovers."
+            )
+        consecutive_failures = 0
+    return consecutive_failures
+
+
+# ---------------------------------------------------------------------------
 # Manual halt flag file (extracted for unit-testability)
 # ---------------------------------------------------------------------------
 _HALT_FLAG_PATH = os.path.join(_log_dir, "HALT")
@@ -1333,38 +1400,19 @@ def run():
                             cfg.exchange.drift_alert_threshold, alerter,
                         )
                         _drift_succeeded = True
-                        _drift_consecutive_failures = 0
-                        if not _auth_health["ok"]:
-                            _auth_health["ok"] = True
-                            alerter.error(
-                                "Kraken auth RECOVERED — position drift check succeeded "
-                                "again. BUYs/exits should work normally now."
-                            )
+                        _drift_consecutive_failures = _update_auth_health(
+                            _auth_health, True, _drift_consecutive_failures, 5, alerter,
+                        )
                         break
                     except Exception as _drift_exc:
                         if _attempt < len(_drift_delays) - 1:
                             time.sleep(_delay)
                         else:
-                            _drift_consecutive_failures += 1
                             logger.warning("Position drift check failed: %s", _drift_exc)
-                            if _drift_consecutive_failures >= 5:
-                                logger.warning(
-                                    "WARNING: Position drift check: 5 consecutive failures"
-                                    " — Kraken BalanceEx may be rate-limited or session expired"
-                                )
-                                if _auth_health["ok"]:
-                                    _auth_health["ok"] = False
-                                    alerter.error(
-                                        "Kraken authenticated API calls failing (5 "
-                                        f"consecutive position-drift-check failures): "
-                                        f"{_drift_exc}. Public price/candle data is "
-                                        "unaffected — this looks like an auth or IP-"
-                                        "restriction issue, not a network outage. If a BUY "
-                                        "signal fires while this persists, order placement "
-                                        "will likely fail the same way. Heartbeat now "
-                                        "reports unhealthy until this recovers."
-                                    )
-                                _drift_consecutive_failures = 0
+                            _drift_consecutive_failures = _update_auth_health(
+                                _auth_health, False, _drift_consecutive_failures,
+                                5, alerter, _drift_exc,
+                            )
 
             # ── 1d. Drawdown warning (non-blocking, informational) ────
             # The blocking tiers (kill switch, drawdown halt, weekly loss)

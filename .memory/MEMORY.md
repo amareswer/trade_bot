@@ -19,3 +19,4 @@
 - [Stock Bot](stock_bot.md) — all 6 phases built; $1k paper trading; STABLE as of 2026-06-19; reverts documented
 - [1d Swing Validated](decisions/swing-1d-validated.md) — SL=4% TP=25% walk-forward PASS all 3 periods; paper-trade candidate; not in live .env
 - [Known Gaps](decisions/known-gaps.md) — BUY fills missing from trades.db; regime monitor PF too permissive (no EMA spread filter); live_state.json is dead code
+- [Expert Practices Benchmark](decisions/expert-practices-benchmark.md) — 2026-08-18 web research vs. this codebase: sizing/stops/breakers/walk-forward/capital-gates already match or exceed expert practice; VPS uptime gap and statistical overfitting tooling both found but deliberately deferred, not implemented

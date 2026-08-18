@@ -174,7 +174,7 @@ need the full narrative behind any decision below.
 
 ## Test Suite Manifest (reconciled 2026-08-05)
 
-Expected total: **521 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~11s — if it takes minutes, a test is reading live `.env` config.
+Expected total: **526 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~11s — if it takes minutes, a test is reading live `.env` config.
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -193,7 +193,7 @@ Expected total: **521 tests** (verified via `pytest --collect-only -q`; table su
 | `test_fill_recording.py` | 8 | BUG 1: qty=0 fill — filled priority, amount fallback, guard, TradeLog guard |
 | `test_external_holdings.py` | 6 | External-holdings guard in _sync_position (adopt=false/true) |
 | `test_executor.py` | 6 | PaperExecutor: BUY/SELL, insufficient cash, history |
-| `test_drift_escalation.py` | 8 | Drift: tests REAL `_evaluate_drift()` from bot.main — escalation, ack (no re-alert on unchanged drift), changed-amount re-alert, resolution reset |
+| `test_drift_escalation.py` | 13 | Drift: tests REAL `_evaluate_drift()` from bot.main — escalation, ack (no re-alert on unchanged drift), changed-amount re-alert, resolution reset. Plus (2026-08-18) REAL `_update_auth_health()` — the Kraken-auth-outage alert-edge/heartbeat-flag logic from 2026-08-15, extracted out of the inline tick loop specifically to close the "no test coverage" gap noted at the time: below-threshold silence, trip-at-threshold alert + heartbeat flag flip, no re-alert while still failing, recovery alert + counter reset, healthy-path never touches the alerter |
 | `test_tsx_validation.py` | 5 | Stock-bot TSX price sanity check |
 | `test_stock_breaker.py` | 14 | Stock-bot circuit breakers (StockPaperExecutor): daily-loss restart baseline includes position marks; weekly-loss/drawdown-halt/kill-switch tiers — reject-on-trip, halt auto-lifts on recovery, kill switch stays sticky through recovery and across restart, SELL never blocked, peak-equity persistence, drawdown_status() warning flag; per-position ATR stop-pct override — defaults to baseline, persists across restart, clears on full close, survives a partial close |
 | `test_candle_watchdog.py` | 7 | Candle watchdog circuit breaker (upgraded 2026-08-07): silent/blocked/no-re-alert-while-stale on the stale side, alert+unblock on recovery, no re-alert once recovered |
@@ -233,7 +233,7 @@ Expected total: **521 tests** (verified via `pytest --collect-only -q`; table su
 | `test_grid_dca_experiment.py` | 12 | `grid_dca_experiment.py` standalone backtest engines (crypto research tooling, not the live pipeline): grid strategy fills/reopens/floor-stop, capital split across slots, fee math on both legs, DCA safety-order averaging + cycle restart, empty-candle edge cases |
 | `test_telegram_retry.py` | 3 | `TelegramAlerter._send()` retry (added 2026-08-17, closes known-gaps #17): healthy send calls `requests.post` once with no retry, a transient failure recovers on retry, a persistent failure still degrades to a warning-only no-raise after exhausting attempts |
 
-Run: `python -m pytest --tb=short -q` — must show **521 passed**.
+Run: `python -m pytest --tb=short -q` — must show **526 passed**.
 
 ---
 
@@ -606,19 +606,25 @@ EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-0
   note above — the key is restricted to an IP) or a revoked/reset key, not a network outage.
   Position was flat (0 BTC) throughout, so nothing was left unprotected, but had a BUY signal
   fired during the outage, order placement (also authenticated) would very likely have failed
-  the same way. Root cause needs a Kraken-side check (API key page) — not resolved from the
-  code side. What WAS found and fixed: this failure was invisible to every monitoring layer
+  the same way. Root cause needed a Kraken-side check (API key page) — never resolved from
+  the code side, but the log shows the last `Permission denied` at 2026-08-15 10:22 UTC and
+  none since (checked 2026-08-18) — auth calls are succeeding again on their own, whether
+  from the IP restriction being lifted or the key being reset outside this repo. What WAS
+  found and fixed at the time: this failure was invisible to every monitoring layer
   in the bot — the drift-check failure only ever logged (`logger.warning`), never alerted via
   Telegram, and the heartbeat's `healthy_fn` only checks that the main loop is ticking, not
   that authenticated calls work, so healthchecks.io stayed green the whole four days. Fixed
-  in `bot/main.py` (position-drift-check block, ~line 1318): a new shared `_auth_health` flag
+  in `bot/main.py` (position-drift-check block): a new shared `_auth_health` flag
   now (1) fires an `alerter.error()` Telegram alert on entering/leaving the failure state
   (edge-triggered, not per-check — same alert-once-per-episode pattern as the candle
   watchdog/drawdown-warning tiers elsewhere in this file), and (2) feeds into the heartbeat's
   `healthy_fn`, so a repeat of this would flip healthchecks.io unhealthy too instead of
-  staying silently green. No test coverage added yet for the new alert-edge/heartbeat-flag
-  behavior — `test_drift_escalation.py` and `test_heartbeat.py` still pass unchanged (518
-  total), but neither exercises the new branches directly.
+  staying silently green. **2026-08-18: the "no test coverage" gap noted here is now closed**
+  — the alert-edge/heartbeat-flag logic was extracted into `_update_auth_health()` (same
+  pattern as `_evaluate_drift()`) and given 5 direct unit tests in `test_drift_escalation.py`
+  (below-threshold silence, trip-alert + flag flip, no re-alert while still failing, recovery
+  alert + counter reset, healthy-path no-op) — behavior is unchanged, only the missing
+  verification was added. Suite is now 526 total.
 - **Stock bot:** live on IBKR paper (DUQ273338, reset to $5,000 CAD 2026-07-20). Swing book
   retired (`FAST_ENABLED=false`) — position book (rule-based, Mode A/B) is the only active
   book. TSX symbols are **permanently** advisory-only — CIRO regulation blocks API orders on

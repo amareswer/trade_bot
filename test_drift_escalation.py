@@ -11,6 +11,10 @@ Covers:
   (d) Post-fill position convergence: after a SELL fill, executor.position == 0
   (e) Acknowledged (unchanged) drift never re-alerts — external-deposit spam fix
   (f) A CHANGED drift amount re-arms the counter and re-alerts
+  (g) `_update_auth_health()` (extracted 2026-08-18): the Kraken-auth-outage
+      alert-edge/heartbeat-flag logic added 2026-08-15 had zero direct test
+      coverage until now — test_heartbeat.py and the tests above passed
+      unchanged throughout that incident without ever exercising it.
 
 Run: python -m pytest test_drift_escalation.py -v
 """
@@ -26,7 +30,7 @@ import bot.execution.live_executor as le_mod
 from bot.execution.executor import OrderSide, OrderStatus
 from bot.execution.live_executor import LiveExecutor
 from bot.strategy.threshold_strategy import Signal
-from bot.main import _evaluate_drift
+from bot.main import _evaluate_drift, _update_auth_health
 
 
 def _ss() -> dict:
@@ -237,3 +241,76 @@ def test_post_fill_fallback_executor_position_converges(tmp_path):
     assert exc.position == pytest.approx(0.0), (
         f"Position must converge to 0 after fallback SELL, got {exc.position}"
     )
+
+
+# ── (g) _update_auth_health(): 2026-08-15 Kraken-auth-outage logic ───────────
+
+def test_auth_health_below_threshold_no_alert():
+    """Failures under the threshold log nowhere near alerter — just count up."""
+    alerter = MagicMock()
+    auth_health = {"ok": True}
+    n = 0
+    for _ in range(4):
+        n = _update_auth_health(auth_health, False, n, 5, alerter, Exception("boom"))
+    alerter.error.assert_not_called()
+    assert auth_health["ok"] is True
+    assert n == 4
+
+
+def test_auth_health_trips_at_threshold_and_flips_heartbeat_flag():
+    """At the 5th consecutive failure: alerts once and flips ok -> False, which
+    is what the heartbeat's healthy_fn reads."""
+    alerter = MagicMock()
+    auth_health = {"ok": True}
+    n = 0
+    for _ in range(5):
+        n = _update_auth_health(auth_health, False, n, 5, alerter, Exception("Permission denied"))
+    alerter.error.assert_called_once()
+    assert "authenticated API calls failing" in alerter.error.call_args[0][0]
+    assert auth_health["ok"] is False
+    assert n == 0  # counter resets after evaluating the threshold
+
+
+def test_auth_health_stays_failing_without_realert():
+    """Once tripped, further failure batches keep ok=False but must NOT
+    re-alert every 5 failures — edge-triggered, not per-episode spam."""
+    alerter = MagicMock()
+    auth_health = {"ok": True}
+    n = 0
+    for _ in range(5):
+        n = _update_auth_health(auth_health, False, n, 5, alerter, Exception("x"))
+    for _ in range(15):  # three more threshold batches
+        n = _update_auth_health(auth_health, False, n, 5, alerter, Exception("x"))
+    alerter.error.assert_called_once()
+    assert auth_health["ok"] is False
+
+
+def test_auth_health_recovers_and_alerts_once():
+    """A single success after tripping flips ok -> True and fires exactly one
+    recovery alert, resetting the failure counter."""
+    alerter = MagicMock()
+    auth_health = {"ok": True}
+    n = 0
+    for _ in range(5):
+        n = _update_auth_health(auth_health, False, n, 5, alerter, Exception("x"))
+    assert auth_health["ok"] is False
+
+    n = _update_auth_health(auth_health, True, n, 5, alerter)
+
+    assert auth_health["ok"] is True
+    assert n == 0
+    assert alerter.error.call_count == 2  # one trip alert + one recovery alert
+    assert "RECOVERED" in alerter.error.call_args[0][0]
+
+
+def test_auth_health_success_while_already_healthy_never_alerts():
+    """The common case — every drift check succeeds — must never touch
+    alerter at all."""
+    alerter = MagicMock()
+    auth_health = {"ok": True}
+    n = 0
+    for _ in range(50):
+        n = _update_auth_health(auth_health, True, n, 5, alerter)
+    alerter.error.assert_not_called()
+    assert auth_health["ok"] is True
+    assert n == 0
