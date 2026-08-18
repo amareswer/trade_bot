@@ -174,7 +174,7 @@ need the full narrative behind any decision below.
 
 ## Test Suite Manifest (reconciled 2026-08-05)
 
-Expected total: **518 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~11s — if it takes minutes, a test is reading live `.env` config.
+Expected total: **521 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~11s — if it takes minutes, a test is reading live `.env` config.
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -231,8 +231,9 @@ Expected total: **518 tests** (verified via `pytest --collect-only -q`; table su
 | `test_sl_tp_watcher_audit_log.py` | 9 | First behavioral coverage of `_check_open_positions_sl_tp` (previously untested) plus the 2026-08-06 INFO-level "N/M positions priced" audit log — added after a yfinance outage broke the main scan loop for a full day with no direct evidence either way on whether this separate `get_live_price()` path (fast_info, independent thread) was also blind. Covers full/partial/total pricing failure counts, no-log-when-no-positions, zero-share exclusion, None-executor no-op, and basic STOP_LOSS/TAKE_PROFIT trigger sanity |
 | `test_grid_stress_test.py` | 14 | `grid_stress_test.py` pure helpers (crypto research tooling, not the live pipeline): crash-period date parsing, buy-and-hold P&L calc, PASS/MARGINAL/FAILED classification. Hermetic — the actual stress run against Binance is a separate manual step |
 | `test_grid_dca_experiment.py` | 12 | `grid_dca_experiment.py` standalone backtest engines (crypto research tooling, not the live pipeline): grid strategy fills/reopens/floor-stop, capital split across slots, fee math on both legs, DCA safety-order averaging + cycle restart, empty-candle edge cases |
+| `test_telegram_retry.py` | 3 | `TelegramAlerter._send()` retry (added 2026-08-17, closes known-gaps #17): healthy send calls `requests.post` once with no retry, a transient failure recovers on retry, a persistent failure still degrades to a warning-only no-raise after exhausting attempts |
 
-Run: `python -m pytest --tb=short -q` — must show **518 passed**.
+Run: `python -m pytest --tb=short -q` — must show **521 passed**.
 
 ---
 
@@ -323,14 +324,22 @@ upgrading). Tests: `test_risk_manager.py`, 12 new cases (kill-switch trip/sticky
 priority-over-halt/never-blocks-SELL, drawdown-halt now has dedicated tests for the first
 time, weekly-loss trip/allow/week-rollover, warning-tier status + non-blocking confirmation).
 
-### Native exchange-side stop-loss (crypto — opt-in, off by default)
+### Native exchange-side stop-loss (crypto — ON since 2026-08-15)
 ```
-NATIVE_STOP_LOSS_ENABLED=false   # NOT set in .env — using the config.py default (false).
-                                  # Added 2026-08-07 from a gap review against external crypto-
-                                  # bot best-practice research: the software SL/TP path only
-                                  # works while the bot process is alive and polling — a crash
-                                  # loop, VPS outage, or extended network partition left an open
+NATIVE_STOP_LOSS_ENABLED=true    # Set in .env 2026-08-15 (was false/unset — config.py
+                                  # default is still false). Added 2026-08-07 from a gap
+                                  # review against external crypto-bot best-practice
+                                  # research: the software SL/TP path only works while the
+                                  # bot process is alive and polling — a crash loop, VPS
+                                  # outage, or extended network partition left an open
                                   # position with zero protection until the bot came back.
+                                  # Flipped on 2026-08-15 while the user was traveling with
+                                  # reduced ability to babysit the bot, without the planned
+                                  # prior live-validation window — position was flat (0 BTC)
+                                  # at flip time so there was nothing to retroactively
+                                  # protect; takes effect on the next BUY fill. Re-confirm
+                                  # behavior on that first live fill rather than assuming
+                                  # the deferred validation happened.
 ```
 When enabled, `bot/execution/live_executor.py`'s `sync_protective_stop()` rests a real
 Kraken stop order (`create_order(..., params={"stopLossPrice": X})`, executes as market on
@@ -350,12 +359,13 @@ the bot crashed before it could place one) gets a same-startup fallback at flat
 real BUY for that symbol. Currently trades one symbol with no trailing-stop/partial-TP
 config active (`TRAILING_STOP_PCT`/`PARTIAL_TP_PCT` both unset → 0 = disabled), so the
 quantity-tracking half of `sync_protective_stop` is defensive/future-proofing rather than
-exercised today. Ships **off** — validate on live with the real $77 slot before flipping on;
-placement/cancel failures alert to Telegram but never raise, so a Kraken-side rejection
-degrades to "no backstop, software SL/TP still fully works while the bot is up," never a
-crashed trading loop. Tests: `test_live_executor.py`, 11 new cases (placement, cancel,
-resync-on-quantity-change, failure alerting, dry-run/flag-off no-ops, restart reconciliation
-for all three states above).
+exercised today. Placement/cancel failures alert to Telegram but never raise, so a
+Kraken-side rejection degrades to "no backstop, software SL/TP still fully works while the
+bot is up," never a crashed trading loop — including the current Kraken auth outage (see
+"Known live incident" below): if that's still unresolved when the next BUY fires, the stop
+placement will fail the same way and alert, not crash. Tests: `test_live_executor.py`, 11
+cases (placement, cancel, resync-on-quantity-change, failure alerting, dry-run/flag-off
+no-ops, restart reconciliation for all three states above).
 
 ### Slippage guard (crypto — post-fill alert, on by default)
 ```
@@ -575,9 +585,10 @@ EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-0
   fee-currency-mismatch silent cash drift (see gap #9).
   Native exchange-side stop-loss added 2026-08-07 (see "Native exchange-side stop-loss"
   above) — closes the top finding from a gap review against external crypto-bot best-practice
-  research: software SL/TP only protects a position while the bot process is alive. Ships
-  **off** (`NATIVE_STOP_LOSS_ENABLED=false`) pending live validation before enabling on the
-  real $77 slot. Risk-engine tiering upgrade done the same day (see "Risk-gate config" above)
+  research: software SL/TP only protects a position while the bot process is alive. Shipped
+  off pending live validation, then flipped **on** 2026-08-15 (see "Known live incident"
+  below and the dated section above) ahead of that validation, traded off against reduced
+  ability to babysit the bot while traveling. Risk-engine tiering upgrade done the same day (see "Risk-gate config" above)
   — crypto's RiskManager gained the weekly-loss/drawdown-warning/kill-switch tiers the stock
   bot got 2026-08-05, closing the second research finding. Slippage guard added the same day
   too (see "Slippage guard" above) — post-fill Telegram alert when a live fill lands >1%
@@ -586,11 +597,46 @@ EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-0
   the same day too (see "Candle watchdog" above) — now blocks new BUYs while the feed is
   stale instead of only alerting, closing the fourth and last finding from that research
   pass. All four items from the 2026-08-07 crypto-bot gap review are now closed.
+- **Known live incident, 2026-08-15 (Kraken auth + monitoring blind spot):** while the user
+  was traveling (bot host machine still running, still had internet — public Kraken
+  ticker/candle calls kept succeeding throughout), every *authenticated* Kraken call
+  (`BalanceEx` / balance & position sync) started failing with `EGeneral:Permission denied`
+  starting 2026-08-11, escalating to continuous failure by the morning of 2026-08-15. Public-
+  vs-private-only failing is the signature of an API-key IP restriction (see the Kraken setup
+  note above — the key is restricted to an IP) or a revoked/reset key, not a network outage.
+  Position was flat (0 BTC) throughout, so nothing was left unprotected, but had a BUY signal
+  fired during the outage, order placement (also authenticated) would very likely have failed
+  the same way. Root cause needs a Kraken-side check (API key page) — not resolved from the
+  code side. What WAS found and fixed: this failure was invisible to every monitoring layer
+  in the bot — the drift-check failure only ever logged (`logger.warning`), never alerted via
+  Telegram, and the heartbeat's `healthy_fn` only checks that the main loop is ticking, not
+  that authenticated calls work, so healthchecks.io stayed green the whole four days. Fixed
+  in `bot/main.py` (position-drift-check block, ~line 1318): a new shared `_auth_health` flag
+  now (1) fires an `alerter.error()` Telegram alert on entering/leaving the failure state
+  (edge-triggered, not per-check — same alert-once-per-episode pattern as the candle
+  watchdog/drawdown-warning tiers elsewhere in this file), and (2) feeds into the heartbeat's
+  `healthy_fn`, so a repeat of this would flip healthchecks.io unhealthy too instead of
+  staying silently green. No test coverage added yet for the new alert-edge/heartbeat-flag
+  behavior — `test_drift_escalation.py` and `test_heartbeat.py` still pass unchanged (518
+  total), but neither exercises the new branches directly.
 - **Stock bot:** live on IBKR paper (DUQ273338, reset to $5,000 CAD 2026-07-20). Swing book
   retired (`FAST_ENABLED=false`) — position book (rule-based, Mode A/B) is the only active
   book. TSX symbols are **permanently** advisory-only — CIRO regulation blocks API orders on
   Canadian exchanges (never re-add `.TO` symbols to RULE_WHITELIST). AI provider `nvidia_nim`,
-  model `mistralai/mistral-small-4-119b-2603`. Daily-loss breaker now marks open positions to
+  model `meta/llama-3.1-8b-instruct` (swapped 2026-08-07 — see `stock_bot/.env` comment above
+  `NVIDIA_MODEL` for the full incident history: this is the **third** model on this account to
+  degrade the same way, ~5h of 100% `APITimeoutError`/`DEGRADED` on the prior model
+  `mistral-nemotron`, verified provider-side via direct API calls bypassing the bot's own code
+  before swapping. Picked deliberately small this time on the theory that congestion here
+  tracks model popularity/size, not account quota — the code's own hardcoded fallback default,
+  `nvidia/nemotron-3-ultra-550b-a55b`, was re-tested at the same time and is NOT reliable
+  either, 1/3 calls timing out at the full 20s). AI is advisory-only throughout — zero trading
+  impact during the outage, `RULE_TRADING_ENABLED` signals were unaffected the whole time.
+  The dormant `_fallback_openrouter()`/`_fallback_to_openrouter()` in `stock_bot/ai/ai_engine.py`
+  found during this investigation is still unwired (zero call sites, no test coverage) — a
+  live `OPENROUTER_API_KEY` sits unused in root `.env` that could auto-switch providers on a
+  future nvidia_nim outage instead of requiring this same manual model-swap dance again. Not
+  acted on yet — flagged, not fixed. Daily-loss breaker now marks open positions to
   live scan-cycle prices every cycle (`refresh_position_marks()`), not just at fill time —
   was previously stale between fills, could under-detect real intraday drawdown. Restarted
   2026-07-28 (PID 25877) after an apparent ~6h scan-loop stall turned out most likely to be

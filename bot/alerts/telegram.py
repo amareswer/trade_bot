@@ -10,6 +10,15 @@ Setup:
        TELEGRAM_CHAT_ID=987654321
 
 Fails silently — never raises. If Telegram is unreachable the bot keeps trading.
+
+Sends retry on transient failures (matches bot/exchanges/retry.py's Kraken-call pattern —
+3 attempts, 2s delay) before giving up. Added 2026-08-17 after a known-gaps audit found the
+crypto bot's api.telegram.org DNS resolution failing intermittently (1,320 occurrences since
+2026-08-05, including a ~13h continuous stretch on 2026-08-05) with the old single-attempt
+send silently dropping whatever alert was in flight each time. See
+.memory/decisions/known-gaps.md gap #17 for the full incident timeline — root cause (why
+only the crypto bot process hits this, never the stock bot) is still not identified; this
+closes the "alert silently dropped" symptom regardless of cause.
 """
 from __future__ import annotations
 
@@ -17,6 +26,8 @@ import logging
 import threading
 from datetime import datetime
 from typing import Optional
+
+from bot.exchanges.retry import fetch_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +136,7 @@ class TelegramAlerter:
         t.start()
 
     def _send(self, text: str) -> None:
-        try:
+        def _post():
             import requests
             url = f"https://api.telegram.org/bot{self._token}/sendMessage"
             resp = requests.post(
@@ -135,5 +146,8 @@ class TelegramAlerter:
             )
             if not resp.ok:
                 logger.warning("Telegram send failed: %s %s", resp.status_code, resp.text[:100])
+
+        try:
+            fetch_with_retry(_post, label="Telegram send")
         except Exception as exc:
             logger.warning("Telegram send error: %s", exc)

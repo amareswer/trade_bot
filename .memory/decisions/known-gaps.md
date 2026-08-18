@@ -615,3 +615,59 @@ was git-tracked, so the deletion needs its own `git add`/commit to persist; not 
 per this project's "user handles git" convention. `.gitignore` covers `logs/trades.db` via
 the `logs/` pattern but has no bare root-level `trades.db` rule, so this could quietly
 reappear the same way — flagged, not added, a one-line judgment call for the user.
+
+## 17. Crypto bot's Telegram sends fail with DNS resolution errors, recurring since 2026-08-05 — symptom FIXED 2026-08-17, root cause still open
+
+**Symptom:** `bot.alerts.telegram` logs `Telegram send error: ... NameResolutionError("...
+Failed to resolve 'api.telegram.org' ...")` recurring in `logs/trade_bot.log`. Not a one-off
+blip — 1,320 occurrences found on a 2026-08-17 log sweep:
+- **2026-08-05, 03:53–16:41 (~13h straight):** failing continuously every ~40s. The crypto
+  bot's Telegram channel was effectively dead for over half a day.
+- **2026-08-08 through 2026-08-10:** dozens/day, spread across all hours.
+- **2026-08-16 onward, ongoing as of 2026-08-18 02:07 (most recent check):** still recurring
+  every 15–45 min.
+
+**Key clue toward root cause:** `logs/stock_bot.log` has **zero** occurrences of this exact
+error, despite both bots sharing the same `bot.alerts.telegram` module, presumably the same
+machine, and overlapping uptime. A genuine system-wide DNS/network outage should hit both
+identically — it doesn't. Points toward something specific to the crypto bot process (its
+tighter retry/tick cadence catching transient resolver hiccups the stock bot's looser
+polling doesn't hit, or a caffeinate/sleep-wake interaction specific to that process) rather
+than a general network problem. Not yet investigated further.
+
+**Practical impact:** `TelegramAlerter._send_async()` is fire-and-forget with no retry/queue
+on a failed send (see gap #13's description of the same method) — any real alert
+(fill, risk-breaker trip, native stop-loss failure, drift alert) that happened to fall in one
+of these windows would be silently dropped, no re-send. Checked risk_state.json/
+live_state_BTC_CAD.json at the time this was found (2026-08-17 ~18:40 EDT) — 0 fills, no
+HALT, no kill-switch trip — so nothing was actually missed by this particular gap so far,
+but the exposure is real and ongoing.
+
+**Status:** logged per user decision 2026-08-17 ("just log it, investigate later"), then the
+same session the user asked to fix whatever was fixable, so the practical symptom (silent
+drop) was closed the same day.
+
+**Fix (2026-08-17):** `bot/alerts/telegram.py`'s `_send()` now wraps its `requests.post` call
+in the existing `fetch_with_retry` helper (`bot/exchanges/retry.py` — same 3-attempts/2s-delay
+default already used for Kraken price/candle/balance calls and `shadow_signal.py`'s fetch).
+A transient DNS blip now gets up to 3 tries (~4s of retry delay) before the send is given up
+on; still fails silently (never raises) per the class's existing contract if all 3 fail. Both
+`_send_async` (the normal fire-and-forget path, runs in its own daemon thread — the extra
+delay doesn't block the trading loop) and `send_now` (the synchronous crash-exit path) go
+through this, so a crash alert now also gets retried rather than only getting one shot.
+**Tests:** new `test_telegram_retry.py` (3 tests) — healthy send calls `requests.post` once
+with no retry, a transient failure recovers on the second attempt, a persistent failure still
+degrades to a warning log with no raise after exhausting attempts. Had to capture
+`TelegramAlerter._send` at module-import time in the test file (before conftest.py's autouse
+`_block_real_telegram_sends` fixture — see gap #13 — monkeypatches it to a no-op) to actually
+exercise the real retry logic instead of the safety-net no-op. Full suite 521/521 PASS
+(518 → 521), strategy hash unchanged (`659d1c03987b72fd` — only `bot/alerts/telegram.py` and
+a test file touched, no `bot/strategy/*`). CLAUDE.md's test manifest and count updated to
+match.
+
+**Not fixed — still open:** root cause of *why only the crypto bot's process* hits this DNS
+failure (never the stock bot, despite sharing the same alerts module and presumably the same
+machine/network) is still unknown. The retry closes the "alert silently dropped" symptom for
+short blips but would NOT have saved the 2026-08-05 ~13h continuous outage (retries exhaust in
+seconds, the outage lasted hours) — if this recurs at that scale, investigate the underlying
+resolver/process-specific cause rather than assuming the retry alone is sufficient.

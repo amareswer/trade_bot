@@ -1090,6 +1090,14 @@ def run():
     tick        = 0
     tick_log:   deque[dict] = deque(maxlen=200)
     _drift_consecutive_failures = 0
+    # Mutable so both the heartbeat healthy_fn closure (defined before the
+    # tick loop starts) and the drift-check block (inside the loop) share
+    # the same flag. 2026-08-15: a Kraken auth failure (IP-restriction —
+    # traveling changed the bot host's public IP) went undetected for days
+    # because the drift-check failure only logged, never alerted, and the
+    # heartbeat only checks that the loop is *ticking* — public price/candle
+    # calls kept succeeding so liveness stayed green throughout.
+    _auth_health = {"ok": True}
     _dd_warning_active = False   # non-blocking drawdown-warning tier — alert-once-per-episode
     candle_log: deque[dict] = deque(maxlen=50)
 
@@ -1218,7 +1226,7 @@ def run():
         os.getenv("HEARTBEAT_URL", ""),
         interval_s=int(os.getenv("HEARTBEAT_INTERVAL_S", "60")),
         name="heartbeat-crypto",
-        healthy_fn=lambda: _liveness.is_alive(_LIVENESS_MAX_STALE_S),
+        healthy_fn=lambda: _liveness.is_alive(_LIVENESS_MAX_STALE_S) and _auth_health["ok"],
     )
 
     _halt_file_active = False
@@ -1326,6 +1334,12 @@ def run():
                         )
                         _drift_succeeded = True
                         _drift_consecutive_failures = 0
+                        if not _auth_health["ok"]:
+                            _auth_health["ok"] = True
+                            alerter.error(
+                                "Kraken auth RECOVERED — position drift check succeeded "
+                                "again. BUYs/exits should work normally now."
+                            )
                         break
                     except Exception as _drift_exc:
                         if _attempt < len(_drift_delays) - 1:
@@ -1338,6 +1352,18 @@ def run():
                                     "WARNING: Position drift check: 5 consecutive failures"
                                     " — Kraken BalanceEx may be rate-limited or session expired"
                                 )
+                                if _auth_health["ok"]:
+                                    _auth_health["ok"] = False
+                                    alerter.error(
+                                        "Kraken authenticated API calls failing (5 "
+                                        f"consecutive position-drift-check failures): "
+                                        f"{_drift_exc}. Public price/candle data is "
+                                        "unaffected — this looks like an auth or IP-"
+                                        "restriction issue, not a network outage. If a BUY "
+                                        "signal fires while this persists, order placement "
+                                        "will likely fail the same way. Heartbeat now "
+                                        "reports unhealthy until this recovers."
+                                    )
                                 _drift_consecutive_failures = 0
 
             # ── 1d. Drawdown warning (non-blocking, informational) ────
