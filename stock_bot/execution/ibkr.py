@@ -394,9 +394,18 @@ class IBKRExecutor(StockExecutorBase):
             # @ $210.55 ~700ms afterward with nothing left recording it).
             # Don't trust an unfilled 'Cancelled' at face value — give it a
             # short grace window to reveal whether it's actually still alive.
+            #
+            # The resubmit doesn't necessarily sit in 'Cancelled' for the
+            # whole window — it can cycle through PreSubmitted/Submitted
+            # (order alive again, still unfilled) before the fill lands
+            # (RY, 2026-08-19: left 'Cancelled' for 'Submitted' within
+            # ~350ms, then filled ~2.4s later — a loop gated on "still
+            # Cancelled" exited the instant status moved off it, treating a
+            # live-but-unfilled order as resolved and dropping the same
+            # fill again). Wait on an actual fill, not a specific status,
+            # so any resubmit path is covered.
             grace_deadline = self._loop.time() + 5.0
-            while (trade.orderStatus.status in ("Cancelled", "ApiCancelled")
-                    and not trade.fills
+            while (not trade.fills
                     and float(trade.orderStatus.filled or 0.0) <= 0
                     and self._loop.time() < grace_deadline):
                 await asyncio.sleep(0.25)

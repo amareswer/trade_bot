@@ -64,6 +64,11 @@ class FakeIB:
                              instant it's placed (IBKR Error 10349 quirk), then
                              resubmits and fills on its own a moment later —
                              no cancelOrder() call from us at all
+      "flicker_cancel_resubmit_then_fill" — same Error 10349 quirk, but the
+                             resubmit passes through a live, still-unfilled
+                             'Submitted' status before the real fill lands,
+                             instead of jumping straight from 'Cancelled' to
+                             'Filled'
     """
 
     def __init__(self, accounts=("DUQ273338",), cash=100_000.0,
@@ -118,6 +123,16 @@ class FakeIB:
                 self._fill(trade, order)
 
             asyncio.ensure_future(_delayed_fill())
+        elif self.fill_mode == "flicker_cancel_resubmit_then_fill":
+            trade.orderStatus.status = "Cancelled"
+
+            async def _resubmit_then_fill():
+                await asyncio.sleep(0.15)
+                trade.orderStatus.status = "Submitted"   # alive again, still unfilled
+                await asyncio.sleep(0.4)
+                self._fill(trade, order)
+
+            asyncio.ensure_future(_resubmit_then_fill())
         return trade
 
     def cancelOrder(self, order):
@@ -384,6 +399,28 @@ def test_flicker_cancel_then_fill_is_recorded(executors):
     order = ex.buy("RY", 4, 210.0, reason="test")
     assert order.status == OrderStatus.FILLED
     assert order.price == 210.55
+    assert order.quantity == 4
+    assert fake.cancelled == []    # never initiated a cancel ourselves
+
+
+def test_flicker_cancel_resubmit_then_fill_is_recorded(executors):
+    # RY, 2026-08-19: a second occurrence of the same Error 10349 quirk, but
+    # this time the resubmit passed through a live, still-unfilled
+    # 'Submitted' status ~350ms after the 'Cancelled' flicker, before filling
+    # for real ~2.4s after that. The 2026-07-31 fix's grace loop only kept
+    # waiting *while status stayed 'Cancelled'* — the instant it saw
+    # 'Submitted' it exited, treating a live-but-unfilled order as resolved.
+    # The executor logged/alerted the order as REJECTED ("position remains
+    # open") and the real fill that followed was never recorded anywhere,
+    # even though the broker genuinely closed the position. This must not
+    # regress: the grace window should wait on an actual fill, not on the
+    # order staying in one particular status.
+    fake = FakeIB(fill_mode="flicker_cancel_resubmit_then_fill", fill_price=212.13)
+    ex = make_executor(fake, fill_timeout_s=2.0)
+    executors.append(ex)
+    order = ex.buy("RY", 4, 212.0, reason="test")
+    assert order.status == OrderStatus.FILLED
+    assert order.price == 212.13
     assert order.quantity == 4
     assert fake.cancelled == []    # never initiated a cancel ourselves
 

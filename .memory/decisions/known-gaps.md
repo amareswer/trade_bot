@@ -202,12 +202,22 @@ Full line-by-line review of `live_executor.py`, `risk_manager.py`, `retry.py`, a
   `bot.exchanges.retry.time.sleep` in that test, same pattern already used in
   `test_kraken_retry.py`. Suite back to ~6s.
 
-**Deferred (explicitly out of scope for this pass):**
+**Deferred (explicitly out of scope for this pass) — BOTH RESOLVED, see gap #14 below:**
 - Config-documentation gaps (`RISK_MAX_POSITION_PCT`, `RISK_DAILY_LOSS_LIMIT`,
   `RISK_MAX_DRAWDOWN`, `RISK_MAX_TRADES_PER_DAY`, `COOLDOWN_TICKS`, `RISK_HALT_BLOCKS_STOPS`
-  live in `.env`/`config.py` but absent from CLAUDE.md's config tables). Not touched.
+  live in `.env`/`config.py` but absent from CLAUDE.md's config tables). ~~Not touched.~~
+  Turned out already documented by the time gap #14 checked (2026-07-29) — no action needed.
 - Fee-currency-mismatch silent cash drift (`live_executor.py` ~852-858, warning-only, no
-  alert). Not touched — lower severity, no capital-pool sizing impact.
+  alert). ~~Not touched — lower severity, no capital-pool sizing impact.~~ Fixed 2026-07-29:
+  now also fires `alerter.error(...)`, with test coverage
+  (`test_fee_currency_mismatch_alerts_telegram`).
+  **2026-08-19: this note itself was stale for three weeks after the fix landed** — gap #14
+  said as much at the time ("the Deferred note inside this gap's own item #9 text body...
+  was just never cleaned up") but nobody actually edited these two bullets until now.
+  Corrected while auditing "what's missing" from a fresh session with no memory of gap #14's
+  existence — a reminder that a forward-pointing note in the resolving entry isn't enough;
+  the original entry needs the strikethrough too, or a stale "Not touched" here will keep
+  reading as an open gap to anyone who doesn't also find #14.
 
 **Strategy hash:** unchanged, `659d1c03987b72fd` — confirmed via
 `bot/strategy/fingerprint.compute_strategy_hash()` after all three fixes (execution/risk
