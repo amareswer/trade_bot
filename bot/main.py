@@ -760,6 +760,49 @@ def _check_halt_flag(
     return halt_file_active
 
 
+def _seed_native_stop_state(executor) -> tuple[float | None, bool]:
+    """
+    Restart-recovery helper (2026-08-20): mirror the executor's own
+    already-reconciled native-stop bookkeeping into a symbol_state (ss)
+    entry's 'native_stop_price' / 'native_stop_is_trailing' fields.
+
+    Why this exists: LiveExecutor.__init__ already confirms its resting
+    native stop against Kraken's real open orders on startup
+    (_verify_resting_stop_on_startup — see live_executor.py), so
+    executor.native_stop_price / executor.native_stop_is_trailing /
+    executor.has_resting_stop are correct by the time this runs. But
+    bot/main.py's OWN symbol_state dict initializes its copies of these two
+    fields to None/False unconditionally and never re-read the executor's
+    reconciled values — a gap flagged during the 2026-08-19 native
+    trailing-stop session and left unfixed at the time. The practical risk:
+    _resync_native_stop(ss) (fired by a partial TP or a partial fill on an
+    urgent SL/TP exit) trusts ss's copy, not the executor's — if a
+    quantity-changing event fires after a restart but before the next BUY
+    fill re-seeds ss (the only other place these fields get set), it would
+    call sync_protective_stop(None) with no trailing_pct either, which
+    unconditionally CANCELS whatever's actually resting on Kraken (via the
+    executor's correctly-tracked order id) and then places nothing —
+    leaving a real, previously-protected position naked.
+
+    Deliberately does NOT recompute a fresh price from avg_entry/ATR, and
+    does NOT try to resolve an ambiguous multi-order state itself (that's
+    handled, separately, by _verify_resting_stop_on_startup's own alert) —
+    this is a pure, passive mirror of whatever the executor already
+    determined is really resting. Matches the existing documented decision
+    ("a still-open saved order is kept as-is — level never touches down",
+    see CLAUDE.md's native stop-loss section) rather than introducing a
+    second, inconsistent source of truth.
+
+    Extracted as a standalone function (same pattern as _evaluate_drift,
+    _update_auth_health, _check_candle_watchdog) purely for direct unit
+    testability — no side effects, pure read of the executor's public
+    properties.
+    """
+    if not executor.has_resting_stop:
+        return None, False
+    return executor.native_stop_price, executor.native_stop_is_trailing
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -1149,6 +1192,22 @@ def run():
                     f" @ ${_rexc.avg_entry:,.2f}"
                     f" — state machine set to LONG",
                     flush=True,
+                )
+
+                # Mirror the executor's own already-reconciled native-stop
+                # state into ss — see _seed_native_stop_state docstring for
+                # why this matters (2026-08-20 restart-seeding gap fix).
+                # Safe to call unconditionally: when native stop-loss is
+                # disabled, executor.has_resting_stop is always False, so
+                # this correctly seeds (None, False) — a no-op matching ss's
+                # own pre-existing defaults.
+                (
+                    _rec_ss['native_stop_price'],
+                    _rec_ss['native_stop_is_trailing'],
+                ) = _seed_native_stop_state(_rexc)
+                logger.warning(
+                    "NATIVE STOP RECOVERED [%s]: ss synced — price=%s trailing=%s",
+                    _rsym, _rec_ss['native_stop_price'], _rec_ss['native_stop_is_trailing'],
                 )
 
     # Aliases for _render_dashboard closure and display.stopped()

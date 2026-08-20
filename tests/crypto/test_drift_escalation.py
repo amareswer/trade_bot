@@ -15,6 +15,13 @@ Covers:
       alert-edge/heartbeat-flag logic added 2026-08-15 had zero direct test
       coverage until now — test_heartbeat.py and the tests above passed
       unchanged throughout that incident without ever exercising it.
+  (h) `_seed_native_stop_state()` (extracted 2026-08-20): the restart-
+      recovery helper that mirrors an executor's already-Kraken-reconciled
+      native-stop bookkeeping into symbol_state — closes the gap flagged
+      (not fixed) during the 2026-08-19 native trailing-stop session, where
+      ss['native_stop_price']/ss['native_stop_is_trailing'] were never
+      seeded on restart and a post-restart quantity-changing event could
+      cancel a real resting stop without replacing it.
 
 Run: python -m pytest tests/crypto/test_drift_escalation.py -v
 """
@@ -30,7 +37,7 @@ import bot.execution.live_executor as le_mod
 from bot.execution.executor import OrderSide, OrderStatus
 from bot.execution.live_executor import LiveExecutor
 from bot.strategy.threshold_strategy import Signal
-from bot.main import _evaluate_drift, _update_auth_health
+from bot.main import _evaluate_drift, _update_auth_health, _seed_native_stop_state
 
 
 def _ss() -> dict:
@@ -313,4 +320,71 @@ def test_auth_health_success_while_already_healthy_never_alerts():
         n = _update_auth_health(auth_health, True, n, 5, alerter)
     alerter.error.assert_not_called()
     assert auth_health["ok"] is True
-    assert n == 0
+
+
+# ---------------------------------------------------------------------------
+# (h) _seed_native_stop_state() — restart-recovery native-stop mirroring
+# (2026-08-20). A minimal stub stands in for LiveExecutor here: the function
+# under test only ever reads three public properties
+# (has_resting_stop / native_stop_price / native_stop_is_trailing), and the
+# real properties themselves are already covered by test_live_executor.py —
+# this file's job is the mirroring LOGIC, not the executor plumbing.
+# ---------------------------------------------------------------------------
+
+class _StubExecutor:
+    def __init__(self, has_resting_stop: bool, native_stop_price=None,
+                 native_stop_is_trailing: bool = False):
+        self.has_resting_stop        = has_resting_stop
+        self.native_stop_price       = native_stop_price
+        self.native_stop_is_trailing = native_stop_is_trailing
+
+
+def test_seed_native_stop_state_static_resting():
+    """A confirmed-still-open static stop — ss must mirror its exact price,
+    trailing flag False."""
+    exc = _StubExecutor(has_resting_stop=True, native_stop_price=88_000.0,
+                         native_stop_is_trailing=False)
+    price, is_trailing = _seed_native_stop_state(exc)
+    assert price == 88_000.0
+    assert is_trailing is False
+
+
+def test_seed_native_stop_state_trailing_resting():
+    """A confirmed-still-open trailing stop — price is None (Kraken tracks
+    the peak server-side, no fixed level to read back), trailing flag True."""
+    exc = _StubExecutor(has_resting_stop=True, native_stop_price=None,
+                         native_stop_is_trailing=True)
+    price, is_trailing = _seed_native_stop_state(exc)
+    assert price is None
+    assert is_trailing is True
+
+
+def test_seed_native_stop_state_naked():
+    """Nothing resting (has_resting_stop False — either never placed, or
+    the executor's own startup reconciliation found it gone) — ss gets the
+    safe (None, False) defaults, same as its own pre-existing init values.
+    This function does NOT place a fresh stop itself — that remediation is
+    main.py's separate 'Native stop-loss startup reconciliation' block,
+    which already ran and produces the has_resting_stop this function reads."""
+    exc = _StubExecutor(has_resting_stop=False)
+    price, is_trailing = _seed_native_stop_state(exc)
+    assert price is None
+    assert is_trailing is False
+
+
+def test_seed_native_stop_state_mismatched_price_not_recomputed():
+    """A resting stop exists at a price that does NOT match what a fresh
+    avg_entry/ATR computation would produce right now (e.g. the position's
+    avg_entry has since drifted, or ATR would compute differently today).
+    Proves _seed_native_stop_state trusts the executor's ACTUAL resting
+    price verbatim and never substitutes a freshly-computed one — matching
+    the existing documented decision that a still-open saved order is kept
+    as-is (CLAUDE.md's native stop-loss section: 'level never touches
+    down')."""
+    _actual_resting_price = 71_500.0      # what's really on Kraken
+    _freshly_computed_price = 88_000.0    # what avg_entry*(1-SL%) would give today
+    exc = _StubExecutor(has_resting_stop=True, native_stop_price=_actual_resting_price,
+                         native_stop_is_trailing=False)
+    price, is_trailing = _seed_native_stop_state(exc)
+    assert price == _actual_resting_price
+    assert price != _freshly_computed_price

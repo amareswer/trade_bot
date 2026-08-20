@@ -53,16 +53,48 @@ one-shot static→trailing swap the instant `trail_peak` arms (`bot/main.py`, gu
 cancel/replace (`_resync_native_stop()` helper in bot/main.py) — Kraken has no in-place volume
 amend via `create_order`; a trailing re-place restarts the tracked peak from the price at
 re-placement (accepted precision loss, same as the static order's own per-resize snapshot).
-Restart always re-arms **static** regardless of prior kind — `trail_peak`/`atr_sl` already
-reset to 0 in-memory every restart, so there's nothing to resume a trailing distance from;
-`native_stop_is_trailing` is persisted in the state file for observability only, not decision
-logic. **Related pre-existing gap found, not fixed (out of scope):** `ss['native_stop_price']`
-is never seeded from the executor's actual resting-stop state on restart recovery — a
-quantity-changing event (partial TP) firing before the next BUY fill after a restart would
-call `sync_protective_stop(None)`, cancelling whatever's resting without replacing it. Applies
-identically to the pre-existing static path; unrelated to this fix. Tests: `test_live_executor.py`,
-7 new cases (trailing placement param, priority-over-static, dry-run no-op, cancel, resync-on-
-quantity-change, failure-alert, state persist/restore across restart).
+`native_stop_is_trailing` is persisted in the state file — LiveExecutor's own copy was always
+correctly restored from disk + reconciled against Kraken on restart; it's `bot/main.py`'s
+*separate* `symbol_state` copy that had the gap (see 2026-08-20 entry below, now closed).
+Tests: `test_live_executor.py`, 7 new cases (trailing placement param, priority-over-static,
+dry-run no-op, cancel, resync-on-quantity-change, failure-alert, state persist/restore across
+restart).
+
+**Restart-seeding gap CLOSED 2026-08-20** (flagged, deliberately unfixed, right above). Root
+cause was narrower than first described: `LiveExecutor`'s own `native_stop_order_id`/
+`native_stop_price`/`native_stop_is_trailing` were ALREADY correctly reconciled against
+Kraken's real open orders on every restart via `_verify_resting_stop_on_startup()` (built into
+the original 2026-08-07 feature) — the actual gap was that `bot/main.py`'s *separate*
+`symbol_state` (`ss`) copy of the same two fields was never re-seeded from it, always
+defaulting to `None`/`False` post-restart. Confirmed the concrete risk mechanistically:
+`_resync_native_stop(ss)` (fires on partial TP / a partial fill on an urgent SL/TP exit)
+trusts `ss`'s stale copy — with both fields at their defaults it calls
+`sync_protective_stop(None)`, which unconditionally cancels whatever's really resting
+(`_cancel_native_stop()` always runs first) and then places nothing, since neither
+`stop_price` nor `trailing_pct` is set. Real naked-position risk, not theoretical. Fix: new
+`_seed_native_stop_state(executor) -> (price, is_trailing)` in `bot/main.py` (same
+extract-for-testability pattern as `_evaluate_drift`/`_update_auth_health`), a pure read of
+the executor's own already-reconciled public properties (added `native_stop_price` as a new
+public property alongside the existing `native_stop_is_trailing`) — no new network calls, no
+recomputation, wired into the existing "Restart recovery" loop right where `pm`/`sm` already
+get seeded. Deliberately mirrors whatever's ACTUALLY resting verbatim rather than recomputing
+from `avg_entry`/ATR, matching the pre-existing "still-open saved order kept as-is" decision.
+**Also found+fixed same pass:** `_verify_resting_stop_on_startup()` never checked for MORE
+than one stop-type order resting (only ever confirmed/cleared its own single tracked id) — now
+also scans the same already-fetched `fetch_open_orders()` result for `descr.ordertype` in
+`{stop-loss, trailing-stop}` (the two ordertypes this bot ever places; the unified ccxt `type`
+field is unreliable here since Kraken's `stop-loss` maps to unified `'market'`), and alerts
+loudly via Telegram if more than one is found — deliberately does not try to auto-resolve by
+picking one. **Deliberately NOT fixed, flagged for later:** (1) whether a still-resting
+order's quantity matches the position's actual post-restart size — separate, adjacent gap;
+(2) adopting an untracked-but-real resting order when the state file's own id is
+missing/lost — `_verify_resting_stop_on_startup()` still only confirms/clears its own tracked
+id in the no-tracked-id branch, found during design work but deliberately scoped out rather
+than expanding an already-reviewed, approved plan mid-implementation. Tests:
+`test_live_executor.py` (+3: multi-stop-order alert, unrelated-order no-false-positive,
+`native_stop_price` property), `test_drift_escalation.py` (+4: `_seed_native_stop_state()` —
+static/trailing/naked/mismatched-trusted-verbatim). Suite 536→543. No `bot/strategy/*`
+touched — hash unchanged, confirmed via `compute_strategy_hash()`, no walk-forward needed.
 **`trailingPercent` param verified same day, redone as literal proof after a review correctly
 called out that the first pass was prose-with-citations, not actual evidence:**
 `verify_kraken_trailing_stop_param.py` (repo root) runs the REAL installed ccxt 4.5.56

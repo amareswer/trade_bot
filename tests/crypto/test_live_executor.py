@@ -1263,6 +1263,96 @@ def test_native_stop_startup_position_closed_externally_clears_stale_id(tmp_path
     mock_ex.cancel_order.assert_called_once_with("stop-001", "BTC/CAD")
 
 
+def test_native_stop_startup_detects_multiple_stop_orders_and_alerts(tmp_path):
+    """Two stop-type orders (raw Kraken descr.ordertype in {stop-loss,
+    trailing-stop}) found resting simultaneously — this bot's own cancel-
+    then-place logic should never produce this, so it must not be silently
+    resolved by picking one. Alerts loudly; existing tracked-id confirm
+    logic still runs unchanged underneath (the tracked id here IS still
+    open, so has_resting_stop stays True either way — the alert is the
+    thing under test, not a behavior change to the confirm path)."""
+    state_path = str(tmp_path / "state.json")
+    json.dump({
+        "symbol": "BTC/CAD", "cash": 89.88, "position": 0.001,
+        "cost_basis": 88_870.0, "realized_pnl": 0.0, "fees_paid": 0.0,
+        "native_stop_order_id": "stop-001", "native_stop_price": 88_000.0,
+        "saved_at": "2026-08-01T00:00:00+00:00",
+    }, open(state_path, "w"))
+
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = _DEFAULT_MARKETS
+    mock_ex.fetch_balance.return_value = {
+        "free": {"CAD": 89.88, "BTC": 0.001}, "total": {"CAD": 89.88, "BTC": 0.001},
+    }
+    mock_ex.fetch_open_orders.return_value = [
+        {"id": "stop-001", "info": {"descr": {"ordertype": "stop-loss"}}},
+        {"id": "stop-002", "info": {"descr": {"ordertype": "trailing-stop"}}},
+    ]
+
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = mock_ex
+        ex = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=100.0, dry_run=False, state_path=state_path,
+            native_stop_loss_enabled=True,
+        )
+        with patch.object(ex._alerter, "error") as mock_alert:
+            ex._verify_resting_stop_on_startup()
+
+    mock_alert.assert_called_once()
+    assert "NATIVE STOP AMBIGUOUS" in mock_alert.call_args[0][0]
+    assert "stop-001" in mock_alert.call_args[0][0]
+    assert "stop-002" in mock_alert.call_args[0][0]
+    # Existing tracked-id logic untouched — our own id is among the two
+    # found and still open, so it's still correctly confirmed as resting.
+    assert ex.has_resting_stop
+    mock_ex.create_order.assert_not_called()   # no auto-adoption, no third order placed
+
+
+def test_native_stop_startup_ignores_unrelated_open_orders(tmp_path):
+    """A resting native stop PLUS an unrelated open order (e.g. a stray
+    limit-chase BUY interrupted by the same crash) must not be misread as
+    'multiple stop orders' — only orders with a stop-type descr.ordertype
+    count. Negative case for the ambiguity check above."""
+    state_path = str(tmp_path / "state.json")
+    json.dump({
+        "symbol": "BTC/CAD", "cash": 89.88, "position": 0.001,
+        "cost_basis": 88_870.0, "realized_pnl": 0.0, "fees_paid": 0.0,
+        "native_stop_order_id": "stop-001", "native_stop_price": 88_000.0,
+        "saved_at": "2026-08-01T00:00:00+00:00",
+    }, open(state_path, "w"))
+
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = _DEFAULT_MARKETS
+    mock_ex.fetch_balance.return_value = {
+        "free": {"CAD": 89.88, "BTC": 0.001}, "total": {"CAD": 89.88, "BTC": 0.001},
+    }
+    mock_ex.fetch_open_orders.return_value = [
+        {"id": "stop-001", "info": {"descr": {"ordertype": "stop-loss"}}},
+        {"id": "buy-999", "info": {"descr": {"ordertype": "limit"}}},
+    ]
+
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = mock_ex
+        ex = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=100.0, dry_run=False, state_path=state_path,
+            native_stop_loss_enabled=True,
+        )
+        with patch.object(ex._alerter, "error") as mock_alert:
+            ex._verify_resting_stop_on_startup()
+
+    mock_alert.assert_not_called()
+    assert ex.has_resting_stop
+
+
+def test_native_stop_price_property_reflects_private_field(tmp_path):
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True, tmp_path=tmp_path)
+    assert ex.native_stop_price is None
+    ex._native_stop_price = 88_000.0
+    assert ex.native_stop_price == 88_000.0
+
+
 # ---------------------------------------------------------------------------
 # Native trailing-stop backstop (sync_protective_stop trailing_pct path —
 # 2026-08-19: mirrors the software trailing stop when it's the level in

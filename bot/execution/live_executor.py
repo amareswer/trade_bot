@@ -40,6 +40,27 @@ _DEFAULT_STATE_PATH = os.path.join(
 # guard's scope is live_executor.py + tests only.
 _MIN_SIZE_SAFETY_MARGIN = float(os.getenv("MIN_SIZE_SAFETY_MARGIN", "1.5"))
 
+# The only two Kraken ordertypes this bot ever places as a native protective
+# stop (see _place_native_stop / _place_native_trailing_stop). Kraken's raw
+# ordertype string lives at order['info']['descr']['ordertype'] — confirmed
+# via ccxt's kraken.py parse_order(), which preserves the raw AddOrder/
+# fetchOpenOrders response verbatim under 'info'. The unified ccxt 'type'
+# field is NOT reliable for this: Kraken's 'stop-loss' ordertype maps to
+# unified type 'market' (indistinguishable from a genuine market order) —
+# only the raw descr.ordertype string distinguishes our two stop kinds from
+# everything else that could be resting on the symbol.
+_NATIVE_STOP_ORDERTYPES = frozenset({"stop-loss", "trailing-stop"})
+
+
+def _is_native_stop_order(order: dict) -> bool:
+    """True if a ccxt-parsed order dict (from fetch_open_orders etc.) is one
+    of the two ordertypes this bot's own native-stop logic ever places."""
+    try:
+        ordertype = order.get("info", {}).get("descr", {}).get("ordertype", "")
+    except AttributeError:
+        return False
+    return ordertype in _NATIVE_STOP_ORDERTYPES
+
 
 class LiveExecutor:
     """
@@ -405,6 +426,20 @@ class LiveExecutor:
         picture; main.py owns deciding what price a replacement should use
         and calls sync_protective_stop() itself if this leaves a real gap
         (position open, no resting stop).
+
+        Also scans the same already-fetched open-orders list for how many
+        stop-type orders (see _is_native_stop_order) exist on this symbol
+        overall — not just whether OUR tracked id survived. This bot's own
+        logic only ever cancels-then-places, never places without cancelling
+        first, so more than one should be structurally impossible via normal
+        operation; if it's ever found anyway (manual intervention outside the
+        bot, a race, a bug), that's not something to silently resolve by
+        picking one — alert loudly and leave the existing tracked-id
+        confirm/clear logic below to run unchanged. (2026-08-20 — found
+        during the native_stop_price restart-seeding gap fix; deliberately
+        does NOT add new auto-adoption logic for an untracked-but-real
+        resting order — see .memory/execution_layer.md for that separate,
+        deliberately-not-fixed-here finding.)
         """
         if self._portfolio.position <= 0:
             # No position to protect — any leftover id is stale by definition.
@@ -435,6 +470,22 @@ class LiveExecutor:
                 self._native_stop_order_id, exc,
             )
             return
+
+        _stop_orders = [o for o in open_orders if _is_native_stop_order(o)]
+        if len(_stop_orders) > 1:
+            _ids = [str(o.get("id", "")) for o in _stop_orders]
+            logger.error(
+                "NATIVE STOP AMBIGUOUS [%s]: %d stop-type orders found "
+                "resting simultaneously (%s) — this bot's own logic never "
+                "places more than one (always cancel-then-place); needs "
+                "manual review. Leaving tracked state as-is.",
+                self.symbol, len(_stop_orders), ", ".join(_ids),
+            )
+            self._alerter.error(
+                f"NATIVE STOP AMBIGUOUS [{self.symbol}]: {len(_stop_orders)} "
+                f"stop-type orders resting simultaneously ({', '.join(_ids)}) "
+                f"— manual review needed."
+            )
 
         if still_open:
             if self._native_stop_is_trailing:
@@ -605,6 +656,15 @@ class LiveExecutor:
     @property
     def native_stop_is_trailing(self) -> bool:
         return self._native_stop_is_trailing
+
+    @property
+    def native_stop_price(self) -> float | None:
+        """Static stop level, or None for a trailing stop (Kraken tracks the
+        peak server-side — there's no fixed price to read back) or when
+        nothing is resting. Public so main.py's restart-recovery seeding
+        (_seed_native_stop_state) can mirror this already-reconciled state
+        into symbol_state without reaching into a private attribute."""
+        return self._native_stop_price
 
     def sync_protective_stop(
         self, stop_price: float | None, trailing_pct: float | None = None,
