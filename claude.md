@@ -415,19 +415,26 @@ failure alerting, dry-run/flag-off no-ops, restart reconciliation for all three 
 + 7 new trailing-path cases (placement param, priority-over-static, dry-run no-op, cancel,
 resync-on-quantity-change, failure-alert, state persist/restore across restart).
 
-**`trailingPercent` param verified against real ccxt source, 2026-08-19:** confirmed by
-tracing ccxt 4.5.56's `kraken.py` `order_request()` line-by-line (mock-based tests alone
-can't prove a real exchange accepts an unrecognized param) — `params={"trailingPercent":
-"X.XXXX"}` on a market-type `create_order()` call correctly builds Kraken's native
-`ordertype=trailing-stop` + relative `price="+X.XXXX%"` request, matching Kraken's own
-AddOrder REST docs exactly (ordertype enum includes `trailing-stop` with no spot/margin
-distinction; price field documented as this same relative `+X%` format). ccxt's docstring
-labels the param "*margin only*" — confirmed stale/not code-enforced, same as the sibling
-`stopLossPrice` param already running live on spot BTC/CAD under the identical annotation.
-No fix was needed. Source citation lives as a code comment on
-`_place_native_trailing_stop()`. Separately confirmed: Kraken spot has no open public
-sandbox (only Kraken Futures does), but `AddOrder` supports a `validate=true` param for a
-zero-risk request-shape check against the real endpoint — available as a future no-code-risk
+**`trailingPercent` param verified against real ccxt source, 2026-08-19 — re-run to reproduce,
+don't just trust this paragraph:** `.venv/bin/python verify_kraken_trailing_stop_param.py`
+(repo root) imports the ACTUAL installed ccxt (asserts version `4.5.56`, no network calls —
+`order_request()` is a pure request-dict builder) and asserts it turns
+`params={"trailingPercent": "2.0000"}` into
+`{'ordertype': 'trailing-stop', 'price': '+2.0000%', 'trigger': 'last', ...}` — Kraken's
+native trailing-stop shape, not a made-up param ccxt silently drops. Exits non-zero with a
+clear message if a future ccxt upgrade ever changes this. This replaced an earlier
+"verification" pass that only restated the claim in prose with citations, no literal source
+or runtime evidence actually sitting in the repo — the script + the literal source excerpt
+and runtime output now embedded in `_place_native_trailing_stop()`'s docstring
+(`bot/execution/live_executor.py`) are the actual proof. Cross-checked the same day against
+Kraken's own AddOrder REST docs (docs.kraken.com/api/docs/rest-api/add-order/): `ordertype`
+enum includes `trailing-stop` with no spot/margin distinction; `price` documented as this
+same relative `+X%` format. ccxt's docstring labels the param "*margin only*" (kraken.py:1637)
+— confirmed not code-enforced anywhere in `create_order()`/`order_request()`, same as the
+sibling `stopLossPrice` param already running live on spot BTC/CAD under the identical
+annotation. No fix needed. Separately confirmed: Kraken spot has no open public sandbox (only
+Kraken Futures does), but `AddOrder` supports a `validate=true` param for a zero-risk
+request-shape check against the real endpoint — available as a future no-code-risk
 verification step, not yet used.
 
 ### Slippage guard (crypto — post-fill alert, on by default)

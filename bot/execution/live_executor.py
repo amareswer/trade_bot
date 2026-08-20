@@ -533,23 +533,47 @@ class LiveExecutor:
         a retry after an accepted-but-timed-out create_order would place an
         untracked duplicate.
 
-        params={"trailingPercent": ...} verified 2026-08-19 against ccxt
-        4.5.56's actual kraken.py source (not just its docstring, which
-        mislabels this "*margin only*" — that annotation isn't enforced
-        anywhere in create_order()/order_request(), and the sibling
-        stopLossPrice param under the same annotation already works live on
-        spot BTC/CAD). Traced order_request() (kraken.py:2047, the trailing
-        branch at :2094-2117): a market-type call with trailingPercent set
-        skips the stop-loss/take-profit branch, prepends '+' and appends '%'
-        to build e.g. "+2.0000%", and — since no limit price or
-        trailingLimit* params are given — lands in the non-limit branch
-        (:2112-2117) that sets request['ordertype']='trailing-stop' and
-        request['price']=that string. Cross-checked against Kraken's own
-        AddOrder docs (docs.kraken.com/api/docs/rest-api/add-order/):
+        params={"trailingPercent": ...} verified 2026-08-19 — not just by
+        reading, by RUNNING the actual installed ccxt (4.5.56, sha256
+        604e267f4d5246491ab0f3ec88ecd9526defad3b7abc0c5d79871fa8cce2eac5 —
+        .venv/lib/python3.11/site-packages/ccxt/kraken.py) against this exact
+        param. Re-run `verify_kraken_trailing_stop_param.py` (repo root) any
+        time to reproduce. That run's literal output:
+
+            ex.order_request('createOrder', 'BTC/CAD', 'market',
+                {'pair': 'XBTCAD', 'type': 'sell', 'ordertype': 'market',
+                 'volume': '0.00100000'},
+                amount=0.001, price=None,
+                params={'trailingPercent': '2.0000'})
+            ==>
+            {'pair': 'XBTCAD', 'type': 'sell', 'ordertype': 'trailing-stop',
+             'volume': '0.00100000', 'trigger': 'last', 'price': '+2.0000%'}
+
+        i.e. Kraken's native trailing-stop ordertype + a relative '+X%' price
+        field — exactly the shape Kraken's own AddOrder docs describe
+        (docs.kraken.com/api/docs/rest-api/add-order/, fetched 2026-08-19):
         ordertype enum includes 'trailing-stop' with no spot/margin
-        distinction, and price is documented as exactly this relative
-        '+X%'/'+X' format for trailing order types. Confirmed match — no
-        raw-params override needed.
+        distinction; price is documented as "must use a relative price...
+        the `+` prefix... The `%` suffix also works". The literal ccxt source
+        producing this (kraken.py, installed copy, verbatim):
+
+            2058:        trailingPercent = self.safe_string(params, 'trailingPercent')
+            2062:        isTrailingPercentOrder = trailingPercent is not None
+            2094:        elif isTrailingAmountOrder or isTrailingPercentOrder:
+            2097:                trailingPercentString = ('+' + trailingPercent) if (trailingPercent.endswith('%')) else ('+' + trailingPercent + '%')
+            2101:            trailingActivationPriceType = self.safe_string(params, 'trigger', 'last')
+            2102:            request['trigger'] = trailingActivationPriceType
+            2103:            if isLimitOrder or (trailingLimitAmount is not None) or (trailingLimitPercent is not None):
+            2112:            else:
+            2113:                request['ordertype'] = 'trailing-stop'
+            2114:                if trailingPercent is not None:
+            2115:                    request['price'] = trailingPercentString
+
+        ccxt's own docstring on this param says "*margin only*" (kraken.py:1637)
+        — confirmed NOT enforced anywhere in create_order()/order_request()
+        (no market['spot']/market['margin'] check exists in either), and the
+        sibling stopLossPrice param under the identical annotation is what
+        the existing static backstop already places live on spot BTC/CAD.
         """
         try:
             _pct_str = f"{trailing_pct * 100:.4f}"
