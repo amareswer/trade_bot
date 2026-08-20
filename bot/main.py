@@ -804,6 +804,144 @@ def _seed_native_stop_state(executor) -> tuple[float | None, bool]:
 
 
 # ---------------------------------------------------------------------------
+# Two-way Telegram control — command bodies (2026-08-20)
+#
+# Extracted as standalone functions (same "extract for testability" pattern
+# as _check_halt_flag/_seed_native_stop_state/_evaluate_drift above) so they
+# can be unit-tested and, critically, so it's mechanically checkable that
+# none of them import or call any LiveExecutor TRADING method — every
+# function here takes plain data (executors/symbol_state dicts, a
+# RiskManager, a flag-file path) and either only READS attributes or only
+# does open()/os.remove() on the halt flag file. run() wires these into
+# closures over its own real objects and registers them with
+# TelegramCommandPoller — see the "Two-way Telegram control" block below.
+# ---------------------------------------------------------------------------
+
+def _format_symbol_status(sym: str, exc, ss: dict) -> str:
+    """Read-only formatting of one symbol's position/cash/PF/regime.
+    Touches only: exc.avg_entry/.position/.cash/.portfolio.total_value()
+    (all read-only properties), pm.unrealized_pnl()/.realized_pnl/.history
+    (read-only), ss['strategy'].last_regime (read-only property)."""
+    pm    = ss.get('pm')
+    px    = ss.get('last_price') or getattr(exc, 'avg_entry', 0.0) or 0.0
+    pos   = getattr(exc, 'position', 0.0)
+    entry = getattr(exc, 'avg_entry', 0.0)
+    cash  = getattr(exc, 'cash', 0.0)
+    total = exc.portfolio.total_value(px) if px else cash
+    upnl  = pm.unrealized_pnl(px) if pm and px else 0.0
+    rpnl  = pm.realized_pnl if pm else 0.0
+    sell_pnls = [r.pnl for r in pm.history if r.pnl is not None] if pm else []
+    wins   = sum(p for p in sell_pnls if p > 0)
+    losses = sum(p for p in sell_pnls if p < 0)
+    if losses < 0:
+        pf_s = f"{wins / abs(losses):.2f}"
+    elif wins > 0:
+        pf_s = "inf (no losses yet)"
+    else:
+        pf_s = "n/a (no closed trades)"
+    regime = getattr(ss.get('strategy'), 'last_regime', None) or "n/a"
+    return (
+        f"{sym}\n"
+        f"  Position: {pos:.6f} @ avg ${entry:,.2f}\n"
+        f"  Cash: ${cash:,.2f}  Total: ${total:,.2f}\n"
+        f"  Realized P&L: ${rpnl:+.2f}  Unrealized: ${upnl:+.2f}\n"
+        f"  PF: {pf_s}  Regime: {regime}"
+    )
+
+
+def _status_crypto_text(
+    executors: dict, symbol_state: dict, risk: "RiskManager",
+    live_trading: bool, dry_run: bool,
+) -> str:
+    """/status_crypto body — read-only across every tracked symbol."""
+    mode = "LIVE" if live_trading else ("DRY RUN" if dry_run else "PAPER")
+    halt_s = "🔴 ENGAGED" if risk.config.halt else "🟢 clear"
+    if risk.kill_switch_tripped:
+        halt_s += " (kill switch TRIPPED — sticky, needs manual clear)"
+    lines = [f"📊 Crypto bot — {mode}", f"Halt: {halt_s}"]
+    for sym, exc in executors.items():
+        lines.append("")
+        lines.append(_format_symbol_status(sym, exc, symbol_state.get(sym, {})))
+    return "\n".join(lines)
+
+
+def _pause_crypto_flag(flag_path: str, loop_interval: int) -> str:
+    """/pause_crypto body — writes logs/HALT only. Reuses the SAME manual
+    halt mechanism _check_halt_flag() already polls every tick; does not
+    call risk.halt() directly and does not add a second halt path."""
+    try:
+        with open(flag_path, "a"):
+            pass
+    except Exception as exc:
+        return f"⚠️ Could not write {flag_path}: {exc}"
+    return (
+        f"⏸️ Halt flag written ({flag_path}). Takes effect on the next tick "
+        f"(≤{loop_interval}s). BUY and strategy SELL will be blocked; "
+        f"SL/TP exits still fire."
+    )
+
+
+def _resume_crypto_flag(flag_path: str, loop_interval: int) -> str:
+    """/resume_crypto body — removes logs/HALT only. Same single-mechanism
+    reasoning as _pause_crypto_flag."""
+    try:
+        if os.path.exists(flag_path):
+            os.remove(flag_path)
+            return (
+                f"▶️ Halt flag removed ({flag_path}). Trading resumes on "
+                f"the next tick (≤{loop_interval}s)."
+            )
+        return "Halt flag was not set — nothing to resume."
+    except Exception as exc:
+        return f"⚠️ Could not remove {flag_path}: {exc}"
+
+
+def _status_stock_text(load_stock_state=None) -> str:
+    """/status_stock body — read-only direct file read of the STOCK bot's
+    own state, same pattern unified_dashboard.py already uses to render
+    both bots' cards from one process. Deliberately NOT a second Telegram
+    poller: the stock bot has no getUpdates consumer, and this crypto
+    process must stay the ONLY consumer of the shared bot token (see
+    bot/alerts/telegram_control.py's module docstring). load_stock_state is
+    injectable for tests; defaults to the real unified_dashboard reader."""
+    try:
+        if load_stock_state is None:
+            from unified_dashboard import _load_stock_state as load_stock_state
+        state = load_stock_state()
+    except Exception as exc:
+        return f"⚠️ Could not read stock bot state: {exc}"
+    if state is None:
+        return "📈 Stock bot: no state file found (offline or never traded)."
+    cash      = float(state.get("cash", 0) or 0)
+    starting  = float(state.get("starting_cash", 0) or 0)
+    rpnl      = float(state.get("realized_pnl", 0) or 0)
+    positions = state.get("positions", {}) or {}
+    pos_val = sum(
+        float(p.get("shares", 0)) * float(p.get("avg_cost", 0))
+        for p in positions.values()
+    )
+    total = cash + pos_val
+    badge = "IBKR PAPER" if state.get("executor") == "ibkr" else "PAPER"
+    return (
+        f"📈 Stock bot — {badge}\n"
+        f"Cash: ${cash:,.2f}  Open positions: {len(positions)}\n"
+        f"Position value (est.): ${pos_val:,.2f}  Total: ${total:,.2f}\n"
+        f"Realized P&L: ${rpnl:+.2f}  Starting cash: ${starting:,.2f}"
+    )
+
+
+def _help_crypto_text() -> str:
+    return (
+        "Commands:\n"
+        "/status_crypto — position, cash, P&L, PF, regime, halt state\n"
+        "/pause_crypto — engage the manual halt (logs/HALT)\n"
+        "/resume_crypto — lift the manual halt\n"
+        "/status_stock — read-only stock bot snapshot\n"
+        "/help_crypto — this message"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
@@ -1380,6 +1518,42 @@ def run():
         name="heartbeat-crypto",
         healthy_fn=lambda: _liveness.is_alive(_LIVENESS_MAX_STALE_S) and _auth_health["ok"],
     )
+
+    # ── Two-way Telegram control (getUpdates poller — 2026-08-20) ──────────
+    # Opt-in (TELEGRAM_CONTROL_ENABLED, separate from telegram_enabled/
+    # outbound alerts). See bot/alerts/telegram_control.py's module
+    # docstring for the shared-token-with-the-stock-bot constraint and why
+    # this MUST stay the only getUpdates poller against this bot token.
+    # Every handler below either only READS symbol_state/executor/risk
+    # attributes, or only touches the logs/HALT flag file — never a
+    # LiveExecutor trading method (execute/sync_protective_stop/cancel/...).
+    # That's a structural property, not a convention: this file's import of
+    # TelegramCommandPoller carries no reference to those methods for a
+    # handler to even reach.
+    if cfg.alerts.telegram_control_enabled:
+        from bot.alerts.telegram_control import (
+            TelegramCommandPoller, start_telegram_control_thread,
+        )
+
+        _tg_control_poller = TelegramCommandPoller(
+            bot_token = cfg.alerts.telegram_bot_token,
+            chat_id   = cfg.alerts.telegram_chat_id,
+            handlers  = {
+                "/status_crypto": lambda: _status_crypto_text(
+                    executors, symbol_state, risk,
+                    cfg.exchange.live_trading, cfg.exchange.dry_run,
+                ),
+                "/pause_crypto":  lambda: _pause_crypto_flag(
+                    _HALT_FLAG_PATH, cfg.exchange.loop_interval,
+                ),
+                "/resume_crypto": lambda: _resume_crypto_flag(
+                    _HALT_FLAG_PATH, cfg.exchange.loop_interval,
+                ),
+                "/status_stock":  _status_stock_text,
+                "/help_crypto":   _help_crypto_text,
+            },
+        )
+        start_telegram_control_thread(_tg_control_poller, name="telegram-control-crypto")
 
     _halt_file_active = False
     _last_daily_pnl_date = datetime.now(_tz.utc).date()

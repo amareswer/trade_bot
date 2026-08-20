@@ -174,7 +174,7 @@ need the full narrative behind any decision below.
 
 ## Test Suite Manifest (reconciled 2026-08-18)
 
-Expected total: **552 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-11s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later.)
+Expected total: **580 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-11s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later.)
 
 **Directory layout (2026-08-18):** all 54 files moved out of repo root into `tests/{crypto,stock,shared}/` for
 a cleaner root — 54 files loose alongside `bot/`, `stock_bot/`, `config.py`, etc. had gotten hard to scan.
@@ -217,6 +217,7 @@ now `.parent.parent.parent`. Verified before/after: same 526 collected, same 526
 | `tests/stock/test_stock_breaker.py` | 14 | Stock-bot circuit breakers (StockPaperExecutor): daily-loss restart baseline includes position marks; weekly-loss/drawdown-halt/kill-switch tiers — reject-on-trip, halt auto-lifts on recovery, kill switch stays sticky through recovery and across restart, SELL never blocked, peak-equity persistence, drawdown_status() warning flag; per-position ATR stop-pct override — defaults to baseline, persists across restart, clears on full close, survives a partial close |
 | `tests/crypto/test_candle_watchdog.py` | 7 | Candle watchdog circuit breaker (upgraded 2026-08-07): silent/blocked/no-re-alert-while-stale on the stale side, alert+unblock on recovery, no re-alert once recovered |
 | `tests/crypto/test_halt_flag.py` | 5 | Manual halt kill-switch: logs/HALT flag file engage/lift, ownership guard |
+| `tests/crypto/test_telegram_control.py` | 28 | Two-way Telegram control (added 2026-08-20): `TelegramCommandPoller` transport (authorized dispatch+reply, unauthorized-chat silent ignore, unrecognized-command silent ignore, handler-exception no-raise, offset advances past both handled and ignored updates, `prime_offset()` drains backlog without dispatching, getUpdates failure doesn't raise/doesn't lose offset, disabled-without-credentials no-network, thread-starter returns None when disabled), source-inspection structural guards (no command body calls any order-placement/modification/cancellation method or bypasses `logs/HALT` via a direct `risk.halt()`/`resume()`, and the poller module itself carries zero trading imports), `_pause_crypto_flag`/`_resume_crypto_flag` (write/remove `logs/HALT`, idempotent, end-to-end proof they drive the SAME `_check_halt_flag()` the tick loop already polls — not a second path), `_status_crypto_text`/`_format_symbol_status` (halt/kill-switch display, per-symbol position/cash/PF/regime, PF n/a-vs-inf-vs-computed edge cases), `_status_stock_text` (paper/IBKR badge formatting, no-state-file case, loader-exception no-raise), `_help_crypto_text` |
 | `tests/crypto/test_orphaned_positions.py` | 5 | Startup orphan check: open position outside this run's symbol list alerts (removed-from-whitelist safety) |
 | `tests/crypto/test_universe.py` | 4 | Universe screener: scoring, momentum filter, fallback |
 | `tests/crypto/test_main_strategy.py` | 2 | Strategy builder: full config wiring |
@@ -589,6 +590,72 @@ it only ever makes a BUY more conservative, never loosens anything. Tests:
 (silent/blocked/re-alert-suppressed on the stale side, unchanged; two new: alerts + unblocks
 on recovery, and a recovered feed doesn't re-alert on subsequent fresh ticks).
 
+### Two-way Telegram control (crypto — built 2026-08-20, opt-in, off by default)
+```
+TELEGRAM_CONTROL_ENABLED=false   # NOT set in .env — using the config.py default (false).
+                                  # Separate from TELEGRAM_ENABLED (outbound alerts only):
+                                  # this one starts an INBOUND getUpdates poller — a real
+                                  # control surface, not just notifications — so it ships
+                                  # opt-in rather than silently active on upgrade, same
+                                  # reasoning as NATIVE_STOP_LOSS_ENABLED. Set true (same
+                                  # TELEGRAM_BOT_TOKEN/CHAT_ID already used for alerts) to
+                                  # turn it on.
+```
+Closes the gap flagged during the 2026-08-19 Freqtrade comparison: Telegram was alert-only
+(`bot/alerts/telegram.py`'s `TelegramAlerter`, outbound `sendMessage` only), no way to query
+status or control the bot remotely without SSH. New module `bot/alerts/telegram_control.py`
+(`TelegramCommandPoller`) long-polls `getUpdates` — no webhook/public endpoint, fits the
+home/VPS-undecided deployment — in its own daemon thread (same pattern as
+`start_heartbeat_thread`), started from `bot/main.py` only when the flag above is true.
+
+**Commands:** `/status_crypto` (mode, halt/kill-switch state, then per symbol: position,
+cash, total value, realized/unrealized P&L, profit factor from closed-trade history, current
+regime), `/pause_crypto`, `/resume_crypto`, `/status_stock` (read-only stock-bot snapshot),
+`/help_crypto`.
+
+**Auth:** every inbound message's `chat.id` is compared against the configured
+`TELEGRAM_CHAT_ID`. A mismatch is silently ignored — no reply, logged at INFO only —
+replying would confirm to a stranger that a live, responsive bot exists at this token. An
+authorized chat sending an unrecognized command (typo, or a foreign namespace like a future
+`/pause_stock`) gets the identical silent-ignore treatment.
+
+**`/pause_crypto`/`/resume_crypto` reuse `logs/HALT` exactly** — they only `open()`/
+`os.remove()` the same flag file `_check_halt_flag()` already polls every tick (`bot/main.py`).
+No parallel halt path, no direct `risk.halt()`/`risk.resume()` call from a command handler.
+Same latency as a manual SSH `touch logs/HALT`: takes effect on the next tick (≤
+`LOOP_INTERVAL`, 30s), not instantly — the reply text says so rather than claiming immediate
+effect.
+
+**`/status_crypto` is structurally read-only**, not just by convention: `bot/main.py`'s
+command-body functions (`_status_crypto_text`, `_format_symbol_status`, `_status_stock_text`,
+`_help_crypto_text`, plus the two flag-file functions above) take plain data and either only
+read attributes or only touch the halt flag file — none of them import or reference
+`LiveExecutor`, and `telegram_control.py` itself carries zero trading imports at all.
+Verified by a source-inspection test, not just a behavioral one (see test list below).
+
+**Shared-token constraint with the stock bot — read before ever adding a second poller.**
+`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` are the SAME credentials the stock bot's outbound-only
+`TelegramAlerter` also uses (`stock_bot/alerts/notifier.py`'s `_make_telegram()`, "one
+token/chat source for both bots" since 2026-07-17). Telegram's `getUpdates` `offset` is a
+**server-side, per-token** acknowledgment — passing `offset=N` permanently discards every
+update with `update_id < N` for that token, for *every* caller, not just whoever passed it.
+Two independent processes each tracking their own local offset against this same token WILL
+corrupt each other: whichever advances its offset further can silently erase updates the
+other hasn't processed yet. This is Telegram's documented single-consumer-per-token model,
+not an edge case to code around. Consequence: **exactly one process may ever run a
+`TelegramCommandPoller` against this token** — today that's the crypto bot only. The stock
+bot has no inbound polling at all and, separately, has no `logs/HALT`-equivalent flag file to
+pause against yet (`/status_stock` is answered by the crypto poller reading
+`stock_bot/paper_state.json`/`ibkr_state.json` directly — the same read-only cross-bot file
+read `unified_dashboard.py` already does from one process — not by a second poller). If
+stock-bot two-way *control* (not just read-only status) is ever added, it must either route
+through this same crypto-owned poller (more handlers here) or use a second, dedicated
+Telegram bot token — never a second independent `getUpdates` loop against this token. This
+constraint is documented in `bot/alerts/telegram_control.py`'s module docstring too.
+
+Tests: `tests/crypto/test_telegram_control.py`, 28 cases — see Test Suite Manifest above.
+Suite 552→580. No `bot/strategy/*` touched, no walk-forward needed — alerting/ops-layer only.
+
 ### Risk-gate config (stock bot — `StockPaperExecutor` / `IBKRExecutor`, both in `stock_bot/execution/`)
 Both executors implement the same tiers independently (accepted duplication — same pattern
 as the sector-concentration gate). All tiers block new BUYs only; SELL/exits are never
@@ -796,6 +863,11 @@ classify ordering, confirmed manually before landing). Suite 534→536.
   the same day too (see "Candle watchdog" above) — now blocks new BUYs while the feed is
   stale instead of only alerting, closing the fourth and last finding from that research
   pass. All four items from the 2026-08-07 crypto-bot gap review are now closed.
+  Two-way Telegram control built 2026-08-20 (see "Two-way Telegram control" above) —
+  `/status_crypto`, `/pause_crypto`, `/resume_crypto`, `/status_stock`, `/help_crypto` via a
+  `getUpdates` long-poller, closing the Freqtrade-comparison gap (Telegram was alert-only).
+  Ships **off** by default (`TELEGRAM_CONTROL_ENABLED`) — built and tested this session but
+  not yet turned on live; the user opts in via `.env` when ready.
 - **Known live incident, 2026-08-15 (Kraken auth + monitoring blind spot):** while the user
   was traveling (bot host machine still running, still had internet — public Kraken
   ticker/candle calls kept succeeding throughout), every *authenticated* Kraken call

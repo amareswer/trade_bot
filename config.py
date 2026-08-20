@@ -372,6 +372,15 @@ class AlertConfig:
     telegram_enabled:  bool = False
     telegram_bot_token: str = ""
     telegram_chat_id:  str  = ""
+    # Two-way Telegram control (added 2026-08-20) — inbound /status_crypto,
+    # /pause_crypto, /resume_crypto, /help_crypto, /status_stock commands.
+    # Separate opt-in flag from telegram_enabled (outbound alerts only):
+    # this one starts a getUpdates poller, a control surface, not just a
+    # notification channel — should not silently activate for existing
+    # users on upgrade. See bot/alerts/telegram_control.py and
+    # .memory/execution_layer.md for the shared-token/single-poller
+    # constraint with the stock bot (same TELEGRAM_BOT_TOKEN/CHAT_ID).
+    telegram_control_enabled: bool = False
 
 
 @dataclass
@@ -686,9 +695,10 @@ def _load() -> AppConfig:
             funding_cache_seconds  = _int  ("EXT_FUNDING_CACHE_S",   3600),
         ),
         alerts=AlertConfig(
-            telegram_enabled    = _bool("TELEGRAM_ENABLED",    False),
-            telegram_bot_token  = _str ("TELEGRAM_BOT_TOKEN",  ""),
-            telegram_chat_id    = _str ("TELEGRAM_CHAT_ID",    ""),
+            telegram_enabled          = _bool("TELEGRAM_ENABLED",          False),
+            telegram_bot_token        = _str ("TELEGRAM_BOT_TOKEN",        ""),
+            telegram_chat_id          = _str ("TELEGRAM_CHAT_ID",          ""),
+            telegram_control_enabled  = _bool("TELEGRAM_CONTROL_ENABLED",  False),
         ),
         universe=UniverseConfig(
             enabled             = _bool ("UNIVERSE_ENABLED",       False),

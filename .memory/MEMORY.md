@@ -20,3 +20,4 @@
 - [1d Swing Validated](decisions/swing-1d-validated.md) — SL=4% TP=25% walk-forward PASS all 3 periods; paper-trade candidate; not in live .env
 - [Known Gaps](decisions/known-gaps.md) — BUY fills missing from trades.db; regime monitor PF too permissive (no EMA spread filter); live_state.json is dead code
 - [Expert Practices Benchmark](decisions/expert-practices-benchmark.md) — 2026-08-18 web research vs. this codebase: sizing/stops/breakers/walk-forward/capital-gates already match or exceed expert practice; VPS uptime gap and statistical overfitting tooling both found but deliberately deferred, not implemented
+- [Telegram Control](decisions/telegram-control.md) — 2026-08-20 two-way Telegram (/status_crypto, /pause_crypto, /resume_crypto, /status_stock), off by default; shared-token-with-stock-bot constraint means only ONE getUpdates poller may ever exist — read before adding a second
