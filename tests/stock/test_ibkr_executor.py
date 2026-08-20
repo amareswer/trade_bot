@@ -192,6 +192,103 @@ def test_gateway_live_port_refused_without_allow_live():
         IBKRExecutor(port=4001)
 
 
+# ---------------------------------------------------------------------------
+# LiveTradingGate enforcement (2026-08-20 — closes the deferred-enforcement
+# decision from the same day's gate-repair session)
+# ---------------------------------------------------------------------------
+
+def _gate(n, description, status, detail="ok"):
+    return {"gate": n, "description": description, "status": status, "detail": detail}
+
+
+def _all_gates_pass():
+    return [
+        _gate(1, "Backtest walk-forward (current strategy)", "PASS"),
+        _gate(2, "AI confidence-band edge", "PASS"),
+        _gate(3, "Position book (live)", "PASS"),
+        _gate(4, "Infrastructure", "PASS"),
+    ]
+
+
+def test_live_port_allowed_when_gates_1_to_3_pass(executors):
+    fake = FakeIB(accounts=("U26459664",))   # allow_live bypasses the paper-prefix check too
+    with patch.object(ibkr_mod.LiveTradingGate, "evaluate", return_value=_all_gates_pass()):
+        ex = make_executor(fake, port=7496, allow_live=True)
+    executors.append(ex)
+    assert ex is not None
+
+
+def test_live_port_allowed_even_when_gate4_fails(executors):
+    """Gate 4 (infrastructure importability) is deliberately not enforced —
+    a broken smoke-test import must not block someone otherwise cleared."""
+    fake  = FakeIB(accounts=("U26459664",))
+    gates = _all_gates_pass()
+    gates[3] = _gate(4, "Infrastructure", "FAIL", "AI memory ✗  TSX audit ✓")
+    with patch.object(ibkr_mod.LiveTradingGate, "evaluate", return_value=gates):
+        ex = make_executor(fake, port=7496, allow_live=True)
+    executors.append(ex)
+    assert ex is not None
+
+
+def test_live_port_blocked_when_gate2_fails():
+    gates = _all_gates_pass()
+    gates[1] = _gate(2, "AI confidence-band edge", "FAIL", "4 round-trips 40.0% win rate (need 55%)")
+    with patch.object(ibkr_mod.LiveTradingGate, "evaluate", return_value=gates):
+        with pytest.raises(ValueError, match="Gate 2"):
+            IBKRExecutor(port=7496, allow_live=True)
+
+
+def test_live_port_blocked_when_gate_pending():
+    """PENDING (not enough data yet) blocks just like FAIL — 'not proven
+    ready' is not the same as 'ready'."""
+    gates = _all_gates_pass()
+    gates[2] = _gate(3, "Position book (live)", "PENDING", "5 / 30 round-trips")
+    with patch.object(ibkr_mod.LiveTradingGate, "evaluate", return_value=gates):
+        with pytest.raises(ValueError, match="Gate 3"):
+            IBKRExecutor(port=7496, allow_live=True)
+
+
+def test_live_port_blocked_error_names_only_failing_gates():
+    gates = _all_gates_pass()
+    gates[0] = _gate(1, "Backtest walk-forward (current strategy)", "FAIL", "failing: AMD")
+    gates[1] = _gate(2, "AI confidence-band edge", "PENDING", "3 / 10 round-trips")
+    with patch.object(ibkr_mod.LiveTradingGate, "evaluate", return_value=gates):
+        with pytest.raises(ValueError) as exc_info:
+            IBKRExecutor(port=7496, allow_live=True)
+    msg = str(exc_info.value)
+    assert "Gate 1" in msg
+    assert "Gate 2" in msg
+    assert "Gate 3" not in msg   # gate 3 passed — must not be named as a problem
+
+
+def test_live_port_blocked_before_any_connection_attempt():
+    """Fail fast: the gate check runs before __init__ ever touches the IB
+    connection, so no connectAsync call and no event-loop thread left
+    dangling on a blocked start."""
+    fake  = FakeIB(accounts=("U26459664",))
+    gates = _all_gates_pass()
+    gates[1] = _gate(2, "AI confidence-band edge", "FAIL", "not ready")
+    with patch.object(ibkr_mod.LiveTradingGate, "evaluate", return_value=gates):
+        with pytest.raises(ValueError):
+            make_executor(fake, port=7496, allow_live=True)
+    assert not fake._connected
+    assert fake.placed == []
+
+
+def test_paper_mode_never_evaluates_gate(executors):
+    """allow_live=False (paper, the default) must never even call
+    LiveTradingGate — the gate check must have zero effect on the common
+    case, even if the gate itself were somehow broken."""
+    fake = FakeIB()   # default DU-prefixed paper account
+    with patch.object(
+        ibkr_mod.LiveTradingGate, "evaluate",
+        side_effect=AssertionError("LiveTradingGate must not run in paper mode"),
+    ):
+        ex = make_executor(fake)   # default port=7497, allow_live=False
+    executors.append(ex)
+    assert ex is not None
+
+
 def test_non_paper_account_refused(executors):
     fake = FakeIB(accounts=("U26459664",))   # live account id — no DU prefix
     with pytest.raises(ValueError, match="not a paper account"):

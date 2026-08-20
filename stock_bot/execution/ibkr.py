@@ -24,6 +24,17 @@ Safety guards
   explicitly (env IBKR_ALLOW_LIVE=true).  Default port is 7497 (paper).
 - The connected account must start with "DU" (IBKR paper prefix) unless
   allow_live — belt and suspenders against a mis-toggled TWS login.
+- LiveTradingGate enforcement (added 2026-08-20, closing the "deliberately
+  deferred" note from the same day's gate-repair session): when allow_live
+  is True on a live port, __init__ ALSO requires Gates 1-3 of
+  stock_bot.analysis.accuracy_tracker.LiveTradingGate (backtest walk-forward
+  vs the current strategy, AI confidence-band edge, live position-book
+  performance) to all report PASS, before ever attempting a TWS connection.
+  Gate 4 (infrastructure importability) is deliberately excluded — it's a
+  code-hygiene smoke check, not a trading-readiness signal, and shouldn't
+  block someone who's otherwise cleared to go live over an unrelated import
+  issue. This check only runs when allow_live=True is already being passed;
+  paper-mode callers (the default) never reach it.
 - Market orders wait for a fill deadline; on timeout the order is
   cancelled and THEN re-checked for a fill that raced the cancel — the
   fill is recorded, never lost (2026-07-15 crypto limit-chase lesson).
@@ -53,6 +64,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
+from stock_bot.analysis.accuracy_tracker import LiveTradingGate
 from stock_bot.data.price_feed import get_sector, get_usd_cad_rate
 from stock_bot.execution.base import (
     OrderSide, OrderStatus, StockExecutorBase, StockOrder,
@@ -94,6 +106,11 @@ def _next_business_day(d: date) -> date:
 _LIVE_PORTS = {7496, 4001}   # TWS live, IB Gateway live
 _PAPER_ACCOUNT_PREFIX = "DU"
 
+# LiveTradingGate gates enforced before a live-port connection is allowed.
+# Gate 4 (infrastructure importability) is deliberately excluded — see the
+# class docstring's "Safety guards" section for why.
+_ENFORCED_GATE_NUMBERS = (1, 2, 3)
+
 # A manual IBKR paper-account reset (or any other external deposit/withdrawal)
 # changes NetLiquidation outside of anything this executor traded — at cost
 # basis, a BUY just moves cash into inventory at no gain/loss, so absent an
@@ -134,6 +151,25 @@ class IBKRExecutor(StockExecutorBase):
                 f"Port {port} is a LIVE trading port. IBKRExecutor refuses to "
                 f"start without allow_live=True (env IBKR_ALLOW_LIVE=true)."
             )
+
+        if port in _LIVE_PORTS and allow_live:
+            gates = LiveTradingGate().evaluate()
+            not_passing = [
+                g for g in gates
+                if g["gate"] in _ENFORCED_GATE_NUMBERS and g["status"] != "PASS"
+            ]
+            if not_passing:
+                summary = "; ".join(
+                    f"Gate {g['gate']} ({g['description']}): {g['status']} — {g.get('detail', '')}"
+                    for g in not_passing
+                )
+                raise ValueError(
+                    f"Port {port} is a LIVE trading port, and allow_live=True was "
+                    f"passed, but LiveTradingGate is not clear: {summary}. "
+                    f"IBKRExecutor refuses to start until Gates "
+                    f"{'/'.join(str(n) for n in _ENFORCED_GATE_NUMBERS)} all report PASS "
+                    f"(Gate 4 — infrastructure — is not enforced here)."
+                )
 
         self._host = host
         self._port = port

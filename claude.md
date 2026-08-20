@@ -174,7 +174,7 @@ need the full narrative behind any decision below.
 
 ## Test Suite Manifest (reconciled 2026-08-18)
 
-Expected total: **598 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-11s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later.)
+Expected total: **605 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-11s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later.)
 
 **Directory layout (2026-08-18):** all 54 files moved out of repo root into `tests/{crypto,stock,shared}/` for
 a cleaner root — 54 files loose alongside `bot/`, `stock_bot/`, `config.py`, etc. had gotten hard to scan.
@@ -228,7 +228,7 @@ now `.parent.parent.parent`. Verified before/after: same 526 collected, same 526
 | `tests/stock/test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last (forming candle), determinism, validated-parameter pin |
 | `tests/crypto/test_audit_scheduler.py` | 14 | In-bot audit scheduler: tests REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, monthly 1st-anchored (re-screen), missed-run catch-up |
 | `tests/crypto/test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
-| `tests/stock/test_ibkr_executor.py` | 48 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping (.TO↔TSE/CAD, bare NYSE cross-listings→NYSE), broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe (redial/never-raise/no-op), low-equity FX/margin-minimum guard (CAD exempt), starting_cash auto-rebaseline on external reset/deposit, live-cash snapshot persisted + preserved across disconnect, sector-concentration gate (reject 3rd same-sector position, allow add-on to already-held symbol, allow different sector), weekly-loss/drawdown-halt/kill-switch tiers (reject-on-trip, halt auto-lifts, kill switch sticky + persists across restart, SELL never blocked, peak-equity persistence, warning-status flag), per-position ATR stop-pct override (default/persistence/cleared-on-full-close), check_exposure projected (pending-trade-value) exposure — defaults to current-state-only, catches an oversized single BUY, allows one that stays under cap |
+| `tests/stock/test_ibkr_executor.py` | 56 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping (.TO↔TSE/CAD, bare NYSE cross-listings→NYSE), broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe (redial/never-raise/no-op), low-equity FX/margin-minimum guard (CAD exempt), starting_cash auto-rebaseline on external reset/deposit, live-cash snapshot persisted + preserved across disconnect, sector-concentration gate (reject 3rd same-sector position, allow add-on to already-held symbol, allow different sector), weekly-loss/drawdown-halt/kill-switch tiers (reject-on-trip, halt auto-lifts, kill switch sticky + persists across restart, SELL never blocked, peak-equity persistence, warning-status flag), per-position ATR stop-pct override (default/persistence/cleared-on-full-close), check_exposure projected (pending-trade-value) exposure — defaults to current-state-only, catches an oversized single BUY, allows one that stays under cap; LiveTradingGate enforcement (added 2026-08-20) — all-Gates-1-3-pass succeeds, Gate-4-fail still succeeds (not enforced), single-gate FAIL/PENDING blocks with `ValueError`, error names only the actually-failing gate(s), blocked before any TWS connection attempt, paper mode never evaluates the gate (count corrected 48→49 pre-existing then +7 new — the 48 in this manifest predated an untracked 49th test, not investigated further, same class of drift as the 2026-08-19 note above) |
 | `tests/stock/test_fx_sizing.py` | 14 | USD/CAD sizing fix (2026-07-31): `is_cad_symbol`, `get_usd_cad_rate` (fetch/fallback/cache), StockPaperExecutor mixed-currency `total_value`/`check_exposure`, sector-concentration gate (reject 3rd same-sector position, allow add-on to already-held symbol, allow different sector), check_exposure projected (pending-trade-value) exposure — defaults to current-state-only, catches an oversized single BUY, allows one that stays under cap |
 | `tests/stock/test_accuracy_tracker.py` | 18 | `LiveTradingGate` gate-repair (2026-08-20): Gate 1 (`logs/stock_backtest_latest.json` vs `RULE_WHITELIST`) — missing/malformed JSON, all-symbols-pass, one-symbol-fail, symbol-missing-from-run, non-whitelist-symbol ignored, empty-whitelist; Gate 2 (AI confidence-band edge, repurposed from the retired fast book) — pending/pass/fail on win-rate threshold, LOW/PRE-band trades excluded, structural guard confirming no `_FAST_TRADES_CSV` reference remains; Gate 3 (raised to ≥30 round-trips/PF≥1.2/win≥30%) — pending, all-three-pass, both directions of "2/3 criteria pass but still FAIL" (PF-only-failing, win-rate-only-failing) |
 | `tests/shared/test_heartbeat.py` | 8 | Heartbeat pings (bot/alerts/heartbeat.py): URL-off, success/failure never raise, healthy_fn gate |
@@ -842,7 +842,7 @@ here). `fx_rate_at_trade` is `1.0` for CAD-denominated symbols, the live USD/CAD
 otherwise — the same `is_cad_symbol()`/`get_usd_cad_rate()` helpers already used for exposure
 sizing, just persisted per-trade now instead of only used transiently.
 
-### LiveTradingGate — stock bot readiness check (repaired 2026-08-20)
+### LiveTradingGate — stock bot readiness check (repaired + enforced 2026-08-20)
 `stock_bot/analysis/accuracy_tracker.py`, surfaced on the dashboard and in the weekly email.
 DISPLAY-ONLY — not wired into `IBKRExecutor` or `IBKR_ALLOW_LIVE`; see "Enforcement — still
 open, deferred" below. A 2026-08-20 investigation found two of the four gates were
@@ -885,19 +885,31 @@ implemented. Below 30 trades: `PENDING` with a progress count, same pattern as b
 corrected from "Swing paper (daily)" (stale — reads the active Mode A/B position book, not the
 retired swing/fast book) to "Position book (live)".
 
-**Enforcement — still open, deferred.** This pass fixed what the four gates *measure*: it did
-NOT wire `LiveTradingGate` into `IBKRExecutor.__init__()` or touch `IBKR_ALLOW_LIVE` — that
-remains a pure human-read dashboard/email number today, same as before. Current leaning if/
-when that gets built: mirror `IBKRExecutor`'s existing `allow_live` "refuse to start" pattern
-(`stock_bot/execution/ibkr.py:132`, already raises `ValueError` for a live port without
-`allow_live=True` — a gate check would extend that exact guard, not add a new mechanism) —
-but this is **not decided**, and deliberately a separate future task. Tests:
-`tests/stock/test_accuracy_tracker.py`, 18 cases (Gate 1: missing/malformed JSON, all-pass,
-one-symbol-fail, symbol-missing-from-run, non-whitelist-symbol-ignored, empty-whitelist; Gate
-2: pending/pass/fail on the win-rate threshold, LOW/PRE-band trades excluded, structural guard
-confirming no reference to the retired fast book remains; Gate 3: pending, all-three-pass, and
-both directions of "2 of 3 criteria pass but still FAIL" — PF-only-failing and
-win-rate-only-failing with trade count already satisfied). Suite 580→598.
+**Enforcement — RESOLVED 2026-08-20 (same day, second pass), hard block.** `IBKRExecutor.
+__init__()` (`stock_bot/execution/ibkr.py`) now extends its existing `port in _LIVE_PORTS and
+not allow_live` guard: when a live port (7496/4001) is requested **and** `allow_live=True`,
+it additionally calls `LiveTradingGate().evaluate()` and raises `ValueError` — same exception
+type, same "refuse to start" style as the existing guard — naming every non-PASS gate (status
++ detail) if Gates 1-3 aren't all `PASS`. Runs before any TWS connection is attempted (fail
+fast, no dangling event-loop thread on a blocked start). **Gate 4 (infrastructure
+importability) is deliberately excluded** — a broken smoke-test import shouldn't block someone
+otherwise cleared to go live over an unrelated issue; confirmed with the user before building,
+not assumed. The check only fires inside the `allow_live=True` branch — paper-mode callers
+(the default, `IBKR_ALLOW_LIVE=false`) never reach it, confirmed by a dedicated test that makes
+`LiveTradingGate.evaluate()` raise if called and shows paper construction still succeeds.
+`stock_bot/.env`'s `IBKR_ALLOW_LIVE` comment updated to say this is now code-enforced, not a
+human-honor-system note. Tests: `tests/stock/test_ibkr_executor.py`, 7 new (all-3-gates-pass
+succeeds, Gate-4-fail still succeeds, single-gate-FAIL blocks, PENDING blocks same as FAIL,
+error message names only the actually-failing gates, blocked before any connection attempt,
+paper mode never evaluates the gate at all). Suite 598→605.
+
+Tests for what the gates *measure* (the first, same-day pass): `tests/stock/
+test_accuracy_tracker.py`, 18 cases (Gate 1: missing/malformed JSON, all-pass, one-symbol-fail,
+symbol-missing-from-run, non-whitelist-symbol-ignored, empty-whitelist; Gate 2: pending/pass/
+fail on the win-rate threshold, LOW/PRE-band trades excluded, structural guard confirming no
+reference to the retired fast book remains; Gate 3: pending, all-three-pass, and both
+directions of "2 of 3 criteria pass but still FAIL" — PF-only-failing and win-rate-only-failing
+with trade count already satisfied). Suite 580→598.
 
 ### How to verify the config is active
 Run: `EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py`
@@ -1346,10 +1358,9 @@ All of the following must be met before adding any USD pair to UNIVERSE_WHITELIS
 |---|------|--------|
 | F | VPS logrotate (`/etc/logrotate.d/trade_bot`) | Open — small effort |
 | H | Ollama Cloud key revoke | Confirmed unused 2026-07-16; user parked indefinitely — don't re-raise unprompted |
-| I | IBKR live go-live | Gate-blocked (30 paper trades + PF ≥ 1.2) — now tracked by `LiveTradingGate` Gate 3 (repaired 2026-08-20, see "LiveTradingGate" above); still display-only, no enforcement wired to `IBKR_ALLOW_LIVE` yet — separate, deliberately deferred decision |
+| I | IBKR live go-live | Gate-blocked (30 paper trades + PF ≥ 1.2) — `LiveTradingGate` Gates 1-3 now CODE-ENFORCED in `IBKRExecutor.__init__()` (2026-08-20); `IBKR_ALLOW_LIVE=true` on a live port raises `ValueError` unless all three PASS. Current real status: Gate 1 15/16 (AMD fails), Gates 2-3 PENDING (insufficient live trades) |
 | J | USD symbol re-screen | Automated monthly via rescreen.py |
 | K | ATR SL experiment for SYN/LINK | SYN + SOL + BTC all OOS-validated at ATR×2.0; still gate-blocked on USD/new-symbol preconditions above |
-| L | `LiveTradingGate` enforcement | Gates now measure the right things (repaired 2026-08-20); whether/how a PASS actually blocks or gates the IBKR paper→live switch is undecided — current leaning is mirroring `IBKRExecutor`'s existing `allow_live` pattern, not final |
 | — | Crypto capital gate | 0/15 live fills on BTC/CAD — strategy trades ~every 1–3 weeks; keep watching, don't force it |
 | — | Stock Phase A gate | Position book counting toward 30 completed trades, PF ≥ 1.2, win rate ≥ 30% — now the literal `LiveTradingGate` Gate 3 threshold, current status 5/30 |
 

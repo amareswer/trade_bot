@@ -1,6 +1,6 @@
 ---
 name: livetradinggate-gate-repair-2026-08-20
-description: Investigation + fix of two structurally broken gates in stock_bot's LiveTradingGate (accuracy_tracker.py) — Gate 1 was validating a stale/disconnected strategy config, Gate 2 was checking a permanently-retired book. Both repaired 2026-08-20. Enforcement (wiring into IBKRExecutor) deliberately deferred, not decided.
+description: Investigation + fix of two structurally broken gates in stock_bot's LiveTradingGate (accuracy_tracker.py) — Gate 1 was validating a stale/disconnected strategy config, Gate 2 was checking a permanently-retired book. Both repaired 2026-08-20. Enforcement (wiring into IBKRExecutor) — RESOLVED same day, second pass: hard block on Gates 1-3, Gate 4 excluded.
 metadata:
   type: project
 ---
@@ -85,26 +85,46 @@ implemented; reused verbatim rather than inventing a new threshold. Below 30 tra
 (daily)" (stale, conflated with the retired book by name even though the code always read the
 position book) to "Position book (live)".
 
-**Deliberately NOT done this pass:** `LiveTradingGate` is still not wired into
-`IBKRExecutor.__init__()` or `IBKR_ALLOW_LIVE` — remains a pure human-read dashboard/email
-number. Current leaning, if/when that gets built: mirror `IBKRExecutor`'s existing
-`allow_live` "refuse to start" pattern (`stock_bot/execution/ibkr.py:132`, already raises
-`ValueError` for a live port without `allow_live=True`) rather than inventing a new
-enforcement mechanism — but this is explicitly not decided, and scoped to a separate future
-task.
+**Enforcement — RESOLVED, same day, second pass (hard block, Gates 1-3, Gate 4 excluded).**
+`IBKRExecutor.__init__()` (`stock_bot/execution/ibkr.py`) now extends its existing
+`port in _LIVE_PORTS and not allow_live` guard: when a live port is requested with
+`allow_live=True`, it also calls `LiveTradingGate().evaluate()` and raises `ValueError` (same
+exception type/pattern as the pre-existing guard) naming every gate that isn't `PASS`, before
+any TWS connection is attempted. Gate 4 (infrastructure importability) was explicitly asked
+about and excluded — a broken smoke-test import (an unrelated code-hygiene signal, not a
+trading-readiness one) shouldn't block someone otherwise cleared to go live. The check only
+fires inside the `allow_live=True` branch; paper-mode construction (the default) never
+evaluates the gate at all — confirmed by a test that makes `LiveTradingGate.evaluate()` raise
+if called and shows paper mode still succeeds.
+
+This closes the "deliberately deferred" item from the same day's first pass. The reasoning
+that made enforcement a genuinely open question then (no code-enforced precedent anywhere
+else in this codebase — see "What was found" above) still stands as *context* for why this
+was worth asking rather than assuming; the answer, once asked, was a clean hard block matching
+`IBKRExecutor`'s own existing pattern, not a new mechanism.
 
 ## Tests
 
-`tests/stock/test_accuracy_tracker.py` (new file, 18 cases): Gate 1 — missing/malformed JSON
-(fail-safe, doesn't raise), all-whitelist-symbols-pass, one-symbol-fail, symbol-missing-from-
-latest-run, non-whitelist-symbol-in-JSON-ignored, empty-whitelist. Gate 2 — pending below
-minimum, pass/fail on the win-rate threshold, LOW/PRE-confidence trades excluded from the
-tally, structural guard confirming zero remaining reference to `_FAST_TRADES_CSV`. Gate 3 —
-pending below 30, all-three-criteria PASS, and both directions of "2 of 3 criteria pass but
-still FAIL" (enough trades + win rate but PF<1.2; enough trades + PF but win rate<30%) — the
-specific edge case requested to prove the gate doesn't loosen to a majority-vote. Suite
-580→598, all passing, no regressions.
+`tests/stock/test_accuracy_tracker.py` (new file, 18 cases, first pass — what the gates
+measure): Gate 1 — missing/malformed JSON (fail-safe, doesn't raise), all-whitelist-symbols-
+pass, one-symbol-fail, symbol-missing-from-latest-run, non-whitelist-symbol-in-JSON-ignored,
+empty-whitelist. Gate 2 — pending below minimum, pass/fail on the win-rate threshold,
+LOW/PRE-confidence trades excluded from the tally, structural guard confirming zero remaining
+reference to `_FAST_TRADES_CSV`. Gate 3 — pending below 30, all-three-criteria PASS, and both
+directions of "2 of 3 criteria pass but still FAIL" (enough trades + win rate but PF<1.2;
+enough trades + PF but win rate<30%) — the specific edge case requested to prove the gate
+doesn't loosen to a majority-vote. Suite 580→598.
+
+`tests/stock/test_ibkr_executor.py` (+7, second pass — enforcement): all-Gates-1-3-pass
+succeeds, Gate-4-fail still succeeds (confirms exclusion), single-gate FAIL blocks with
+`ValueError` naming it, PENDING blocks the same as FAIL (not-proven-ready isn't ready), error
+message names only the actually-failing gate(s) — not ones that passed, blocked before any
+FakeIB connection attempt (`fake._connected` stays False), and paper mode (`allow_live=False`)
+never even calls `LiveTradingGate.evaluate()` (patched to raise `AssertionError` if invoked,
+confirms zero effect on the common case). Suite 598→605, all passing, no regressions.
 
 See also [[expert-practices-benchmark]] for the DSR/CSCV-adjacent reasoning about this
-codebase's general "human checkpoint, not automatic enforcement" pattern, which directly
-informed the decision to leave enforcement deferred here too.
+codebase's general "human checkpoint, not automatic enforcement" pattern — the context that
+made the enforcement question worth asking explicitly in the first pass, even though the
+answer here ended up being a hard block, a deliberate departure from that general pattern for
+this specific, higher-stakes gate (real brokerage capital, not a position-sizing tier).
