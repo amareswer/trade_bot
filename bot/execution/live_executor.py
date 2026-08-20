@@ -52,14 +52,68 @@ _MIN_SIZE_SAFETY_MARGIN = float(os.getenv("MIN_SIZE_SAFETY_MARGIN", "1.5"))
 _NATIVE_STOP_ORDERTYPES = frozenset({"stop-loss", "trailing-stop"})
 
 
+def _raw_ordertype(order: dict) -> str:
+    """Raw Kraken descr.ordertype string from a ccxt-parsed order dict
+    (fetch_open_orders etc.) — see _is_native_stop_order for why the raw
+    field is needed instead of ccxt's unified 'type'."""
+    try:
+        return order.get("info", {}).get("descr", {}).get("ordertype", "")
+    except AttributeError:
+        return ""
+
+
 def _is_native_stop_order(order: dict) -> bool:
     """True if a ccxt-parsed order dict (from fetch_open_orders etc.) is one
     of the two ordertypes this bot's own native-stop logic ever places."""
+    return _raw_ordertype(order) in _NATIVE_STOP_ORDERTYPES
+
+
+def _resting_order_quantity(order: dict) -> float | None:
+    """Unfilled quantity still resting for a ccxt-parsed order — 'remaining'
+    when ccxt computed it, else the full 'amount' (both ultimately sourced
+    from Kraken's raw 'vol'/'vol_exec' fields via ccxt's kraken.py
+    parse_order — confirmed by reading the installed ccxt 4.5.56 source:
+    `amount = self.safe_string(order, 'vol', amount)`, `filled =
+    self.safe_string(order, 'vol_exec')`, with safe_order() deriving
+    'remaining'). None if neither field is present/parseable (e.g. a test
+    double, or a genuinely malformed response) — callers must treat None as
+    'unknown, skip the check', not as a mismatch."""
+    for key in ("remaining", "amount"):
+        val = order.get(key)
+        if val is None:
+            continue
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _extract_stop_trigger(order: dict) -> tuple[float | None, float | None]:
+    """From a ccxt-parsed order's raw info (order['info']), extract
+    (stop_price, trailing_pct) for whichever kind of native stop this is.
+    Reads Kraken's raw fields directly rather than ccxt's unified 'price' —
+    ccxt deliberately nulls unified 'price' for a trailing-stop order (it's
+    a relative '+X%' string, not an absolute price — see kraken.py
+    parse_order: `if price.endswith('%'): price = None`), so the raw
+    descr.price / stopprice fields are the only place this is available.
+    Returns (None, None) if neither is parseable. Used to resize a resting
+    stop at the SAME level/trailing-pct it already had (Gap A fix) or to
+    adopt an untracked order's real level (Gap B fix) — always read back
+    from the exchange's own order, never recomputed from avg_entry/ATR."""
+    info = order.get("info", {}) or {}
+    descr = info.get("descr", {}) or {}
+    price_field = str(descr.get("price", ""))
+    if price_field.endswith("%"):
+        try:
+            return None, abs(float(price_field.rstrip("%"))) / 100.0
+        except ValueError:
+            return None, None
     try:
-        ordertype = order.get("info", {}).get("descr", {}).get("ordertype", "")
-    except AttributeError:
-        return False
-    return ordertype in _NATIVE_STOP_ORDERTYPES
+        stop_price = float(info.get("stopprice", 0) or 0)
+    except (TypeError, ValueError):
+        return None, None
+    return (stop_price if stop_price > 0 else None), None
 
 
 class LiveExecutor:
@@ -72,6 +126,13 @@ class LiveExecutor:
     # before the external-holdings guard fires (avoids false positives from
     # sub-satoshi rounding differences between Kraken and state files).
     _EXTERNAL_THRESHOLD = 1e-5  # 10 satoshis / 10 DOGE / etc.
+
+    # Gap A (2026-08-20 follow-up, see _reconcile_resting_stop_quantity):
+    # tolerance for comparing a resting native stop order's own volume
+    # against the current position — same satoshi-scale magnitude as
+    # _EXTERNAL_THRESHOLD above, for the same "don't false-positive on
+    # floating-point/rounding noise" reason.
+    _STOP_QTY_MISMATCH_THRESHOLD = 1e-5
 
     def __init__(
         self,
@@ -421,11 +482,11 @@ class LiveExecutor:
         Confirms a stop order recorded in the state file is still open on
         the exchange; clears the tracked id if it isn't (filled while the
         bot was down — the whole point of this feature working correctly —
-        or cancelled manually). Never places a new order here: this method
-        only knows the OLD price, and a fresh BUY may have changed the
-        picture; main.py owns deciding what price a replacement should use
-        and calls sync_protective_stop() itself if this leaves a real gap
-        (position open, no resting stop).
+        or cancelled manually). Never places a NEW price/trailing-pct level
+        here: this method only knows the OLD price, and a fresh BUY may have
+        changed the picture; main.py owns deciding what price a replacement
+        should use and calls sync_protective_stop() itself if this leaves a
+        real gap (position open, no resting stop).
 
         Also scans the same already-fetched open-orders list for how many
         stop-type orders (see _is_native_stop_order) exist on this symbol
@@ -434,12 +495,39 @@ class LiveExecutor:
         first, so more than one should be structurally impossible via normal
         operation; if it's ever found anyway (manual intervention outside the
         bot, a race, a bug), that's not something to silently resolve by
-        picking one — alert loudly and leave the existing tracked-id
-        confirm/clear logic below to run unchanged. (2026-08-20 — found
-        during the native_stop_price restart-seeding gap fix; deliberately
-        does NOT add new auto-adoption logic for an untracked-but-real
-        resting order — see .memory/execution_layer.md for that separate,
-        deliberately-not-fixed-here finding.)
+        picking one — alert loudly.
+
+        Two adjacent gaps, both CLOSED 2026-08-20 in a follow-up pass (see
+        .memory/execution_layer.md for the full writeup):
+
+        Gap A — resting order's quantity can go stale (Kraken-side fills
+        while the bot was down, either a partial fill on the resting stop
+        itself or an external event changing the position) even when the
+        order is still confirmed open. Checked in
+        _reconcile_resting_stop_quantity() against the already-reconciled
+        self._portfolio.position (set by _sync_position just before this
+        method runs). Always alerts on any mismatch; only auto-resizes
+        (cancel + replace at the SAME price/trailing-pct, read back from the
+        resting order's own raw fields — never recomputed from avg_entry/
+        ATR) when under-sized — the genuinely unprotected direction. An
+        over-sized resting stop is left alone (benign — Kraken can't oversell
+        a position — and resizing a trailing stop would forfeit its
+        server-tracked trail progress for no protective benefit).
+
+        Gap B — an untracked-but-real resting order. If
+        native_stop_order_id is missing/lost (state file corruption, or a
+        crash between create_order() succeeding and _save_state()
+        persisting it), the "no tracked id" branch below used to do nothing
+        to look for a real order already resting — main.py's startup
+        reconciliation would then place a second stop alongside the
+        untracked first one. Now: if exactly one untracked stop-type order
+        is found, adopted verbatim in _adopt_untracked_stop() (id/price/
+        trailing-flag trusted from the exchange, same "exchange is
+        authoritative" philosophy as _sync_position/_sync_cash). Two or more
+        untracked candidates is the same ambiguous case as above — alert,
+        adopt nothing (confirmed the pre-existing ambiguity alert did NOT
+        cover this case: it only ever ran after the "no tracked id" early
+        return, so a lost-id restart never reached it).
         """
         if self._portfolio.position <= 0:
             # No position to protect — any leftover id is stale by definition.
@@ -447,45 +535,49 @@ class LiveExecutor:
                 self._cancel_native_stop()
             return
 
-        if not self._native_stop_order_id:
-            logger.warning(
-                "NATIVE STOP GAP [%s]: position=%.6f open but no resting stop "
-                "recorded — main.py startup reconciliation should place one.",
-                self.symbol, self._portfolio.position,
-            )
-            return
-
         try:
             open_orders = fetch_with_retry(
                 lambda: self._exchange.fetch_open_orders(self.symbol),
                 label=f"open orders check [{self.symbol}]",
             )
-            still_open = any(
-                str(o.get("id", "")) == self._native_stop_order_id for o in open_orders
-            )
         except Exception as exc:
             logger.warning(
-                "Could not verify resting stop %s on startup: %s — leaving "
-                "tracked as-is, will re-check on the next placement/cancel.",
-                self._native_stop_order_id, exc,
+                "Could not verify resting stop on startup: %s — leaving "
+                "tracked state as-is, will re-check on the next "
+                "placement/cancel.", exc,
             )
             return
 
         _stop_orders = [o for o in open_orders if _is_native_stop_order(o)]
+
+        if not self._native_stop_order_id:
+            # Gap B: no tracked id — look for a real untracked order before
+            # assuming the position is naked.
+            if len(_stop_orders) == 1:
+                self._adopt_untracked_stop(_stop_orders[0])
+            elif len(_stop_orders) > 1:
+                self._alert_ambiguous_stops(_stop_orders)
+                logger.warning(
+                    "NATIVE STOP GAP [%s]: position=%.6f open, no tracked "
+                    "stop, and multiple untracked stop orders found — not "
+                    "auto-adopting any of them, manual review needed.",
+                    self.symbol, self._portfolio.position,
+                )
+            else:
+                logger.warning(
+                    "NATIVE STOP GAP [%s]: position=%.6f open but no "
+                    "resting stop recorded and none found on the exchange "
+                    "— main.py startup reconciliation should place one.",
+                    self.symbol, self._portfolio.position,
+                )
+            return
+
+        still_open = any(
+            str(o.get("id", "")) == self._native_stop_order_id for o in open_orders
+        )
+
         if len(_stop_orders) > 1:
-            _ids = [str(o.get("id", "")) for o in _stop_orders]
-            logger.error(
-                "NATIVE STOP AMBIGUOUS [%s]: %d stop-type orders found "
-                "resting simultaneously (%s) — this bot's own logic never "
-                "places more than one (always cancel-then-place); needs "
-                "manual review. Leaving tracked state as-is.",
-                self.symbol, len(_stop_orders), ", ".join(_ids),
-            )
-            self._alerter.error(
-                f"NATIVE STOP AMBIGUOUS [{self.symbol}]: {len(_stop_orders)} "
-                f"stop-type orders resting simultaneously ({', '.join(_ids)}) "
-                f"— manual review needed."
-            )
+            self._alert_ambiguous_stops(_stop_orders)
 
         if still_open:
             if self._native_stop_is_trailing:
@@ -498,6 +590,11 @@ class LiveExecutor:
                     "Native stop confirmed on restart: %s @ %.2f",
                     self._native_stop_order_id, self._native_stop_price or 0.0,
                 )
+            matched = next(
+                o for o in open_orders
+                if str(o.get("id", "")) == self._native_stop_order_id
+            )
+            self._reconcile_resting_stop_quantity(matched)
         else:
             logger.warning(
                 "NATIVE STOP GAP [%s]: tracked order %s is no longer open "
@@ -510,6 +607,111 @@ class LiveExecutor:
             self._native_stop_price       = None
             self._native_stop_is_trailing = False
             self._save_state()
+
+    def _alert_ambiguous_stops(self, stop_orders: list[dict]) -> None:
+        """Shared by both the tracked-id-still-open path and the Gap B
+        no-tracked-id path — 2+ real stop-type orders resting at once is
+        the same ambiguous, needs-manual-review situation regardless of
+        which path found it."""
+        _ids = [str(o.get("id", "")) for o in stop_orders]
+        logger.error(
+            "NATIVE STOP AMBIGUOUS [%s]: %d stop-type orders found "
+            "resting simultaneously (%s) — this bot's own logic never "
+            "places more than one (always cancel-then-place); needs "
+            "manual review.",
+            self.symbol, len(stop_orders), ", ".join(_ids),
+        )
+        self._alerter.error(
+            f"NATIVE STOP AMBIGUOUS [{self.symbol}]: {len(stop_orders)} "
+            f"stop-type orders resting simultaneously ({', '.join(_ids)}) "
+            f"— manual review needed."
+        )
+
+    def _adopt_untracked_stop(self, order: dict) -> None:
+        """Gap B fix: a real stop-type order is resting on Kraken with no
+        matching tracked id in our state. Trust the exchange over our own
+        (lost) bookkeeping and adopt it verbatim, instead of letting
+        main.py's startup reconciliation place a duplicate alongside it."""
+        order_id      = str(order.get("id", ""))
+        is_trailing   = _raw_ordertype(order) == "trailing-stop"
+        stop_price, _ = _extract_stop_trigger(order)
+        self._native_stop_order_id    = order_id
+        self._native_stop_price       = None if is_trailing else stop_price
+        self._native_stop_is_trailing = is_trailing
+        logger.warning(
+            "NATIVE STOP ADOPTED [%s]: found untracked resting %s order %s "
+            "— adopted instead of placing a duplicate.",
+            self.symbol, "trailing" if is_trailing else "static", order_id,
+        )
+        self._alerter.message(
+            f"ℹ️ NATIVE STOP ADOPTED [{self.symbol}]: found an "
+            f"untracked resting {'trailing' if is_trailing else 'static'} "
+            f"stop order {order_id} on restart — adopted it rather than "
+            f"placing a second one. The state file's tracked id was likely "
+            f"lost to a crash before it could be saved."
+        )
+        self._save_state()
+
+    def _reconcile_resting_stop_quantity(self, order: dict) -> None:
+        """Gap A fix: compare a confirmed-still-open resting stop's actual
+        volume against the current (already-reconciled) position. Always
+        alerts on a mismatch beyond a satoshi-scale tolerance; only
+        auto-resizes when the resting order is UNDER-sized (the genuinely
+        unprotected direction). An over-sized resting order is left alone —
+        benign (Kraken can't oversell a position) and, for a trailing stop,
+        resizing would forfeit server-tracked trail progress for no
+        protective benefit. See _verify_resting_stop_on_startup docstring.
+        """
+        resting_qty = _resting_order_quantity(order)
+        if resting_qty is None:
+            return  # unknown — nothing to compare, leave as-is
+
+        position = self._portfolio.position
+        if abs(resting_qty - position) <= self._STOP_QTY_MISMATCH_THRESHOLD:
+            return  # matches, nothing to do
+
+        under_protected = resting_qty < position
+        logger.warning(
+            "NATIVE STOP QTY MISMATCH [%s]: resting order %s covers %.6f "
+            "but position is %.6f (%s).",
+            self.symbol, self._native_stop_order_id, resting_qty, position,
+            "under-protected — resizing" if under_protected else "over-sized — benign, left as-is",
+        )
+        self._alerter.error(
+            f"NATIVE STOP QTY MISMATCH [{self.symbol}]: resting stop "
+            f"{self._native_stop_order_id} covers {resting_qty:.6f} but "
+            f"position is {position:.6f}."
+            + (
+                " Position is UNDER-protected — resizing now."
+                if under_protected
+                else " Resting stop covers more than the position (benign"
+                     " — left as-is)."
+            )
+        )
+        if not under_protected:
+            return  # benign over-sized case — leave the resting order untouched
+
+        stop_price, trailing_pct = _extract_stop_trigger(order)
+        was_trailing = _raw_ordertype(order) == "trailing-stop"
+        self._cancel_native_stop()
+        if was_trailing and trailing_pct is not None:
+            self._place_native_trailing_stop(position, trailing_pct)
+        elif not was_trailing and stop_price is not None:
+            self._place_native_stop(position, stop_price)
+        else:
+            logger.error(
+                "NATIVE STOP QTY MISMATCH [%s]: could not read back the "
+                "resting order's own price/trailing-pct to resize it — "
+                "cancelled the under-sized stop and left nothing in its "
+                "place.",
+                self.symbol,
+            )
+            self._alerter.error(
+                f"NATIVE STOP RESIZE FAILED [{self.symbol}]: cancelled an "
+                f"under-sized resting stop but couldn't read back its "
+                f"price/trailing-pct to replace it — position is now "
+                f"UNPROTECTED by this backstop until the next reconciliation."
+            )
 
     def _cancel_native_stop(self) -> None:
         """Best-effort cancel. A cancel racing an actual trigger (the stop

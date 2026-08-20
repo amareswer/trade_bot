@@ -174,7 +174,7 @@ need the full narrative behind any decision below.
 
 ## Test Suite Manifest (reconciled 2026-08-18)
 
-Expected total: **543 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-11s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later.)
+Expected total: **552 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-11s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later.)
 
 **Directory layout (2026-08-18):** all 54 files moved out of repo root into `tests/{crypto,stock,shared}/` for
 a cleaner root — 54 files loose alongside `bot/`, `stock_bot/`, `config.py`, etc. had gotten hard to scan.
@@ -198,7 +198,7 @@ now `.parent.parent.parent`. Verified before/after: same 526 collected, same 526
 | File | Tests | What it covers |
 |------|-------|----------------|
 | `tests/shared/test_indicators.py` | 30 | RSI, EMA, ADX, MACD, ATR calculations; regime-classification self-referential-ATR-baseline regression (2026-08-20 — `_classify_regime()` contract check + a mutation-verified test driving real `evaluate()` end to end) |
-| `tests/crypto/test_live_executor.py` | 54 | LiveExecutor: dry-run, market/limit orders, urgent-exit bypass, fee deduction, state save/load, pre-trade min-size guard, restart recovery (seeds position manager + state machine), native stop-loss backstop (placement, cancel, resync, failure alerting, dry-run/flag-off no-ops, restart reconciliation), native TRAILING stop-loss backstop (placement w/ trailingPercent param, priority over static, cancel, resync-on-quantity-change, failure alerting, dry-run no-op, state persist/restore — added 2026-08-19), `native_stop_price` property, multi-stop-order ambiguity detection on startup (alerts on 2+ stop-type orders resting, ignores unrelated non-stop open orders — added 2026-08-20), slippage guard (BUY/SELL unfavorable trip, within-threshold, favorable-direction, disabled, dry-run no-ops) |
+| `tests/crypto/test_live_executor.py` | 63 | LiveExecutor: dry-run, market/limit orders, urgent-exit bypass, fee deduction, state save/load, pre-trade min-size guard, restart recovery (seeds position manager + state machine), native stop-loss backstop (placement, cancel, resync, failure alerting, dry-run/flag-off no-ops, restart reconciliation), native TRAILING stop-loss backstop (placement w/ trailingPercent param, priority over static, cancel, resync-on-quantity-change, failure alerting, dry-run no-op, state persist/restore — added 2026-08-19), `native_stop_price` property, multi-stop-order ambiguity detection on startup (alerts on 2+ stop-type orders resting, ignores unrelated non-stop open orders — added 2026-08-20), slippage guard (BUY/SELL unfavorable trip, within-threshold, favorable-direction, disabled, dry-run no-ops), restart-startup resting-stop quantity reconciliation (resize under-sized static/trailing, leave over-sized alone, no-op on match/unknown-qty) + untracked-but-real resting stop adoption (single static, single trailing, multiple-not-adopted, none-found-unchanged — both added 2026-08-20 follow-up) |
 | `tests/crypto/test_capital_pool.py` | 19 | CapitalPool: slot allocation, slot cap, release, edge cases |
 | `tests/crypto/test_correlation.py` | 17 | Pearson correlation, pct_returns, fetch_correlation |
 | `tests/stock/test_stock_correlation.py` | 5 | `stock_bot/risk/correlation.py`: `fetch_correlation_from_closes` — no-network wrapper reusing bot/risk/correlation.py's pearson/pct_returns unchanged |
@@ -445,21 +445,50 @@ Telegram and leaves the existing single-id confirm/clear logic to run unchanged 
 deliberately does **not** try to auto-resolve the ambiguity by picking one, per the explicit
 "fail loud, don't silently guess" decision for this case.
 
-**Deliberately NOT fixed in this pass, flagged for later:** whether a still-resting order's
-*quantity* matches the position's actual size post-restart (e.g. Kraken-side fills happened
-while the bot was down, changing the position, but the resting stop's original volume is now
-stale) — a different, adjacent gap from price/trailing-flag/order-id seeding, not addressed
-here. Also not fixed: adopting an untracked-but-real resting stop order when the state file's
-own tracked id is missing/lost (state file corruption, or a crash between `create_order()`
-succeeding and `_save_state()` persisting it) — `_verify_resting_stop_on_startup()` still only
-confirms/clears its own tracked id in that branch, doesn't scan for an orphaned-but-real order
-to adopt; found during this session's design work but deliberately scoped out to avoid
-expanding an approved, reviewed plan mid-implementation. Tests:
+Two items were deliberately left unfixed in this pass, flagged for later — **both since
+CLOSED, 2026-08-20 same-day follow-up** (see below and `.memory/execution_layer.md` for the
+full writeup): whether a still-resting order's *quantity* matches the position's actual size
+post-restart, and adopting an untracked-but-real resting stop order when the state file's own
+tracked id is missing/lost. Tests for the original pass:
 `tests/crypto/test_live_executor.py` (+3: multiple-stop-orders alert, unrelated-open-order
 no-false-positive, `native_stop_price` property) and `tests/crypto/test_drift_escalation.py`
 (+4: `_seed_native_stop_state()` — static resting, trailing resting, naked/nothing resting,
 mismatched-price-trusted-verbatim). Suite 536→543. No `bot/strategy/*` touched — no walk-forward
 revalidation needed, confirmed via unchanged `bot/strategy/fingerprint.compute_strategy_hash()`.
+
+**Both remaining gaps CLOSED, 2026-08-20 (same-day follow-up pass).** Re-traced both against
+the actual code before changing anything — confirmed real, not assumed.
+
+*Quantity mismatch:* `_verify_resting_stop_on_startup()` only ever checked order-id membership,
+never volume, even though `_sync_position()` (called just before it) may have already
+reconciled the position to a different size than what the resting order was placed for.
+ccxt's installed `kraken.py` confirms the unified `order['amount']`/`order['remaining']`
+fields are populated straight from Kraken's raw `vol`/`vol_exec` — used directly, no `info`
+parsing needed for this half. Fixed with a hybrid policy (explicit choice presented and made,
+not decided unilaterally): always alert on any mismatch beyond a small tolerance; auto
+cancel+replace (at the *same* price/trailing-pct, sized up to the real position) only when the
+resting order is **under-sized** — the genuinely unprotected direction. An over-sized resting
+order is left alone: benign (an exchange can't oversell a position that isn't there) and, for
+a trailing stop, replacing it would forfeit Kraken's server-tracked trail-peak progress for no
+protective benefit. The replacement level is read back from the resting order's own raw fields
+(`info['stopprice']` for static, `info['descr']['price']`'s `"+X.XXXX%"` string for trailing —
+ccxt nulls its own unified `price` for a trailing order) — never recomputed from `avg_entry`/
+ATR, consistent with the existing "a resting order's level never touches down" rule elsewhere
+in this feature.
+
+*Untracked-but-real order:* confirmed the multi-order ambiguity alert above does **not** cover
+this case — `_verify_resting_stop_on_startup()`'s no-tracked-id branch returned before ever
+calling `fetch_open_orders()`, so the ambiguity scan was structurally unreachable whenever
+`native_stop_order_id` was `None`. Traced the concrete consequence: `bot/main.py`'s startup
+reconciliation would call `sync_protective_stop(fallback_sl)`, whose first step
+(`_cancel_native_stop()`) is a no-op with no tracked id — so a real untracked order was never
+touched, and a second stop got placed alongside it. Fixed: the method now always fetches open
+orders and scans for stop-type orders even with no tracked id — exactly one found is adopted
+verbatim (id/price/trailing-flag trusted from the exchange, same philosophy as
+`_sync_position`/`_sync_cash`); two or more reuses the same ambiguity alert, adopting nothing;
+zero found keeps the pre-existing behavior. Tests: `tests/crypto/test_live_executor.py`, +9
+(5 for the quantity fix, 4 for the adoption fix). Suite 543→552. No `bot/strategy/*` touched,
+no walk-forward needed.
 
 **`trailingPercent` param verified against real ccxt source, 2026-08-19 — re-run to reproduce,
 don't just trust this paragraph:** `.venv/bin/python verify_kraken_trailing_stop_param.py`

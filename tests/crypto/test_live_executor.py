@@ -14,6 +14,7 @@ import pytest
 
 import ccxt
 import bot.execution.live_executor as le_mod
+from bot.alerts.telegram import TelegramAlerter
 from bot.execution.executor import OrderSide, OrderStatus
 from bot.execution.live_executor import LiveExecutor
 from bot.strategy.threshold_strategy import Signal
@@ -1351,6 +1352,311 @@ def test_native_stop_price_property_reflects_private_field(tmp_path):
     assert ex.native_stop_price is None
     ex._native_stop_price = 88_000.0
     assert ex.native_stop_price == 88_000.0
+
+
+# ---------------------------------------------------------------------------
+# Gap A — resting stop quantity mismatch after fills-while-down
+# (2026-08-20 follow-up pass; see .memory/execution_layer.md)
+# ---------------------------------------------------------------------------
+
+def _startup_with_tracked_stop(tmp_path, *, resting_order: dict, position: float = 0.001):
+    """Shared setup: a saved state with a tracked static stop id, restarted
+    against a mocked exchange whose fetch_open_orders returns exactly one
+    matching order (the caller supplies its shape — id/amount/remaining/
+    info)."""
+    state_path = str(tmp_path / "state.json")
+    json.dump({
+        "symbol": "BTC/CAD", "cash": 89.88, "position": position,
+        "cost_basis": 88_870.0, "realized_pnl": 0.0, "fees_paid": 0.0,
+        "native_stop_order_id": "stop-001", "native_stop_price": 88_000.0,
+        "native_stop_is_trailing": False,
+        "saved_at": "2026-08-01T00:00:00+00:00",
+    }, open(state_path, "w"))
+
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = _DEFAULT_MARKETS
+    mock_ex.fetch_balance.return_value = {
+        "free": {"CAD": 89.88, "BTC": position}, "total": {"CAD": 89.88, "BTC": position},
+    }
+    mock_ex.fetch_open_orders.return_value = [resting_order]
+    mock_ex.price_to_precision.return_value = "87000.0"
+
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = mock_ex
+        ex = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=100.0, dry_run=False, state_path=state_path,
+            native_stop_loss_enabled=True,
+        )
+    return ex, mock_ex
+
+
+def test_native_stop_startup_resizes_under_sized_static_stop(tmp_path):
+    """Resting stop covers less than the actual position (a Kraken-side
+    partial fill happened while the bot was down) — always alerts, and
+    since this is the under-protected direction, cancels + re-places a
+    fresh static stop at the SAME price, sized to the real position."""
+    resting_order = {
+        "id": "stop-001", "amount": 0.0005, "remaining": 0.0005,
+        "info": {"descr": {"ordertype": "stop-loss", "price": "87000.0"},
+                  "stopprice": "87000.0"},
+    }
+    ex, mock_ex = _startup_with_tracked_stop(tmp_path, resting_order=resting_order, position=0.001)
+
+    mock_ex.cancel_order.assert_called_once_with("stop-001", "BTC/CAD")
+    mock_ex.create_order.assert_called_once()
+    call = mock_ex.create_order.call_args
+    assert abs(call[0][3] - 0.001) < 1e-9        # resized to real position
+    assert call[1]["params"]["stopLossPrice"] == "87000.0"   # same price
+
+
+def test_native_stop_startup_leaves_over_sized_static_stop(tmp_path):
+    """Resting stop covers MORE than the actual position — benign (Kraken
+    can't oversell), left untouched. No cancel, no re-place."""
+    resting_order = {
+        "id": "stop-001", "amount": 0.002, "remaining": 0.002,
+        "info": {"descr": {"ordertype": "stop-loss", "price": "87000.0"},
+                  "stopprice": "87000.0"},
+    }
+    ex, mock_ex = _startup_with_tracked_stop(tmp_path, resting_order=resting_order, position=0.001)
+
+    mock_ex.cancel_order.assert_not_called()
+    mock_ex.create_order.assert_not_called()
+    assert ex._native_stop_order_id == "stop-001"   # unchanged
+
+
+def test_native_stop_startup_no_alert_when_quantity_matches(tmp_path):
+    """Resting stop quantity matches the position within tolerance —
+    no alert, nothing touched."""
+    resting_order = {
+        "id": "stop-001", "amount": 0.001, "remaining": 0.001,
+        "info": {"descr": {"ordertype": "stop-loss", "price": "87000.0"},
+                  "stopprice": "87000.0"},
+    }
+    state_path = str(tmp_path / "state.json")
+    json.dump({
+        "symbol": "BTC/CAD", "cash": 89.88, "position": 0.001,
+        "cost_basis": 88_870.0, "realized_pnl": 0.0, "fees_paid": 0.0,
+        "native_stop_order_id": "stop-001", "native_stop_price": 88_000.0,
+        "saved_at": "2026-08-01T00:00:00+00:00",
+    }, open(state_path, "w"))
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = _DEFAULT_MARKETS
+    mock_ex.fetch_balance.return_value = {
+        "free": {"CAD": 89.88, "BTC": 0.001}, "total": {"CAD": 89.88, "BTC": 0.001},
+    }
+    mock_ex.fetch_open_orders.return_value = [resting_order]
+
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = mock_ex
+        with patch.object(TelegramAlerter, "error") as mock_alert:
+            ex = LiveExecutor(
+                exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+                starting_cash=100.0, dry_run=False, state_path=state_path,
+                native_stop_loss_enabled=True,
+            )
+
+    mock_alert.assert_not_called()
+    mock_ex.cancel_order.assert_not_called()
+    mock_ex.create_order.assert_not_called()
+
+
+def test_native_stop_startup_qty_check_skips_when_amount_unknown(tmp_path):
+    """A resting order with no amount/remaining field at all (e.g. a bare
+    test double, or a genuinely malformed response) — the quantity check
+    must degrade to a no-op, not a false-positive alert or a crash."""
+    resting_order = {"id": "stop-001", "info": {"descr": {"ordertype": "stop-loss"}}}
+    ex, mock_ex = _startup_with_tracked_stop(tmp_path, resting_order=resting_order, position=0.001)
+
+    mock_ex.cancel_order.assert_not_called()
+    mock_ex.create_order.assert_not_called()
+
+
+def test_native_stop_startup_resizes_under_sized_trailing_stop(tmp_path):
+    """Same under-sized case, but the resting order is a native TRAILING
+    stop — the replacement must also be trailing, at the SAME percent read
+    back from the resting order's own descr.price field (there is no
+    numeric trailing_pct stored anywhere in memory to fall back on)."""
+    state_path = str(tmp_path / "state.json")
+    json.dump({
+        "symbol": "BTC/CAD", "cash": 89.88, "position": 0.001,
+        "cost_basis": 88_870.0, "realized_pnl": 0.0, "fees_paid": 0.0,
+        "native_stop_order_id": "trail-001", "native_stop_price": None,
+        "native_stop_is_trailing": True,
+        "saved_at": "2026-08-01T00:00:00+00:00",
+    }, open(state_path, "w"))
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = _DEFAULT_MARKETS
+    mock_ex.fetch_balance.return_value = {
+        "free": {"CAD": 89.88, "BTC": 0.001}, "total": {"CAD": 89.88, "BTC": 0.001},
+    }
+    mock_ex.fetch_open_orders.return_value = [{
+        "id": "trail-001", "amount": 0.0005, "remaining": 0.0005,
+        "info": {"descr": {"ordertype": "trailing-stop", "price": "+2.5000%"}},
+    }]
+
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = mock_ex
+        ex = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=100.0, dry_run=False, state_path=state_path,
+            native_stop_loss_enabled=True,
+        )
+
+    mock_ex.cancel_order.assert_called_once_with("trail-001", "BTC/CAD")
+    mock_ex.create_order.assert_called_once()
+    call = mock_ex.create_order.call_args
+    assert abs(call[0][3] - 0.001) < 1e-9
+    assert call[1]["params"]["trailingPercent"] == "2.5000"
+    assert ex.native_stop_is_trailing
+
+
+# ---------------------------------------------------------------------------
+# Gap B — untracked-but-real resting order not adopted
+# (2026-08-20 follow-up pass; see .memory/execution_layer.md)
+# ---------------------------------------------------------------------------
+
+def test_native_stop_startup_adopts_untracked_single_static_stop(tmp_path):
+    """State file's tracked id is missing entirely (lost to a crash before
+    save), but a real static stop order is actually resting — adopted
+    verbatim instead of main.py placing a duplicate."""
+    state_path = str(tmp_path / "state.json")
+    json.dump({
+        "symbol": "BTC/CAD", "cash": 89.88, "position": 0.001,
+        "cost_basis": 88_870.0, "realized_pnl": 0.0, "fees_paid": 0.0,
+        "saved_at": "2026-08-01T00:00:00+00:00",
+    }, open(state_path, "w"))
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = _DEFAULT_MARKETS
+    mock_ex.fetch_balance.return_value = {
+        "free": {"CAD": 89.88, "BTC": 0.001}, "total": {"CAD": 89.88, "BTC": 0.001},
+    }
+    mock_ex.fetch_open_orders.return_value = [{
+        "id": "orphan-001",
+        "info": {"descr": {"ordertype": "stop-loss", "price": "87500.0"},
+                  "stopprice": "87500.0"},
+    }]
+
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = mock_ex
+        with patch.object(TelegramAlerter, "message") as mock_msg:
+            ex = LiveExecutor(
+                exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+                starting_cash=100.0, dry_run=False, state_path=state_path,
+                native_stop_loss_enabled=True,
+            )
+
+    assert ex.has_resting_stop
+    assert ex._native_stop_order_id == "orphan-001"
+    assert ex._native_stop_price == 87_500.0
+    assert not ex.native_stop_is_trailing
+    mock_ex.create_order.assert_not_called()   # adopted, not duplicated
+    mock_msg.assert_called_once()
+    assert "ADOPTED" in mock_msg.call_args[0][0]
+
+
+def test_native_stop_startup_adopts_untracked_trailing_stop(tmp_path):
+    """Same adoption path, but the untracked resting order is a trailing
+    stop — native_stop_is_trailing must be set True and native_stop_price
+    stays None (no fixed price for a trailing order, same convention as a
+    freshly-placed one)."""
+    state_path = str(tmp_path / "state.json")
+    json.dump({
+        "symbol": "BTC/CAD", "cash": 89.88, "position": 0.001,
+        "cost_basis": 88_870.0, "realized_pnl": 0.0, "fees_paid": 0.0,
+        "saved_at": "2026-08-01T00:00:00+00:00",
+    }, open(state_path, "w"))
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = _DEFAULT_MARKETS
+    mock_ex.fetch_balance.return_value = {
+        "free": {"CAD": 89.88, "BTC": 0.001}, "total": {"CAD": 89.88, "BTC": 0.001},
+    }
+    mock_ex.fetch_open_orders.return_value = [{
+        "id": "orphan-002",
+        "info": {"descr": {"ordertype": "trailing-stop", "price": "+2.0000%"}},
+    }]
+
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = mock_ex
+        ex = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=100.0, dry_run=False, state_path=state_path,
+            native_stop_loss_enabled=True,
+        )
+
+    assert ex.has_resting_stop
+    assert ex._native_stop_order_id == "orphan-002"
+    assert ex.native_stop_price is None
+    assert ex.native_stop_is_trailing
+    mock_ex.create_order.assert_not_called()
+
+
+def test_native_stop_startup_multiple_untracked_stops_not_adopted(tmp_path):
+    """No tracked id AND 2+ real stop-type orders resting — the same
+    ambiguous situation as the tracked-id case, must alert and adopt
+    nothing (never guess which one is 'ours')."""
+    state_path = str(tmp_path / "state.json")
+    json.dump({
+        "symbol": "BTC/CAD", "cash": 89.88, "position": 0.001,
+        "cost_basis": 88_870.0, "realized_pnl": 0.0, "fees_paid": 0.0,
+        "saved_at": "2026-08-01T00:00:00+00:00",
+    }, open(state_path, "w"))
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = _DEFAULT_MARKETS
+    mock_ex.fetch_balance.return_value = {
+        "free": {"CAD": 89.88, "BTC": 0.001}, "total": {"CAD": 89.88, "BTC": 0.001},
+    }
+    mock_ex.fetch_open_orders.return_value = [
+        {"id": "orphan-001", "info": {"descr": {"ordertype": "stop-loss"}}},
+        {"id": "orphan-002", "info": {"descr": {"ordertype": "trailing-stop"}}},
+    ]
+
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = mock_ex
+        with patch.object(TelegramAlerter, "error") as mock_alert:
+            ex = LiveExecutor(
+                exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+                starting_cash=100.0, dry_run=False, state_path=state_path,
+                native_stop_loss_enabled=True,
+            )
+
+    assert not ex.has_resting_stop   # nothing adopted
+    mock_ex.create_order.assert_not_called()
+    mock_alert.assert_called_once()
+    assert "NATIVE STOP AMBIGUOUS" in mock_alert.call_args[0][0]
+
+
+def test_native_stop_startup_no_untracked_stops_unchanged_gap_behavior(tmp_path):
+    """No tracked id and nothing resting on the exchange either — unchanged
+    pre-existing behavior: logged as a gap, nothing adopted, no ambiguity
+    alert (there's nothing ambiguous about zero orders)."""
+    state_path = str(tmp_path / "state.json")
+    json.dump({
+        "symbol": "BTC/CAD", "cash": 89.88, "position": 0.001,
+        "cost_basis": 88_870.0, "realized_pnl": 0.0, "fees_paid": 0.0,
+        "saved_at": "2026-08-01T00:00:00+00:00",
+    }, open(state_path, "w"))
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = _DEFAULT_MARKETS
+    mock_ex.fetch_balance.return_value = {
+        "free": {"CAD": 89.88, "BTC": 0.001}, "total": {"CAD": 89.88, "BTC": 0.001},
+    }
+    mock_ex.fetch_open_orders.return_value = []
+
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = mock_ex
+        with patch.object(TelegramAlerter, "error") as mock_alert, \
+             patch.object(TelegramAlerter, "message") as mock_msg:
+            ex = LiveExecutor(
+                exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+                starting_cash=100.0, dry_run=False, state_path=state_path,
+                native_stop_loss_enabled=True,
+            )
+
+    assert not ex.has_resting_stop
+    mock_ex.create_order.assert_not_called()
+    mock_alert.assert_not_called()
+    mock_msg.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

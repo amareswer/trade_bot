@@ -121,6 +121,58 @@ identical reason on `reduce_only`/`post_only`). Sized at the real `MAX_SLOT_CASH
 of verification (ccxt-source-level and real-server-level) are now PASS. This does not need
 re-running absent a ccxt/Kraken API change.
 
+**Both remaining flagged gaps CLOSED, 2026-08-20 (same-day follow-up pass).** The two items
+the entry above deliberately left unfixed both turned out to be real, traced against the
+actual code (not assumed) before any change was made — see the full investigation writeup in
+conversation history if needed; summary here:
+
+*Gap A — resting order quantity mismatch.* `_verify_resting_stop_on_startup()` only checked
+`still_open` (id membership), never volume. Confirmed via ccxt's installed `kraken.py`
+(`parse_order()`) that the unified `order['amount']`/`order['remaining']` fields are populated
+straight from Kraken's raw `vol`/`vol_exec` — no need to reach into `info` for this half.
+Fixed with a **hybrid** policy (explicit user decision, not unilateral — two other options
+were presented: always-replace, and alert-only-never-replace):
+`_reconcile_resting_stop_quantity()` always alerts (Telegram `.error()`) on any mismatch
+beyond a `1e-5`-unit tolerance (`_STOP_QTY_MISMATCH_THRESHOLD`, same magnitude as
+`_EXTERNAL_THRESHOLD`), but only auto cancel+replaces when the resting order is **under-sized**
+(the genuinely-unprotected direction) — sized back up to the current position at the SAME
+price/trailing-pct. An **over-sized** resting order is left untouched: benign (Kraken can't
+oversell a position you don't have), and for a trailing stop, replacing it would forfeit
+Kraken's server-tracked trail-peak progress for zero protective benefit. The replacement price/
+trailing-pct is read back from the resting order's own raw fields via a new
+`_extract_stop_trigger()` helper — `info['stopprice']` for a static stop, or `info['descr']
+['price']` (Kraken's relative `"+X.XXXX%"` string; ccxt nulls its own unified `price` field for
+a trailing order, confirmed in `kraken.py`) for a trailing one — never recomputed from
+`avg_entry`/ATR, matching the pre-existing "keep a resting order's level as-is" philosophy.
+
+*Gap B — untracked-but-real resting order.* Confirmed the existing multi-order ambiguity alert
+(added in the entry above) does **NOT** cover this case, contrary to what that entry assumed:
+`_verify_resting_stop_on_startup()`'s "no tracked id" branch `return`ed before ever calling
+`fetch_open_orders()`, so the ambiguity scan — which runs later in the same function — was
+structurally unreachable whenever `native_stop_order_id` was `None`. Concrete consequence
+traced through to `bot/main.py`'s startup reconciliation (`if position>0 and not
+has_resting_stop: sync_protective_stop(fallback_sl)`): `sync_protective_stop()`'s first line
+is `_cancel_native_stop()`, which itself is a no-op when there's no tracked id — so the real
+untracked order on Kraken was never touched, and a second, newly-tracked stop got placed
+alongside it. Fixed: `_verify_resting_stop_on_startup()` now fetches open orders unconditionally
+(once, for both the tracked and untracked paths) and, when there's no tracked id, scans for
+stop-type orders first. Exactly one found → `_adopt_untracked_stop()` trusts it verbatim
+(id/price/trailing-flag straight from the exchange, same "exchange is authoritative"
+philosophy as `_sync_position`/`_sync_cash`) instead of placing a duplicate — Telegram
+`.message()` notes the adoption (not `.error()` — this is the recovery working as intended, not
+a fault). Two or more found → same `_alert_ambiguous_stops()` used by the tracked-id path,
+nothing adopted. Zero found → unchanged pre-existing behavior (logged gap, main.py's fallback
+placement proceeds).
+
+Both gaps required a restructure of `_verify_resting_stop_on_startup()` (fetch-then-branch
+instead of branch-then-fetch) but no change to its public contract — `has_resting_stop`,
+`native_stop_price`, `native_stop_is_trailing` all mean the same thing as before, just kept
+accurate in two more restart scenarios. Tests: `test_live_executor.py`, +9 (Gap A: resize-
+under-sized static, leave-over-sized static, no-alert-on-match, skip-when-qty-unknown,
+resize-under-sized-trailing-reads-pct-from-order; Gap B: adopt-untracked-static, adopt-
+untracked-trailing, multiple-untracked-not-adopted, zero-untracked-unchanged-behavior). Suite
+543→552. No `bot/strategy/*` touched — confirmed via `git status`, no walk-forward needed.
+
 ---
 
 ## PaperExecutor — `bot/execution/executor.py`
