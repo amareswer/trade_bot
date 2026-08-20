@@ -1,6 +1,6 @@
 ---
 name: telegram-control
-description: Two-way Telegram control for the crypto bot (getUpdates poller) — commands, auth model, and the shared-token constraint with the stock bot
+description: Two-way Telegram control for the crypto bot (getUpdates poller) — commands, auth model, and the shared-token constraint with the stock bot. Built and ENABLED LIVE 2026-08-20, live smoke test passed.
 metadata:
   type: project
 ---
@@ -32,9 +32,17 @@ worth flagging fast if it ever comes up again: **the shared-token constraint.**
   reply, INFO log only) — a reply would confirm to a stranger the bot is live and worth
   probing. An authorized chat sending an unrecognized command gets the same silent-ignore
   treatment.
-- Ships **off** by default — `TELEGRAM_CONTROL_ENABLED=false` (config.py default; not set in
-  `.env`), separate flag from `TELEGRAM_ENABLED` (outbound alerts). Built and tested, not yet
-  turned on live as of 2026-08-20.
+- Config.py default is `TELEGRAM_CONTROL_ENABLED=false` (opt-in by design, separate flag from
+  `TELEGRAM_ENABLED`), but **set to `true` in `.env` and enabled live 2026-08-20**, same day
+  it was built — bot restarted (PID 57954, 07:20 local), startup log confirmed the poller
+  thread started cleanly alongside heartbeat/dashboard/audit. Live smoke test: a bare `/help`
+  (missing the `_crypto` suffix) was correctly silently ignored (log line only, no reply) —
+  proving the ignore path works live, not just in tests — then `/help_crypto` and
+  `/status_crypto` were sent from the configured chat and replied to correctly.
+  `/status_crypto`'s reply (position 0.0, cash $77.00, halt clear, regime VOLATILE) was
+  cross-checked against `logs/live_state_BTC_CAD.json` and the absence of `logs/HALT` —
+  matched exactly. `/pause_crypto`/`/resume_crypto` deliberately NOT live-tested (would have
+  engaged the real halt mid-session); covered by the unit tests' end-to-end proof instead.
 
 **⚠️ Shared-token constraint — read this before ever adding a second `getUpdates` poller
 anywhere in this repo:** `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` are the SAME credentials the

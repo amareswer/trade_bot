@@ -590,17 +590,30 @@ it only ever makes a BUY more conservative, never loosens anything. Tests:
 (silent/blocked/re-alert-suppressed on the stale side, unchanged; two new: alerts + unblocks
 on recovery, and a recovered feed doesn't re-alert on subsequent fresh ticks).
 
-### Two-way Telegram control (crypto — built 2026-08-20, opt-in, off by default)
+### Two-way Telegram control (crypto — built 2026-08-20, ENABLED live 2026-08-20)
 ```
-TELEGRAM_CONTROL_ENABLED=false   # NOT set in .env — using the config.py default (false).
-                                  # Separate from TELEGRAM_ENABLED (outbound alerts only):
-                                  # this one starts an INBOUND getUpdates poller — a real
-                                  # control surface, not just notifications — so it ships
-                                  # opt-in rather than silently active on upgrade, same
-                                  # reasoning as NATIVE_STOP_LOSS_ENABLED. Set true (same
-                                  # TELEGRAM_BOT_TOKEN/CHAT_ID already used for alerts) to
-                                  # turn it on.
+TELEGRAM_CONTROL_ENABLED=true    # Set in .env 2026-08-20 (was false/unset — config.py
+                                  # default is still false). Separate from TELEGRAM_ENABLED
+                                  # (outbound alerts only): this one starts an INBOUND
+                                  # getUpdates poller — a real control surface, not just
+                                  # notifications, so it shipped opt-in rather than silently
+                                  # active on upgrade, same reasoning as
+                                  # NATIVE_STOP_LOSS_ENABLED. Turned on the same day it was
+                                  # built, after the live smoke test below passed clean.
 ```
+**Live smoke test, 2026-08-20 (bot restarted PID 57954, 07:20 local):** startup log confirmed
+`bot.alerts.telegram_control INFO Telegram control thread 'telegram-control-crypto' started`
+right alongside the heartbeat/dashboard/audit threads, no errors. A bare `/help` (missing the
+`_crypto` suffix) was correctly silently ignored (`Telegram control: unrecognized command
+ignored: '/help'`, logged server-side, no reply) — live proof the namespacing/ignore path
+works, not just the happy path. `/help_crypto` and `/status_crypto` were then sent from the
+configured chat and replied to correctly; `/status_crypto`'s reply (position 0.0, cash $77.00,
+halt clear, regime VOLATILE) was cross-checked against `logs/live_state_BTC_CAD.json` (cash
+77.0, position 0.0) and the absence of `logs/HALT` — matched exactly, confirming the reply
+reflects real live state, not stale or fabricated data. `/pause_crypto`/`/resume_crypto` were
+deliberately NOT live-tested (would have engaged the real halt mid-session) — covered by the
+28 unit tests instead (see below), including the end-to-end proof they drive the same
+`_check_halt_flag()` the tick loop already polls.
 Closes the gap flagged during the 2026-08-19 Freqtrade comparison: Telegram was alert-only
 (`bot/alerts/telegram.py`'s `TelegramAlerter`, outbound `sendMessage` only), no way to query
 status or control the bot remotely without SSH. New module `bot/alerts/telegram_control.py`
@@ -906,11 +919,11 @@ classify ordering, confirmed manually before landing). Suite 534→536.
   the same day too (see "Candle watchdog" above) — now blocks new BUYs while the feed is
   stale instead of only alerting, closing the fourth and last finding from that research
   pass. All four items from the 2026-08-07 crypto-bot gap review are now closed.
-  Two-way Telegram control built 2026-08-20 (see "Two-way Telegram control" above) —
-  `/status_crypto`, `/pause_crypto`, `/resume_crypto`, `/status_stock`, `/help_crypto` via a
-  `getUpdates` long-poller, closing the Freqtrade-comparison gap (Telegram was alert-only).
-  Ships **off** by default (`TELEGRAM_CONTROL_ENABLED`) — built and tested this session but
-  not yet turned on live; the user opts in via `.env` when ready.
+  Two-way Telegram control built AND enabled live 2026-08-20 (see "Two-way Telegram control"
+  above) — `/status_crypto`, `/pause_crypto`, `/resume_crypto`, `/status_stock`,
+  `/help_crypto` via a `getUpdates` long-poller, closing the Freqtrade-comparison gap
+  (Telegram was alert-only). `TELEGRAM_CONTROL_ENABLED=true` in `.env`, bot restarted, live
+  smoke test passed (`/help_crypto`/`/status_crypto` verified against real on-disk state).
 - **Known live incident, 2026-08-15 (Kraken auth + monitoring blind spot):** while the user
   was traveling (bot host machine still running, still had internet — public Kraken
   ticker/candle calls kept succeeding throughout), every *authenticated* Kraken call
