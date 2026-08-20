@@ -1,6 +1,6 @@
 ---
 name: expert-practices-benchmark
-description: 2026-08-18 web research on how experts run crypto trading bots, benchmarked against this codebase's actual practices — what already matches/exceeds, two real gaps, decision not to implement either right now. 2026-08-19 addendum vs Freqtrade adds a third candidate (lookahead/recursive-bias check tooling) — resolved 2026-08-20: no lookahead bug, but a related self-referential-baseline bug was found and fixed. See [[stock-offline-audit-2026-08-20]] for the sibling check of the stock bot's independent offline indicator implementation — clean, no bug found.
+description: 2026-08-18 web research on how experts run crypto trading bots, benchmarked against this codebase's actual practices — what already matches/exceeds, two real gaps, decision not to implement either right now. 2026-08-19 addendum vs Freqtrade adds a third candidate (lookahead/recursive-bias check tooling) — resolved 2026-08-20: no lookahead bug, but a related self-referential-baseline bug was found and fixed. See [[stock-offline-audit-2026-08-20]] for the sibling check of the stock bot's independent offline indicator implementation — clean, no bug found. 2026-08-20 re-evaluation: DSR/CSCV deferral (gap #2) re-checked against everything since — still holds, no parameter grid search introduced; symbol-screening's adjacent multiple-testing exposure characterized precisely rather than hand-waved.
 metadata:
   type: project
 ---
@@ -134,3 +134,56 @@ fix). Suite 534→536.
 
 **Addendum's original candidate item is now closed** — worth revisiting only if the strategy
 gains genuinely incremental/stateful indicator math in the future (none exists today).
+
+---
+
+## Re-evaluation 2026-08-20: DSR/CSCV deferral (gap #2) — still holds
+
+Asked to revisit whether the original trigger — *"multi-parameter grid optimization across
+many symbols"* — has actually occurred since 2026-08-18. Checked every script capable of it
+by git-log last-touched date, not by assumption:
+
+`validate_symbol.py`, `universe_manager.py`, `screen_universe.py`, `rescreen.py`,
+`walkforward.py` — none touched since 2026-07-18, none touched by the 2026-08-19/20 sessions
+(ATR self-referential-baseline fix, native-stop gap fixes, Telegram control, stock offline
+audit, capital-gate check, BTC signal-drought investigation — none involved parameter
+tuning). The one real parameter sweep in the repo, `swing_backtest.py` (6 SL/TP
+combinations), is dormant since 2026-07-03 and tied to the swing book, which is now retired
+(`FAST_ENABLED=false`). `swing_atr_walkforward.py` explicitly documents itself as "no grid
+search over other [values]" — a deliberate one-shot validation, not a sweep.
+**Verdict: trigger condition has not fired. Deferral stands.**
+
+**The one question worth answering precisely rather than dismissing:** does
+`screen_universe.py` screening ~15 candidate symbols against one fixed strategy config count
+as the same multiple-testing bias DSR/CSCV correct for? **Yes, structurally the same
+selection-bias mechanism** — "try N things, keep the ones that pass" inflates false-positive
+risk whether the free variable is a parameter or a symbol; not a categorically different
+problem, and worth being honest about that rather than reflexively distinguishing it away.
+Confirmed via `_run_window()` in `screen_universe.py`: every parameter passed to `engine.run()`
+across every candidate and every window is `cfg.strategy.*`/`cfg.risk.*` — the SAME live
+config, zero per-symbol variation — so it's pure symbol-selection multiple-testing, no
+parameter-search compounding it. `rescreen.py` runs this monthly, so it's an ongoing practice,
+not a one-off — noted, not a reason to change the verdict.
+
+**Why the marginal value stays low despite the mechanism being real:** (1) scale — 15
+candidates is far below the trial counts (typically hundreds+) where DSR's deflation starts
+to diverge meaningfully from a naive threshold; (2) the pass bar is already a genuine 3-window
+walk-forward, not a single in-sample fit; (3) the actual capital-scaling gate
+([[project_trade_bot]] / CLAUDE.md Capital Sizing Rules — 15+ live fills, PF≥1.2 **and**
+shadow-match-rate≥95% before any increase) is an empirical version of exactly what DSR/CSCV
+approximate statistically — "don't trust the backtest selection alone" — already enforced
+downstream of the screen; (4) the one documented false-positive case (XRP/CAD, validated on a
+stale strategy version, caught and removed 2026-07-02) was caught by the
+re-validate-on-every-strategy-change rule, not something a screen-time DSR/CSCV check would
+have flagged differently.
+
+**Effort estimate, for the record (not a recommendation to build):** DSR added to
+`screen_universe.py`'s output — well under a day (per-window Sharpe already derivable from
+existing trade stats, standard Bailey/López de Prado formula, ~30-50 lines). CSCV/PBO —
+several days (combinatorial train/test partitioning per candidate, multiplies backtest
+runtime, needs real care to trust the implementation).
+
+**Decision: deferral stands, unchanged.** No code written this pass — investigation only.
+Revisit trigger is unchanged from the original: multi-parameter grid search actually combined
+with multi-symbol screening. Symbol-screening alone, at this scale, with these existing
+downstream mitigations, doesn't clear that bar.

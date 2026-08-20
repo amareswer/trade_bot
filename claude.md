@@ -1174,6 +1174,46 @@ The 15-fill capital gate ($100 → $250) requires **ALL THREE**, not just PF:
   re-running XRP walk-forward. XRP traded live with real money for weeks on a stale,
   passing-but-now-failed validation before being caught and removed 2026-07-02.
 
+### Deflated Sharpe Ratio / CSCV — deferred, re-evaluated 2026-08-20, deferral stands
+
+Deflated Sharpe Ratio (DSR) and Combinatorially Symmetric Cross-Validation / Probability of
+Backtest Overfitting (CSCV/PBO) are institutional-grade corrections for multiple-testing
+bias — inflated backtest results from trying many strategy variations and keeping the
+best-performing one. Surfaced 2026-08-18 during a benchmark against outside research, judged
+premature at the time (single BTC/CAD symbol, small personal capital, no active
+multi-parameter search) and deferred, revisit condition: *"the strategy search space grows
+materially (e.g., multi-parameter grid optimization across many symbols)."*
+
+**Re-checked 2026-08-20 — condition hasn't fired, deferral stands.** Every script capable of a
+parameter search (`validate_symbol.py`, `universe_manager.py`, `screen_universe.py`,
+`rescreen.py`, `walkforward.py`) is untouched since 2026-07-18, and untouched by the
+2026-08-19/20 sessions (ATR self-referential-baseline fix, native-stop gap fixes, Telegram
+control, capital-gate/signal-drought checks — none involved parameter tuning). The one real
+parameter sweep in the repo (`swing_backtest.py`, 6 SL/TP combinations) is dormant since
+2026-07-03 and tied to the now-retired swing book.
+
+**One question worth answering precisely, not dismissing:** `screen_universe.py` screens up
+to `SCREEN_MAX_CANDIDATES=15` symbols (monthly, via `rescreen.py`) against one fixed strategy
+config (`cfg.strategy.*`/`cfg.risk.*`, identical across every candidate and window — confirmed
+by reading `_run_window()`). Structurally, this **is** the same multiple-testing/selection-bias
+mechanism DSR/CSCV correct for — trying N things and keeping the ones that pass inflates
+false positives whether the free variable is a parameter or a symbol. Not a categorically
+different problem. It stays low-value to formalize anyway because: the trial count (~15) is
+far below where DSR's correction diverges meaningfully from a naive threshold; the pass bar is
+already a genuine 3-window walk-forward, not an in-sample fit; and the real gate is downstream
+of the screen anyway — the 15-fill live capital gate above (PF≥1.2 **and** shadow-match≥95%)
+is an empirical version of exactly what DSR/CSCV approximate statistically ("don't trust the
+backtest selection alone"). The one documented false positive (XRP/CAD, above) was caught by
+the re-validate-on-every-strategy-change rule, not something a screen-time statistical
+correction would have flagged differently.
+
+Effort if ever revisited: DSR added to `screen_universe.py`'s output — well under a day
+(Sharpe already derivable from existing trade stats, standard formula, ~30-50 lines). CSCV/PBO
+— several days (combinatorial train/test partitioning per candidate, multiplies backtest
+runtime). Revisit trigger unchanged: multi-parameter grid search actually *combined with*
+multi-symbol screening — symbol-screening alone, at this scale, with these downstream
+mitigations, doesn't clear that bar. Full writeup: `.memory/decisions/expert-practices-benchmark.md`.
+
 ---
 
 ## Standing Policies

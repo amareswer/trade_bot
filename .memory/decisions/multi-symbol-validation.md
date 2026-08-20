@@ -1,6 +1,6 @@
 ---
 name: multi-symbol-validation
-description: "Symbol ranking, fee constraint, and expansion decisions from 2026-06-11 multi-symbol backtest"
+description: "Symbol ranking, fee constraint, and expansion decisions from 2026-06-11 multi-symbol backtest. 2026-08-20 addendum: live investigation into BTC/CAD's 7-week zero-BUY drought confirms and extends the original 'BTC is weak now' finding — MTF daily-trend veto data, blocked-gate distribution, real price characterization."
 metadata:
   type: project
 ---
@@ -35,6 +35,54 @@ Everything net-negative at 0.8% fee, regardless of signal quality (even SOL PF 1
 - Do NOT switch to Binance — unavailable in Canada
 
 **Why:** 2026-06-11 first live fill returned 0.80% actual fee vs 0.26% modeled. Cause not yet confirmed (fee-dict logging added; next fill will reveal the raw ccxt response).
+
+## BTC/CAD live signal drought — 2026-08-20 investigation (extends "Why BTC is weak now")
+
+The 2026-06-11 finding above ("very high EMA spread rejection ~69%, low ADX... BTC is the
+wrong instrument right now") held up under a full live-data investigation two months later:
+BTC/CAD produced **zero live BUY signals for 7 weeks straight** (2026-06-30 → 2026-08-20).
+Verdict: genuinely choppy/unfavorable regime, not a misconfigured gate or mechanical fault —
+confirmed, not assumed, against `logs/live_signals.csv`, real independently-fetched Kraken
+price data, the candle-watchdog/risk-breaker logs, and the strategy source itself.
+
+**Blocked-gate distribution (144 BUY-considered-then-blocked candles, `logs/live_signals.csv`,
+2026-07-02 → 2026-08-20):** ADX<18 threshold 52 (36%), "regime" 43 (30%, of which 36 =
+`REGIME_EMA_PERIOD=200` macro filter, 5 = genuine VOLATILE/ATR-spike, 2 unresolved),
+EMA_spread 24 (17%), MACD 22 (15%), trend 2, RSI 1. The binding gate **shifts week to week**
+with measured ADX — high-ADX weeks get blocked by `regime`/EMA_spread/MACD, low-ADX weeks get
+blocked by ADX itself — consistent with genuine chop rotating which single condition fails,
+not one gate stuck misfiring.
+
+**Real price action (fetched fresh from Kraken, independent of the bot's own logs), June 1 →
+Aug 20:** net move **−2.5%** despite a **22.8% high-low range** — textbook ranging signature.
+Walk-forward ADX(14): mean 26.8, but 22% of all readings below the 18 threshold, weekly means
+swinging 18.7–36.9. Not dead-flat, not cleanly trending either — exactly the kind of stretch a
+trend-following, walk-forward-validated strategy is expected to sit out.
+
+**The one MTF (multi-timeframe) daily-trend veto, 2026-08-18 12:00 UTC:** the strategy's ONLY
+raw BUY signal in the entire 7-week window (price $90,042, valid 4h Mode A/B setup, price
++0.59% *above* the 200-EMA so the regime_ema macro filter did NOT block it, `regime=TRENDING`
+not VOLATILE) was vetoed by the separate MTF daily-trend gate in `bot/main.py`:
+`MTF gate [BTC/CAD]: BUY suppressed — daily trend BEARISH`. The 4h leg turned bullish inside a
+daily chart still reading bearish — the gate did exactly its documented job (filtering a
+probable false start within a larger range), not a bug. Worth remembering as the one concrete
+moment anything got close, but it's one candle out of hundreds — doesn't change the "genuinely
+unfavorable regime" verdict on its own.
+
+**Mechanically clean throughout:** zero candle-watchdog stale-feed events in either direction
+(feed never went stale — confirmed via log grep, not assumed). No risk-manager breaker ever
+engaged (`halt=False` at every restart across the window, `kill_switch_tripped: false`,
+`peak_value` unchanged at $77 — no drawdown to speak of, consistent with zero trades). The
+known Kraken auth outage (2026-08-11→15, already documented elsewhere) only affected
+authenticated balance/position sync, never the public candle feed signals are generated from,
+and didn't overlap the one real BUY attempt (which was Aug 18, after that incident resolved).
+
+**How to apply:** if BTC/CAD goes quiet again for an extended stretch, this is the checklist
+that was actually run (blocked-gate tabulation from `live_signals.csv` + independent price
+refetch + watchdog/breaker log grep) — re-run it before assuming either "the strategy is
+broken" or "nothing to see here." A shifting blocked-gate bottleneck tracking real measured
+ADX is the signature of genuine chop; a gate stuck on one label regardless of market
+conditions would be the signature of an actual misconfiguration.
 
 ## Decisions
 
