@@ -4,8 +4,43 @@ Confidence band accuracy tracker + Live Trading Gate for the stock bot.
 ConfidenceBandTracker — reads paper_trades.csv, pairs BUY→SELL round trips,
 and reports whether the AI confidence score predicts profitable outcomes.
 
-LiveTradingGate — four-gate check-list that must all PASS before switching
-to live IBKR trading.  Call print_gate_status() to see current state.
+LiveTradingGate — four-gate check-list surfaced on the dashboard and in the
+weekly email as a live-trading readiness indicator. Call print_gate_status()
+to see current state.
+
+DISPLAY-ONLY as of 2026-08-20 — deliberately not wired into IBKRExecutor or
+IBKR_ALLOW_LIVE. Whether/how to make a PASS status actually block or gate a
+live-trading switch (most likely mirroring IBKRExecutor's existing
+allow_live "refuse to start" pattern in stock_bot/execution/ibkr.py) is an
+open, deferred decision — see CLAUDE.md and .memory/decisions/ for the
+2026-08-20 gate-repair session that fixed what these gates measure without
+yet deciding whether they enforce anything.
+
+Gate definitions corrected 2026-08-20 (see the same session's investigation
+first, then this fix pass):
+  Gate 1 — was validating a stale (2026-06-29), disconnected strategy config
+           via the dead stock_bot/backtest.py tool. Now reads
+           logs/stock_backtest_latest.json, written by the CURRENT
+           walk-forward tool (stock_backtest.py / stock_bot/backtest/
+           engine.py, which imports bot/strategy/indicator_strategy.py
+           directly — the same module rules.py's live signal path uses, so
+           this gate now checks the strategy the bot actually runs) against
+           the CURRENT RULE_WHITELIST symbols, not a hardcoded AAPL/SPY pair.
+  Gate 2 — was checking fast_trades.csv, the retired swing/fast book
+           (FAST_ENABLED=false, frozen since 2026-07-22, structurally could
+           never reach its own pass threshold again). Repurposed to AI
+           confidence-band edge: reads the same active position book Gate 3
+           reads, but asks whether MED/HIGH-confidence AI calls are actually
+           predictive — a genuine second signal (AI-advisory-path
+           calibration), independent of whether the rules-based strategy
+           itself has edge, not a duplicate of Gate 3.
+  Gate 3 — threshold raised from 5 round-trips (far below any real
+           readiness signal) to the already-documented "Stock Phase A gate"
+           / "IBKR live go-live" bar in CLAUDE.md's Roadmap: >=30 completed
+           round-trips, PF>=1.2, win rate>=30%, all three required. Label
+           corrected from "Swing paper (daily)" (stale — this reads the
+           active Mode A/B position book, not the retired swing book).
+  Gate 4 — unchanged (infrastructure importability smoke check).
 """
 from __future__ import annotations
 
@@ -17,11 +52,15 @@ from datetime import datetime
 # ─────────────────────────────── paths ────────────────────────────────────────
 
 _STOCK_BOT_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PROJECT_ROOT    = os.path.dirname(_STOCK_BOT_DIR)
 
 _TRADES_CSV      = os.path.join(_STOCK_BOT_DIR, "paper_trades.csv")
 _IBKR_CSV        = os.path.join(_STOCK_BOT_DIR, "ibkr_trades.csv")
-_FAST_TRADES_CSV = os.path.join(_STOCK_BOT_DIR, "fast_trades.csv")
-_BACKTEST_JSON   = os.path.join(_STOCK_BOT_DIR, "backtest_results.json")
+# Fixed path stock_backtest.py (project root) writes on every run — see that
+# file's module docstring. NOT stock_bot/backtest_results.json (the old
+# path) — that was written by the dead stock_bot/backtest.py tool and is no
+# longer read by anything in this file.
+_LATEST_BACKTEST_JSON = os.path.join(_PROJECT_ROOT, "logs", "stock_backtest_latest.json")
 
 # ─────────────────────── confidence band constants ────────────────────────────
 
@@ -259,11 +298,12 @@ class ConfidenceBandTracker:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Gate thresholds — change only after re-validation
-_GATE_SYMBOLS       = ("AAPL", "SPY")   # MSFT excluded — walk-forward FAIL 2024-now (monitor only)
-_GATE1_MIN_PASS     = 2      # symbols (of 2) that must pass all WF windows
-_GATE2_MIN_TRADES   = 20
-_GATE2_MIN_WIN_PCT  = 50.0   # percent
-_GATE3_MIN_TRADES   = 5
+_GATE1_QUORUM        = "all"   # every current RULE_WHITELIST symbol must PASS
+_GATE2_MIN_TRADES    = 10      # MED/HIGH-confidence round-trips (mirrors recommendation()'s own bar)
+_GATE2_MIN_WIN_PCT   = 55.0    # percent — mirrors recommendation()'s "AI HAS EDGE" threshold
+_GATE3_MIN_TRADES    = 30      # CLAUDE.md "Stock Phase A gate" / "IBKR live go-live" bar
+_GATE3_MIN_PF        = 1.2
+_GATE3_MIN_WIN_PCT   = 30.0    # percent
 
 _STATUS_DISPLAY = {
     "PASS":    "PASS    ✓",
@@ -273,107 +313,132 @@ _STATUS_DISPLAY = {
 }
 
 
+def _fmt_pf(pf: float) -> str:
+    return "inf" if pf == float("inf") else f"{pf:.2f}"
+
+
 class LiveTradingGate:
     """
-    Four-gate live trading readiness check.
+    Four-gate live trading readiness check. DISPLAY-ONLY — see module
+    docstring for the deferred enforcement decision.
 
-    Gate 1 — Backtest walk-forward (backtest_results.json):
-              At least 2 of 2 symbols (AAPL/SPY) must have PF ≥ 1.3
-              in all 3 walk-forward windows.
-              (MSFT excluded — walk-forward FAIL 2024-now, monitor only)
+    Gate 1 — Backtest walk-forward (logs/stock_backtest_latest.json):
+              Every symbol in the CURRENT RULE_WHITELIST must have
+              verdict PASS in the latest stock_backtest.py run — the same
+              tool (and same bot/strategy/indicator_strategy.py module) the
+              live rules engine actually runs.
 
-    Gate 2 — Fast validator (fast_trades.csv):
-              ≥ 20 completed 1h-candle round-trips with ≥ 50% win rate.
+    Gate 2 — AI confidence-band edge (paper_trades.csv + ibkr_trades.csv):
+              >= 10 completed MED/HIGH-confidence round-trips with a
+              >= 55% win rate — is the AI's confidence score actually
+              predictive, independent of the rules engine's own edge.
 
-    Gate 3 — Swing paper (paper_trades.csv):
-              ≥ 5 completed daily-candle round-trips (any confidence band).
+    Gate 3 — Position book, live (paper_trades.csv + ibkr_trades.csv):
+              >= 30 completed round-trips, PF >= 1.2, win rate >= 30% —
+              all three required. Matches CLAUDE.md's documented
+              "Stock Phase A gate" / "IBKR live go-live" bar.
 
     Gate 4 — Infrastructure:
               AI signal memory importable; TSX price-audit function importable.
 
     Statuses:  PASS | FAIL | PENDING | NOT_RUN
       PENDING — not enough data yet (gate not failed, just needs more trades)
-      NOT_RUN — gate 1 only, when backtest_results.json has never been written
+      NOT_RUN — gate 1 only, when logs/stock_backtest_latest.json has never
+                been written (stock_backtest.py never run)
     """
 
     # ── Gate 1: backtest walk-forward ─────────────────────────────────────────
 
     def check_gate1(self) -> dict:
-        if not os.path.exists(_BACKTEST_JSON):
+        if not os.path.exists(_LATEST_BACKTEST_JSON):
             return {
                 "status":        "NOT_RUN",
-                "detail":        "backtest_results.json missing — run: python -m stock_bot.backtest --walkforward",
+                "detail":        "logs/stock_backtest_latest.json missing — run: .venv/bin/python stock_backtest.py",
                 "passing_count": 0,
-                "total_count":   len(_GATE_SYMBOLS),
+                "total_count":   0,
             }
 
         try:
-            with open(_BACKTEST_JSON, "r", encoding="utf-8") as f:
+            with open(_LATEST_BACKTEST_JSON, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except (json.JSONDecodeError, OSError) as exc:
-            return {"status": "FAIL", "detail": f"backtest_results.json unreadable ({exc})"}
+            return {"status": "FAIL", "detail": f"stock_backtest_latest.json unreadable ({exc})"}
 
-        pass_pf = float(data.get("pass_threshold_pf", 1.3))
+        try:
+            from stock_bot.config import load as _load_stock_config
+            whitelist = sorted({
+                s.strip().upper()
+                for s in _load_stock_config().rule_whitelist_str.split(",")
+                if s.strip()
+            })
+        except Exception as exc:
+            return {"status": "FAIL", "detail": f"could not read RULE_WHITELIST: {exc}"}
+
+        if not whitelist:
+            return {"status": "FAIL", "detail": "RULE_WHITELIST is empty — nothing to validate"}
+
         run_at  = (data.get("run_at") or "")[:10]
         sym_map = {r["symbol"].upper(): r for r in data.get("results", [])}
 
         passing: list[str] = []
         failing: list[str] = []
-        for sym in sorted(s.upper() for s in _GATE_SYMBOLS):
+        missing: list[str] = []
+        for sym in whitelist:
             r = sym_map.get(sym)
             if r is None:
+                missing.append(sym)
+            elif r.get("verdict") == "PASS":
+                passing.append(sym)
+            else:
                 failing.append(sym)
-                continue
-            windows = r.get("windows", [])
-            sym_ok  = len(windows) >= 3 and all(
-                w.get("total_trades", 0) > 0
-                and (
-                    w.get("profit_factor") is None        # null = ∞ → always pass
-                    or float(w["profit_factor"]) >= pass_pf
-                )
-                for w in windows
-            )
-            (passing if sym_ok else failing).append(sym)
 
         run_note = f"  (run {run_at})" if run_at else ""
+        total    = len(whitelist)
 
-        _total    = len(_GATE_SYMBOLS)
-        _msft_note = " | MSFT excluded — walk-forward FAIL 2024-now"
-        if len(passing) >= _GATE1_MIN_PASS:
+        if len(passing) == total:
             return {
                 "status":        "PASS",
-                "detail":        (
-                    f"{len(passing)}/{_total} symbols pass all windows"
-                    f" (PF≥{pass_pf:.1f}): {', '.join(passing)}{run_note}{_msft_note}"
-                ),
+                "detail":        f"{len(passing)}/{total} RULE_WHITELIST symbols pass{run_note}",
                 "passing_count": len(passing),
-                "total_count":   _total,
+                "total_count":   total,
             }
+        problems = []
+        if failing:
+            problems.append(f"failing: {', '.join(failing)}")
+        if missing:
+            problems.append(f"not in latest run: {', '.join(missing)}")
         return {
             "status":        "FAIL",
             "detail":        (
-                f"{len(passing)}/{_total} pass, need {_GATE1_MIN_PASS}"
-                f" — failing: {', '.join(failing)}{run_note}{_msft_note}"
+                f"{len(passing)}/{total} RULE_WHITELIST symbols pass{run_note}"
+                f" — {'; '.join(problems)}"
             ),
             "passing_count": len(passing),
-            "total_count":   _total,
+            "total_count":   total,
         }
 
-    # ── Gate 2: fast validator ────────────────────────────────────────────────
+    # ── Gate 2: AI confidence-band edge ───────────────────────────────────────
 
     def check_gate2(self) -> dict:
+        """Reads the same active position book Gate 3 reads (NOT
+        fast_trades.csv — that book is retired, FAST_ENABLED=false, frozen
+        since 2026-07-22). Mirrors ConfidenceBandTracker.recommendation()'s
+        own MED/HIGH-band threshold (structured here instead of parsing its
+        return string, so this gate stays testable independent of that
+        method's exact wording)."""
         tracker = ConfidenceBandTracker()
-        trades  = tracker.load_trades(_FAST_TRADES_CSV)
-        pairs   = tracker.pair_trades(trades)
-        n       = len(pairs)
-        wins    = sum(1 for p in pairs if p["pnl_pct"] > 0)
-        win_pct = wins / n * 100 if n > 0 else 0.0
+        trades  = tracker.load_trades() + tracker.load_trades(_IBKR_CSV)
+        trades.sort(key=lambda t: t.get("timestamp", ""))
+        pairs    = tracker.pair_trades(trades)
+        med_high = [p for p in pairs if _confidence_band(p["confidence"]) in ("MED", "HIGH")]
+        n        = len(med_high)
+        win_pct  = (sum(1 for p in med_high if p["pnl_pct"] > 0) / n * 100) if n > 0 else 0.0
 
         if n < _GATE2_MIN_TRADES:
             return {
                 "status":  "PENDING",
                 "detail":  (
-                    f"{n} / {_GATE2_MIN_TRADES} trades"
+                    f"{n} / {_GATE2_MIN_TRADES} MED/HIGH-confidence round-trips"
                     f"  ({win_pct:.1f}% win rate, need {_GATE2_MIN_WIN_PCT:.0f}%)"
                 ),
                 "trades":  n,
@@ -382,21 +447,21 @@ class LiveTradingGate:
         if win_pct >= _GATE2_MIN_WIN_PCT:
             return {
                 "status":  "PASS",
-                "detail":  f"{n} trades  {win_pct:.1f}% win rate",
+                "detail":  f"{n} MED/HIGH-confidence round-trips  {win_pct:.1f}% win rate",
                 "trades":  n,
                 "win_pct": win_pct,
             }
         return {
             "status":  "FAIL",
             "detail":  (
-                f"{n} trades  {win_pct:.1f}% win rate"
+                f"{n} MED/HIGH-confidence round-trips  {win_pct:.1f}% win rate"
                 f" (need {_GATE2_MIN_WIN_PCT:.0f}%)"
             ),
             "trades":  n,
             "win_pct": win_pct,
         }
 
-    # ── Gate 3: swing paper ───────────────────────────────────────────────────
+    # ── Gate 3: position book, live ───────────────────────────────────────────
 
     def check_gate3(self) -> dict:
         tracker = ConfidenceBandTracker()
@@ -407,13 +472,43 @@ class LiveTradingGate:
         pairs   = tracker.pair_trades(trades)
         n       = len(pairs)
 
-        if n >= _GATE3_MIN_TRADES:
-            return {"status": "PASS", "detail": f"{n} round-trips", "pairs": n}
+        if n < _GATE3_MIN_TRADES:
+            return {
+                "status": "PENDING",
+                "detail": f"{n} / {_GATE3_MIN_TRADES} round-trips",
+                "pairs":  n,
+            }
 
+        wins         = sum(1 for p in pairs if p["pnl_pct"] > 0)
+        win_pct      = wins / n * 100
+        total_wins   = sum(p["pnl"] for p in pairs if p["pnl"] > 0)
+        total_losses = -sum(p["pnl"] for p in pairs if p["pnl"] <= 0)
+        pf           = (
+            (total_wins / total_losses) if total_losses > 0
+            else (float("inf") if total_wins > 0 else 0.0)
+        )
+        pf_ok  = pf >= _GATE3_MIN_PF
+        win_ok = win_pct >= _GATE3_MIN_WIN_PCT
+
+        if pf_ok and win_ok:
+            return {
+                "status":  "PASS",
+                "detail":  f"{n} round-trips  PF={_fmt_pf(pf)}  win rate={win_pct:.1f}%",
+                "pairs":   n,
+                "pf":      pf,
+                "win_pct": win_pct,
+            }
+        problems = []
+        if not pf_ok:
+            problems.append(f"PF {_fmt_pf(pf)} < {_GATE3_MIN_PF}")
+        if not win_ok:
+            problems.append(f"win rate {win_pct:.1f}% < {_GATE3_MIN_WIN_PCT:.0f}%")
         return {
-            "status": "PENDING",
-            "detail": f"{n} / {_GATE3_MIN_TRADES} round-trips",
-            "pairs":  n,
+            "status":  "FAIL",
+            "detail":  f"{n} round-trips but {', '.join(problems)}",
+            "pairs":   n,
+            "pf":      pf,
+            "win_pct": win_pct,
         }
 
     # ── Gate 4: infrastructure ────────────────────────────────────────────────
@@ -448,10 +543,10 @@ class LiveTradingGate:
     def evaluate(self) -> list[dict]:
         """Run all four gates. Returns list of gate-result dicts."""
         return [
-            {"gate": 1, "description": "Backtest walk-forward",    **self.check_gate1()},
-            {"gate": 2, "description": "Fast validator (1h paper)", **self.check_gate2()},
-            {"gate": 3, "description": "Swing paper (daily)",       **self.check_gate3()},
-            {"gate": 4, "description": "Infrastructure",            **self.check_gate4()},
+            {"gate": 1, "description": "Backtest walk-forward (current strategy)", **self.check_gate1()},
+            {"gate": 2, "description": "AI confidence-band edge",                  **self.check_gate2()},
+            {"gate": 3, "description": "Position book (live)",                     **self.check_gate3()},
+            {"gate": 4, "description": "Infrastructure",                           **self.check_gate4()},
         ]
 
     def get_gate_status(self) -> dict:
@@ -466,6 +561,8 @@ class LiveTradingGate:
                 "gate2_min_trades":  _GATE2_MIN_TRADES,
                 "gate2_min_win_pct": _GATE2_MIN_WIN_PCT,
                 "gate3_min_trades":  _GATE3_MIN_TRADES,
+                "gate3_min_pf":      _GATE3_MIN_PF,
+                "gate3_min_win_pct": _GATE3_MIN_WIN_PCT,
             },
         }
 
@@ -484,9 +581,9 @@ def print_gate_status() -> None:
       ══════════════════════════════════════════════════════════════════════
         #   Gate                           Status     Detail
         ──────────────────────────────────────────────────────────────────
-        1   Backtest walk-forward          PASS    ✓  3/3 symbols pass…
-        2   Fast validator (1h paper)      PENDING    7 / 20 trades …
-        3   Swing paper (daily)            PENDING    2 / 5 round-trips
+        1   Backtest walk-forward (current strategy)  PASS    ✓  16/16 RULE_WHITELIST symbols pass…
+        2   AI confidence-band edge        PENDING    6 / 10 MED/HIGH-confidence round-trips …
+        3   Position book (live)           PENDING    12 / 30 round-trips
         4   Infrastructure                 PASS    ✓  AI memory ✓  TSX audit ✓
         ──────────────────────────────────────────────────────────────────
         LIVE TRADING: 2 gates remaining

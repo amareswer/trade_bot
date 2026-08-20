@@ -14,7 +14,12 @@ Engine now lives in stock_bot/backtest/engine.py with its own test file
 (test_stock_backtest_engine.py).
 
 Run:    .venv/bin/python stock_backtest.py
-Output: console table + logs/stock_backtest_<date>.md
+Output: console table + logs/stock_backtest_<date>.md (dated historical record) +
+        logs/stock_backtest_latest.json (fixed path, overwritten every run — machine-
+        readable per-symbol verdicts, read by LiveTradingGate.check_gate1() in
+        stock_bot/analysis/accuracy_tracker.py; added 2026-08-20 so Gate 1 can validate
+        the CURRENT strategy instead of stock_bot/backtest.py's stale, disconnected
+        --walkforward output)
 
 Pass gate per symbol (same discipline as the crypto USD screen):
   - full-window completed trades >= 10
@@ -32,13 +37,14 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 
 # Ensure project root importable when run as a script
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+from bot.atomic_json import atomic_write_json
 from stock_bot.config import load as load_stock_config
 from stock_bot.data.price_feed import fetch_candles
 from stock_bot.backtest.engine import (
@@ -47,6 +53,10 @@ from stock_bot.backtest.engine import (
     run_symbol,
 )
 from stock_bot.strategy.rules import build_indicator_config
+
+# Fixed path, overwritten every run — see module docstring. Gate 1 always reads
+# exactly this file, no dated-filename parsing needed.
+_LATEST_JSON_PATH = os.path.join("logs", "stock_backtest_latest.json")
 
 logging.basicConfig(level=logging.WARNING)
 logging.getLogger("bot.strategy").setLevel(logging.ERROR)
@@ -101,16 +111,25 @@ def run() -> int:
 
     passes: list[str] = []
     fails:  list[str] = []
+    json_results: list[dict] = []
 
     for sym in symbols:
         candles = fetch_candles(sym, "1d", days)
         if not candles or len(candles) < 400:
             print(f"{sym:<10} SKIP — insufficient history ({len(candles) if candles else 0} candles)")
             report_lines.append(f"| {sym} | — | — | — | — | — | — | SKIP (thin history) |")
+            json_results.append({
+                "symbol":  sym,
+                "verdict": "SKIP",
+                "reason":  "insufficient history",
+                "candles": len(candles) if candles else 0,
+                "windows": [],
+            })
             continue
 
         sym_ok = True
         full_res: BacktestResult | None = None
+        sym_windows: list[dict] = []
         for w in WINDOWS:
             start_idx = 0 if w == 0 else max(0, len(candles) - w)
             res = run_symbol(sym, candles, bt_cfg, trade_start_idx=start_idx)
@@ -133,12 +152,30 @@ def run() -> int:
                 f"| {sym} | {label} | {n} | {wr:.1f}% | {_fmt_pf(pf)} | "
                 f"${res.total_net_pnl:+.2f} | {sl:.1f}% |{note or ' '}|"
             )
+            sym_windows.append({
+                "window_days":   w,
+                "label":         label,
+                "n_trades":      n,
+                "win_rate":      wr,
+                # inf isn't valid JSON — represented as null, same convention
+                # backtest_results.json used ("null = ∞ → always pass", see
+                # accuracy_tracker.py's old check_gate1 comment).
+                "profit_factor": None if pf == float("inf") else pf,
+                "net_pnl":       res.total_net_pnl,
+                "sl_exit_rate":  sl,
+                "low_sample":    n < MIN_TRADES_FOR_VERDICT,
+            })
 
         verdict = "PASS" if sym_ok else "FAIL"
         (passes if sym_ok else fails).append(sym)
         print(f"{sym:<10} → {verdict}")
         print()
         report_lines.append(f"| **{sym}** | | | | | | | **{verdict}** |")
+        json_results.append({
+            "symbol":  sym,
+            "verdict": verdict,
+            "windows": sym_windows,
+        })
 
     report_lines += [
         "",
@@ -155,10 +192,25 @@ def run() -> int:
     with open(out, "w", encoding="utf-8") as f:
         f.write("\n".join(report_lines) + "\n")
 
+    # Machine-readable snapshot — fixed path, always overwritten. See module
+    # docstring and _LATEST_JSON_PATH comment.
+    atomic_write_json(_LATEST_JSON_PATH, {
+        "run_at":   datetime.now(timezone.utc).isoformat(),
+        "windows":  WINDOWS,
+        "gate_criteria": {
+            "min_trades_full_window":  MIN_TRADES_FULL_WINDOW,
+            "min_trades_for_verdict":  MIN_TRADES_FOR_VERDICT,
+            "max_sl_exit_rate":        MAX_SL_EXIT_RATE,
+            "min_pf":                  MIN_PF,
+        },
+        "results":  json_results,
+    })
+
     print("=" * 70)
     print(f"PASS ({len(passes)}): {', '.join(passes) if passes else '—'}")
     print(f"FAIL ({len(fails)}): {', '.join(fails) if fails else '—'}")
     print(f"Report: {out}")
+    print(f"JSON:   {_LATEST_JSON_PATH}")
     return 0
 
 
