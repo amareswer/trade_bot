@@ -1,8 +1,38 @@
 """
-Stock bot historical backtester.
+Stock bot historical backtester — LEGACY / UNUSED (confirmed 2026-08-20).
 
-Runs the same indicator pipeline and EMA-crossover + RSI + ADX rule logic
-as the live stock bot against historical daily OHLCV from yfinance.
+This file has zero importers anywhere in the codebase (verified via grep,
+confirmed with the user during the 2026-08-20 offline-code audit) — it is a
+standalone CLI tool only, not called from any live or gating code path.
+
+The docstring below used to claim this "runs the same indicator pipeline...
+as the live stock bot." That stopped being true once stock_bot/strategy/
+rules.py switched to importing IndicatorStrategy directly from
+bot/strategy/indicator_strategy.py (the crypto strategy module) instead of
+this file's own indicator implementations
+(stock_bot/indicators/indicators.py). This file's indicators are NOT what
+gates any live trade decision.
+
+The real, load-bearing walk-forward gate for whitelist additions is the
+root-level stock_backtest.py script, which imports stock_bot/backtest/engine.py
+(a DIFFERENT file, in the stock_bot/backtest/ *package* — not this
+stock_bot/backtest.py *module*) — that engine already imports
+bot/strategy/indicator_strategy.py directly, so it stays in sync with the
+live strategy automatically. See "Adding a symbol requires a fresh
+stock_backtest.py walk-forward PASS" in CLAUDE.md for the actual gating
+workflow.
+
+stock_bot/indicators/indicators.py (used by this file) was still audited on
+2026-08-20 despite this file being unused, since that indicators module is
+independently live-relevant elsewhere — see CLAUDE.md's "Stock bot regime()
+live-gating + offline-audit note" for the audit result (clean: no
+lookahead, no self-referential-baseline bug, no incremental-state drift).
+
+Kept in the repo only as the historical implementation this file's own
+--walkforward output (stock_bot/backtest_results.json) still feeds into —
+LiveTradingGate.check_gate1() in stock_bot/analysis/accuracy_tracker.py
+reads that file for a DISPLAY-ONLY (dashboard + weekly email) IBKR-paper-
+to-live readiness indicator, never wired into automated trade execution.
 
 Default run — AAPL, MSFT, SPY across full / 2y / 6m windows:
     python -m stock_bot.backtest

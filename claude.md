@@ -765,6 +765,49 @@ reduction — consistent with how every other market-wide gate in this codebase 
 macro blackout) is a binary block rather than a sizing dial, and is the stricter reading of
 the spec's own language.
 
+### Stock bot `regime()` live-gating + offline-audit note (2026-08-20)
+The SPY BULL/BEAR/NEUTRAL regime line referenced above (`_regime_ok`, shared with VIX crisis
+mode) is computed by `regime()` in `stock_bot/indicators/indicators.py` —
+`stock_bot/main.py:1038`, called live every scan cycle on freshly-fetched SPY closes. This is
+worth naming explicitly because it's easy to assume that module is purely an offline-backtest
+artifact (it also has its own standalone backtest tool, `stock_bot/backtest.py` — see below)
+when in fact this one function inside it is live and directly gates real BUYs. The same
+module's `rsi()`/`trend()`/`adx()`/`macd()` are ALSO called live every cycle
+(`stock_bot/main.py:235-240`) but only feed the console/log indicator line
+(`stock_bot/main.py:1241-1262`, `print`/`logger.info`) — display only. The actual rule-based
+trade trigger comes from a separate module, `IndicatorStrategy` in
+`bot/strategy/indicator_strategy.py` (the crypto strategy module, imported directly by
+`stock_bot/strategy/rules.py`) — already fixed for the self-referential-ATR-baseline bug in
+the 2026-08-20 crypto session, and confirmed via a code comment in `stock_bot/main.py`
+distinguishing "the trade trigger" from the indicator-line display values above it.
+
+**Audited 2026-08-20 (read-only, no bugs found):** every function in
+`stock_bot/indicators/indicators.py` (`sma`, `ema`, `rsi`, `macd`, `adx`, `atr`, `trend`,
+`regime` — 8 total) is a pure, stateless, full-recompute-per-call — none carry any
+instance/module state across calls. That's the specific property that rules out the crypto
+bot's self-referential-ATR-baseline bug class here: that bug required a *persisted rolling
+history* (`self._atr_history`) that a new value got folded into before being compared against
+its own baseline — no such construct exists anywhere in this file, so the bug class is
+structurally impossible, not just absent by luck. No lookahead found either: `stock_bot/
+backtest.py`'s `compute_indicators()` slices `closes[:i+1]`/`highs[:i+1]`/`lows[:i+1]`
+(inclusive of bar `i`, nothing beyond) for every indicator call, and the SPY regime path
+(`_fetch_spy_regimes`/`_spy_regime_at`) does the same growing-slice `spy_closes[:i+1]` bounded
+to each day, with `_spy_regime_at` only ever walking backward to bridge weekend/holiday gaps.
+Wilder-smoothing boundary cases in `adx()`/`atr()` (the minimum-valid-length edge, the class
+of bug most likely to hide in this kind of code) were checked by hand and partition cleanly
+with no gap or overlap. Full findings: `.memory/decisions/stock-offline-audit-2026-08-20.md`.
+
+**`stock_bot/backtest.py` itself (the standalone file with its own indicator pipeline) is
+confirmed DEAD TOOLING** — zero importers anywhere in the codebase, a standalone CLI only.
+The real, load-bearing walk-forward gate for whitelist additions is the root-level
+`stock_backtest.py` script (see "Workflow after a strategy change" / symbol re-entry rules
+elsewhere in this file), which imports `stock_bot/backtest/engine.py` — a different file, in
+the `stock_bot/backtest/` *package*, not this `stock_bot/backtest.py` *module* — and that
+engine already imports `bot/strategy/indicator_strategy.py` directly, so it stays in sync
+with the live strategy automatically and was never exposed to this audit's question in the
+first place. `stock_bot/backtest.py`'s own docstring is corrected accordingly (2026-08-20) —
+no logic changes, since the audit found nothing to fix.
+
 ### Settlement date + FX-rate tax record-keeping (stock bot — closes punch-list #9)
 Minimal scope, deliberately: captures the missing data fields only — no ACB/capital-gain
 computation, no CRA-compliant report. Full tax reporting (superficial-loss rules, T5008

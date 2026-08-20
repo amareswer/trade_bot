@@ -1,6 +1,6 @@
 ---
 name: expert-practices-benchmark
-description: 2026-08-18 web research on how experts run crypto trading bots, benchmarked against this codebase's actual practices — what already matches/exceeds, two real gaps, decision not to implement either right now. 2026-08-19 addendum vs Freqtrade adds a third candidate (lookahead/recursive-bias check tooling) — resolved 2026-08-20: no lookahead bug, but a related self-referential-baseline bug was found and fixed.
+description: 2026-08-18 web research on how experts run crypto trading bots, benchmarked against this codebase's actual practices — what already matches/exceeds, two real gaps, decision not to implement either right now. 2026-08-19 addendum vs Freqtrade adds a third candidate (lookahead/recursive-bias check tooling) — resolved 2026-08-20: no lookahead bug, but a related self-referential-baseline bug was found and fixed. See [[stock-offline-audit-2026-08-20]] for the sibling check of the stock bot's independent offline indicator implementation — clean, no bug found.
 metadata:
   type: project
 ---
