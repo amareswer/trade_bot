@@ -63,6 +63,13 @@ call `sync_protective_stop(None)`, cancelling whatever's resting without replaci
 identically to the pre-existing static path; unrelated to this fix. Tests: `test_live_executor.py`,
 7 new cases (trailing placement param, priority-over-static, dry-run no-op, cancel, resync-on-
 quantity-change, failure-alert, state persist/restore across restart).
+**`trailingPercent` param verified same day** (not just left to pass on mocked tests): traced
+ccxt 4.5.56's `kraken.py` `order_request()` by hand — confirms it builds Kraken's native
+`ordertype=trailing-stop` + relative `price="+X%"` request, cross-checked against Kraken's own
+AddOrder REST docs (ordertype enum includes `trailing-stop`, price format matches exactly, no
+spot/margin restriction). ccxt's "*margin only*" docstring label isn't code-enforced — same
+label sits on the already-working-live `stopLossPrice` param. No fix needed; citation added as
+a code comment on `_place_native_trailing_stop()`.
 
 ---
 

@@ -415,6 +415,21 @@ failure alerting, dry-run/flag-off no-ops, restart reconciliation for all three 
 + 7 new trailing-path cases (placement param, priority-over-static, dry-run no-op, cancel,
 resync-on-quantity-change, failure-alert, state persist/restore across restart).
 
+**`trailingPercent` param verified against real ccxt source, 2026-08-19:** confirmed by
+tracing ccxt 4.5.56's `kraken.py` `order_request()` line-by-line (mock-based tests alone
+can't prove a real exchange accepts an unrecognized param) — `params={"trailingPercent":
+"X.XXXX"}` on a market-type `create_order()` call correctly builds Kraken's native
+`ordertype=trailing-stop` + relative `price="+X.XXXX%"` request, matching Kraken's own
+AddOrder REST docs exactly (ordertype enum includes `trailing-stop` with no spot/margin
+distinction; price field documented as this same relative `+X%` format). ccxt's docstring
+labels the param "*margin only*" — confirmed stale/not code-enforced, same as the sibling
+`stopLossPrice` param already running live on spot BTC/CAD under the identical annotation.
+No fix was needed. Source citation lives as a code comment on
+`_place_native_trailing_stop()`. Separately confirmed: Kraken spot has no open public
+sandbox (only Kraken Futures does), but `AddOrder` supports a `validate=true` param for a
+zero-risk request-shape check against the real endpoint — available as a future no-code-risk
+verification step, not yet used.
+
 ### Slippage guard (crypto — post-fill alert, on by default)
 ```
 MAX_SLIPPAGE_PCT=0.01   # NOT set in .env — using the config.py default (1%). Added

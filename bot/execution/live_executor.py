@@ -532,6 +532,24 @@ class LiveExecutor:
         Deliberately NO retry — identical reasoning to _place_native_stop:
         a retry after an accepted-but-timed-out create_order would place an
         untracked duplicate.
+
+        params={"trailingPercent": ...} verified 2026-08-19 against ccxt
+        4.5.56's actual kraken.py source (not just its docstring, which
+        mislabels this "*margin only*" — that annotation isn't enforced
+        anywhere in create_order()/order_request(), and the sibling
+        stopLossPrice param under the same annotation already works live on
+        spot BTC/CAD). Traced order_request() (kraken.py:2047, the trailing
+        branch at :2094-2117): a market-type call with trailingPercent set
+        skips the stop-loss/take-profit branch, prepends '+' and appends '%'
+        to build e.g. "+2.0000%", and — since no limit price or
+        trailingLimit* params are given — lands in the non-limit branch
+        (:2112-2117) that sets request['ordertype']='trailing-stop' and
+        request['price']=that string. Cross-checked against Kraken's own
+        AddOrder docs (docs.kraken.com/api/docs/rest-api/add-order/):
+        ordertype enum includes 'trailing-stop' with no spot/margin
+        distinction, and price is documented as exactly this relative
+        '+X%'/'+X' format for trailing order types. Confirmed match — no
+        raw-params override needed.
         """
         try:
             _pct_str = f"{trailing_pct * 100:.4f}"
