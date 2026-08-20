@@ -1058,6 +1058,7 @@ def run():
                 'partial_done':     False,
                 'atr_sl':           0.0,
                 'native_stop_price': None,        # static native-stop backstop price for the current position
+                'native_stop_is_trailing': False, # has the backstop been swapped to a native Kraken trailing-stop this fill?
                 'candle_feed_stale': False,       # candle watchdog circuit-breaker state
                 'last_price':       0.0,
                 'err_count':        0,            # consecutive price-fetch failures
@@ -1095,6 +1096,7 @@ def run():
             'partial_done':     False,
             'atr_sl':           0.0,
             'native_stop_price': None,        # static native-stop backstop price for the current position
+            'native_stop_is_trailing': False, # has the backstop been swapped to a native Kraken trailing-stop this fill?
             'candle_feed_stale': False,       # candle watchdog circuit-breaker state
             'last_price':       0.0,
             'err_count':        0,
@@ -1180,6 +1182,30 @@ def run():
                 _px = getattr(_e, "avg_entry", 0.0) or 0.0
             total += _e.cash + _e.position * _px
         return total
+
+    def _resync_native_stop(ss: dict) -> None:
+        """
+        Re-place the native backstop sized to the position AFTER a quantity-
+        changing event that doesn't close it (partial TP, a partial fill on
+        an urgent SL/TP exit) — preserving whichever kind (static or native
+        trailing) is currently resting. Quantity is the one thing a resting
+        Kraken order can't be amended in place for via create_order, so this
+        always cancels and re-places; a trailing order loses its
+        exchange-tracked peak on the re-place (a fresh trail starts from the
+        price at re-placement) — accepted, same precision loss the static
+        order already takes on every resize. Full-close paths call
+        sync_protective_stop(None) directly instead of this helper.
+        """
+        if not ss['pm'].has_position:
+            ss['executor'].sync_protective_stop(None)
+            ss['native_stop_is_trailing'] = False
+            return
+        if ss['native_stop_is_trailing']:
+            ss['executor'].sync_protective_stop(
+                None, trailing_pct=cfg.backtest.trail_stop_pct,
+            )
+        else:
+            ss['executor'].sync_protective_stop(ss.get('native_stop_price'))
 
     # Trailing stop and partial TP state — reset on each new trade
     _trail_peak:      float = 0.0
@@ -1457,6 +1483,26 @@ def run():
                         )
                     )
 
+                    # Native trailing-stop backstop: only relevant when the
+                    # software trailing level is itself in control (atr_sl==0
+                    # — ATR SL otherwise always wins _trail_sl_level above, so
+                    # a flat native stop already mirrors it exactly with no
+                    # gap). One-shot swap the instant trail_peak arms — from
+                    # then on Kraken's own engine tracks the peak, so no
+                    # further re-sync is needed for price alone, only for a
+                    # quantity change (handled by _resync_native_stop below).
+                    if (
+                        _trail_stop_pct > 0
+                        and ss['atr_sl'] == 0.0
+                        and ss['trail_peak'] > 0.0
+                        and not ss['native_stop_is_trailing']
+                        and cfg.exchange.native_stop_loss_enabled
+                    ):
+                        ss['executor'].sync_protective_stop(
+                            None, trailing_pct=_trail_stop_pct,
+                        )
+                        ss['native_stop_is_trailing'] = True
+
                     _partial_tp_level = (
                         _ic_entry * (1 + cfg.backtest.partial_tp_pct)
                         if cfg.backtest.partial_tp_pct > 0 else None
@@ -1486,11 +1532,10 @@ def run():
                                     ss['partial_done'] = True
                                     ss['sm'].recover_long(_p_order.price)
                                     # Resize the native stop backstop to the
-                                    # reduced position (same static price —
-                                    # partial TP changes quantity, not level).
-                                    ss['executor'].sync_protective_stop(
-                                        ss.get('native_stop_price') if ss['pm'].has_position else None
-                                    )
+                                    # reduced position (same static price or
+                                    # same trailing % — partial TP changes
+                                    # quantity, not level).
+                                    _resync_native_stop(ss)
                                     print(f"           📊 PARTIAL TP [{sym}]:  {_p_qty:.6f} @ {price:,.2f}  PnL={_p_pnl:+.2f}", flush=True)
                                     logger.warning("PARTIAL TP [%s]: sold %.6f @ %.2f  pnl=%.2f", sym, _p_qty, price, _p_pnl)
                                     trade_log.log_fill(
@@ -1568,6 +1613,7 @@ def run():
                                     # already-filled order — harmless, logged at
                                     # info level by _cancel_native_stop.
                                     ss['executor'].sync_protective_stop(None)
+                                    ss['native_stop_is_trailing'] = False
                                 else:
                                     # Urgent market SELL only partially filled — a
                                     # residual position remains. The resting native
@@ -1576,9 +1622,7 @@ def run():
                                     # held. Without this the backstop would try to
                                     # sell more than the position. Same resize the
                                     # partial-TP and strategy-SELL paths already do.
-                                    ss['executor'].sync_protective_stop(
-                                        ss.get('native_stop_price')
-                                    )
+                                    _resync_native_stop(ss)
                                 _ic_reason = (
                                     "trail_stop" if (_trail_sl_level > 0 and price <= _trail_sl_level)
                                     else "stop_loss" if _ic_sl
@@ -2082,6 +2126,10 @@ def run():
                             # Native stop-loss backstop (static — see
                             # sync_protective_stop docstring): mirrors whatever
                             # level the software SL just armed for this fill.
+                            # Always static at entry — a native trailing-stop
+                            # is only swapped in later, once trail_peak arms
+                            # (intra-candle block above), matching the
+                            # software trailing logic's own activation delay.
                             ss['native_stop_price'] = (
                                 ss['atr_sl'] if ss['atr_sl'] > 0
                                 else (
@@ -2089,6 +2137,7 @@ def run():
                                     if cfg.backtest.stop_loss_pct > 0 else None
                                 )
                             )
+                            ss['native_stop_is_trailing'] = False
                             ss['executor'].sync_protective_stop(ss['native_stop_price'])
                         else:
                             pnl = ss['pm'].on_sell(order.price, order.quantity)
@@ -2098,12 +2147,13 @@ def run():
                             if not ss['pm'].has_position:
                                 capital_pool.release(sym, ss['executor'].cash)
                                 ss['executor'].sync_protective_stop(None)
+                                ss['native_stop_is_trailing'] = False
                             else:
                                 # Partial fill leaving a residual position (not
                                 # currently reachable with strategy SELLs, which
                                 # always close in full — defensive parity with
                                 # the partial-TP path below).
-                                ss['executor'].sync_protective_stop(ss.get('native_stop_price'))
+                                _resync_native_stop(ss)
 
                         display.fill(
                             order.side.value, order.quantity,

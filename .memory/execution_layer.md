@@ -38,6 +38,32 @@ Built 2026-06-07. Hardened 2026-06-09/10. Places real market orders on Kraken vi
 
 **Known fee finding (2026-06-11):** Actual Kraken fee on first fill was 0.80% (not 0.26% modeled). Raw fee-dict logging added; next fill will reveal true structure. Likely BTC/CAD FX surcharge on top of 0.26% taker.
 
+**Native trailing-stop fix (2026-08-19):** `sync_protective_stop(stop_price, trailing_pct=None)` now
+takes an optional `trailing_pct` — when set, places a Kraken `trailing-stop` order
+(`params={"trailingPercent": "X.XXXX"}`, ccxt derives the ordertype) instead of the static
+`stopLossPrice` order. Why: `ss['native_stop_price']` (bot/main.py) was set once at BUY-fill
+and never updated as the software trailing stop's `trail_peak` rose — the native backstop
+under-protected exactly when there was profit to protect. **Scoped narrowly**: only matters
+when `ss['atr_sl'] == 0` (ATR SL otherwise always wins `_trail_sl_level` in bot/main.py, so a
+flat native stop already mirrors it exactly) — with the current live config (`ATR_SL_MULT=2.0`
+always set), this path is dormant; `TRAILING_STOP_PCT=0` in `.env` too. Kraken trailing-stop
+orders track the peak server-side once placed — no repeated repricing calls needed, only a
+one-shot static→trailing swap the instant `trail_peak` arms (`bot/main.py`, guarded by new
+`ss['native_stop_is_trailing']` flag). Quantity changes (partial TP, partial fill) still
+cancel/replace (`_resync_native_stop()` helper in bot/main.py) — Kraken has no in-place volume
+amend via `create_order`; a trailing re-place restarts the tracked peak from the price at
+re-placement (accepted precision loss, same as the static order's own per-resize snapshot).
+Restart always re-arms **static** regardless of prior kind — `trail_peak`/`atr_sl` already
+reset to 0 in-memory every restart, so there's nothing to resume a trailing distance from;
+`native_stop_is_trailing` is persisted in the state file for observability only, not decision
+logic. **Related pre-existing gap found, not fixed (out of scope):** `ss['native_stop_price']`
+is never seeded from the executor's actual resting-stop state on restart recovery — a
+quantity-changing event (partial TP) firing before the next BUY fill after a restart would
+call `sync_protective_stop(None)`, cancelling whatever's resting without replacing it. Applies
+identically to the pre-existing static path; unrelated to this fix. Tests: `test_live_executor.py`,
+7 new cases (trailing placement param, priority-over-static, dry-run no-op, cancel, resync-on-
+quantity-change, failure-alert, state persist/restore across restart).
+
 ---
 
 ## PaperExecutor — `bot/execution/executor.py`

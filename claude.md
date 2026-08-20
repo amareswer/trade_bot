@@ -174,7 +174,7 @@ need the full narrative behind any decision below.
 
 ## Test Suite Manifest (reconciled 2026-08-18)
 
-Expected total: **526 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~11s — if it takes minutes, a test is reading live `.env` config.
+Expected total: **534 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~11s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before this session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later.)
 
 **Directory layout (2026-08-18):** all 54 files moved out of repo root into `tests/{crypto,stock,shared}/` for
 a cleaner root — 54 files loose alongside `bot/`, `stock_bot/`, `config.py`, etc. had gotten hard to scan.
@@ -198,7 +198,7 @@ now `.parent.parent.parent`. Verified before/after: same 526 collected, same 526
 | File | Tests | What it covers |
 |------|-------|----------------|
 | `tests/shared/test_indicators.py` | 28 | RSI, EMA, ADX, MACD, ATR calculations |
-| `tests/crypto/test_live_executor.py` | 44 | LiveExecutor: dry-run, market/limit orders, urgent-exit bypass, fee deduction, state save/load, pre-trade min-size guard, restart recovery (seeds position manager + state machine), native stop-loss backstop (placement, cancel, resync, failure alerting, dry-run/flag-off no-ops, restart reconciliation), slippage guard (BUY/SELL unfavorable trip, within-threshold, favorable-direction, disabled, dry-run no-ops) |
+| `tests/crypto/test_live_executor.py` | 51 | LiveExecutor: dry-run, market/limit orders, urgent-exit bypass, fee deduction, state save/load, pre-trade min-size guard, restart recovery (seeds position manager + state machine), native stop-loss backstop (placement, cancel, resync, failure alerting, dry-run/flag-off no-ops, restart reconciliation), native TRAILING stop-loss backstop (placement w/ trailingPercent param, priority over static, cancel, resync-on-quantity-change, failure alerting, dry-run no-op, state persist/restore — added 2026-08-19), slippage guard (BUY/SELL unfavorable trip, within-threshold, favorable-direction, disabled, dry-run no-ops) |
 | `tests/crypto/test_capital_pool.py` | 19 | CapitalPool: slot allocation, slot cap, release, edge cases |
 | `tests/crypto/test_correlation.py` | 17 | Pearson correlation, pct_returns, fetch_correlation |
 | `tests/stock/test_stock_correlation.py` | 5 | `stock_bot/risk/correlation.py`: `fetch_correlation_from_closes` — no-network wrapper reusing bot/risk/correlation.py's pearson/pct_returns unchanged |
@@ -252,7 +252,7 @@ now `.parent.parent.parent`. Verified before/after: same 526 collected, same 526
 | `tests/crypto/test_grid_dca_experiment.py` | 12 | `grid_dca_experiment.py` standalone backtest engines (crypto research tooling, not the live pipeline): grid strategy fills/reopens/floor-stop, capital split across slots, fee math on both legs, DCA safety-order averaging + cycle restart, empty-candle edge cases |
 | `tests/shared/test_telegram_retry.py` | 3 | `TelegramAlerter._send()` retry (added 2026-08-17, closes known-gaps #17): healthy send calls `requests.post` once with no retry, a transient failure recovers on retry, a persistent failure still degrades to a warning-only no-raise after exhausting attempts |
 
-Run: `python -m pytest --tb=short -q` — must show **526 passed**.
+Run: `python -m pytest --tb=short -q` — must show **534 passed**.
 
 ---
 
@@ -364,27 +364,56 @@ When enabled, `bot/execution/live_executor.py`'s `sync_protective_stop()` rests 
 Kraken stop order (`create_order(..., params={"stopLossPrice": X})`, executes as market on
 trigger — same "never sit in a limit book during a stop" reasoning as `urgent=True`
 elsewhere in this file) after every BUY fill, at whatever SL price `bot/main.py` already
-computed (ATR if available, else flat `STOP_LOSS_PCT`). **Deliberately static** — it does
-NOT track the trailing stop as it rises or reprice mid-trade; it's pure insurance for "the
-bot itself is unreachable," not a second copy of the live SL/TP logic. Cancelled the moment
-the bot closes the position itself (strategy SELL, software SL/TP, partial TP), so under
-normal operation it never fires — Kraken's own trigger only matters when the bot can't get
-there first. Order id/price persist in `logs/live_state_BTC_CAD.json` and are reconciled on
-every restart: a still-open saved order is kept as-is (level never touches down); a
-saved-but-now-gone order (filled while the bot was down — this feature working exactly as
-intended) is cleared; a held position with no resting stop at all (feature just enabled, or
-the bot crashed before it could place one) gets a same-startup fallback at flat
-`STOP_LOSS_PCT` off cost_basis, replaced with the more precise ATR-based level on the next
-real BUY for that symbol. Currently trades one symbol with no trailing-stop/partial-TP
-config active (`TRAILING_STOP_PCT`/`PARTIAL_TP_PCT` both unset → 0 = disabled), so the
-quantity-tracking half of `sync_protective_stop` is defensive/future-proofing rather than
-exercised today. Placement/cancel failures alert to Telegram but never raise, so a
-Kraken-side rejection degrades to "no backstop, software SL/TP still fully works while the
-bot is up," never a crashed trading loop — including the current Kraken auth outage (see
-"Known live incident" below): if that's still unresolved when the next BUY fires, the stop
-placement will fail the same way and alert, not crash. Tests: `test_live_executor.py`, 11
-cases (placement, cancel, resync-on-quantity-change, failure alerting, dry-run/flag-off
-no-ops, restart reconciliation for all three states above).
+computed (ATR if available, else flat `STOP_LOSS_PCT`). **Usually static** — it does NOT
+reprice mid-trade by default; it's pure insurance for "the bot itself is unreachable," not a
+second copy of the live SL/TP logic. Cancelled the moment the bot closes the position itself
+(strategy SELL, software SL/TP, partial TP), so under normal operation it never fires —
+Kraken's own trigger only matters when the bot can't get there first. Order id/price persist
+in `logs/live_state_BTC_CAD.json` and are reconciled on every restart: a still-open saved
+order is kept as-is (level never touches down); a saved-but-now-gone order (filled while the
+bot was down — this feature working exactly as intended) is cleared; a held position with no
+resting stop at all (feature just enabled, or the bot crashed before it could place one) gets
+a same-startup fallback at flat `STOP_LOSS_PCT` off cost_basis, replaced with the more precise
+ATR-based level on the next real BUY for that symbol. Placement/cancel failures alert to
+Telegram but never raise, so a Kraken-side rejection degrades to "no backstop, software SL/TP
+still fully works while the bot is up," never a crashed trading loop — including the current
+Kraken auth outage (see "Known live incident" below): if that's still unresolved when the
+next BUY fires, the stop placement will fail the same way and alert, not crash. `PARTIAL_TP_PCT`
+is unset → 0 = disabled today, so the quantity-tracking (resize-on-partial-fill) half of
+`sync_protective_stop` is defensive/future-proofing rather than exercised live currently.
+
+**Native trailing-stop, added 2026-08-19 (protection-gap fix):** a code + Kraken API research
+review found the static backstop never followed the software trailing stop as it rose —
+`ss['native_stop_price']` was set once at BUY-fill and never updated as `ss['trail_peak']`
+climbed, so a bot outage mid-trade after a favorable move would only be protected at the
+*original* entry-relative level, not the trailed-up one. Fix, scoped narrowly: this only
+matters when `ss['atr_sl'] == 0` — with ATR SL available (as it always is in live config,
+`ATR_SL_MULT=2.0`), `_trail_sl_level` in `bot/main.py` uses the fixed ATR level regardless of
+`TRAILING_STOP_PCT`, so the software trailing logic itself is dormant and a flat native stop
+already mirrors it with no gap. When trailing IS the active software level and
+`NATIVE_STOP_LOSS_ENABLED=true`, `sync_protective_stop()` now accepts an optional
+`trailing_pct` and places a genuine Kraken `trailing-stop` order
+(`params={"trailingPercent": "X.XXXX"}`) instead — Kraken's own matching engine tracks the
+peak server-side from placement, so unlike the static path this needs no repeated repricing
+calls, only a one-shot swap the instant `trail_peak` first arms (`bot/main.py`, guarded by a
+new `ss['native_stop_is_trailing']` flag). Quantity-changing events (partial TP, a partial
+fill on an urgent SL/TP exit) still cancel + re-place — ccxt/Kraken has no in-place volume
+amend — via a new `_resync_native_stop()` helper; a trailing re-place restarts the
+exchange-tracked peak from the price at re-placement time (accepted precision loss, same
+shape as the static order's own per-resize snapshot). A restart always re-arms **static**
+regardless of what kind was resting before — `trail_peak`/`atr_sl` already reset to 0
+in-memory on every restart (unchanged, pre-existing behavior), so there's no trailing
+distance to resume from; `native_stop_is_trailing` is persisted for restart-log observability
+only, not decision logic. `TRAILING_STOP_PCT=0` in `.env` today, so this path is currently
+dormant live — pre-emptive, not incident response. A related pre-existing gap was found
+during this work and deliberately left unfixed (out of scope, applies identically to the
+static path): `ss['native_stop_price']` is never seeded from the executor's actual
+resting-stop state on restart recovery, so a quantity-changing event firing before the next
+BUY fill after a restart would cancel whatever's resting without replacing it. Tests:
+`test_live_executor.py`, static-path 11 cases (placement, cancel, resync-on-quantity-change,
+failure alerting, dry-run/flag-off no-ops, restart reconciliation for all three states above)
++ 7 new trailing-path cases (placement param, priority-over-static, dry-run no-op, cancel,
+resync-on-quantity-change, failure-alert, state persist/restore across restart).
 
 ### Slippage guard (crypto — post-fill alert, on by default)
 ```

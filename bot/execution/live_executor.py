@@ -80,11 +80,15 @@ class LiveExecutor:
         self._fees_paid:           float = 0.0
         self._bot_opened_position: bool  = False
         # Resting exchange-side stop-loss order — a backstop that survives the
-        # bot process dying (VPS outage, crash loop, etc.). Static: placed once
-        # per fill at whatever SL price main.py already computed (fixed % or
-        # ATR), never repriced to follow a trailing stop. See sync_protective_stop().
+        # bot process dying (VPS outage, crash loop, etc.). Usually static:
+        # placed once per fill at whatever SL price main.py already computed
+        # (fixed % or ATR), never repriced. When main.py's software trailing
+        # stop is itself active (ATR unavailable + TRAILING_STOP_PCT set), it
+        # gets swapped for a native Kraken trailing-stop order instead — see
+        # sync_protective_stop() and _place_native_trailing_stop().
         self._native_stop_order_id:    str | None   = None
         self._native_stop_price:       float | None = None
+        self._native_stop_is_trailing: bool         = False
         self._alerter = TelegramAlerter(
             cfg.alerts.telegram_bot_token,
             cfg.alerts.telegram_chat_id,
@@ -367,14 +371,24 @@ class LiveExecutor:
     # still protected if the bot process itself is unavailable (crash loop,
     # VPS outage, extended network partition) — the software SL/TP path in
     # main.py only works while the bot is alive and polling. Deliberately
-    # STATIC: placed once per fill at whatever price main.py already
-    # computed (fixed % or ATR), never repriced to chase a trailing stop.
-    # The software SL/TP/trailing/partial-TP logic is unaffected and keeps
-    # being the primary exit path whenever the bot is running — this order
-    # is pure insurance, cancelled the moment the bot exits the position
-    # itself. Kraken's 'stop-loss' order type triggers as a market order
-    # (same reasoning as urgent=True everywhere else in this file: a stop
-    # exit must never sit in a limit book while price runs away).
+    # USUALLY STATIC: placed once per fill at whatever price main.py already
+    # computed (fixed % or ATR), never repriced. The software SL/TP/trailing/
+    # partial-TP logic is unaffected and keeps being the primary exit path
+    # whenever the bot is running — this order is pure insurance, cancelled
+    # the moment the bot exits the position itself. Kraken's 'stop-loss'
+    # order type triggers as a market order (same reasoning as urgent=True
+    # everywhere else in this file: a stop exit must never sit in a limit
+    # book while price runs away).
+    #
+    # EXCEPTION — native trailing: when main.py's own trailing-stop logic is
+    # active (TRAILING_STOP_PCT>0 and the software ATR SL is unavailable —
+    # see sync_protective_stop() below), the backstop is instead placed as a
+    # Kraken 'trailing-stop' order (ordertype derived by ccxt from the
+    # trailingPercent param). Unlike the static order, Kraken's own matching
+    # engine tracks the peak and reprices the trigger itself — no repeated
+    # placement calls needed as price moves favorably, only on a quantity
+    # change (partial TP / partial fill), which still requires cancel+replace
+    # since order volume can't be amended via create_order.
 
     @property
     def has_resting_stop(self) -> bool:
@@ -423,10 +437,16 @@ class LiveExecutor:
             return
 
         if still_open:
-            logger.warning(
-                "Native stop confirmed on restart: %s @ %.2f",
-                self._native_stop_order_id, self._native_stop_price or 0.0,
-            )
+            if self._native_stop_is_trailing:
+                logger.warning(
+                    "Native TRAILING stop confirmed on restart: %s",
+                    self._native_stop_order_id,
+                )
+            else:
+                logger.warning(
+                    "Native stop confirmed on restart: %s @ %.2f",
+                    self._native_stop_order_id, self._native_stop_price or 0.0,
+                )
         else:
             logger.warning(
                 "NATIVE STOP GAP [%s]: tracked order %s is no longer open "
@@ -435,8 +455,9 @@ class LiveExecutor:
                 "place a fresh one.",
                 self.symbol, self._native_stop_order_id, self._portfolio.position,
             )
-            self._native_stop_order_id = None
-            self._native_stop_price    = None
+            self._native_stop_order_id    = None
+            self._native_stop_price       = None
+            self._native_stop_is_trailing = False
             self._save_state()
 
     def _cancel_native_stop(self) -> None:
@@ -454,8 +475,9 @@ class LiveExecutor:
                 "Native stop cancel %s: %s (likely already filled/gone — fine)",
                 _order_id, exc,
             )
-        self._native_stop_order_id = None
-        self._native_stop_price    = None
+        self._native_stop_order_id    = None
+        self._native_stop_price       = None
+        self._native_stop_is_trailing = False
         self._save_state()
 
     def _place_native_stop(self, quantity: float, stop_price: float) -> None:
@@ -472,8 +494,9 @@ class LiveExecutor:
                 self.symbol, "market", "sell", quantity,
                 params={"stopLossPrice": _price_str},
             )
-            self._native_stop_order_id = str(raw.get("id", ""))
-            self._native_stop_price    = stop_price
+            self._native_stop_order_id    = str(raw.get("id", ""))
+            self._native_stop_price       = stop_price
+            self._native_stop_is_trailing = False
             logger.warning(
                 "Native stop placed [%s]: %.6f @ %.2f (order %s)",
                 self.symbol, quantity, stop_price, self._native_stop_order_id,
@@ -487,30 +510,93 @@ class LiveExecutor:
                 f"Position is UNPROTECTED if the bot goes down. Software SL/TP "
                 f"still works while the bot is running."
             )
-            self._native_stop_order_id = None
-            self._native_stop_price    = None
+            self._native_stop_order_id    = None
+            self._native_stop_price       = None
+            self._native_stop_is_trailing = False
 
-    def sync_protective_stop(self, stop_price: float | None) -> None:
+    def _place_native_trailing_stop(self, quantity: float, trailing_pct: float) -> None:
+        """
+        Places a Kraken 'trailing-stop' order (market-triggered — ccxt derives
+        this ordertype from the trailingPercent param, same non-limit
+        reasoning as _place_native_stop). Unlike the static stop, Kraken's own
+        matching engine tracks the peak/trough itself from the moment this
+        order is accepted — the trigger reprices server-side as the market
+        moves favorably, so no repeated placement calls are needed to follow
+        a rising price the way sync_protective_stop's caller does for the
+        static path. A fresh call here (e.g. resizing on a partial fill)
+        necessarily restarts the exchange's tracked peak from the price at
+        placement time — there's no ccxt/Kraken amend for a resting order's
+        volume, so this is an accepted precision loss on resize, same as the
+        static order's own per-resize snapshot.
+
+        Deliberately NO retry — identical reasoning to _place_native_stop:
+        a retry after an accepted-but-timed-out create_order would place an
+        untracked duplicate.
+        """
+        try:
+            _pct_str = f"{trailing_pct * 100:.4f}"
+            raw = self._exchange.create_order(
+                self.symbol, "market", "sell", quantity,
+                params={"trailingPercent": _pct_str},
+            )
+            self._native_stop_order_id    = str(raw.get("id", ""))
+            self._native_stop_price       = None
+            self._native_stop_is_trailing = True
+            logger.warning(
+                "Native TRAILING stop placed [%s]: %.6f trailing %.2f%% (order %s)",
+                self.symbol, quantity, trailing_pct * 100, self._native_stop_order_id,
+            )
+            self._save_state()
+        except Exception as exc:
+            logger.error("Native trailing stop placement FAILED [%s]: %s", self.symbol, exc)
+            self._alerter.error(
+                f"NATIVE TRAILING STOP FAILED [{self.symbol}]: could not place "
+                f"backstop trailing stop for {quantity:.6f} trailing "
+                f"{trailing_pct * 100:.2f}% — {exc}. Position is UNPROTECTED "
+                f"if the bot goes down. Software SL/TP still works while the "
+                f"bot is running."
+            )
+            self._native_stop_order_id    = None
+            self._native_stop_price       = None
+            self._native_stop_is_trailing = False
+
+    @property
+    def native_stop_is_trailing(self) -> bool:
+        return self._native_stop_is_trailing
+
+    def sync_protective_stop(
+        self, stop_price: float | None, trailing_pct: float | None = None,
+    ) -> None:
         """
         Reconcile the resting native stop with the current position. Call
         after every fill that changes position (BUY, strategy SELL, SL/TP
         exit, partial TP) and once at startup for a held position with no
         confirmed resting stop.
 
-        stop_price=None, or position<=0: cancel any existing resting stop,
-            don't replace (position closed — nothing to protect).
-        stop_price>0 and position>0: cancel any existing resting stop (if
-            any) and place a fresh one sized to the CURRENT position.
-            Idempotent and safe to call repeatedly.
+        trailing_pct>0 and position>0: cancel any existing resting stop and
+            place a native Kraken trailing-stop sized to the CURRENT
+            position, trailing by trailing_pct. Takes priority over
+            stop_price when both are given.
+        stop_price>0 and position>0 (trailing_pct None/0): cancel any
+            existing resting stop (if any) and place a fresh static stop
+            sized to the CURRENT position. Idempotent and safe to call
+            repeatedly.
+        Otherwise (stop_price=None and no trailing_pct, or position<=0):
+            cancel any existing resting stop, don't replace (position
+            closed — nothing to protect).
 
         No-op when the feature is disabled or dry-run. Never raises —
-        failures are logged/alerted from the two helpers above, not here;
-        this must never be able to crash the trading loop.
+        failures are logged/alerted from the helpers above, not here; this
+        must never be able to crash the trading loop.
         """
         if self.dry_run or not self._native_stop_loss_enabled:
             return
         self._cancel_native_stop()
-        if stop_price is not None and stop_price > 0 and self._portfolio.position > 0:
+        if self._portfolio.position <= 0:
+            return
+        if trailing_pct is not None and trailing_pct > 0:
+            self._place_native_trailing_stop(self._portfolio.position, trailing_pct)
+        elif stop_price is not None and stop_price > 0:
             self._place_native_stop(self._portfolio.position, stop_price)
 
     # ── State persistence ─────────────────────────────────────────────
@@ -525,8 +611,9 @@ class LiveExecutor:
             "realized_pnl": self._portfolio.realized_pnl,
             "fees_paid":    self._fees_paid,
             "bot_opened":   self._bot_opened_position,
-            "native_stop_order_id": self._native_stop_order_id,
-            "native_stop_price":    self._native_stop_price,
+            "native_stop_order_id":    self._native_stop_order_id,
+            "native_stop_price":       self._native_stop_price,
+            "native_stop_is_trailing": self._native_stop_is_trailing,
             "saved_at":     datetime.now(timezone.utc).isoformat(),
         }
         try:
@@ -577,6 +664,13 @@ class LiveExecutor:
         self._native_stop_order_id    = state.get("native_stop_order_id")
         _nsp                          = state.get("native_stop_price")
         self._native_stop_price       = float(_nsp) if _nsp is not None else None
+        # Informational only — startup reconciliation in main.py always
+        # re-arms a STATIC fallback on a restart-with-gap regardless of what
+        # kind the previous process had resting (trail_peak/atr_sl reset to
+        # 0 in-memory on every restart too, so there's nothing to resume the
+        # trailing distance FROM). Restored here only so a still-open order
+        # confirmed by _verify_resting_stop_on_startup logs its real kind.
+        self._native_stop_is_trailing = bool(state.get("native_stop_is_trailing", False))
         logger.warning(
             "Accounting restored: cost_basis=%.2f pnl=%.2f fees=%.4f (saved %s)",
             self._portfolio._cost_basis, self._portfolio.realized_pnl,

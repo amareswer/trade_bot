@@ -1263,6 +1263,145 @@ def test_native_stop_startup_position_closed_externally_clears_stale_id(tmp_path
     mock_ex.cancel_order.assert_called_once_with("stop-001", "BTC/CAD")
 
 
+# ---------------------------------------------------------------------------
+# Native trailing-stop backstop (sync_protective_stop trailing_pct path —
+# 2026-08-19: mirrors the software trailing stop when it's the level in
+# control, i.e. ATR SL unavailable and TRAILING_STOP_PCT>0)
+# ---------------------------------------------------------------------------
+
+def test_native_trailing_stop_placed_with_trailing_percent_param(tmp_path):
+    """trailing_pct>0 places a market SELL with Kraken's trailingPercent param
+    (not stopLossPrice), sized to the current position."""
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True, tmp_path=tmp_path)
+    ex._portfolio.position = 0.001
+    mock_ex.create_order.return_value = {"id": "trail-001"}
+
+    ex.sync_protective_stop(None, trailing_pct=0.02)
+
+    assert ex.has_resting_stop
+    assert ex.native_stop_is_trailing
+    call = mock_ex.create_order.call_args
+    assert call[0][0] == "BTC/CAD"
+    assert call[0][1] == "market"
+    assert call[0][2] == "sell"
+    assert abs(call[0][3] - 0.001) < 1e-9
+    assert "stopLossPrice" not in call[1]["params"]
+    assert call[1]["params"]["trailingPercent"] == "2.0000"
+
+
+def test_native_trailing_stop_takes_priority_over_stop_price(tmp_path):
+    """When both are given, trailing_pct wins — the static stop_price is ignored."""
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True, tmp_path=tmp_path)
+    ex._portfolio.position = 0.001
+    mock_ex.create_order.return_value = {"id": "trail-001"}
+
+    ex.sync_protective_stop(88_000.0, trailing_pct=0.02)
+
+    call = mock_ex.create_order.call_args
+    assert "trailingPercent" in call[1]["params"]
+    assert "stopLossPrice" not in call[1]["params"]
+
+
+def test_native_trailing_stop_dry_run_noop(tmp_path):
+    """Feature enabled but dry_run=True — must never place a real order."""
+    ex, mock_ex = _make(dry_run=True, native_stop_loss_enabled=True, tmp_path=tmp_path)
+    ex._portfolio.position = 0.001
+    ex.sync_protective_stop(None, trailing_pct=0.02)
+    mock_ex.create_order.assert_not_called()
+    assert not ex.has_resting_stop
+
+
+def test_native_trailing_stop_cancelled_when_position_closes(tmp_path):
+    """sync_protective_stop(None) with no trailing_pct cancels an existing
+    resting trailing stop and doesn't replace it."""
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True, tmp_path=tmp_path)
+    ex._portfolio.position = 0.001
+    mock_ex.create_order.return_value = {"id": "trail-001"}
+    ex.sync_protective_stop(None, trailing_pct=0.02)
+    assert ex.has_resting_stop
+
+    ex._portfolio.position = 0.0
+    ex.sync_protective_stop(None)
+
+    mock_ex.cancel_order.assert_called_once_with("trail-001", "BTC/CAD")
+    assert not ex.has_resting_stop
+    assert not ex.native_stop_is_trailing
+
+
+def test_native_trailing_stop_resync_on_quantity_change_replaces_order(tmp_path):
+    """A quantity change (partial TP / partial fill) cancels the old resting
+    trailing order and places a fresh one sized to the new quantity — same
+    cancel/replace shape as the static path, since Kraken's create_order has
+    no in-place volume amend."""
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True, tmp_path=tmp_path)
+    ex._portfolio.position = 0.001
+    mock_ex.create_order.return_value = {"id": "trail-001"}
+    ex.sync_protective_stop(None, trailing_pct=0.02)
+
+    ex._portfolio.position = 0.0005
+    mock_ex.create_order.return_value = {"id": "trail-002"}
+    ex.sync_protective_stop(None, trailing_pct=0.02)
+
+    mock_ex.cancel_order.assert_called_once_with("trail-001", "BTC/CAD")
+    assert ex._native_stop_order_id == "trail-002"
+    assert ex.native_stop_is_trailing
+    call = mock_ex.create_order.call_args
+    assert abs(call[0][3] - 0.0005) < 1e-9
+
+
+def test_native_trailing_stop_placement_failure_alerts_and_stays_unprotected(tmp_path):
+    """create_order fails — must alert, not raise, and leave has_resting_stop
+    False and native_stop_is_trailing False."""
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True, tmp_path=tmp_path)
+    ex._portfolio.position = 0.001
+    mock_ex.create_order.side_effect = ccxt.BaseError("exchange rejected")
+
+    with patch.object(ex._alerter, "error") as mock_alert:
+        ex.sync_protective_stop(None, trailing_pct=0.02)   # must not raise
+
+    assert not ex.has_resting_stop
+    assert not ex.native_stop_is_trailing
+    mock_alert.assert_called_once()
+    assert "NATIVE TRAILING STOP FAILED" in mock_alert.call_args[0][0]
+
+
+def test_native_trailing_stop_state_persists_and_restores_across_restart(tmp_path):
+    """Order id / trailing flag survive a save/reload cycle. native_stop_price
+    stays None for a trailing order — there's no fixed price to restore."""
+    state_path = str(tmp_path / "state.json")
+    ex, mock_ex = _make(
+        dry_run=False, native_stop_loss_enabled=True,
+        state_path=state_path, tmp_path=tmp_path,
+    )
+    ex._portfolio.position = 0.001
+    mock_ex.create_order.return_value = {"id": "trail-001"}
+    ex.sync_protective_stop(None, trailing_pct=0.02)
+
+    with open(state_path) as f:
+        saved = json.load(f)
+    assert saved["native_stop_order_id"]    == "trail-001"
+    assert saved["native_stop_price"]       is None
+    assert saved["native_stop_is_trailing"] is True
+
+    # Fresh executor loading this state restores the trailing flag.
+    mock_ex2 = MagicMock()
+    mock_ex2.load_markets.return_value = _DEFAULT_MARKETS
+    mock_ex2.fetch_balance.return_value = {
+        "free": {"CAD": ex.cash, "BTC": 0.001}, "total": {"CAD": ex.cash, "BTC": 0.001},
+    }
+    mock_ex2.fetch_open_orders.return_value = [{"id": "trail-001"}]
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = mock_ex2
+        ex2 = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=100.0, dry_run=False, state_path=state_path,
+            native_stop_loss_enabled=True,
+        )
+    assert ex2.has_resting_stop
+    assert ex2.native_stop_is_trailing
+    mock_ex2.create_order.assert_not_called()   # confirmed still open — nothing re-placed
+
+
 if __name__ == "__main__":
     import pathlib
     import shutil
