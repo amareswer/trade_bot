@@ -1,6 +1,6 @@
 ---
 name: expert-practices-benchmark
-description: 2026-08-18 web research on how experts run crypto trading bots, benchmarked against this codebase's actual practices — what already matches/exceeds, two real gaps, decision not to implement either right now
+description: 2026-08-18 web research on how experts run crypto trading bots, benchmarked against this codebase's actual practices — what already matches/exceeds, two real gaps, decision not to implement either right now. 2026-08-19 addendum vs Freqtrade adds a third candidate (lookahead/recursive-bias check tooling), also not implemented.
 metadata:
   type: project
 ---
@@ -61,3 +61,32 @@ first — both were already evaluated and consciously deferred, not overlooked.
 **Net conclusion:** no code changes made from this research pass. Both gaps were already
 either decided (VPS) or assessed as premature (statistical overfitting tooling) rather than
 overlooked — this file exists so that judgment doesn't need re-deriving from scratch.
+
+---
+
+## Addendum 2026-08-19: lookahead/recursive-bias check tooling (candidate, not implemented)
+
+Re-run of the 2026-08-18 benchmark pass, one day later — no major shift, but comparison
+against Freqtrade surfaced one specific tool class not previously considered.
+
+**Finding:** Freqtrade ships `lookahead-analysis` and `recursive-analysis` CLI commands —
+narrow, cheap checks for two concrete bug classes: (1) a strategy indicator accidentally
+using future-bar data during backtest, (2) an indicator whose calculation differs between
+a fresh recalculation and a rolling/incremental one (recursive formula drift), which can
+silently produce different values live vs. in backtest.
+
+**Why this is distinct from the DSR/CSCV gap already deferred in this file:** that gap is
+about correcting for bias from *searching many parameters* (multiple-testing bias). This
+is about catching a strategy that backtests well because it's *structurally cheating* —
+different bug class, cheaper to check, not a duplicate ask.
+
+**Status:** not implemented. Candidate for a future audit pass — check whether
+`bot/strategy/indicator_strategy.py`'s EMA/RSI/ADX calculations use only closed candles
+(no forward-looking window) and whether incremental (`_closes`/`_highs`/`_lows` deque)
+values match a full recompute over the same window at any given point. If confirmed clean
+by inspection, note it here as verified-by-design rather than building new tooling for it.
+
+**Also surfaced, not gaps:** Freqtrade's two-way Telegram control (pause/resume/status
+from chat, not just alerts) and its explicit exchange-diversification advice — both
+consistent with existing deliberate scope (single-exchange Kraken, alert-only Telegram),
+not new problems.
