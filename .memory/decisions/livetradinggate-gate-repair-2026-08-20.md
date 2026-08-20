@@ -62,6 +62,9 @@ hardcoding removed entirely.
 
 Quorum decision (asked, not assumed): **all** RULE_WHITELIST symbols must pass, not a
 percentage. First real run under the new logic: 16 symbols, ~4m45s, **15/16 PASS, AMD FAIL**.
+AMD's failure investigated separately same day — see [[amd-whitelist-investigation-2026-08-20]]:
+small-sample noise (one thin 3-trade recent window), not a genuine edge failure. AMD NOT
+removed from `RULE_WHITELIST`; re-check once that window holds more trades.
 
 **Gate 2 — repurposed to AI confidence-band edge.** Reads the same active book Gate 3 reads
 (`paper_trades.csv`+`ibkr_trades.csv`), not the retired fast book. Checks ≥10 completed
