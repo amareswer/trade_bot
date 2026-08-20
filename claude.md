@@ -432,10 +432,41 @@ enum includes `trailing-stop` with no spot/margin distinction; `price` documente
 same relative `+X%` format. ccxt's docstring labels the param "*margin only*" (kraken.py:1637)
 — confirmed not code-enforced anywhere in `create_order()`/`order_request()`, same as the
 sibling `stopLossPrice` param already running live on spot BTC/CAD under the identical
-annotation. No fix needed. Separately confirmed: Kraken spot has no open public sandbox (only
-Kraken Futures does), but `AddOrder` supports a `validate=true` param for a zero-risk
-request-shape check against the real endpoint — available as a future no-code-risk
-verification step, not yet used.
+annotation. No fix needed. Kraken spot has no open public sandbox (only Kraken Futures does),
+but `AddOrder` supports a `validate=true` param for a zero-risk request-shape check against
+the real endpoint — no execution, per Kraken's own docs: *"If set to `true` the order will be
+validated only, it will not trade in the matching engine."*
+
+**Final step done, 2026-08-19 — real authenticated Kraken server round-trip, PASS.** Before
+running: found that `validate=True` (Python bool) is unsafe — ccxt's `urlencode_nested()`
+(used for this private POST body) has no bool→string normalization, so a Python `True`
+serializes as the literal `validate=True` (capital T) on the wire, not Kraken's documented
+`true`. Verified directly: `ccxt.Exchange.urlencode_nested({'validate': True})` →
+`'validate=True'`, vs. `{'validate': 'true'}` → `'validate=true'`. ccxt's own `kraken.py` hits
+this exact pitfall for `reduce_only`/`post_only` and hardcodes the lowercase string for the
+same reason (`kraken.py:2122`,`:2187`). Script always passes the **string** `'true'`, never
+the bool, for this reason.
+
+Ran `verify_kraken_trailing_stop_live_validate.py --i-understand-this-makes-a-real-kraken-api-call`
+once, sizing at the real `MAX_SLOT_CASH_CAD=$77` cap against the live BTC/CAD price
+($95,568.70 → 0.000806 BTC). **Kraken's literal raw response:**
+```
+{'id': None, 'clientOrderId': None,
+ 'info': {'descr': {'order': 'sell 0.00080 XBTCAD @ trailing stop -2.0000%'}},
+ 'symbol': 'BTC/CAD', 'type': 'trailing stop', 'side': 'sell', 'amount': 0.0008, ...}
+```
+`id: None` — no order id returned, confirming nothing executed (matches Kraken's documented
+validate-only behavior). Kraken's own engine parsed and echoed the request back as
+`'sell 0.00080 XBTCAD @ trailing stop -2.0000%'` — a fully well-formed trailing-stop order
+(the `+2.0000%` sent was correctly flipped to the sell-side `-2.0000%` in Kraken's own
+description, matching their docs: *"direction will be automatic based on if the original
+order is a buy or sell"*). No shape/format error of any kind. This is the real server
+confirming the exact request `_place_native_trailing_stop()` builds — the local-only
+ccxt-source verification (above) plus this real round-trip are now both PASS.
+`verify_kraken_trailing_stop_live_validate.py` stays in the repo as the historical record of
+this exact run (guarded behind an explicit `--i-understand-...` flag, not in pytest/CI, not
+meant for casual re-runs) — this result doesn't need reproducing again absent a ccxt/Kraken
+API change.
 
 ### Slippage guard (crypto — post-fill alert, on by default)
 ```

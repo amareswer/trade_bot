@@ -75,6 +75,20 @@ price format matches exactly, no spot/margin restriction). ccxt's "*margin only*
 label isn't code-enforced — same label sits on the already-working-live `stopLossPrice` param.
 No fix needed.
 
+**Real Kraken server round-trip done same day, PASS — the one remaining zero-risk check.**
+`verify_kraken_trailing_stop_live_validate.py` (repo root, DIFFERENT risk profile than the
+script above: real authenticated API call, guarded behind an explicit `--i-understand-...`
+flag, not pytest/CI, not for casual re-runs) called Kraken's real AddOrder with
+`params={"trailingPercent": "2.0000", "validate": "true"}` — note the **string** `'true'`,
+not Python bool `True`: `urlencode_nested()` (this endpoint's POST-body encoder) has no
+bool→string normalization, so `True` would've serialized as literal `validate=True` and risked
+Kraken not recognizing it as truthy (ccxt's own kraken.py hardcodes lowercase strings for the
+identical reason on `reduce_only`/`post_only`). Sized at the real `MAX_SLOT_CASH_CAD=$77` cap
+→ 0.000806 BTC. Kraken's response: `id: None` (nothing executed) + description
+`'sell 0.00080 XBTCAD @ trailing stop -2.0000%'` — fully accepted, well-formed. Both halves
+of verification (ccxt-source-level and real-server-level) are now PASS. This does not need
+re-running absent a ccxt/Kraken API change.
+
 ---
 
 ## PaperExecutor — `bot/execution/executor.py`
