@@ -1,6 +1,6 @@
 ---
 name: expert-practices-benchmark
-description: 2026-08-18 web research on how experts run crypto trading bots, benchmarked against this codebase's actual practices — what already matches/exceeds, two real gaps, decision not to implement either right now. 2026-08-19 addendum vs Freqtrade adds a third candidate (lookahead/recursive-bias check tooling), also not implemented.
+description: 2026-08-18 web research on how experts run crypto trading bots, benchmarked against this codebase's actual practices — what already matches/exceeds, two real gaps, decision not to implement either right now. 2026-08-19 addendum vs Freqtrade adds a third candidate (lookahead/recursive-bias check tooling) — resolved 2026-08-20: no lookahead bug, but a related self-referential-baseline bug was found and fixed.
 metadata:
   type: project
 ---
@@ -90,3 +90,47 @@ by inspection, note it here as verified-by-design rather than building new tooli
 from chat, not just alerts) and its explicit exchange-diversification advice — both
 consistent with existing deliberate scope (single-exchange Kraken, alert-only Telegram),
 not new problems.
+
+---
+
+## Resolution 2026-08-20: lookahead check done — no bug found; one related bug found and fixed
+
+Did the audit pass this addendum proposed. Two separate questions, two separate answers:
+
+**1. Lookahead (future-bar data used during backtest) — NOT FOUND, verified by design.**
+`IndicatorStrategy.evaluate()` computes every indicator (`calc_rsi`, `calc_ema`, `calc_adx`,
+`calc_atr`) as a full stateless recompute over `list(self._closes)`/`_highs`/`_lows` — plain
+Python lists sliced from `deque`s that only ever have the *current* candle's OHLC appended
+immediately before those calls, once per `evaluate()` invocation. No indicator function
+receives or indexes anything beyond what's already in that snapshot. There is no
+forward-looking window anywhere in the calculation path — confirmed by direct inspection of
+`bot/indicators/indicators.py` and every call site in `evaluate()`, not just re-asserted from
+the addendum's framing.
+
+**2. Recursive/incremental-vs-recompute drift — NOT APPLICABLE as originally framed, but a
+real self-referential-baseline bug was found in the adjacent regime-classification code.**
+Every indicator here (RSI/EMA/ADX/ATR) is already a fresh full recompute each candle, not an
+incremental rolling update — so the "does incremental drift from recompute" question Freqtrade's
+`recursive-analysis` checks for doesn't apply to this codebase's indicator layer at all.
+However, the deep-verification pass this addendum prompted found a **different, real** bug one
+level up, in how the regime classifier *uses* the recomputed ATR: `evaluate()` appended the
+current candle's ATR to `self._atr_history` (a 20-entry rolling window) BEFORE
+`_classify_regime()` compared that same ATR against the window's mean — the VOLATILE-regime
+threshold was being judged against a baseline the current spike had already been folded into
+(self-inclusion bias, ~1/20th of the spike's own pull on the mean). Not lookahead (nothing
+future was touched) and not recursive drift (the ATR value itself was always correctly
+recomputed) — a third, narrower bug class: a rolling statistic computed AFTER the value it's
+being compared against had already been added to it.
+
+**Fix:** moved the `self._atr_history.append(atr_val)` call to strictly after
+`_classify_regime()` consumes `atr_val`, so the comparison is always against the prior (up to
+20) candles only. `bot/strategy/indicator_strategy.py`. Full detail, walk-forward result, and
+new hash: CLAUDE.md "Canonical strategy fingerprint" section (hash `659d1c03987b72fd` →
+`b30f2f9e769c8d41`, BTC/USDT backtest 32 trades/PF 1.72 → 31 trades/PF 2.19, walk-forward
+PASS both windows PF ≥ 1.0). Tests: `tests/shared/test_indicators.py`, 2 new — one a direct
+contract check on `_classify_regime()`, one a mutation-verified regression test driving real
+`evaluate()` end to end (confirmed to fail under the pre-fix ordering, not just pass under the
+fix). Suite 534→536.
+
+**Addendum's original candidate item is now closed** — worth revisiting only if the strategy
+gains genuinely incremental/stateful indicator math in the future (none exists today).

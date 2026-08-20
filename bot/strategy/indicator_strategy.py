@@ -192,13 +192,25 @@ class IndicatorStrategy:
         atr_val: Optional[float] = None
         if len(highs) >= 28:
             atr_val = calc_atr(highs, lows, closes, 14)
-        if atr_val is not None:
-            self._atr_history.append(atr_val)
         self._last_atr = atr_val
 
         # ── Regime classification ─────────────────────────────────────
+        # _classify_regime() compares atr_val against the mean of
+        # self._atr_history — that must be the mean of PRIOR candles only.
+        # Do NOT append atr_val to _atr_history before this call: appending
+        # first would let the current bar's own value pull up the baseline
+        # it's being tested against (self-referential bias, found in a
+        # 2026-08-19 deep-verification pass — not a lookahead bug, since
+        # nothing future is used, but it made a genuine volatility spike
+        # slightly harder to detect than comparing against the strictly-
+        # prior history, worth ~1/len(history) of the spike itself). The
+        # append below happens strictly after classification, so atr_val
+        # only becomes part of the baseline for FUTURE candles' comparisons
+        # — the normal rolling-average-of-history shape.
         regime = self._classify_regime(adx_val, atr_val)
         self._last_regime = regime
+        if atr_val is not None:
+            self._atr_history.append(atr_val)
 
         # ── RSI direction ─────────────────────────────────────────────
         rsi_rising  = self._last_rsi is not None and rsi_val > self._last_rsi

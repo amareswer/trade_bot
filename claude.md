@@ -174,7 +174,7 @@ need the full narrative behind any decision below.
 
 ## Test Suite Manifest (reconciled 2026-08-18)
 
-Expected total: **534 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~11s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before this session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later.)
+Expected total: **536 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~11s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later.)
 
 **Directory layout (2026-08-18):** all 54 files moved out of repo root into `tests/{crypto,stock,shared}/` for
 a cleaner root — 54 files loose alongside `bot/`, `stock_bot/`, `config.py`, etc. had gotten hard to scan.
@@ -197,7 +197,7 @@ now `.parent.parent.parent`. Verified before/after: same 526 collected, same 526
 
 | File | Tests | What it covers |
 |------|-------|----------------|
-| `tests/shared/test_indicators.py` | 28 | RSI, EMA, ADX, MACD, ATR calculations |
+| `tests/shared/test_indicators.py` | 30 | RSI, EMA, ADX, MACD, ATR calculations; regime-classification self-referential-ATR-baseline regression (2026-08-20 — `_classify_regime()` contract check + a mutation-verified test driving real `evaluate()` end to end) |
 | `tests/crypto/test_live_executor.py` | 51 | LiveExecutor: dry-run, market/limit orders, urgent-exit bypass, fee deduction, state save/load, pre-trade min-size guard, restart recovery (seeds position manager + state machine), native stop-loss backstop (placement, cancel, resync, failure alerting, dry-run/flag-off no-ops, restart reconciliation), native TRAILING stop-loss backstop (placement w/ trailingPercent param, priority over static, cancel, resync-on-quantity-change, failure alerting, dry-run no-op, state persist/restore — added 2026-08-19), slippage guard (BUY/SELL unfavorable trip, within-threshold, favorable-direction, disabled, dry-run no-ops) |
 | `tests/crypto/test_capital_pool.py` | 19 | CapitalPool: slot allocation, slot cap, release, edge cases |
 | `tests/crypto/test_correlation.py` | 17 | Pearson correlation, pct_returns, fetch_correlation |
@@ -252,7 +252,7 @@ now `.parent.parent.parent`. Verified before/after: same 526 collected, same 526
 | `tests/crypto/test_grid_dca_experiment.py` | 12 | `grid_dca_experiment.py` standalone backtest engines (crypto research tooling, not the live pipeline): grid strategy fills/reopens/floor-stop, capital split across slots, fee math on both legs, DCA safety-order averaging + cycle restart, empty-candle edge cases |
 | `tests/shared/test_telegram_retry.py` | 3 | `TelegramAlerter._send()` retry (added 2026-08-17, closes known-gaps #17): healthy send calls `requests.post` once with no retry, a transient failure recovers on retry, a persistent failure still degrades to a warning-only no-raise after exhausting attempts |
 
-Run: `python -m pytest --tb=short -q` — must show **534 passed**.
+Run: `python -m pytest --tb=short -q` — must show **536 passed**.
 
 ---
 
@@ -645,8 +645,8 @@ sizing, just persisted per-trade now instead of only used transiently.
 
 ### How to verify the config is active
 Run: `EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py`
-Expected (current, since macd_enabled was wired into `engine_kwargs_from_cfg`, 2026-07-20):
-**32 trades, PF 1.72, 37.5% win rate.** Hash `659d1c03987b72fd` unchanged.
+Expected (current, since the self-referential ATR regime-baseline fix, 2026-08-20):
+**31 trades, PF 2.19, 38.7% win rate.** Hash `b30f2f9e769c8d41` unchanged.
 If RSI_FILTER_ENABLED=false accidentally: trade count jumps significantly, PF drops below 1.2.
 
 Reproducible pinned-window verification (identical result to rolling run):
@@ -655,14 +655,37 @@ EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-0
 ```
 
 ### Canonical strategy fingerprint (BTC/USDT)
-- **Strategy hash:** `659d1c03987b72fd`
+- **Strategy hash:** `b30f2f9e769c8d41`
 - **Hashed files (behavior-defining only):** `bot/strategy/indicator_strategy.py`,
   `bot/strategy/threshold_strategy.py`, `bot/indicators/indicators.py`
   (fingerprint.py and __init__.py excluded — non-behavioral)
-- **Current result:** 32 trades, PF 1.72 (see "How to verify" above). Full research
+- **Current result:** 31 trades, PF 2.19 (see "How to verify" above). Full research
   trail (why the trade count moved 58→39→35→32 across sessions) is in `CLAUDE_HISTORY.md`.
 - Stamp after each passing walk-forward: `python stamp_strategy.py` → `logs/validated_strategy_hash`
 - If the bot or backtest prints `STRATEGY CODE DIFFERS`, re-run walk-forward before trusting any PF numbers
+
+**2026-08-20 hash change — self-referential ATR regime baseline fixed.** Found during a
+deep-verification pass (see `.memory/decisions/expert-practices-benchmark.md`'s 2026-08-19
+lookahead/recursive-bias addendum): `IndicatorStrategy.evaluate()` appended the current
+candle's ATR to `self._atr_history` **before** `_classify_regime()` compared it against that
+same history's mean — the VOLATILE check was judging a spike against a baseline the spike
+itself had already been folded into (self-inclusion bias, worth ~1/20th of the spike's own
+pull on the 20-entry rolling history). Not a lookahead bug — nothing future was used — but it
+made a genuine volatility spike marginally harder to detect than comparing against the
+strictly-prior candles. Fixed by moving the `self._atr_history.append(atr_val)` call to
+strictly after `_classify_regime()` returns, so the current bar's ATR only enters the
+baseline for *future* candles' comparisons (`bot/strategy/indicator_strategy.py`). Trade
+count moved 32→31 (one fewer setup taken — a marginal case now correctly reads VOLATILE and
+sits flat instead of trading), aggregate PF moved 1.72→2.19. Walk-forward (Binance BTC/USDT,
+Kraken BTC/CAD has insufficient history for the training window — see "Exchange Setup" above
+for why Binance is the standing proxy): **PASS**, PF holds out-of-sample (training 1.20 →
+validation 2.99, both ≥1.0). Re-stamped via `stamp_strategy.py`. Tests:
+`tests/shared/test_indicators.py`, 2 new — `test_classify_regime_excludes_current_bar_from_baseline`
+(direct `_classify_regime()` contract check) and
+`test_evaluate_regime_excludes_current_bar_from_baseline` (the actual regression test —
+drives real `evaluate()` end to end with a spike sized to land between the exclusive- and
+self-inclusive-mean thresholds; mutation-verified to FAIL under the pre-fix append-before-
+classify ordering, confirmed manually before landing). Suite 534→536.
 
 ### Current operational status (as of 2026-07-28)
 - **Crypto bot:** live on Kraken, BTC/CAD only, $77 slot cap, capital gate at 0/15 fills
