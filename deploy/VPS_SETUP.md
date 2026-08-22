@@ -107,17 +107,13 @@ All checks must pass before starting the bot. If any fail:
 
 ### 7. Set up logrotate
 
+Copy the repo's own config rather than retyping it — `deploy/logrotate_trade_bot.conf`
+is the single source of truth for the rotation policy (already pointed at `/opt/trade_bot`,
+matching `deploy.sh`'s `INSTALL_DIR` and this service file's `WorkingDirectory`):
+
 ```bash
-sudo tee /etc/logrotate.d/trade_bot << 'EOF'
-/opt/trade_bot/logs/trade_bot.log {
-    weekly
-    rotate 4
-    compress
-    missingok
-    notifempty
-    copytruncate
-}
-EOF
+sudo cp /opt/trade_bot/deploy/logrotate_trade_bot.conf /etc/logrotate.d/trade_bot
+sudo logrotate -d /etc/logrotate.d/trade_bot   # dry-run test (no changes)
 ```
 
 ### 8. Start the bot

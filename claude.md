@@ -1356,7 +1356,7 @@ All of the following must be met before adding any USD pair to UNIVERSE_WHITELIS
 
 | # | Item | Status |
 |---|------|--------|
-| F | VPS logrotate (`/etc/logrotate.d/trade_bot`) | Open — small effort |
+| F | VPS logrotate (`/etc/logrotate.d/trade_bot`) | Config ready (2026-08-21): `deploy/logrotate_trade_bot.conf` fixed to the canonical `/opt/trade_bot` path (was a `/path/to/your/project` placeholder) and `VPS_SETUP.md` step 7 now copies that one file instead of duplicating a slightly different inline copy (the two had drifted — the inline version was missing `delaycompress`). Nothing left to do until a VPS actually exists — migration itself is still deferred per [[expert-practices-benchmark]] |
 | H | Ollama Cloud key revoke | Confirmed unused 2026-07-16; user parked indefinitely — don't re-raise unprompted |
 | I | IBKR live go-live | Gate-blocked (30 paper trades + PF ≥ 1.2) — `LiveTradingGate` Gates 1-3 now CODE-ENFORCED in `IBKRExecutor.__init__()` (2026-08-20); `IBKR_ALLOW_LIVE=true` on a live port raises `ValueError` unless all three PASS. Current real status: Gate 1 15/16 (AMD fails), Gates 2-3 PENDING (insufficient live trades) |
 | J | USD symbol re-screen | Automated monthly via rescreen.py |
