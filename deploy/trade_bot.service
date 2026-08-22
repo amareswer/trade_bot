@@ -13,7 +13,7 @@ User=ubuntu
 WorkingDirectory=/opt/trade_bot
 EnvironmentFile=/opt/trade_bot/.env
 
-ExecStart=/opt/trade_bot/venv/bin/python main.py
+ExecStart=/opt/trade_bot/venv/bin/python -m bot.main
 Restart=always
 RestartSec=30
 
