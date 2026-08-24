@@ -1980,9 +1980,15 @@ def run():
 
             # ── Blocked-gate tracking (initialise per-candle) ─────────
             # Records the first gate (in priority order) that blocked a BUY.
-            # Priority: trend → RSI → ADX → EMA_spread → MACD → regime
-            #           → correlation → candle_watchdog → state_machine
-            #           → risk_manager → capital_pool
+            # Priority: trend → RSI → ADX → EMA_spread → MACD → mtf_trend
+            #           → external_signal → regime → correlation
+            #           → candle_watchdog → state_machine → risk_manager
+            #           → capital_pool
+            # mtf_trend / external_signal / regime were previously a single
+            # shared "regime" label — split 2026-08-24 after the 2026-08-18
+            # missed-BUY investigation found it impossible to tell which of
+            # the three had actually fired from live_signals.csv alone. See
+            # .memory/decisions/2026-08-18-missed-buy-signal.md.
             _signal_raw_for_csv = raw_signal
             _buy_block_gate: str = ""
             if is_indicator and live_exchange is not None:
@@ -2021,9 +2027,16 @@ def run():
                     if _mtf_trend == "BEARISH":
                         raw_signal = Signal.HOLD
                         if not _buy_block_gate:
-                            _buy_block_gate = "regime"
+                            # 2026-08-24: was "regime" — split from the regime-proper
+                            # gate (2e) and the external-signal gate (2d) below so
+                            # live_signals.csv's blocked_gate column can distinguish
+                            # which of the three actually fired (see .memory/decisions/
+                            # 2026-08-18-missed-buy-signal.md for why this mattered).
+                            _buy_block_gate = "mtf_trend"
                         print(f"  [{sym}] MTF gate: 1D trend BEARISH — BUY suppressed", flush=True)
                         logger.info("MTF gate [%s]: BUY suppressed — daily trend BEARISH", sym)
+                    else:
+                        logger.info("MTF gate [%s]: OK — daily trend %s", sym, _mtf_trend)
 
             # ── 2d. External signal gate ──────────────────────────────
             if raw_signal == Signal.BUY and ext_gate is not None:
@@ -2031,9 +2044,17 @@ def run():
                 if not _ext_approved:
                     raw_signal = Signal.HOLD
                     if not _buy_block_gate:
-                        _buy_block_gate = "regime"
+                        # 2026-08-24: was "regime" — see MTF gate comment above.
+                        _buy_block_gate = "external_signal"
                     print(f"  [{sym}] EXT gate: {_ext_reason}", flush=True)
                     logger.info("External signal gate blocked BUY [%s]: %s", sym, _ext_reason)
+                else:
+                    _ext_status = ext_gate.status()
+                    logger.info(
+                        "External signal gate [%s]: OK — FNG=%s (%s)  funding=%s",
+                        sym, _ext_status.get("fng_value"), _ext_status.get("fng_classification"),
+                        _ext_status.get("funding_rate"),
+                    )
 
             # ── 2e. Regime gate ───────────────────────────────────────
             # Independent check: ADX ≥ threshold AND EMA spread ≥ MIN_EMA_SPREAD_PCT.
@@ -2094,6 +2115,7 @@ def run():
                     for other_sym, other_ss in symbol_state.items()
                     if other_sym != sym and other_ss['pm'].has_position
                 ]
+                _corr_blocked = False
                 for _peer in _open_peers:
                     _corr = fetch_correlation(live_exchange, sym, _peer)
                     if _corr is not None and _corr > CORRELATION_THRESHOLD:
@@ -2106,7 +2128,13 @@ def run():
                         )
                         print(f"  [{sym}] {_corr_msg}", flush=True)
                         logger.warning(_corr_msg)
+                        _corr_blocked = True
                         break
+                if not _corr_blocked:
+                    logger.info(
+                        "Correlation gate [%s]: OK — checked %d open peer(s), none > %.2f",
+                        sym, len(_open_peers), CORRELATION_THRESHOLD,
+                    )
 
             # ── 2g. Candle watchdog gate ───────────────────────────────
             # Circuit breaker (upgraded 2026-08-07 — previously alert-only,
@@ -2122,6 +2150,8 @@ def run():
                     _buy_block_gate = "candle_watchdog"
                 print(f"  [{sym}] CANDLE WATCHDOG: BUY blocked — feed stale", flush=True)
                 logger.warning("CANDLE WATCHDOG [%s]: BUY blocked — feed stale", sym)
+            elif raw_signal == Signal.BUY:
+                logger.info("Candle watchdog [%s]: OK — feed fresh", sym)
 
             # ── 3. Warmup guard ───────────────────────────────────────
             if is_indicator and not ss['strategy'].is_warmed_up:
@@ -2134,26 +2164,43 @@ def run():
 
             # ── 4. State machine filter + tick ────────────────────────
             filtered_signal, filter_reason = ss['sm'].filter_signal(raw_signal)
-            if raw_signal == Signal.BUY and filtered_signal != Signal.BUY and not _buy_block_gate:
-                _buy_block_gate = "state_machine"
+            if raw_signal == Signal.BUY:
+                if filtered_signal != Signal.BUY:
+                    if not _buy_block_gate:
+                        _buy_block_gate = "state_machine"
+                    logger.info(
+                        "State machine [%s]: BUY -> %s  (%s)",
+                        sym, filtered_signal.value, filter_reason or "filtered",
+                    )
+                else:
+                    logger.info("State machine [%s]: OK — BUY passed through  (state=%s)",
+                                sym, ss['sm'].state.value)
             ss['sm'].tick()
 
             # ── 5. Dynamic position sizing ────────────────────────────
             # executor.cash is already capped to its pool slot — no division needed.
             # Block BUY when the pool has no slot available for a new position.
-            if filtered_signal == Signal.BUY and not capital_pool.can_open_position(sym):
-                if not _buy_block_gate:
-                    _buy_block_gate = "capital_pool"
-                filtered_signal = Signal.HOLD
-                logger.info(
-                    "CapitalPool: BUY blocked for %s — pool exhausted (%d/%d slots used)",
-                    sym, len(capital_pool.allocated_symbols), _max_conc,
-                )
+            if filtered_signal == Signal.BUY:
+                if not capital_pool.can_open_position(sym):
+                    if not _buy_block_gate:
+                        _buy_block_gate = "capital_pool"
+                    filtered_signal = Signal.HOLD
+                    logger.info(
+                        "CapitalPool: BUY blocked for %s — pool exhausted (%d/%d slots used)",
+                        sym, len(capital_pool.allocated_symbols), _max_conc,
+                    )
+                else:
+                    logger.info(
+                        "CapitalPool [%s]: OK — slot available (%d/%d slots used)",
+                        sym, len(capital_pool.allocated_symbols), _max_conc,
+                    )
             _max_cash_for_sym = ss['executor'].cash
             if filtered_signal == Signal.SELL:
                 trade_qty = ss['pm'].quantity
             else:
-                trade_qty = cfg.calc_trade_qty(_max_cash_for_sym, price)
+                _requested_qty = cfg.calc_trade_qty(_max_cash_for_sym, price)
+                trade_qty       = _requested_qty
+                _sizing_method  = "notional (calc_trade_qty)"
                 # ATR-aware sizing (ATR_SIZING_ENABLED): cap qty so an ATR
                 # stop-out never risks more $ than the fixed-SL baseline.
                 if (
@@ -2173,9 +2220,17 @@ def run():
                             cfg.strategy.atr_sl_mult,
                             cfg.backtest.stop_loss_pct or 0.015,
                         )
+                        _sizing_method = "ATR-risk-capped (calc_trade_qty_atr_risk)"
                 max_affordable = (_max_cash_for_sym * 0.98) / price
                 trade_qty = min(trade_qty, max_affordable)
                 trade_qty = round(trade_qty, 6)
+                if filtered_signal == Signal.BUY:
+                    logger.info(
+                        "Sizing [%s]: requested=%.8f (%s)  cash_available=$%.2f  "
+                        "max_affordable=%.8f  final_qty=%.8f",
+                        sym, _requested_qty, _sizing_method, _max_cash_for_sym,
+                        max_affordable, trade_qty,
+                    )
 
             # ── 6. AI advisory ────────────────────────────────────────
             advice       = None
@@ -2312,7 +2367,28 @@ def run():
 
             # ── 9. Execute ────────────────────────────────────────────
             if approval:
-                order = ss['executor'].execute(final_signal, price, quantity=trade_qty)
+                # 2026-08-24: wrap the executor call itself — everything inside
+                # LiveExecutor.execute() already alerts on the *known* failure
+                # modes it recognizes (min-size, insufficient funds, exchange
+                # rejection), but a genuinely unexpected exception (a bug, an
+                # unhandled ccxt error shape, etc.) previously had no guarantee
+                # of reaching Telegram — it would only surface if it happened to
+                # fall inside one of execute()'s many internal try/excepts.
+                # This is the last line of defense: log + alert + degrade to
+                # "no order this tick" rather than let it crash the loop or go
+                # unnoticed. Does not change what gets sent to the exchange.
+                try:
+                    order = ss['executor'].execute(final_signal, price, quantity=trade_qty)
+                except Exception as _exec_exc:
+                    logger.error(
+                        "EXECUTOR EXCEPTION [%s] %s: %s", sym, final_signal.value, _exec_exc,
+                        exc_info=True,
+                    )
+                    alerter.error(
+                        f"EXECUTOR EXCEPTION [{sym}] {final_signal.value}: {_exec_exc} — "
+                        f"order not confirmed placed or filled, check the exchange manually"
+                    )
+                    order = None
                 if order:
                     if order.status == OrderStatus.FILLED and order.quantity <= 0:
                         logger.error(

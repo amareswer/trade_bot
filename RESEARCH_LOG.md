@@ -3,6 +3,28 @@ BTC/USDT · 4H · Binance · 10,000 candles (2021-11-21 → 2026-06-14)
 
 ---
 
+> ## ⚠️ SUPERSEDED — do not treat this file as current
+>
+> **Confirmed 2026-08-24** (during the 2026-08-18 missed-BUY-signal investigation — see
+> `.memory/decisions/2026-08-18-missed-buy-signal.md`): this file is a standalone research
+> pass (created 2026-06-14, last edited 2026-07-05, per `git log --follow`) that was **never
+> wired into the live system**. Its "FROZEN — do not change without new research" config block
+> below (notably `ADX_THRESHOLD=25.0`, `STOP_LOSS_PCT=0.03`, `TAKE_PROFIT_PCT=0.06`) does not
+> match — and, as far as the documented project history shows, never matched — any version of
+> what has actually run live. It also predates two strategy-code changes that materially affect
+> signal generation (Mode A/B entry-parameter wiring, 2026-07-20; the self-referential
+> ATR-regime-baseline fix, 2026-08-20), so even its own backtest numbers can no longer be
+> reproduced against current code.
+>
+> **The actual validated/live config is documented in `CLAUDE.md`'s "Active .env settings" and
+> "Current Live Configuration" sections** — currently `ADX_THRESHOLD=18.0` (chosen by a
+> documented sweep of 18/25/30/35 in `CLAUDE_HISTORY.md`, around 2026-06-27–07-02, which
+> predates this file's own last edit) — and cross-checked directly against the live `.env` and
+> `config.cfg` at investigation time. Kept here, not deleted, as a historical record of a
+> research pass that was run but not adopted.
+
+---
+
 ## Final System Classification
 
 ```

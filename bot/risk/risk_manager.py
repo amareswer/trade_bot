@@ -183,6 +183,8 @@ class RiskManager:
 
         # ── Check 1: manual halt — blocks BUY and SELL (HOLD returns early above) ──
         if self.config.halt:
+            logger.warning("RiskManager REJECT [%s]: HALT — trading is halted (config.halt=True)",
+                           symbol or signal.value)
             return ApprovalResult(
                 approved=False,
                 message="Trading is halted (config.halt=True)",
@@ -194,14 +196,14 @@ class RiskManager:
         # the two and, once tripped, stays tripped regardless of what the
         # drawdown-halt check below would independently conclude. ──
         if signal == Signal.BUY and self._is_kill_switch_tripped(current_value):
+            _msg = (
+                f"KILL SWITCH active: {self._drawdown_from_peak_pct(current_value)*100:.2f}% "
+                f"drawdown from peak ${self._peak_value:,.2f} — all new BUYs blocked "
+                f"until manually cleared (edit kill_switch_tripped in the risk state file)"
+            )
+            logger.warning("RiskManager REJECT [%s]: KILL_SWITCH — %s", symbol or "", _msg)
             return ApprovalResult(
-                approved=False,
-                message=(
-                    f"KILL SWITCH active: {self._drawdown_from_peak_pct(current_value)*100:.2f}% "
-                    f"drawdown from peak ${self._peak_value:,.2f} — all new BUYs blocked "
-                    f"until manually cleared (edit kill_switch_tripped in the risk state file)"
-                ),
-                block_reason=BlockReason.KILL_SWITCH,
+                approved=False, message=_msg, block_reason=BlockReason.KILL_SWITCH,
             )
 
         # ── Check 3: all-time max drawdown — HALT tier (BUY only — SELL must
@@ -209,14 +211,14 @@ class RiskManager:
         if signal == Signal.BUY and self._peak_value > 0:
             drawdown = self._drawdown_from_peak_pct(current_value)
             if drawdown >= self.config.max_drawdown_pct:
+                _msg = (
+                    f"Max drawdown circuit breaker: portfolio down {drawdown*100:.2f}% "
+                    f"from peak ${self._peak_value:,.2f} "
+                    f"(limit={self.config.max_drawdown_pct*100:.0f}%)"
+                )
+                logger.warning("RiskManager REJECT [%s]: MAX_DRAWDOWN — %s", symbol or "", _msg)
                 return ApprovalResult(
-                    approved=False,
-                    message=(
-                        f"Max drawdown circuit breaker: portfolio down {drawdown*100:.2f}% "
-                        f"from peak ${self._peak_value:,.2f} "
-                        f"(limit={self.config.max_drawdown_pct*100:.0f}%)"
-                    ),
-                    block_reason=BlockReason.MAX_DRAWDOWN,
+                    approved=False, message=_msg, block_reason=BlockReason.MAX_DRAWDOWN,
                 )
 
         # ── Check 4: weekly loss limit (BUY only — SELL must always close).
@@ -224,14 +226,14 @@ class RiskManager:
         if signal == Signal.BUY and self._week_open_value:
             weekly_loss_pct = (self._week_open_value - current_value) / self._week_open_value
             if weekly_loss_pct >= self.config.weekly_loss_limit_pct:
+                _msg = (
+                    f"Weekly loss limit: portfolio down {weekly_loss_pct*100:.2f}% "
+                    f"(limit={self.config.weekly_loss_limit_pct*100:.0f}%) — "
+                    f"week_open=${self._week_open_value:,.2f}, now=${current_value:,.2f}"
+                )
+                logger.warning("RiskManager REJECT [%s]: WEEKLY_LOSS — %s", symbol or "", _msg)
                 return ApprovalResult(
-                    approved=False,
-                    message=(
-                        f"Weekly loss limit: portfolio down {weekly_loss_pct*100:.2f}% "
-                        f"(limit={self.config.weekly_loss_limit_pct*100:.0f}%) — "
-                        f"week_open=${self._week_open_value:,.2f}, now=${current_value:,.2f}"
-                    ),
-                    block_reason=BlockReason.WEEKLY_LOSS,
+                    approved=False, message=_msg, block_reason=BlockReason.WEEKLY_LOSS,
                 )
 
         # ── Check 5: daily trade cap (BUY only — SELL must always be allowed) ──
@@ -243,27 +245,27 @@ class RiskManager:
         )
         if signal == Signal.BUY and _cap_fills >= self.config.max_trades_per_day:
             _cap_label = f" [{symbol}]" if symbol is not None else ""
+            _msg = (
+                f"Daily trade cap reached{_cap_label}: {_cap_fills}/"
+                f"{self.config.max_trades_per_day} fills today"
+            )
+            logger.info("RiskManager REJECT [%s]: DAILY_TRADE_CAP — %s", symbol or "", _msg)
             return ApprovalResult(
-                approved=False,
-                message=(
-                    f"Daily trade cap reached{_cap_label}: {_cap_fills}/"
-                    f"{self.config.max_trades_per_day} fills today"
-                ),
-                block_reason=BlockReason.DAILY_TRADE_CAP,
+                approved=False, message=_msg, block_reason=BlockReason.DAILY_TRADE_CAP,
             )
 
         # ── Check 6: daily loss limit (BUY only — SELL must always close) ──
         if signal == Signal.BUY and self._day_open_value:
             loss_pct = (self._day_open_value - current_value) / self._day_open_value
             if loss_pct >= self.config.daily_loss_limit_pct:
+                _msg = (
+                    f"Daily loss limit: portfolio down {loss_pct*100:.2f}% "
+                    f"(limit={self.config.daily_loss_limit_pct*100:.0f}%) — "
+                    f"open=${self._day_open_value:,.2f}, now=${current_value:,.2f}"
+                )
+                logger.warning("RiskManager REJECT [%s]: DAILY_LOSS — %s", symbol or "", _msg)
                 return ApprovalResult(
-                    approved=False,
-                    message=(
-                        f"Daily loss limit: portfolio down {loss_pct*100:.2f}% "
-                        f"(limit={self.config.daily_loss_limit_pct*100:.0f}%) — "
-                        f"open=${self._day_open_value:,.2f}, now=${current_value:,.2f}"
-                    ),
-                    block_reason=BlockReason.DAILY_LOSS,
+                    approved=False, message=_msg, block_reason=BlockReason.DAILY_LOSS,
                 )
 
         # ── Check 7: max position size (BUY only, always per-slot) ────
@@ -271,16 +273,21 @@ class RiskManager:
             new_position_value = (portfolio.position + trade_qty) * price
             new_position_pct   = new_position_value / slot_value if slot_value else 1.0
             if new_position_pct > self.config.max_position_pct:
+                _msg = (
+                    f"Position size limit: {trade_qty} units would put "
+                    f"{new_position_pct*100:.2f}% in position "
+                    f"(limit={self.config.max_position_pct*100:.0f}%)"
+                )
+                logger.info("RiskManager REJECT [%s]: POSITION_SIZE — %s", symbol or "", _msg)
                 return ApprovalResult(
-                    approved=False,
-                    message=(
-                        f"Position size limit: {trade_qty} units would put "
-                        f"{new_position_pct*100:.2f}% in position "
-                        f"(limit={self.config.max_position_pct*100:.0f}%)"
-                    ),
-                    block_reason=BlockReason.POSITION_SIZE,
+                    approved=False, message=_msg, block_reason=BlockReason.POSITION_SIZE,
                 )
 
+        # All 7 checks passed. Only logged for BUY — SELL/exit approvals are
+        # frequent (every close) and would otherwise flood the log for no
+        # diagnostic benefit; BUY approvals are the rare, worth-recording case.
+        if signal == Signal.BUY:
+            logger.info("RiskManager APPROVE [%s]: all 7 checks passed", symbol or "")
         return APPROVED
 
     def record_fill(self, symbol: Optional[str] = None) -> None:
