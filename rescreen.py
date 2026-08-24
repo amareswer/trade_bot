@@ -2,27 +2,49 @@
 """
 rescreen.py — monthly automated re-screen of both books (2026-07-16).
 
-Runs the two existing validation gates as subprocesses and compares their
+Runs the existing validation gates as subprocesses and compares their
 PASS lists against the live whitelists:
 
   1. screen_universe.py   — Kraken CAD auto-discovery + 3-window walk-forward
                             (crypto; includes BTC/CAD, so live-symbol edge
                             decay is caught too)
-  2. stock_backtest.py    — 4-window daily walk-forward over the stock
+  2. screen_universe.py   — same gate, Kraken USD auto-discovery
+     (SCREEN_QUOTE=USD)    (added 2026-08-24 — closes a real automation gap:
+                            CLAUDE.md had long claimed USD re-screening was
+                            "automated monthly via rescreen.py" when the code
+                            never actually passed SCREEN_QUOTE=USD anywhere —
+                            the USD side was manual-only since 2026-07-16.
+                            No UNIVERSE_WHITELIST entry is USD today, so this
+                            leg only ever surfaces NEW QUALIFIERS, never
+                            decay — see _crypto_usd_whitelist() below.)
+  3. stock_backtest.py    — 4-window daily walk-forward over the stock
                             WATCHLIST (re-validates every RULE_WHITELIST
                             symbol; catches decayed edges like UBER's)
 
 Output: logs/rescreen_<date>.md + Telegram alert when anything needs
 attention. THIS SCRIPT NEVER CHANGES A WHITELIST — additions and removals
 stay manual, per the Validation Discipline in CLAUDE.md. It exists so the
-evidence refreshes itself; the decision remains a human checkpoint.
+evidence refreshes itself; the decision remains a human checkpoint. This
+applies identically to the USD leg: a USD PASS is flagged for a human to
+look at, never auto-added to UNIVERSE_WHITELIST or the USD Expansion
+preconditions list.
 
 Scheduled by the crypto bot's in-bot audit scheduler (monthly, 1st of the
 month at RESCREEN_AUDIT_TIME, catch-up if the bot was down — see
 _scheduled_audits_loop in bot/main.py). Manual run: .venv/bin/python rescreen.py
 
+Load/runtime, measured 2026-08-24 (see CLAUDE_HISTORY.md for the full
+investigation before this leg was added): the USD leg costs the same 2
+Kraken API calls as the CAD leg (load_markets + fetch_tickers, negligible)
+plus up to SCREEN_MAX_CANDIDATES (15 by default) Binance OHLCV fetches for
+the walk-forward step — measured at ~28s/candidate, so up to ~7 extra
+minutes added to the monthly job (well under this script's own 2400s
+per-leg subprocess timeout, and this runs once a month off the trading
+tick loop, not in it).
+
 Env:
-  RESCREEN_SKIP_CRYPTO=true   skip the crypto screen (e.g. while HALT engaged)
+  RESCREEN_SKIP_CRYPTO=true   skip the CAD crypto screen (e.g. while HALT engaged)
+  RESCREEN_SKIP_USD=true      skip the USD crypto screen
   RESCREEN_SKIP_STOCKS=true   skip the stock walk-forward
 """
 from __future__ import annotations
@@ -79,6 +101,23 @@ def _crypto_whitelist() -> set[str]:
     }
 
 
+def _crypto_usd_whitelist() -> set[str]:
+    """USD-quoted subset of UNIVERSE_WHITELIST — empty today, since nothing
+    USD is live-whitelisted yet (see CLAUDE.md 'USD Expansion — Preconditions
+    for any USD pair promotion'). Added 2026-08-24 alongside the new USD
+    screening leg: with an empty whitelist, every USD PASS surfaces as a
+    NEW QUALIFIER, never a decay — there's nothing live to decay from — and
+    that's the correct, useful signal (a candidate worth a human look), not
+    a bug. If a USD pair is ever manually promoted to UNIVERSE_WHITELIST,
+    this starts tracking its decay the same way _crypto_whitelist() already
+    does for CAD, with no further code change needed."""
+    return {
+        s.strip().upper()
+        for s in (cfg.universe.universe_whitelist or "").split(",")
+        if s.strip() and s.strip().upper().endswith("/USD")
+    }
+
+
 def _stock_whitelist() -> set[str]:
     from stock_bot.config import load as load_stock_config
     return {
@@ -89,11 +128,25 @@ def _stock_whitelist() -> set[str]:
 
 
 def _alert(lines: list[str]) -> None:
-    """Fire-and-forget Telegram summary; silent no-op when unconfigured."""
+    """Fire-and-forget Telegram summary; silent no-op when unconfigured.
+
+    2026-08-24: fixed a live bug found while adding the USD leg — this read
+    cfg.telegram_bot_token/telegram_chat_id/telegram_enabled directly, but
+    those fields live under cfg.alerts.* (AlertConfig), not flat on
+    AppConfig. Every real attention-worthy rescreen result (edge decay, new
+    qualifiers — exactly the runs where alerting matters most) has been
+    silently raising AttributeError here since the config was reorganized
+    into nested dataclasses, caught by this function's own try/except and
+    reduced to a console-only 'Telegram alert failed' line that nothing
+    reads, since this runs as an unattended monthly subprocess. The monthly
+    markdown report was never affected — only the Telegram push was silently
+    dead. See CLAUDE_HISTORY.md for the full trail.
+    """
     try:
         from bot.alerts.telegram import TelegramAlerter
         alerter = TelegramAlerter(
-            cfg.telegram_bot_token, cfg.telegram_chat_id, cfg.telegram_enabled
+            cfg.alerts.telegram_bot_token, cfg.alerts.telegram_chat_id,
+            cfg.alerts.telegram_enabled,
         )
         alerter.error("📋 Monthly re-screen:\n" + "\n".join(lines))
         # _send_async uses a daemon thread — give it a moment before exit
@@ -114,15 +167,20 @@ def run() -> int:
     ]
     attention: list[str] = []
 
-    sections = []
+    sections: list[tuple[str, str, set[str], dict[str, str] | None]] = []
     if os.getenv("RESCREEN_SKIP_CRYPTO", "").lower() != "true":
-        sections.append(("crypto", "screen_universe.py", _crypto_whitelist()))
+        sections.append(("crypto", "screen_universe.py", _crypto_whitelist(), None))
+    if os.getenv("RESCREEN_SKIP_USD", "").lower() != "true":
+        sections.append((
+            "crypto-usd", "screen_universe.py", _crypto_usd_whitelist(),
+            {"SCREEN_QUOTE": "USD"},
+        ))
     if os.getenv("RESCREEN_SKIP_STOCKS", "").lower() != "true":
-        sections.append(("stocks", "stock_backtest.py", _stock_whitelist()))
+        sections.append(("stocks", "stock_backtest.py", _stock_whitelist(), None))
 
-    for label, script, whitelist in sections:
+    for label, script, whitelist, extra_env in sections:
         print(f"\n── {label}: {script} ──", flush=True)
-        rc, output = _run_gate(script)
+        rc, output = _run_gate(script, extra_env=extra_env)
         passes = set(_parse_pass_list(output))
         report_lines.append(f"## {label} ({script})")
         if rc != 0:

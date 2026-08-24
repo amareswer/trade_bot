@@ -174,7 +174,7 @@ need the full narrative behind any decision below.
 
 ## Test Suite Manifest (reconciled 2026-08-18, count updated 2026-08-24)
 
-Expected total: **647 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-11s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later. 2026-08-24: 629→639, +10 for CapitalPool per-symbol slot caps — this line and the table row below were caught stale during a "what's missing" self-audit in the same session that added the tests; the manifest count and the actual suite had already diverged by the time that session's own report was written. Same self-audit then found the config-layer half of that same feature — `_slot_caps_by_base()` — had zero test coverage at all; closed it same-day, 639→647.)
+Expected total: **658 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-13s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later. 2026-08-24: 629→639, +10 for CapitalPool per-symbol slot caps — this line and the table row below were caught stale during a "what's missing" self-audit in the same session that added the tests; the manifest count and the actual suite had already diverged by the time that session's own report was written. Same self-audit then found the config-layer half of that same feature — `_slot_caps_by_base()` — had zero test coverage at all; closed it same-day, 639→647. Then 647→658, +11 for `rescreen.py`'s new USD leg + the `_alert()` nested-config bugfix — new file `tests/crypto/test_rescreen.py`, this script's first-ever test coverage.)
 
 **Directory layout (2026-08-18):** all 54 files moved out of repo root into `tests/{crypto,stock,shared}/` for
 a cleaner root — 54 files loose alongside `bot/`, `stock_bot/`, `config.py`, etc. had gotten hard to scan.
@@ -254,14 +254,16 @@ now `.parent.parent.parent`. Verified before/after: same 526 collected, same 526
 | `tests/stock/test_sl_tp_watcher_audit_log.py` | 9 | First behavioral coverage of `_check_open_positions_sl_tp` (previously untested) plus the 2026-08-06 INFO-level "N/M positions priced" audit log — added after a yfinance outage broke the main scan loop for a full day with no direct evidence either way on whether this separate `get_live_price()` path (fast_info, independent thread) was also blind. Covers full/partial/total pricing failure counts, no-log-when-no-positions, zero-share exclusion, None-executor no-op, and basic STOP_LOSS/TAKE_PROFIT trigger sanity |
 | `tests/crypto/test_grid_stress_test.py` | 14 | `grid_stress_test.py` pure helpers (crypto research tooling, not the live pipeline): crash-period date parsing, buy-and-hold P&L calc, PASS/MARGINAL/FAILED classification. Hermetic — the actual stress run against Binance is a separate manual step |
 | `tests/crypto/test_grid_dca_experiment.py` | 12 | `grid_dca_experiment.py` standalone backtest engines (crypto research tooling, not the live pipeline): grid strategy fills/reopens/floor-stop, capital split across slots, fee math on both legs, DCA safety-order averaging + cycle restart, empty-candle edge cases |
+| `tests/crypto/test_rescreen.py` | 11 | `rescreen.py` (added 2026-08-24, first-ever coverage for this script): `_crypto_usd_whitelist()` — empty when only CAD whitelisted, filters `/USD` suffix, empty-string input, and a regression check that `_crypto_whitelist()`'s own (pre-existing) behavior is unaffected; the new USD leg — runs with `extra_env={"SCREEN_QUOTE": "USD"}`, its results land in a correctly-formatted `## crypto-usd` report section, a gate-script failure on the USD leg reports the same way the existing rc≠0 handling already does; regression check that the CAD leg's own report section/whitelist-comparison is unchanged; `RESCREEN_SKIP_USD` skip flag; `_alert()`'s nested-config-attribute bugfix (`cfg.alerts.*` not flat `cfg.*`) — no `AttributeError` swallowed, `TelegramAlerter` constructed with the correct values |
 | `tests/shared/test_telegram_retry.py` | 3 | `TelegramAlerter._send()` retry (added 2026-08-17, closes known-gaps #17): healthy send calls `requests.post` once with no retry, a transient failure recovers on retry, a persistent failure still degrades to a warning-only no-raise after exhausting attempts |
 
-Run: `python -m pytest --tb=short -q` — must show **647 passed**. (This line had drifted to a
+Run: `python -m pytest --tb=short -q` — must show **658 passed**. (This line had drifted to a
 stale "543 passed" — corrected 2026-08-23 to match the manifest total above, which was
 already at 605 before this session's +2. Not investigated why the two numbers had diverged.
 2026-08-24: 629→639→647 for the CapitalPool per-symbol-cap tests plus the config-layer
 coverage gap found right after — caught by a "what's missing" self-audit, not by re-running
-the suite in the session that made the change.)
+the suite in the session that made the change. 647→658 same day, for rescreen.py's new USD
+leg + _alert() bugfix.)
 
 ---
 
@@ -1484,11 +1486,42 @@ originally cited was the wrong threshold; corrected the same day) and
 or `UNIVERSE_WHITELIST` change was made as part of this removal — SOL/CAD is not being added
 to live config by this edit.
 
+### Automated USD re-screen (added 2026-08-24)
+Closes a real automation gap found during a 2026-08-24 doc-accuracy check: CLAUDE.md had long
+claimed USD re-screening was "automated monthly via `rescreen.py`," but the code never actually
+passed `SCREEN_QUOTE=USD` anywhere — `rescreen.py` only ever called `screen_universe.py` with no
+env override, which defaults to CAD. The USD side was manual-only since the last real USD screen,
+2026-07-16. `rescreen.py` now runs `screen_universe.py` a second time with
+`extra_env={"SCREEN_QUOTE": "USD"}`, producing its own `## crypto-usd` report section in the same
+monthly markdown output (identical format to the CAD section — PASS list, whitelist comparison,
+decay/new-qualifier flags, gate-output tail). Since no USD pair is live-whitelisted today, the USD
+leg's whitelist comparison is always against an empty set — every USD PASS surfaces as a **NEW
+QUALIFIER**, never a decay, until/unless a USD pair is ever manually promoted to
+`UNIVERSE_WHITELIST` (`RESCREEN_SKIP_USD=true` skips this leg, same pattern as the existing
+`RESCREEN_SKIP_CRYPTO`/`RESCREEN_SKIP_STOCKS`). **Same "never auto-changes a whitelist" rule
+applies identically** — a USD PASS is flagged for a human to look at, exactly like every other
+finding this script has ever produced. Load impact measured before shipping: adds up to ~7 minutes
+to the monthly job (well under the existing 2400s per-leg subprocess timeout) and 2 extra Kraken
+API calls (negligible) — full measurement in CLAUDE_HISTORY.md. A second, unrelated live bug was
+found and fixed in the same pass: `rescreen.py`'s Telegram alert helper read
+`cfg.telegram_bot_token`/`telegram_chat_id`/`telegram_enabled` directly, but those fields live
+under `cfg.alerts.*` — every attention-worthy rescreen result (the runs where alerting matters
+most) had been silently raising `AttributeError`, caught and reduced to a console-only line nobody
+reads, since this runs unattended. Fixed; the monthly markdown report itself was never affected by
+this, only the Telegram push. Tests: `tests/crypto/test_rescreen.py` (new file, 11 cases). Full
+trail: CLAUDE_HISTORY.md, `.memory/decisions/multi-symbol-validation.md`.
+
 ### Re-screen triggers
 - Strategy code change (new hash after walk-forward) — re-screen all alts before assuming new results
-- New high-volume symbol appears on Kraken USD (run `SCREEN_QUOTE=USD python screen_universe.py`)
 - SL-exit rate cap relaxed (would require separate validation that high-SL symbols are genuinely profitable)
-- Automated monthly via `rescreen.py` (in-bot scheduler) — flags decay/new-qualifiers, never auto-changes whitelists
+- **Automated monthly via `rescreen.py` (in-bot scheduler) — covers BOTH the CAD and USD legs, flags
+  decay/new-qualifiers, never auto-changes whitelists.** Corrected 2026-08-24: this bullet used to sit
+  next to a separate "run `SCREEN_QUOTE=USD python screen_universe.py`" manual-trigger bullet, which
+  contradicted it — the code never actually passed `SCREEN_QUOTE=USD` anywhere, so the USD side was
+  manual-only despite this line's claim. Now genuinely true — see "Automated USD re-screen" below.
+- An out-of-cycle check before the next monthly run (e.g. a new high-volume symbol spotted on Kraken
+  USD) can still be run manually: `SCREEN_QUOTE=USD python screen_universe.py` — same gate the
+  automated leg calls, just on demand instead of waiting for the 1st of the month.
 
 ---
 
@@ -1499,7 +1532,7 @@ to live config by this edit.
 | F | VPS logrotate (`/etc/logrotate.d/trade_bot`) | Config ready (2026-08-21): `deploy/logrotate_trade_bot.conf` fixed to the canonical `/opt/trade_bot` path (was a `/path/to/your/project` placeholder) and `VPS_SETUP.md` step 7 now copies that one file instead of duplicating a slightly different inline copy (the two had drifted — the inline version was missing `delaycompress`). Nothing left to do until a VPS actually exists — migration itself is still deferred per [[expert-practices-benchmark]] |
 | H | Ollama Cloud key revoke | Confirmed unused 2026-07-16; user parked indefinitely — don't re-raise unprompted |
 | I | IBKR live go-live | Gate-blocked (30 paper trades + PF ≥ 1.2) — `LiveTradingGate` Gates 1-3 now CODE-ENFORCED in `IBKRExecutor.__init__()` (2026-08-20); `IBKR_ALLOW_LIVE=true` on a live port raises `ValueError` unless all three PASS. Current real status: Gate 1 15/16 (AMD fails), Gates 2-3 PENDING (insufficient live trades) |
-| J | USD symbol re-screen | Automated monthly via rescreen.py |
+| J | USD symbol re-screen | Automated monthly via rescreen.py — **now actually true as of 2026-08-24** (previously false: the code never passed `SCREEN_QUOTE=USD`; fixed, see "Automated USD re-screen" above) |
 | K | ATR SL experiment for SYN/LINK | SYN + SOL + BTC all OOS-validated at ATR×2.0; SOL re-confirmed 2026-08-24 with dollar-risk-capped sizing (precondition #5) — still HOLDS. **2026-08-24: BTC/CAD ≥15-fill precondition removed** (deliberate correction) and capital threshold (#2) researched to a SOL-specific real figure (~$110–$334 CAD depending on volatility, from Kraken's actual SOL/CAD minimums + the live ATR-risk sizer — not the generic $100/$500 placeholders) — capital is now the sole remaining gate for SOL, and current live balance ($153.39) doesn't clear it while also preserving BTC's $77. `CapitalPool` per-symbol slot caps built the same session (not live-wired). See `.memory/decisions/multi-symbol-validation.md` |
 | — | Crypto capital gate | 0/15 live fills on BTC/CAD — strategy trades ~every 1–3 weeks; keep watching, don't force it |
 | — | Stock Phase A gate | Position book counting toward 30 completed trades, PF ≥ 1.2, win rate ≥ 30% — now the literal `LiveTradingGate` Gate 3 threshold, current status 5/30 |

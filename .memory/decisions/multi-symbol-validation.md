@@ -1,6 +1,6 @@
 ---
 name: multi-symbol-validation
-description: "Symbol ranking, fee constraint, and expansion decisions from 2026-06-11 multi-symbol backtest. 2026-08-20 addendum: live investigation into BTC/CAD's 7-week zero-BUY drought confirms and extends the original 'BTC is weak now' finding — MTF daily-trend veto data, blocked-gate distribution, real price characterization. 2026-08-24 addenda: (1) SOL's ATR×2.0 OOS-HOLDS result re-confirmed with dollar-risk-capped position sizing applied; (2) fill-frequency reality check quantifies the 'BTC/CAD 15 fills' gate as an unexamined default, not a calculated one; (3) that gate REMOVED as a precondition for SOL/other new-symbol promotion — SOL now blocked on capital alone; (4) capital threshold itself corrected from $500 (wrong — Stage-3 scale-up figure) to $100 (correct — Stage-1 new-symbol figure), live balance checked ($153.39 CAD, 0 BTC), and a CapitalPool architecture constraint (no per-symbol slot cap) flagged as unresolved; (5) same-day follow-up: CapitalPool per-symbol slot caps BUILT (code capability, not live-wired) and the $100 Stage-1 placeholder replaced with SOL's real researched minimum (~$110-$334 CAD bare / ~$165-$501 with the bot's own safety-margin guard, volatility-dependent, from real Kraken SOL/CAD minimums + the live ATR-risk sizer) — current $153.39 balance doesn't clear it alongside BTC's $77."
+description: "Symbol ranking, fee constraint, and expansion decisions from 2026-06-11 multi-symbol backtest. 2026-08-20 addendum: live investigation into BTC/CAD's 7-week zero-BUY drought confirms and extends the original 'BTC is weak now' finding — MTF daily-trend veto data, blocked-gate distribution, real price characterization. 2026-08-24 addenda: (1) SOL's ATR×2.0 OOS-HOLDS result re-confirmed with dollar-risk-capped position sizing applied; (2) fill-frequency reality check quantifies the 'BTC/CAD 15 fills' gate as an unexamined default, not a calculated one; (3) that gate REMOVED as a precondition for SOL/other new-symbol promotion — SOL now blocked on capital alone; (4) capital threshold itself corrected from $500 (wrong — Stage-3 scale-up figure) to $100 (correct — Stage-1 new-symbol figure), live balance checked ($153.39 CAD, 0 BTC), and a CapitalPool architecture constraint (no per-symbol slot cap) flagged as unresolved; (5) same-day follow-up: CapitalPool per-symbol slot caps BUILT (code capability, not live-wired) and the $100 Stage-1 placeholder replaced with SOL's real researched minimum (~$110-$334 CAD bare / ~$165-$501 with the bot's own safety-margin guard, volatility-dependent, from real Kraken SOL/CAD minimums + the live ATR-risk sizer) — current $153.39 balance doesn't clear it alongside BTC's $77; (6) same-day follow-up: rescreen.py's 'automated monthly USD re-screen' claim was FALSE (code never passed SCREEN_QUOTE=USD) — fixed with a real USD leg (measured load impact first, ~7min added), plus an unrelated live _alert() bug found and fixed (wrong cfg attribute path, silently killed every rescreen Telegram alert)."
 metadata:
   type: project
 ---
@@ -419,6 +419,63 @@ meaningfully week to week (1.37 to 4.17 observed in just the last 5 days here). 
 same check (`ccxt.fetch_ohlcv('SOL/CAD', '4h')` + `bot.indicators.indicators.atr()` +
 `config.calc_trade_qty_atr_risk()`) close to any actual promotion decision rather than trusting
 these exact dollar figures indefinitely.
+
+## rescreen.py: USD leg added, closing a real automation gap — 2026-08-24 (later same day)
+
+A "what's missing, verify" pass found CLAUDE.md's Roadmap item J ("USD symbol re-screen —
+Automated monthly via `rescreen.py`") was **false**: `rescreen.py` called `screen_universe.py`
+with no env override, and `screen_universe.py` defaults `SCREEN_QUOTE` to `CAD` — the USD side
+had been manual-only since the last real USD screen, 2026-07-16 (confirmed via
+`comm`/`git blame`-style reasoning against the actual code, not by trusting the doc). Load
+impact was measured before implementing anything (per explicit task instruction not to ship
+silently): `screen_universe.py`'s Kraken calls are 2 total regardless of quote currency or
+candidate count (`load_markets()` + `fetch_tickers()`, negligible); the real cost is Binance
+OHLCV fetches for the walk-forward step, measured empirically at ~28s per candidate that
+clears the liquidity gate (`SCREEN_SYMBOLS=ETH/CAD,LTC/CAD` timing run). At the default
+`SCREEN_MAX_CANDIDATES=15`, that's up to ~7 extra minutes for the USD leg — the CAD leg today
+is nearly free (~5-10s) since almost every CAD candidate is already excluded/decided, so this
+roughly triples total monthly job runtime (~5min → ~12min including the stock leg's ~4m45s),
+still well under the existing 2400s per-leg subprocess timeout and running once a month off
+the trading tick loop. Verdict: acceptable, proceeded.
+
+**Fix:** `rescreen.py`'s `sections` list now carries a 4th element (`extra_env`), with a new
+`("crypto-usd", "screen_universe.py", _crypto_usd_whitelist(), {"SCREEN_QUOTE": "USD"})` entry
+reusing the exact same report-building loop the CAD/stocks legs already use — so the USD
+section's format is identical by construction, not a parallel reimplementation. New
+`_crypto_usd_whitelist()` filters `UNIVERSE_WHITELIST` for `/USD`-suffixed entries (empty
+today — nothing USD is live-whitelisted — so every USD PASS surfaces as a NEW QUALIFIER, never
+a decay, which is the correct signal). New `RESCREEN_SKIP_USD` env flag, symmetric with the
+existing `RESCREEN_SKIP_CRYPTO`/`RESCREEN_SKIP_STOCKS`. Same "never auto-changes a whitelist"
+rule applies identically — confirmed no code path touches `UNIVERSE_WHITELIST` or the USD
+Expansion preconditions list.
+
+**Bonus fix, found while in this file:** `_alert()` read `cfg.telegram_bot_token`/
+`telegram_chat_id`/`telegram_enabled` directly — those fields live under `cfg.alerts.*`
+(`AlertConfig`), not flat on `AppConfig`. Confirmed via the 2026-08-01 rescreen run's own
+`logs/rescreen.log`, which shows the exact `AttributeError` this caused, silently caught by
+`_alert()`'s own try/except and reduced to a console line nobody reads (this runs as an
+unattended monthly subprocess). Every attention-worthy rescreen result — exactly the runs
+where the Telegram push matters most — had been silently failing to alert. The monthly
+markdown report itself was unaffected (a completely separate code path); only the Telegram
+push was dead. Fixed the same way `_crypto_whitelist()`'s own `cfg.universe_whitelist` →
+`cfg.universe.universe_whitelist` bug had already been silently fixed at some earlier,
+undocumented point (confirmed by reading the current source — that one's already correct).
+
+**Tests:** new file `tests/crypto/test_rescreen.py` (this script's first-ever test coverage),
+11 cases — `_crypto_usd_whitelist()` behavior + a regression check that `_crypto_whitelist()`
+is unaffected, USD leg env-override wiring, USD results landing correctly in the report, CAD
+leg regression check (report/whitelist-comparison unchanged), `RESCREEN_SKIP_USD`, a USD
+gate-failure report case, and the `_alert()` bugfix (both a no-`AttributeError` check and a
+call-args check against `cfg.alerts.*`). One test-hygiene fix along the way: `_alert()`'s real
+`time.sleep(5)` (daemon-thread hand-off margin, pointless in a test where
+`TelegramAlerter._send` is already a no-op) was costing ~5s per test that triggered it —
+patched `time.sleep` in the relevant tests, cutting the file from ~31s to <1s.
+
+Suite 647→658. Strategy hash reconfirmed unchanged (`b30f2f9e769c8d41`, 31 trades, PF 2.19) —
+`rescreen.py` and its test file only, no `bot/strategy/*` touched. CLAUDE.md's Roadmap item J
+and the "USD Expansion → Re-screen triggers" section (which previously contradicted each
+other — one said manual, one said automated) both corrected to describe what the code now
+actually does. Full detail: CLAUDE_HISTORY.md.
 
 ## Decisions
 

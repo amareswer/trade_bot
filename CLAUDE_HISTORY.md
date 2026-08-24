@@ -2467,3 +2467,77 @@ defaults — features off, not the live-tuned `.env` values) plus explanatory co
 note pointing at CLAUDE.md's "Current Live Configuration" as the actual source of truth for
 live-tuned numbers (this file is explicitly a "recommended starting point" template, not a
 live mirror, per its own header). Docs-only — no code touched, suite still 647/647.
+
+### Crypto bot: rescreen.py's USD leg — closing a real automation gap (2026-08-24, follow-up)
+
+Direct follow-up to the "what else is pending, verify" pass above, which found CLAUDE.md's
+Roadmap item J ("USD symbol re-screen — Automated monthly via `rescreen.py`") was **false**:
+`rescreen.py` called `screen_universe.py` with no env override; `screen_universe.py` defaults
+`SCREEN_QUOTE` to `CAD`. The USD side had been manual-only since the last real USD screen,
+2026-07-16 — 39 days stale at the time this was found, and would have stayed stale forever
+under the existing code no matter how long the monthly job kept running.
+
+**Load impact measured before implementing anything** (explicit task requirement — don't ship
+silently if it looks heavy): `screen_universe.py` makes exactly 2 Kraken API calls total
+(`load_markets()` + `fetch_tickers()`), independent of quote currency or candidate count —
+negligible, no rate-limit risk either leg. The real cost is Binance OHLCV fetches for the
+walk-forward step; timed empirically with `SCREEN_SYMBOLS=ETH/CAD,LTC/CAD` (bypassing
+discovery to get a real walk-forward sample): **~28 seconds per candidate** that clears the
+liquidity gate and has a valid Binance proxy. At the default `SCREEN_MAX_CANDIDATES=15`, a
+USD leg realistically exercising most of that cap (per the 2026-07-03 USD screen: 178 pairs
+cleared liquidity) adds **up to ~7 minutes**. The CAD leg today is nearly free (~5-10s)
+specifically because almost every CAD candidate is already excluded/decided (BTC/XRP/ETH/
+SOL/DOGE) — not representative of what a fresh USD screen costs. Total monthly job estimate:
+~5min today (near-empty CAD leg + stocks leg's measured ~4m45s) → **~12min** with USD added.
+Both well under the existing 2400s (40min) per-leg subprocess timeout; runs once a month in a
+background subprocess, off the trading tick loop. **Verdict: acceptable, proceeded.**
+
+**Implementation:** `rescreen.py`'s `sections` list gained a 4th tuple element (`extra_env`);
+a new `("crypto-usd", "screen_universe.py", _crypto_usd_whitelist(), {"SCREEN_QUOTE": "USD"})`
+entry reuses the *exact same* report-building loop the CAD/stocks legs already run through —
+so the USD section's format is identical to CAD's by construction (PASS list, whitelist
+comparison, decay/new-qualifier flags, gate-output tail), not a second parallel
+implementation that could drift from it. New `_crypto_usd_whitelist()` filters
+`UNIVERSE_WHITELIST` for `/USD`-suffixed entries — empty today (nothing USD is
+live-whitelisted), so every USD PASS surfaces as a 🆕 **NEW QUALIFIER**, never a 🔻 decay,
+which is the correct signal (there's nothing live to decay from). New `RESCREEN_SKIP_USD` env
+flag, symmetric with the existing `RESCREEN_SKIP_CRYPTO`/`RESCREEN_SKIP_STOCKS`. **Same "never
+auto-changes a whitelist" rule applies identically to the USD leg** — confirmed no code path
+touches `UNIVERSE_WHITELIST` or the "USD Expansion" preconditions list; a PASS is reported,
+never acted on.
+
+**Second, unrelated live bug found and fixed in the same pass:** `_alert()` read
+`cfg.telegram_bot_token`/`telegram_chat_id`/`telegram_enabled` directly — those fields live
+under `cfg.alerts.*` (`AlertConfig`), not flat on `AppConfig`. Found concrete evidence in
+`logs/rescreen.log` (the 2026-08-01 run's captured output): a raw `AttributeError` traceback
+for this exact bug, caught by `_alert()`'s own try/except and reduced to a console-only
+"Telegram alert failed" line — invisible, since this runs as an unattended monthly
+subprocess. Every attention-worthy rescreen result (edge decay, new qualifiers — precisely
+the runs where the alert matters) had been silently failing to reach Telegram since whenever
+`config.py` was reorganized into nested dataclasses. The monthly markdown report itself was
+completely unaffected (a separate code path) — only the Telegram push was dead. Fixed the
+same way `_crypto_whitelist()`'s own identical bug class (`cfg.universe_whitelist` →
+`cfg.universe.universe_whitelist`) had evidently already been fixed at some earlier,
+undocumented point — confirmed by reading the current source, which was already correct there.
+
+**Tests:** new file `tests/crypto/test_rescreen.py` — this script's first-ever test coverage,
+11 cases: `_crypto_usd_whitelist()` (empty-when-CAD-only, filters `/USD` suffix, empty-string
+input) + a regression check that `_crypto_whitelist()` itself is unaffected; USD leg env-
+override wiring; USD results landing correctly in a properly-formatted report section; CAD
+leg regression check (report/whitelist-comparison byte-for-byte unchanged); `RESCREEN_SKIP_USD`;
+a USD gate-failure case (reuses the existing rc≠0 handling, no special-casing needed); the
+`_alert()` bugfix (no swallowed `AttributeError`, `TelegramAlerter` constructed with the
+correct nested values). Test-hygiene note: `_alert()`'s real `time.sleep(5)` (daemon-thread
+hand-off margin) was initially costing ~5s in every test that triggered it — `time.sleep`
+patched in the relevant tests, cutting the file from ~31s to <1s before it went in.
+
+**Verification:** suite 647→**658**, all passing. Strategy hash reconfirmed unchanged
+(`b30f2f9e769c8d41`, 31 trades, PF 2.19) — `rescreen.py` and its test file only, no
+`bot/strategy/*` or `build_indicator_config()` touched. `git status --porcelain`: `rescreen.py`
+modified, `tests/crypto/test_rescreen.py` new — no other files in the code diff.
+
+**Docs:** CLAUDE.md's Roadmap item J and the "USD Expansion → Re-screen triggers" section
+(which had genuinely contradicted each other — one bullet said manual, another said automated)
+both corrected to describe what the code now actually does, plus a new "Automated USD
+re-screen" subsection with the full load-impact numbers. Full trail:
+`.memory/decisions/multi-symbol-validation.md`.
