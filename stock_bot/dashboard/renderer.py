@@ -675,6 +675,9 @@ def _top_picks_html(results: list[ScanResult]) -> str:
     return f"""
   <div class="top-picks-section">
     <h2>🔥 Top Picks This Cycle</h2>
+    <div style="color:{_MUTED};font-size:10px;margin:-6px 0 8px">
+      AI advisory only — not trade triggers, see 📐 Rule Signals above
+    </div>
     {body}
   </div>"""
 
