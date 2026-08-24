@@ -63,6 +63,11 @@ logger = logging.getLogger(__name__)
 
 _GETUPDATES_TIMEOUT_S = 25   # Telegram long-poll window
 _HTTP_TIMEOUT_S       = 35   # client-side socket timeout — must exceed the above
+_ERROR_BACKOFF_S      = 5.0  # pause after a failed getUpdates before retrying — a
+                              # long-poll normally paces itself via its own timeout,
+                              # but a fast-failing error (e.g. a 502 that returns
+                              # immediately instead of blocking) has no natural pacing
+                              # and would otherwise hot-loop against Telegram's API
 
 
 class TelegramCommandPoller:
@@ -80,12 +85,14 @@ class TelegramCommandPoller:
         handlers:  dict[str, Callable[[], str]],
         poll_timeout: int = _GETUPDATES_TIMEOUT_S,
         http_timeout: float = _HTTP_TIMEOUT_S,
+        error_backoff_s: float = _ERROR_BACKOFF_S,
     ) -> None:
-        self._token        = bot_token.strip()
-        self._chat_id       = chat_id.strip()
-        self._handlers      = dict(handlers)
-        self._poll_timeout  = poll_timeout
-        self._http_timeout  = http_timeout
+        self._token          = bot_token.strip()
+        self._chat_id        = chat_id.strip()
+        self._handlers       = dict(handlers)
+        self._poll_timeout   = poll_timeout
+        self._http_timeout   = http_timeout
+        self._error_backoff_s = error_backoff_s
         self._offset: Optional[int] = None   # None = not primed yet
 
     @property
@@ -131,6 +138,13 @@ class TelegramCommandPoller:
             updates = self._get_updates(offset=self._offset, timeout=self._poll_timeout)
         except Exception as exc:
             logger.warning("Telegram control: getUpdates failed: %s", exc)
+            # A fast-failing error (e.g. a 502 returned immediately, not after
+            # the long-poll timeout) has no natural pacing — without this the
+            # outer poll loop would hot-loop against Telegram's API for as
+            # long as the outage lasts. Long-poll successes don't need this;
+            # blocking up to poll_timeout already paces those.
+            if self._error_backoff_s > 0:
+                time.sleep(self._error_backoff_s)
             return
 
         max_update_id = None

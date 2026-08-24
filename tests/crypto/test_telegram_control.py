@@ -162,11 +162,34 @@ def test_prime_offset_drains_backlog_without_dispatching():
 
 
 def test_getupdates_failure_does_not_raise_and_keeps_offset():
-    poller = TelegramCommandPoller(TOKEN, CHAT_ID, {})
+    # error_backoff_s=0 — this test isn't about the backoff pause itself
+    # (see test_getupdates_failure_backs_off below), just that failure is
+    # swallowed cleanly. Zeroing it keeps the suite fast.
+    poller = TelegramCommandPoller(TOKEN, CHAT_ID, {}, error_backoff_s=0)
     poller._offset = 10
     with patch("requests.get", side_effect=ConnectionError("network down")):
         poller.poll_once()   # must not raise
     assert poller._offset == 10
+
+
+def test_getupdates_failure_backs_off():
+    """A fast-failing getUpdates error (e.g. an immediate 502, not a timed-out
+    long-poll) must pause before the next attempt — otherwise a persistent
+    outage hot-loops against Telegram's API with no pacing at all."""
+    poller = TelegramCommandPoller(TOKEN, CHAT_ID, {}, error_backoff_s=5.0)
+    with patch("requests.get", side_effect=ConnectionError("network down")), \
+         patch.object(tc_mod.time, "sleep") as mock_sleep:
+        poller.poll_once()
+    mock_sleep.assert_called_once_with(5.0)
+
+
+def test_getupdates_success_does_not_back_off():
+    poller = TelegramCommandPoller(TOKEN, CHAT_ID, {}, error_backoff_s=5.0)
+    with patch("requests.get") as mock_get, \
+         patch.object(tc_mod.time, "sleep") as mock_sleep:
+        mock_get.return_value = _fake_response({"ok": True, "result": []})
+        poller.poll_once()
+    mock_sleep.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

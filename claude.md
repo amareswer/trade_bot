@@ -174,7 +174,7 @@ need the full narrative behind any decision below.
 
 ## Test Suite Manifest (reconciled 2026-08-18)
 
-Expected total: **605 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-11s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later.)
+Expected total: **607 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-11s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later.)
 
 **Directory layout (2026-08-18):** all 54 files moved out of repo root into `tests/{crypto,stock,shared}/` for
 a cleaner root — 54 files loose alongside `bot/`, `stock_bot/`, `config.py`, etc. had gotten hard to scan.
@@ -217,7 +217,7 @@ now `.parent.parent.parent`. Verified before/after: same 526 collected, same 526
 | `tests/stock/test_stock_breaker.py` | 14 | Stock-bot circuit breakers (StockPaperExecutor): daily-loss restart baseline includes position marks; weekly-loss/drawdown-halt/kill-switch tiers — reject-on-trip, halt auto-lifts on recovery, kill switch stays sticky through recovery and across restart, SELL never blocked, peak-equity persistence, drawdown_status() warning flag; per-position ATR stop-pct override — defaults to baseline, persists across restart, clears on full close, survives a partial close |
 | `tests/crypto/test_candle_watchdog.py` | 7 | Candle watchdog circuit breaker (upgraded 2026-08-07): silent/blocked/no-re-alert-while-stale on the stale side, alert+unblock on recovery, no re-alert once recovered |
 | `tests/crypto/test_halt_flag.py` | 5 | Manual halt kill-switch: logs/HALT flag file engage/lift, ownership guard |
-| `tests/crypto/test_telegram_control.py` | 28 | Two-way Telegram control (added 2026-08-20): `TelegramCommandPoller` transport (authorized dispatch+reply, unauthorized-chat silent ignore, unrecognized-command silent ignore, handler-exception no-raise, offset advances past both handled and ignored updates, `prime_offset()` drains backlog without dispatching, getUpdates failure doesn't raise/doesn't lose offset, disabled-without-credentials no-network, thread-starter returns None when disabled), source-inspection structural guards (no command body calls any order-placement/modification/cancellation method or bypasses `logs/HALT` via a direct `risk.halt()`/`resume()`, and the poller module itself carries zero trading imports), `_pause_crypto_flag`/`_resume_crypto_flag` (write/remove `logs/HALT`, idempotent, end-to-end proof they drive the SAME `_check_halt_flag()` the tick loop already polls — not a second path), `_status_crypto_text`/`_format_symbol_status` (halt/kill-switch display, per-symbol position/cash/PF/regime, PF n/a-vs-inf-vs-computed edge cases), `_status_stock_text` (paper/IBKR badge formatting, no-state-file case, loader-exception no-raise), `_help_crypto_text` |
+| `tests/crypto/test_telegram_control.py` | 30 | Two-way Telegram control (added 2026-08-20): `TelegramCommandPoller` transport (authorized dispatch+reply, unauthorized-chat silent ignore, unrecognized-command silent ignore, handler-exception no-raise, offset advances past both handled and ignored updates, `prime_offset()` drains backlog without dispatching, getUpdates failure doesn't raise/doesn't lose offset, disabled-without-credentials no-network, thread-starter returns None when disabled), source-inspection structural guards (no command body calls any order-placement/modification/cancellation method or bypasses `logs/HALT` via a direct `risk.halt()`/`resume()`, and the poller module itself carries zero trading imports), `_pause_crypto_flag`/`_resume_crypto_flag` (write/remove `logs/HALT`, idempotent, end-to-end proof they drive the SAME `_check_halt_flag()` the tick loop already polls — not a second path), `_status_crypto_text`/`_format_symbol_status` (halt/kill-switch display, per-symbol position/cash/PF/regime, PF n/a-vs-inf-vs-computed edge cases), `_status_stock_text` (paper/IBKR badge formatting, no-state-file case, loader-exception no-raise), `_help_crypto_text`. +2 (2026-08-23): getUpdates failure now backs off `error_backoff_s` (default 5s) before the next poll attempt, and a success never backs off — closes a hot-loop bug where a fast-failing error (e.g. an immediate 502, not a timed-out long-poll) had no pacing at all |
 | `tests/crypto/test_orphaned_positions.py` | 5 | Startup orphan check: open position outside this run's symbol list alerts (removed-from-whitelist safety) |
 | `tests/crypto/test_universe.py` | 4 | Universe screener: scoring, momentum filter, fallback |
 | `tests/crypto/test_main_strategy.py` | 2 | Strategy builder: full config wiring |
@@ -254,7 +254,9 @@ now `.parent.parent.parent`. Verified before/after: same 526 collected, same 526
 | `tests/crypto/test_grid_dca_experiment.py` | 12 | `grid_dca_experiment.py` standalone backtest engines (crypto research tooling, not the live pipeline): grid strategy fills/reopens/floor-stop, capital split across slots, fee math on both legs, DCA safety-order averaging + cycle restart, empty-candle edge cases |
 | `tests/shared/test_telegram_retry.py` | 3 | `TelegramAlerter._send()` retry (added 2026-08-17, closes known-gaps #17): healthy send calls `requests.post` once with no retry, a transient failure recovers on retry, a persistent failure still degrades to a warning-only no-raise after exhausting attempts |
 
-Run: `python -m pytest --tb=short -q` — must show **543 passed**.
+Run: `python -m pytest --tb=short -q` — must show **607 passed**. (This line had drifted to a
+stale "543 passed" — corrected 2026-08-23 to match the manifest total above, which was
+already at 605 before this session's +2. Not investigated why the two numbers had diverged.)
 
 ---
 
@@ -669,6 +671,22 @@ constraint is documented in `bot/alerts/telegram_control.py`'s module docstring 
 
 Tests: `tests/crypto/test_telegram_control.py`, 28 cases — see Test Suite Manifest above.
 Suite 552→580. No `bot/strategy/*` touched, no walk-forward needed — alerting/ops-layer only.
+
+**Hot-loop bug fixed 2026-08-23.** Live logs showed a continuous flood of identical
+`Telegram control: getUpdates failed: 502 Server Error: Bad Gateway ...` lines — Telegram's
+own API infrastructure returning transient 502s. Root cause was in this bot, not Telegram:
+`poll_once()` caught the `getUpdates` exception, logged it, and returned with no pause at
+all. The long-poll's own `timeout=25` normally paces the loop, but a *fast-failing* error
+(a 502 that comes back immediately, unlike a real long-poll that blocks up to 25s) bypassed
+that pacing entirely — the outer `while True` loop in `start_telegram_control_thread()`
+retried instantly, as fast as the network round-trip allowed, for as long as the outage
+lasted. This hammers Telegram's API during exactly the kind of transient server-side issue
+retries should back off from, and floods `logs/trade_bot.log`. Fixed: `poll_once()` now
+sleeps `error_backoff_s` (new constructor param, default 5.0s) after a failed `getUpdates`
+call before returning; a successful call never sleeps. Tests: `tests/crypto/
+test_telegram_control.py`, +2 (failure triggers exactly one `time.sleep(5.0)` call; success
+never calls `time.sleep`); the pre-existing failure test was given `error_backoff_s=0` so it
+stays instant. Suite 605→607. No `bot/strategy/*` touched.
 
 ### Risk-gate config (stock bot — `StockPaperExecutor` / `IBKRExecutor`, both in `stock_bot/execution/`)
 Both executors implement the same tiers independently (accepted duplication — same pattern
