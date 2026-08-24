@@ -1757,7 +1757,23 @@ def run():
                                 cfg.risk.risk_halt_blocks_stops and risk.config.halt
                             )
                             if not _p_halted:
-                                _p_order = ss['executor'].execute(Signal.SELL, price, quantity=_p_qty)
+                                # 2026-08-24 (same pattern as the primary execute()
+                                # call site below): guard against a genuinely
+                                # unhandled exception crashing the loop or going
+                                # unnoticed — log + Telegram-alert + degrade to
+                                # "no order this tick" instead.
+                                try:
+                                    _p_order = ss['executor'].execute(Signal.SELL, price, quantity=_p_qty)
+                                except Exception as _exec_exc:
+                                    logger.error(
+                                        "EXECUTOR EXCEPTION [%s] partial_tp: %s", sym, _exec_exc,
+                                        exc_info=True,
+                                    )
+                                    alerter.error(
+                                        f"EXECUTOR EXCEPTION [{sym}] partial_tp: {_exec_exc} — "
+                                        f"order not confirmed placed or filled, check the exchange manually"
+                                    )
+                                    _p_order = None
                                 if _p_order and _p_order.status == OrderStatus.FILLED:
                                     risk.record_fill(sym)
                                     ss['sm'].on_fill(Signal.SELL, _p_order.price)
@@ -1829,9 +1845,24 @@ def run():
                         if not _sl_tp_halted:
                             # urgent=True → always a market order. A stop exit must
                             # never sit in the limit-chase while price runs away.
-                            _ic_order = ss['executor'].execute(
-                                Signal.SELL, price, quantity=_ic_qty, urgent=True,
-                            )
+                            # 2026-08-24 (same pattern as the primary execute() call
+                            # site below): guard against a genuinely unhandled
+                            # exception crashing the loop or going unnoticed — log +
+                            # Telegram-alert + degrade to "no order this tick" instead.
+                            try:
+                                _ic_order = ss['executor'].execute(
+                                    Signal.SELL, price, quantity=_ic_qty, urgent=True,
+                                )
+                            except Exception as _exec_exc:
+                                logger.error(
+                                    "EXECUTOR EXCEPTION [%s] urgent_sl_tp: %s", sym, _exec_exc,
+                                    exc_info=True,
+                                )
+                                alerter.error(
+                                    f"EXECUTOR EXCEPTION [{sym}] urgent_sl_tp: {_exec_exc} — "
+                                    f"order not confirmed placed or filled, check the exchange manually"
+                                )
+                                _ic_order = None
                             if _ic_order and _ic_order.status == OrderStatus.FILLED:
                                 risk.record_fill(sym)
                                 ss['sm'].on_fill(Signal.SELL, _ic_order.price)

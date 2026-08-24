@@ -99,6 +99,27 @@ detail on all of them (screener filter, sizing audit, threshold audit, gate audi
    stock_backtest_atr_validation_20260823.md`. See [[project_trade_bot]]/CLAUDE_HISTORY.md
    for the complete writeup and options going forward (exclude AMD/KO, try a smaller mult,
    or leave sizing flat).
+
+   **Follow-up, 2026-08-24 (read-only, no config change):** investigated *why* AMD regressed.
+   This validation only varies the stop-loss trigger distance — `StockBacktestConfig.notional`
+   is fixed at $1,000/trade regardless of ATR mode, so **position size never changes at all**;
+   confirmed by re-running AMD's full window under both configs and finding share counts
+   byte-identical trade-for-trade. The "ATR sizing is clipping AMD's upside" hypothesis is
+   answered NO and doesn't apply — all 6 of AMD's winning (TP) trades are byte-identical
+   between flat and ATR modes, since a stop that's never touched can't affect a trade that
+   exits via take-profit. What actually happened: AMD's ATR(14)% ran persistently above what
+   the flat 5% baseline implies (1.06x–2.95x wider at every one of its 10 losing entries,
+   averaging ~1.8x — numerically confirmed against real price data, not estimated), so the
+   *same* losing trades simply ran further before exiting under ATR, roughly doubling average
+   loss size. A general property of the mechanism (no upper bound tying the ATR stop back
+   toward the flat baseline, only a generous 50% sanity cap) that happens to bite hardest on
+   AMD specifically because AMD's realized volatility runs unusually high — not a spike-timing
+   flaw, not unique code behavior. Also flagged: this validation never exercised the *sizing*
+   half of `PAPER_ATR_SIZING_ENABLED` (`calc_shares_atr_risk()`'s actual share-count cap) at
+   all — only the paired stop-distance override — so whether live sizing itself would help or
+   hurt AMD remains a separate, unexamined question. Full trade-by-trade table and ATR%
+   numbers: `logs/stock_backtest_atr_validation_20260823.md` (appended). `PAPER_ATR_SIZING_
+   ENABLED` unchanged — still `false`.
 3. **Kill-switch/drawdown thresholds** — audited, NOT changed, per explicit instruction.
    `PAPER_DAILY_LOSS_PCT=0.03` (2026-06-19, original), `PAPER_WEEKLY_LOSS_PCT=0.05`,
    `PAPER_DRAWDOWN_HALT_PCT=0.15`, `PAPER_KILL_SWITCH_PCT=0.20` (all three 2026-08-05,

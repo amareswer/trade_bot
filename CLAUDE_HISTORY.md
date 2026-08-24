@@ -2182,3 +2182,56 @@ system. Added a superseded/archived header note at the top of the file (not dele
 `CLAUDE.md`'s "Active .env settings" as the actual current-state source.
 
 Full detail: `.memory/decisions/2026-08-18-missed-buy-signal.md`.
+
+### Crypto bot: exception handling extended to the two remaining execute() call sites (2026-08-24)
+
+Direct follow-up to the same day's gate-logging fix, which wrapped the primary strategy-signal
+`execute()` call site in `bot/main.py` but flagged two others (partial-TP, urgent SL/TP exit) as
+having the identical theoretical gap — a genuinely unhandled exception from `LiveExecutor.
+execute()` had no guarantee of reaching Telegram, since `execute()` catches many specific known
+failure modes internally but has no top-level catch-all. Both now wrapped with the exact same
+pattern as the primary site: `try`/`except Exception`, `logger.error(..., exc_info=True)`,
+`alerter.error(...)` (Telegram), then degrade to `order = None` — never propagate, never crash
+the loop. Purely defensive: does not change when/why either call fires, only what happens if it
+throws. Both downstream blocks already null-guarded (`if _p_order and ...` / `if _ic_order and
+...`), so degrading to `None` on exception was already the correct, pre-existing "no fill this
+tick" path — no new branch needed there.
+
+Verification: full test suite **629 passed**, unchanged count (pure defensive addition,
+`bot/main.py`-only). `bot/strategy/*` untouched (`git diff --stat` empty), strategy hash
+`b30f2f9e769c8d41` unchanged.
+
+### Stock bot: why AMD regressed under ATR-based sizing — investigated, no config change (2026-08-24)
+
+Read-only follow-up to the 2026-08-23 ATR-sizing validation (`logs/
+stock_backtest_atr_validation_20260823.md`), which found AMD PASS→FAIL while 14/16 whitelist
+symbols held up. `PAPER_ATR_SIZING_ENABLED` was never a candidate to flip on here regardless of
+findings — this was understanding, not a decision.
+
+**Important correction to the investigation's own premise:** the validation only varies the
+stop-loss trigger distance (`StockBacktestConfig.atr_sl_mult`) — position size (`notional`,
+fixed at $1,000/trade) never changes with ATR mode at all in this backtest engine. Re-running
+AMD's full window under both configs confirmed share counts byte-identical, trade-for-trade,
+between flat and ATR modes. So "is ATR sizing clipping AMD's upside by shrinking position size
+before winners" is answered **no, and the premise doesn't apply** — there's no position-size
+variation in this methodology to examine. All 6 of AMD's winning (take-profit) trades came back
+byte-identical between the two configs, confirming winners are untouched either way (a stop
+distance that's never touched can't affect a trade that exits via TP first).
+
+**What actually happened:** the *same* 10 losing trades in both configs, but bigger losses under
+ATR — because AMD's real ATR(14)% ran persistently above what the flat 5% baseline implies at
+every one of those entries (1.06x–2.95x wider, averaging ~1.8x, numerically confirmed against
+real fetched price data). A wider stop let several of those losers run further before exiting
+(two even ran long enough to exit via the strategy's own SELL signal instead of the stop,
+worse off than the tighter flat stop would have been), roughly doubling average loss size and
+accounting for the PF drop. **Assessment: a general property of the mechanism (no upper bound
+tying the ATR-derived stop back toward the flat baseline, only a generous 50% sanity cap) that
+happens to bite hardest on AMD specifically because AMD's realized volatility runs unusually
+high** — not a spike-timing flaw unique to AMD, not a code bug. Also flagged: this validation
+never exercised the *sizing* half of `PAPER_ATR_SIZING_ENABLED` (the actual live share-count cap,
+`calc_shares_atr_risk()`) at all — only the paired stop-distance override — so whether live
+sizing itself would help or hurt AMD is a separate, still-unexamined question.
+
+No code or config changed. Full trade-by-trade table + ATR% numbers appended to `logs/
+stock_backtest_atr_validation_20260823.md`; cross-referenced in `.memory/decisions/
+stock-whitelist-gate-removed-2026-08-23.md`.
