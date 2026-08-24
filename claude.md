@@ -1157,7 +1157,7 @@ classify ordering, confirmed manually before landing). Suite 534→536.
 |--------|--------|--------|
 | DOGE/CAD | BLOCKED | Walk-forward failed at corrected 0.8% fee on all windows. |
 | ETH/CAD | BLOCKED | Walk-forward failed on all windows; no edge on ETH over the full 2024–2026 period. |
-| SOL/CAD | BLOCKED | Walk-forward failed — all windows below 1.0. ATR×2.0 OOS validation showed genuine promise (HOLDS train→validation, 2026-07-17) and — as of 2026-08-24 — **still HOLDS once proper dollar-risk-capped position sizing is applied on top of the ATR stop** (TRAIN PF 1.32, VALIDATION PF 1.46, both ≥1.2, same trade count as unsized — narrow margin, not a blowout). This closes precondition #6 below as *specifically exercised for SOL* (the sizing mechanism itself was already built and symbol-generic since 2026-07-21 — see CLAUDE_HISTORY.md). **SOL stays BLOCKED regardless** — capital (~$146 available vs. $500 required) and BTC/CAD's own live gate (15 fills + PF≥1.2, currently 0/15) remain separately unmet, and neither this sizing work nor the OOS HOLDS results change that. |
+| SOL/CAD | BLOCKED | Walk-forward failed — all windows below 1.0. ATR×2.0 OOS validation showed genuine promise (HOLDS train→validation, 2026-07-17) and — as of 2026-08-24 — **still HOLDS once proper dollar-risk-capped position sizing is applied on top of the ATR stop** (TRAIN PF 1.32, VALIDATION PF 1.46, both ≥1.2, same trade count as unsized — narrow margin, not a blowout). This closes precondition #5 below as *specifically exercised for SOL* (the sizing mechanism itself was already built and symbol-generic since 2026-07-21 — see CLAUDE_HISTORY.md). **2026-08-24: the "BTC/CAD ≥15 fills" precondition was removed** — a deliberate correction, not a loosening (see "Preconditions for any USD pair promotion" below for the full reasoning). **SOL stays BLOCKED regardless** — capital is the sole remaining unmet precondition; the required amount was itself corrected the same day from $500 (the wrong, Stage-3 scale-up figure) to $100 (the correct Stage-1 new-symbol figure — see precondition #2 below and `.memory/decisions/multi-symbol-validation.md` for current live-capital numbers). No `.env`/`UNIVERSE_WHITELIST` change was made. |
 
 ### Screened out — liquidity gate
 | Symbol | 24h Vol (CAD) | Gate | Reason |
@@ -1393,19 +1393,26 @@ Phase A gate, or not whitelisting symbols unaffordable at current account size.
 
 **Status: no qualifying symbols as of last full screen (2026-07-03).** Screen run with strategy hash `659d1c03987b72fd`. Full per-symbol results table and the ATR near-miss follow-up experiment are in `CLAUDE_HISTORY.md`. Summary: 603 Kraken USD spot pairs → 178 cleared the $50,000/day liquidity gate → top 15 by volume walk-forwarded → **zero passed** (dominant failure mode: 79–90% SL-exit rate on every alt tested — the Mode A/B pullback entry has no edge on these assets). Closest near-misses (PF only, still failed SL gate): SYN/USD (PF 1.80/2.56/2.39, SL 79%), LINK/USD (PF 1.54/2.19/1.28, SL 79%).
 
-Later ATR-stop research (2026-07-16/17) showed SYN and SOL both clear the full gate in-sample and hold out-of-sample at ATR×2.0–2.5 — see `CLAUDE_HISTORY.md` "SOL/BTC/SYN ATR OOS validation" entries. SOL's OOS HOLDS result was re-confirmed 2026-08-24 with dollar-risk-capped position sizing applied on top of the ATR stop (see precondition #6 below) — still HOLDS, narrow margin. These remain conditional candidates, not promotions.
+Later ATR-stop research (2026-07-16/17) showed SYN and SOL both clear the full gate in-sample and hold out-of-sample at ATR×2.0–2.5 — see `CLAUDE_HISTORY.md` "SOL/BTC/SYN ATR OOS validation" entries. SOL's OOS HOLDS result was re-confirmed 2026-08-24 with dollar-risk-capped position sizing applied on top of the ATR stop (see precondition #5 below) — still HOLDS, narrow margin. These remain conditional candidates, not promotions.
 
 ### Preconditions for any USD pair promotion
 All of the following must be met before adding any USD pair to UNIVERSE_WHITELIST:
 1. A future screen run produces a 3-window PASS (PF ≥ 1.2 all windows + trades ≥ 10 + SL ≤ 70%)
-2. BTC/CAD live gates met: ≥ 15 fills + live PF ≥ 1.2
-3. Capital ≥ $500 CAD available for the new symbol slot (raised together with
-   `MAX_CONCURRENT_POSITIONS` — see Capital Sizing Rules CapitalPool note)
-4. Documented decision on CAD→USD conversion cost and ongoing FX exposure (Kraken charges
+2. Capital ≥ $100 CAD available for a new Stage-1 starting slot, without reducing BTC/CAD's
+   existing `MAX_SLOT_CASH_CAD=77` allocation (raised together with
+   `MAX_CONCURRENT_POSITIONS` — see Capital Sizing Rules CapitalPool note). **Corrected
+   2026-08-24 (same day, later pass)** — this precondition previously read "$500," which is
+   the Stage-3 scale-up threshold ($250→$500, requires 30 *live* trades on that symbol at
+   PF≥1.3) from Capital Sizing Rules above, not the entry requirement for a symbol that has
+   never traded live. A new symbol starts at Stage 1 ($100), exactly like BTC/CAD originally
+   did — it earns its way to $250 then $500 only after its own live fill history clears those
+   gates, same as BTC/CAD would have to. See `.memory/decisions/multi-symbol-validation.md`
+   for the full correction and the live-capital numbers checked the same day.
+3. Documented decision on CAD→USD conversion cost and ongoing FX exposure (Kraken charges
    ~0.20% conversion; USD P&L requires separate tracking from CAD base)
-5. Full 3-window walk-forward pass on the CURRENT strategy code at promotion time (a pass on
+4. Full 3-window walk-forward pass on the CURRENT strategy code at promotion time (a pass on
    an older hash does not count)
-6. SL-distance-based position sizing — already built generically (`calc_trade_qty_atr_risk()`,
+5. SL-distance-based position sizing — already built generically (`calc_trade_qty_atr_risk()`,
    confirmed symbol-generic 2026-07-21), no new code needed, live for BTC/CAD since 2026-07-17
    (`ATR_SIZING_ENABLED=true`). **2026-08-24: specifically exercised against SOL** —
    `atr_oos_validation.py` gained an opt-in `ATR_RISK_SIZING` flag wiring the same already-live
@@ -1416,9 +1423,34 @@ All of the following must be met before adding any USD pair to UNIVERSE_WHITELIS
    on vs. off showed near-identical PF, same trade count — sizing barely perturbs BTC). SOL/USDT
    **still HOLDS with sizing applied**: TRAIN PF 1.32, VALIDATION PF 1.46 (both ≥1.2, same trade
    count as unsized, margin narrow not wide). This precondition is satisfied as built AND as
-   specifically validated for SOL — but does not by itself unblock SOL: preconditions #2 and #3
-   remain separately unmet. Full trade-level detail: `logs/atr_oos_SOL_2.0_sized_20260824.md`,
-   `logs/atr_oos_BTC_2.0_sized_20260824.md`.
+   specifically validated for SOL. Full trade-level detail:
+   `logs/atr_oos_SOL_2.0_sized_20260824.md`, `logs/atr_oos_BTC_2.0_sized_20260824.md`.
+
+**Removed 2026-08-24: "BTC/CAD live gates met: ≥15 fills + live PF ≥ 1.2" (was precondition
+#2).** This was a deliberate correction to an unexamined default, not a loosening of
+standards — the evidentiary bar itself (PF ≥ 1.2, full walk-forward validation) is unchanged
+and applies exactly as strictly to every remaining precondition above. What was removed was a
+*coupling*: requiring BTC/CAD's own live trade count to clear 15 fills before SOL (or any
+other independently-validated USD/new symbol) could be promoted, regardless of that symbol's
+own edge. A dated investigation (`.memory/decisions/multi-symbol-validation.md`, 2026-08-24
+"Fill-frequency reality check" addendum) quantified why this coupling didn't hold up: real
+recent BTC/CAD fill frequency is 35–42 days/trade (not the "roughly every 1–3 weeks" this gate
+was informally justified against after the fact), making 15 live fills a realistic 1.1–1.7+
+year wait — and as of 2026-08-24, 65 days had already elapsed with zero progress toward fill
+#1. Searching CLAUDE.md, CLAUDE_HISTORY.md, and every `.memory/decisions/*.md` file found no
+record of "15" ever being *derived* from BTC/CAD's own expected frequency or any other
+calculation specific to this gate — it was a reused round number, asserted once and
+retroactively rationalized, not a deliberate risk-sizing decision. Requiring it added no
+evidence about SOL's own edge (SOL clears the real bar — walk-forward PF ≥ 1.2 across
+train/validation, with proper ATR-risk sizing applied, precondition #5 above — independently
+of anything BTC/CAD does); it only tied SOL's promotion timeline to BTC/CAD's unrelated trade
+frequency. **This does not unblock SOL.** Capital (precondition #2 above) was the sole unmet
+precondition for SOL/CAD specifically at the time this paragraph was written — see the
+2026-08-24 correction directly above precondition #2 (the $500 figure this paragraph
+originally cited was the wrong threshold; corrected the same day) and
+`.memory/decisions/multi-symbol-validation.md` for the current live-capital numbers. No `.env`
+or `UNIVERSE_WHITELIST` change was made as part of this removal — SOL/CAD is not being added
+to live config by this edit.
 
 ### Re-screen triggers
 - Strategy code change (new hash after walk-forward) — re-screen all alts before assuming new results
@@ -1436,7 +1468,7 @@ All of the following must be met before adding any USD pair to UNIVERSE_WHITELIS
 | H | Ollama Cloud key revoke | Confirmed unused 2026-07-16; user parked indefinitely — don't re-raise unprompted |
 | I | IBKR live go-live | Gate-blocked (30 paper trades + PF ≥ 1.2) — `LiveTradingGate` Gates 1-3 now CODE-ENFORCED in `IBKRExecutor.__init__()` (2026-08-20); `IBKR_ALLOW_LIVE=true` on a live port raises `ValueError` unless all three PASS. Current real status: Gate 1 15/16 (AMD fails), Gates 2-3 PENDING (insufficient live trades) |
 | J | USD symbol re-screen | Automated monthly via rescreen.py |
-| K | ATR SL experiment for SYN/LINK | SYN + SOL + BTC all OOS-validated at ATR×2.0; SOL re-confirmed 2026-08-24 with dollar-risk-capped sizing (precondition #6) — still HOLDS; still gate-blocked on capital (#3, ~$146 vs. $500) and BTC/CAD's own 15-fill/PF≥1.2 live gate (#2, currently 0/15), unaffected by this sizing work |
+| K | ATR SL experiment for SYN/LINK | SYN + SOL + BTC all OOS-validated at ATR×2.0; SOL re-confirmed 2026-08-24 with dollar-risk-capped sizing (precondition #5) — still HOLDS. **2026-08-24: BTC/CAD ≥15-fill precondition removed** (deliberate correction, see "Preconditions for any USD pair promotion") — capital (#2, corrected same day from $500 to the correct Stage-1 $100 threshold) is now the sole remaining gate for SOL; see `.memory/decisions/multi-symbol-validation.md` for current live-capital numbers |
 | — | Crypto capital gate | 0/15 live fills on BTC/CAD — strategy trades ~every 1–3 weeks; keep watching, don't force it |
 | — | Stock Phase A gate | Position book counting toward 30 completed trades, PF ≥ 1.2, win rate ≥ 30% — now the literal `LiveTradingGate` Gate 3 threshold, current status 5/30 |
 

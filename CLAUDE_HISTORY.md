@@ -2277,3 +2277,68 @@ Verification: full test suite **629 passed**, unchanged. `bot/strategy/*` untouc
 hash `b30f2f9e769c8d41` unchanged. `.env` confirmed untouched (file mtime predates this session).
 Only file changed: `atr_oos_validation.py`. Docs: CLAUDE.md's SOL/CAD entry and precondition #6
 updated; `.memory/decisions/multi-symbol-validation.md` new dated section.
+
+### Crypto bot: BTC/CAD fill-frequency reality check quantified — investigation only, no change (2026-08-24)
+
+Read-only investigation into whether the 15-fill/PF≥1.2 capital gate is calibrated to
+reality, ahead of a decision on whether to decouple SOL's promotion from it (see the entry
+right below — this investigation is what that decision was built on).
+
+**Time-between-trades, current canonical config (31 trades, PF 2.19):** median gap 18.9 days,
+mean 25.4 days (pulled up by a long tail — clustered, not evenly spaced), longest observed dry
+spell **94.7 days**. **Per-window frequency (5000/4000/3000/2000/1000-candle splits) is
+declining, not stable:** 26.9 → 29.0 → 35.6 → **41.6** d/trade from full-history to the most
+recent statistically-meaningful window (11 months) — PF holds up fine across every window, so
+this is a frequency problem, not an edge-quality one. **Live data:** `logs/trades.db` shows
+only 8 fills ever, all clustered 2026-06-12→06-27 (3 round-trips in 15 days), zero since — as
+of today, **65 days elapsed with zero progress toward fill #1**, longer than the previously-
+documented "7-week drought" and still unresolved. **Realistic time to 15 live fills, using the
+most recent relevant window instead of the optimistic full-history average: best case ~1.1yr,
+typical case ~1.7yr, worst case ~3.9yr** (using the observed 94.7-day dry spell as a sustained
+pace). **Origin of "15"/"PF≥1.2":** searched CLAUDE.md, CLAUDE_HISTORY.md, every `.memory/
+decisions/*.md` file, and git log/blame — no derivation found tying "15" to BTC/CAD's own
+expected frequency or any specific calculation. It's reused identically across several
+unrelated gates in this codebase (a general "minimum sample" convention), and the one existing
+piece of related reasoning (a 2026-07-24 note: "trades roughly every 1–3 weeks") was written
+to *justify* the already-existing 15 after the fact, not to derive it — and that assumption is
+now directly contradicted by the data above.
+
+No code or config changed this pass — reporting only, per the task. Full detail:
+`.memory/decisions/multi-symbol-validation.md`, "Fill-frequency reality check" section.
+
+### Crypto bot: BTC/CAD 15-fill precondition removed from new-symbol promotion (2026-08-24, same day)
+
+Direct follow-up to the investigation above. **Removed** "BTC/CAD live gates met: ≥15 fills +
+live PF ≥ 1.2" as a precondition for promoting SOL (or any other independently-validated
+symbol) to `UNIVERSE_WHITELIST` — was item #2 of CLAUDE.md's "Preconditions for any USD pair
+promotion." **A deliberate correction to an unexamined default, not a loosening of
+standards** — the evidentiary bar (PF ≥ 1.2, full walk-forward validation) is unchanged and
+applies exactly as strictly to every remaining precondition. What was removed is a coupling:
+an unrelated symbol's own live trade count gating a different, independently-proven symbol's
+promotion — a coupling the fill-frequency investigation showed added no evidence about that
+symbol's own edge, only tied its timeline to BTC/CAD's own (currently very slow, unrelated)
+fill rate.
+
+Remaining preconditions renumbered in CLAUDE.md (old #3→#2 capital, #4→#3 FX, #5→#4
+walk-forward, #6→#5 SL-distance sizing) — no substantive change to any of them, all
+cross-references updated (SOL/CAD table row, Roadmap item K, the "Later ATR-stop research"
+line).
+
+**Checked whether other gates depend on this same BTC fill-count logic — one real finding, not
+fixed (out of scope, doesn't block anything):** `screen_universe.py` (~line 478) hardcodes the
+identical removed precondition as informational text in its generated report footer — pure
+text, no code path anywhere in this repo actually checks BTC/CAD's fill count programmatically
+(confirmed via grep; this whole precondition list has never been code-enforced). Will drift
+until someone updates that string; flagged, not touched. Two other "15-fill" mentions checked
+and confirmed unrelated: `stock_bot/analysis/checkpoint_tracker.py`'s `ROUND_TRIP_TRIGGER = 15`
+is an independent hardcoded constant (same number chosen by analogy, no coupling);
+`shadow_signal.py`/`unified_dashboard.py`'s "15-fill" references are about BTC/CAD's own
+separate $100→$250 capital-*scaling* gate, a different mechanism entirely, correctly untouched.
+
+**Explicitly confirmed:** SOL/CAD is **not** added to `UNIVERSE_WHITELIST` or any live config
+by this change. No `.env` modification. Capital (~$146 CAD available vs. $500 required) is now
+the sole unmet precondition for SOL/CAD.
+
+Verification: docs-only change — `git status --porcelain` shows only markdown files modified,
+no code touched, no test run needed (nothing executable changed). Full detail:
+`.memory/decisions/multi-symbol-validation.md`, "BTC/CAD 15-fill precondition removed" section.
