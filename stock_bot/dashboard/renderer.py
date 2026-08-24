@@ -1100,6 +1100,85 @@ def _portfolio_overview_html(
 # Alerts panel
 # ---------------------------------------------------------------------------
 
+def _checkpoint_status_html(status: Optional[dict]) -> str:
+    """Post-whitelist review checkpoint (added 2026-08-23) — progress toward
+    the trigger documented in .memory/decisions/
+    stock-whitelist-gate-removed-2026-08-23.md. Reporting only: shows how
+    close the round-trip count + win-rate/PF/AI-agreement comparisons are to
+    the review trigger. Never changes trading behavior — a fired trigger is a
+    one-line notice here, nothing else."""
+    if not status:
+        return ""
+
+    n         = status.get("round_trip_count", 0)
+    target    = status.get("round_trip_target", 15)
+    pct       = status.get("progress_pct", 0.0)
+    non_win   = status.get("non_original_win_pct", 0.0)
+    non_pf    = status.get("non_original_pf", 0.0)
+    orig_n    = status.get("original_n", 0)
+    orig_win  = status.get("original_win_pct", 0.0)
+    orig_pf   = status.get("original_pf", 0.0)
+    agree_n   = status.get("ai_agree_n", 0)
+    agree_win = status.get("ai_agree_win_pct", 0.0)
+    dis_n     = status.get("ai_disagree_n", 0)
+    dis_win   = status.get("ai_disagree_win_pct", 0.0)
+    triggered = status.get("triggered", False)
+    reasons   = status.get("trigger_reasons") or []
+
+    def _pf_str(pf: float) -> str:
+        return "inf" if pf == float("inf") else f"{pf:.2f}"
+
+    bar_color = _RED if triggered else (_GREEN if pct >= 100 else "#e3b341")
+    notice = ""
+    if triggered:
+        reasons_html = "".join(f"<li>{_e(r)}</li>" for r in reasons)
+        notice = f"""
+    <div style="background:#3a1414;border:1px solid {_RED}44;border-radius:6px;
+                padding:10px 14px;margin-top:10px;font-size:13px;color:{_TEXT}">
+      ⚠️ <strong style="color:{_RED}">Review checkpoint reached</strong> — see
+      <code>.memory/decisions/stock-whitelist-gate-removed-2026-08-23.md</code>.
+      This is a notification only — trading is unaffected.
+      <ul style="margin:6px 0 0 18px;padding:0;color:{_MUTED}">{reasons_html}</ul>
+    </div>"""
+
+    return f"""
+  <div style="margin-bottom:20px">
+    <h2>🚦 Post-Whitelist Review Checkpoint</h2>
+    <div style="background:{_CARD_BG};border:1px solid {_BORDER};border-radius:8px;padding:14px">
+      <div style="font-size:13px;color:{_MUTED};margin-bottom:6px">
+        Round-trips on non-original symbols since 2026-08-23:
+        <strong style="color:{_TEXT}">{n} / {target}</strong>
+      </div>
+      <div style="background:{_BORDER2};border-radius:4px;height:8px;overflow:hidden;margin-bottom:12px">
+        <div style="background:{bar_color};height:100%;width:{pct:.0f}%"></div>
+      </div>
+      <div style="display:flex;gap:24px;flex-wrap:wrap;font-size:12px">
+        <div>
+          <div style="color:{_MUTED}">Non-original symbols ({n})</div>
+          <div style="color:{_TEXT};font-weight:600">
+            {non_win:.0f}% win &nbsp;·&nbsp; PF {_pf_str(non_pf)}
+          </div>
+        </div>
+        <div>
+          <div style="color:{_MUTED}">Original 4 — MRNA/AMD/RY/PLTR ({orig_n})</div>
+          <div style="color:{_TEXT};font-weight:600">
+            {orig_win:.0f}% win &nbsp;·&nbsp; PF {_pf_str(orig_pf)}
+          </div>
+        </div>
+        <div>
+          <div style="color:{_MUTED}">AI agree ({agree_n})</div>
+          <div style="color:{_TEXT};font-weight:600">{agree_win:.0f}% win</div>
+        </div>
+        <div>
+          <div style="color:{_MUTED}">AI disagree ({dis_n})</div>
+          <div style="color:{_TEXT};font-weight:600">{dis_win:.0f}% win</div>
+        </div>
+      </div>
+      {notice}
+    </div>
+  </div>"""
+
+
 def _screen_skips_html(screen_skips: Optional[list[dict]]) -> str:
     """In-distribution ATR%/liquidity filter rejections (added 2026-08-23,
     stock_bot/data/screener.py) — the replacement safety net for the removed
@@ -1401,6 +1480,7 @@ def _build_html(
     exit_bars:     Optional[dict]             = None,
     buy_alloc:     Optional[float]            = None,
     screen_skips:  Optional[list[dict]]       = None,
+    checkpoint_status: Optional[dict]         = None,
 ) -> str:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1462,6 +1542,7 @@ def _build_html(
     alerts_section     = _alerts_panel_html(alerts or [])
     readiness_section  = _readiness_panel_html(gate_status)
     screen_skips_section = _screen_skips_html(screen_skips)
+    checkpoint_section = _checkpoint_status_html(checkpoint_status)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1477,6 +1558,7 @@ def _build_html(
 {_header_html(now_str, loop_interval, ai_stats, market_status, loop_mode)}
 {_fg_section_html(fear_greed)}
 {_rule_summary_html(results, held={p.symbol.upper() for p in paper.positions} if paper else set(), buy_alloc=buy_alloc)}
+{checkpoint_section}
 {_summary_html(results, held={p.symbol.upper() for p in paper.positions} if paper else set(), exit_bars=exit_bars)}
 {portfolio_section}
 {paper_section}
@@ -1535,8 +1617,9 @@ class DashboardRenderer:
         exit_bars:     Optional[dict]             = None,
         buy_alloc:     Optional[float]            = None,
         screen_skips:  Optional[list[dict]]       = None,
+        checkpoint_status: Optional[dict]         = None,
     ) -> None:
-        html_str = _build_html(scan_results, fear_greed, self.loop_interval, portfolio, alerts, paper, ai_stats, market_status, loop_mode, gate_status, exit_bars, buy_alloc, screen_skips)
+        html_str = _build_html(scan_results, fear_greed, self.loop_interval, portfolio, alerts, paper, ai_stats, market_status, loop_mode, gate_status, exit_bars, buy_alloc, screen_skips, checkpoint_status)
         os.makedirs(os.path.dirname(os.path.abspath(_OUTPUT_PATH)), exist_ok=True)
         with open(_OUTPUT_PATH, "w", encoding="utf-8") as f:
             f.write(html_str)

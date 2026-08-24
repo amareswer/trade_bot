@@ -142,7 +142,12 @@ class ConfidenceBandTracker:
 
         Each returned dict has:
           symbol, entry_date, exit_date, entry_price, exit_price,
-          shares, pnl, pnl_pct, confidence, exit_reason, hold_days
+          shares, pnl, pnl_pct, confidence, entry_reason, exit_reason, hold_days
+
+        entry_reason added 2026-08-23 (stock_bot/analysis/checkpoint_tracker.py) —
+        carries the BUY leg's raw reason string, which for a RULE BUY includes the
+        " | ai=SIGNAL_CONFIDENCE" shadow-vote tag main.py appends. Purely additive;
+        every pre-existing consumer of this method ignores unknown keys.
         """
         open_buys: dict[str, list[dict]] = {}
         pairs: list[dict] = []
@@ -178,17 +183,18 @@ class ConfidenceBandTracker:
                     hold_days = 0
 
                 pairs.append({
-                    "symbol":      sym,
-                    "entry_date":  buy["timestamp"][:10],
-                    "exit_date":   t["timestamp"][:10],
-                    "entry_price": entry_price,
-                    "exit_price":  exit_price,
-                    "shares":      shares,
-                    "pnl":         pnl,
-                    "pnl_pct":     pnl_pct,
-                    "confidence":  buy["confidence"],
-                    "exit_reason": t.get("reason", ""),
-                    "hold_days":   hold_days,
+                    "symbol":       sym,
+                    "entry_date":   buy["timestamp"][:10],
+                    "exit_date":    t["timestamp"][:10],
+                    "entry_price":  entry_price,
+                    "exit_price":   exit_price,
+                    "shares":       shares,
+                    "pnl":          pnl,
+                    "pnl_pct":      pnl_pct,
+                    "confidence":   buy["confidence"],
+                    "entry_reason": buy.get("reason", ""),
+                    "exit_reason":  t.get("reason", ""),
+                    "hold_days":    hold_days,
                 })
 
         return pairs

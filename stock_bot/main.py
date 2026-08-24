@@ -15,6 +15,7 @@ Keep alive on Mac:
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import logging.handlers
 import os
@@ -64,6 +65,7 @@ from stock_bot.risk.macro_calendar  import is_macro_blackout, parse_user_event_d
 from stock_bot.risk.vix_crisis      import is_vix_crisis
 from stock_bot.fast_validator       import FastValidator
 from stock_bot.analysis.accuracy_tracker import LiveTradingGate
+from stock_bot.analysis.checkpoint_tracker import compute_checkpoint_status
 
 from colorama import Fore, Style, init as _colorama_init
 _colorama_init(autoreset=True)
@@ -1701,6 +1703,12 @@ def run() -> None:
                 logger.debug("Gate status check failed: %s", _ge)
                 _gate_status = None
 
+            try:
+                _checkpoint_status = dataclasses.asdict(compute_checkpoint_status())
+            except Exception as _cse:
+                logger.debug("Checkpoint status check failed: %s", _cse)
+                _checkpoint_status = None
+
             # Current per-trade allocation — lets the rule strip flag
             # whitelisted BUYs that would SIZE_SKIP (1 share > allocation).
             _snap_r     = executor.positions_snapshot()
@@ -1728,6 +1736,7 @@ def run() -> None:
                 },
                 buy_alloc     = _buy_alloc,
                 screen_skips  = screen_skips,
+                checkpoint_status = _checkpoint_status,
             )
         except Exception as exc:
             logger.warning("Dashboard render failed: %s", exc)

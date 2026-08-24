@@ -156,7 +156,13 @@ automatic):**
   `PAPER_KILL_SWITCH_PCT` still fit a wider, less-vetted symbol set — review, not necessarily
   change; the thresholds may well turn out still adequate. Both are decisions to make WITH
   the user at that point — not a rule to auto-revert RULE_WHITELIST removal or auto-tighten
-  the risk thresholds on its own trigger. No code currently computes the entry-quality split
-  automatically; it would need a query against `paper_trades.csv`/`ibkr_trades.csv` filtered
-  by symbol ∉ {MRNA,AMD,RY.TO,PLTR}, which does not exist yet — flagged for whenever this
-  trigger condition is actually reached, not built preemptively.
+  the risk thresholds on its own trigger.
+
+**Progress tracking (added 2026-08-23, same day):** `stock_bot/analysis/checkpoint_tracker.py`
+now computes exactly this split automatically from `paper_trades.csv`/`ibkr_trades.csv`, and
+`stock_dashboard.html` shows it live — look for the **"🚦 Post-Whitelist Review Checkpoint"**
+section (right after the "📐 Rule Signals" strip): round-trip count toward 15, win rate/PF for
+non-original vs. the original 4 side by side, AI-agree vs. AI-disagree win rate, and — only
+once the trigger actually fires — a one-line "⚠️ Review checkpoint reached" notice naming
+which condition(s) tripped. Reporting only; nothing here changes trading behavior on its own.
+Full detail: CLAUDE_HISTORY.md, 2026-08-23 "checkpoint made trackable" entry.

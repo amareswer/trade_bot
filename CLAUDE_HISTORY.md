@@ -1847,3 +1847,114 @@ Full test suite after all of the above: **612 passed** (was 605 immediately afte
 whitelist-removal session; +5 from `test_screener_in_distribution.py`, +2 already added
 earlier the same day for the unrelated Telegram getUpdates backoff fix — see that entry
 above). `bot/strategy/*` untouched, strategy hash unchanged.
+
+### Stock bot: post-whitelist checkpoint made trackable on the dashboard (2026-08-23, same day)
+
+Follow-up to the "AI shadow-vote review criteria" item (#5) above: that checkpoint required
+manually digging through `paper_trades.csv`/`ibkr_trades.csv` to know how close it was to
+firing. This pass adds visibility only — no trading-logic change, no new log, no risk-gate
+change. `bot/strategy/*`, `build_indicator_config()`, entry/exit logic, and risk-gate values
+all confirmed untouched (`git diff --stat` empty on all of them); strategy hash
+`b30f2f9e769c8d41` confirmed unchanged via `bot.strategy.fingerprint.compute_strategy_hash()`.
+
+**Where the data already lives (checked before writing anything new).** `paper_trades.csv` /
+`ibkr_trades.csv` already record every BUY/SELL fill (frozen 9-column schema — untouched), and
+`stock_bot/analysis/accuracy_tracker.py`'s `ConfidenceBandTracker.load_trades()` +
+`pair_trades()` already turn those into completed BUY→SELL round-trips (FIFO per symbol) —
+the exact same machinery `LiveTradingGate`'s Gate 2/Gate 3 already use. No new log needed.
+One small, additive extension was made to `pair_trades()`'s existing output: each pair dict
+now also carries `entry_reason` (the BUY leg's raw `reason` string) alongside the
+pre-existing `exit_reason` — needed to recover the AI shadow-vote tag
+(`"RULE BUY rsi=70 adx=29 | ai=BUY60"`) main.py already appends to every RULE BUY, which
+`pair_trades()` previously discarded. Purely additive (a new dict key); confirmed no other
+caller of `pair_trades()` breaks — `stock_analysis.py`'s only other direct caller only reads
+specific pre-existing keys, and `paper_report.py`/`fast_validator.py`/`unified_dashboard.py`
+all have their own unrelated, differently-named pairing functions.
+
+**New module: `stock_bot/analysis/checkpoint_tracker.py`.** `compute_checkpoint_status()`
+loads the combined paper+IBKR trade history (same merge order as Gate 2/3), pairs it, filters
+to round-trips with `entry_date >= "2026-08-23"` (the whitelist-removal date), and splits by
+symbol into `ORIGINAL_SYMBOLS = {MRNA, AMD, RY, RY.TO, PLTR}` vs. everything else — "RY" (not
+"RY.TO") because that's what `RULE_WHITELIST` actually holds; "RY.TO" is kept as a defensive
+alias since TSX tickers can't be RULE-bought but a manual/legacy row could still use it.
+Computes win rate + PF for each population over the *same* post-cutoff window (an
+apples-to-apples comparison, not all-time-original vs. recent-non-original), and — by parsing
+the `ai=SIGNAL` tag out of `entry_reason` via a small regex — win rate for AI-agree
+(`ai=BUY...`) vs. AI-disagree (`ai=HOLD...`/`ai=SELL...`) non-original-symbol trades;
+`ai=NONE` and untagged reasons (older trades, non-RULE-BUY entries) are excluded from that
+split rather than guessed at. Returns a `CheckpointStatus` dataclass — never places, blocks,
+or modifies a trade; this module only reads and aggregates.
+
+**Trigger check mirrors the decision doc's three conditions exactly where it gives a number,
+and states the one it doesn't as an explicit choice:** ≥15 round-trips AND (win-rate gap
+≥15pp, OR non-original PF < 1.0 while original PF ≥ 1.2 with ≥3 non-original trades, OR — the
+decision doc says only "a wide margin" for the AI-agreement split, no number — operationalized
+here at 20pp (same order of magnitude as the win-rate-gap trigger), documented in the module's
+own comments as a choice made in code, not derived from the decision doc's text. `triggered`
+and a plain-English `trigger_reasons` list are populated the same way the doc's own trigger is
+worded — reviewing, not auto-reverting or auto-tightening anything.
+
+**Dashboard.** `stock_bot/dashboard/renderer.py` gained `_checkpoint_status_html()` — a new
+"🚦 Post-Whitelist Review Checkpoint" section placed right after the existing "📐 Rule
+Signals" strip (`_rule_summary_html`), showing: a progress bar + "N / 15" round-trip count;
+win rate + PF for non-original vs. the original 4, side by side; AI-agree vs. AI-disagree win
+rate; and, only when `triggered` is true, a red one-line notice
+("⚠️ Review checkpoint reached — see .memory/decisions/…") naming the specific reasons, with
+an explicit "this is a notification only — trading is unaffected" line. Renders nothing at
+all when `checkpoint_status` is `None` or empty (matches the existing `gate_status`/
+`screen_skips` optional-section pattern already in this file). Wired through
+`stock_bot/main.py`'s `run()` — `compute_checkpoint_status()` is called once per dashboard
+write, wrapped in the same try/except-to-None pattern already used for `_gate_status`, so a
+failure here degrades to the section just not rendering, never to a crashed tick loop.
+
+**Current real state (2026-08-23):** 0/15 — no trades have posted since the whitelist-removal
+date yet (last real fill in either CSV is 2026-08-19, a SELL, predating the cutoff), so the
+dashboard correctly shows an empty/zero checkpoint right now. This is expected, forward-looking
+infrastructure, not a bug.
+
+Tests: `tests/stock/test_checkpoint_tracker.py`, 13 new cases (empty input, original-symbol
+exclusion from the count, pre-cutoff-date exclusion, on-cutoff-date inclusion, below-sample-
+size never triggers even with bad results, win-rate-gap trigger, PF-gap trigger,
+AI-agreement-gap trigger, a healthy 15-trade population that does NOT trigger, `ai=NONE`/
+untagged reasons excluded from the AI split, progress-bar capping at 100%, and two constant
+sanity checks). Plus a quick manual smoke check that `_checkpoint_status_html()` renders
+correctly for `None`, empty, and `triggered=True` inputs without crashing (no dedicated
+renderer test file exists for this module yet — same as the pre-existing `_screen_skips_html`
+section, which also has no direct test). Suite 615→628.
+
+### Stock bot: sample-size guard added to the AI-agreement checkpoint condition (2026-08-24)
+
+Follow-up review of `stock_bot/analysis/checkpoint_tracker.py`'s AI-agreement "wide margin"
+condition (part of the post-whitelist review checkpoint, above). Asked to investigate/report
+first, no code change until confirmed — this entry covers both the investigation and the fix
+that followed confirmation.
+
+**Finding:** a minimum-sample guard already existed (`_MIN_TRADES_FOR_SPLIT = 3`, requiring
+≥3 trades on both the AI-agree and AI-disagree side before the 20pp gap check runs) — so the
+specific extreme case raised (1 disagree vs. 14 agree) would already have been blocked, 1 < 3.
+But 3 is thin for a 20pp threshold: at n=3 per side, win rate is quantized in 33% steps, so a
+split like 2/3 vs 1/3 wins (67% vs 33%) already clears 20pp on pure noise, no real signal
+needed. A 3-vs-12 (or 3-vs-many) split would pass the old guard and could still fire the
+checkpoint on a near-meaningless sample. Also noted in passing (not fixed — out of scope,
+different condition): the same `_MIN_TRADES_FOR_SPLIT` constant gates the PF-gap condition
+too, but that check sits inside an outer `n >= ROUND_TRIP_TRIGGER` (15) block, making its own
+`n >= 3` sub-check permanently true/dead code — harmless, unrelated to this fix.
+
+**Decision, confirmed with the user before implementing:** add a new, separate constant,
+`_MIN_TRADES_FOR_AI_SPLIT = 5`, used only for the AI-agreement condition —
+`_MIN_TRADES_FOR_SPLIT` (3) is untouched and still gates the PF condition exactly as before,
+and the 15-round-trip total trigger and win-rate-gap condition are untouched too, per the
+explicit instruction that only the AI-agreement split should get a stricter guard. 5 was
+chosen over 10 (a stricter alternative matching `_GATE2_MIN_TRADES=10` in
+`accuracy_tracker.py`) because 5 matches an existing precedent already in this codebase —
+`ConfidenceBandTracker.band_report()`'s own "NEED MORE DATA" cutoff is `n<5` — and stays
+reachable within the 15-30 total non-original round-trips expected near-term, even after
+excluding untagged/`ai=NONE` trades from the split; 10 risked making the AI-agreement
+condition effectively unreachable for a long time.
+
+Tests: `tests/stock/test_checkpoint_tracker.py`, +1 —
+`test_ai_agreement_gap_does_not_trigger_on_a_lopsided_small_sample`: 12 agree (all winners) vs.
+3 disagree (all losers) — a genuine 100pp win-rate gap, clears the old 3-per-side floor, but
+must NOT contribute to a trigger under the new 5-per-side floor. The pre-existing
+`test_ai_agreement_gap_triggers_review` (8 agree vs. 7 disagree, both ≥5) needed no change.
+Suite 628→629. `bot/strategy/*` untouched, strategy hash `b30f2f9e769c8d41` unchanged.
