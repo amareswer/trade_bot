@@ -190,11 +190,8 @@ than the previous pass's now-stale framing. **Still not started** — the walk-f
 PARTIAL, and the user's standing condition (start only on a clean PASS) hasn't been met by
 either the stale-param or the re-derived-param attempt.
 
-**What remains genuinely open, not decided here (per the task's explicit instruction not to
-force this):** whether/how to eventually get Val_2 to a judgeable sample size — waiting for
-more live BTC data to accumulate, revisiting the window boundaries as a deliberate future
-decision (not a today's-workaround), or accepting the strategy stays unvalidated for
-paper-trading purposes until entry frequency naturally increases.
+**What remained open as of the pass above — now resolved, see the 2026-08-24 (third pass)
+section below:** whether/how to eventually get Val_2 to a judgeable sample size.
 
 **Verification:** full test suite **629 passed**, unchanged (same reasoning as the prior
 entry — no test touches these standalone scripts). `bot/strategy/*` and
@@ -204,3 +201,59 @@ untouched, strategy hash `b30f2f9e769c8d41` confirmed unchanged. Files touched t
 pass + SL/TP values updated to the re-derived winner + 3 stale hardcoded "SL=4%/TP=25%"
 display strings made dynamic), `swing_paper_trade.py` (docstring only, no logic change). Full
 narrative: CLAUDE_HISTORY.md, 2026-08-24 second entry.
+
+---
+
+## 2026-08-24 update (third pass, same day) — Val_2 sample-size resolution: wait for calendar time
+
+**Decision:** the open question above — how to eventually get Val_2 (2024-07-01 → now) to a
+judgeable sample size (≥5 trades) — is resolved as **wait for calendar time. No window
+adjustment, no bar-lowering.** Val_2's window grows naturally as "now" advances; this requires
+zero code change and needs no further decision to take effect — it's already in motion simply
+by virtue of `swing_walkforward.py`'s `VAL2_END = None` (open-ended, "through latest").
+
+**Rejected alternatives, and why:**
+- **(a) Extending Val_2's start date backward** to manufacture more trades sooner — rejected.
+  This would retroactively redefine which regime "Val_2" is supposed to represent (the whole
+  point of the 3-window split is that Val_2 isolates the *recent* regime specifically) purely
+  to hit a sample-size target, which is curve-fitting the window to the desired answer rather
+  than measuring what the window is actually there to measure.
+- **(b) Lowering the 5-trade minimum** — rejected. That minimum is what stands between a real
+  PF reading and noise; the whole reason Val_2 currently FAILs is "too few trades to judge,"
+  not "PF is bad" (its PF, 3.28, is actually strong) — lowering the bar to force a pass would
+  launder exactly that distinction away.
+
+Both are the same category of move this project's validation discipline already exists to
+prevent (CLAUDE.md's "Validation Discipline" section, and the DSR/CSCV multiple-testing
+discussion in `.memory/decisions/expert-practices-benchmark.md`) — adjusting the measurement
+until it produces the answer you wanted is a bias, not a fix.
+
+**Why only time can fix this, not parameter tuning:** entry frequency in Val_2 is governed by
+the ADX≥18/RSI-filter/Mode-A/B *entry* logic, not by SL/TP or any other exit parameter — already
+confirmed empirically in the pass above: both the old SL=4%/TP=25% config and the new
+SL=3%/TP=20% config produced **exactly 3 Val_2 trades**, identically, despite being genuinely
+different configs. Sweeping exit parameters further would not change this. Only more live/
+historical BTC data entering the Val_2 window (or accepting a different regime split entirely,
+which is (a) above and already rejected) can move the trade count.
+
+**Recheck cadence:** re-run `swing_walkforward.py` opportunistically whenever the swing scripts
+are touched for any other reason, and **at minimum once every 4–8 weeks**, specifically to check
+whether Val_2's trade count has crossed 5. **This note is dated 2026-08-24** — use that as the
+"time elapsed since" reference for the next recheck; if it's been more than ~8 weeks since this
+date and no recheck has happened, that recheck is overdue.
+
+**Current best config stays SL=3%/TP=20%, no reason to revert.** The 2026-08-24 re-sweep
+(second pass above) ran against *current* strategy code and found SL=3%/TP=20% (PF 2.34) is
+strictly better than the old SL=4%/TP=25% default (PF 2.29, now 2nd) on the same fresh full-window
+data — not a coin-flip or a marginal difference to second-guess. `swing_walkforward.py`'s
+`FIXED` dict keeps this value; `swing_paper_trade.py` keeps reading it via its unchanged
+`from swing_walkforward import FIXED` import — no code change made or needed by this pass.
+
+**Status, unchanged:** the paper-trade observation remains **NOT STARTED** — still gated on a
+clean walk-forward PASS across all 3 windows, which hasn't occurred (Train and Val_1 PASS,
+Val_2 FAILs on sample size, per the pass above). This entry is documentation only; it does not
+start the observation, does not touch any code, and does not run the walk-forward again (that
+already happened in the pass immediately above, same day).
+
+Full detail on the underlying re-sweep/re-validation this decision is downstream of: the
+2026-08-24 (second pass) section above. `CLAUDE_HISTORY.md` carries a matching dated pointer.

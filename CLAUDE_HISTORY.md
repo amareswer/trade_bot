@@ -2110,3 +2110,14 @@ scripts, same as every sibling research script). `bot/strategy/*` and
 `build_indicator_config()` untouched (`git diff --stat` empty on both), `bot/main.py`
 untouched, strategy hash `b30f2f9e769c8d41` unchanged. Full detail:
 `.memory/decisions/swing-1d-validated.md`, 2026-08-24 second update.
+
+### Crypto bot: 1d swing Val_2 sample-size resolution — wait for calendar time (2026-08-24, third pass, documentation only)
+
+Resolved the open question from the pass above: Val_2's sub-5-trade sample size will be fixed
+by **waiting for calendar time** (its window is open-ended, "through latest," and grows on its
+own), not by extending the window backward or lowering the 5-trade minimum — both rejected as
+curve-fitting/bar-lowering moves. Confirmed entry frequency there is SL/TP-independent (both
+4%/25% and 3%/20% produced exactly 3 Val_2 trades), so only new data can resolve it. Recheck
+`swing_walkforward.py` opportunistically and at minimum every 4–8 weeks from this date; SL=3%/
+TP=20% stays the candidate config, no code changed. Full detail: `.memory/decisions/
+swing-1d-validated.md`, 2026-08-24 third update.
