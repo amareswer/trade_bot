@@ -2235,3 +2235,45 @@ sizing itself would help or hurt AMD is a separate, still-unexamined question.
 No code or config changed. Full trade-by-trade table + ATR% numbers appended to `logs/
 stock_backtest_atr_validation_20260823.md`; cross-referenced in `.memory/decisions/
 stock-whitelist-gate-removed-2026-08-23.md`.
+
+### Crypto bot: SL-distance-based sizing precondition exercised for SOL — was already built, task premise corrected (2026-08-24)
+
+Task asked to "build" SL-distance-based position sizing as the unmet precondition for SOL/CAD
+promotion. **It was already built** — `config.calc_trade_qty_atr_risk()` (the standard
+`position_size = risk_budget / stop_distance` formula, `min()`-capped against flat notional so
+a wider stop sizes down, never up) has been symbol-generic since 2026-07-21 and **live for
+BTC/CAD since 2026-07-17** (`ATR_SIZING_ENABLED=true`) — CLAUDE.md's own "Preconditions for
+any USD pair promotion" list #6 already said so before this session. No new sizing logic
+written; writing a second, competing implementation would have been actively wrong.
+
+**What genuinely was missing:** `atr_oos_validation.py` (the script behind SOL's 2026-07-17
+ATR×2.0 OOS-HOLDS result) never actually passed `atr_risk_sizing=True` to `bot.backtest.engine.
+run()`, even though the engine has supported that flag — implementing the identical formula —
+since the same day. So SOL's validated ATR-stop edge had only ever been tested with flat
+notional sizing, never with the paired dollar-risk cap that makes a wider stop NOT a bigger
+bet. That specific gap is what this session closed: added an opt-in `ATR_RISK_SIZING` env flag
+to `atr_oos_validation.py` (default off, reproduces the original methodology unchanged when
+unset), wiring the existing engine parameter through. No `bot/strategy/*` touched, no `.env` or
+`UNIVERSE_WHITELIST` change.
+
+**BTC/CAD regression check:** canonical fingerprint (`EXCHANGE=binance SYMBOL=BTC/USDT python
+backtest.py`) reproduced exactly — 31 trades, PF 2.19, hash `b30f2f9e769c8d41` (this command
+already runs with sizing baked in via `engine_kwargs_from_cfg`, so this alone confirms nothing
+broke). Same-window OOS split with sizing on vs. off: PF 1.77/3.61 → 1.73/4.14, same trade
+counts — sizing barely moves BTC's numbers either way.
+
+**SOL/USDT — still HOLDS with sizing applied.** Same-window comparison: unsized TRAIN PF 1.27 /
+VALIDATION PF 1.46 → sized TRAIN PF 1.32 / VALIDATION PF 1.46, identical trade counts in both.
+Sizing did not clip SOL's edge — both windows still clear PF≥1.2, though narrowly, not by a
+wide margin. Full detail: `logs/atr_oos_SOL_2.0_sized_20260824.md`, `logs/
+atr_oos_BTC_2.0_sized_20260824.md`.
+
+**Restated explicitly, per the task's own instruction not to let this be misread:** precondition
+#6 is now satisfied both generically (already was) and specifically for SOL — **this does not
+unblock SOL.** Precondition #2 (BTC/CAD's own live gate, 0/15 fills) and #3 (capital ~$146 vs.
+$500 required) remain separately, entirely unmet.
+
+Verification: full test suite **629 passed**, unchanged. `bot/strategy/*` untouched, strategy
+hash `b30f2f9e769c8d41` unchanged. `.env` confirmed untouched (file mtime predates this session).
+Only file changed: `atr_oos_validation.py`. Docs: CLAUDE.md's SOL/CAD entry and precondition #6
+updated; `.memory/decisions/multi-symbol-validation.md` new dated section.

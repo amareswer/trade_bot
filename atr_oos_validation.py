@@ -24,6 +24,22 @@ Usage:
   python atr_oos_validation.py                          # SOL/USDT, ATRx2.0 (default)
   SYMBOL=SOL/USDT ATR_MULT=2.0 python atr_oos_validation.py
   SYMBOL=BTC/USDT ATR_MULT=2.0 python atr_oos_validation.py
+
+── ATR_RISK_SIZING (added 2026-08-24) ──────────────────────────────────────
+NOT new sizing logic — bot.backtest.engine.run() has taken an atr_risk_sizing
+flag since 2026-07-17 (the same day ATR_SIZING_ENABLED went live for BTC/CAD,
+implementing the identical dollar-risk-cap formula as config.py's
+calc_trade_qty_atr_risk() — position_size = risk_budget / stop_distance, so a
+wider ATR stop sizes DOWN, never up). This script just never passed it
+through, which means the 2026-07-17 SOL/BTC/SYN/LINK OOS runs in logs/
+atr_oos_*_20260717.md were all evaluated under flat notional sizing — the
+ATR stop distance was tested, but the paired risk-cap that makes a wider
+stop NOT a bigger bet was not. Opt-in, default off, so re-running this
+script with no env override reproduces the exact 2026-07-17 methodology
+unchanged:
+  ATR_RISK_SIZING=true python atr_oos_validation.py                # opt in
+  ATR_RISK_SIZING=true ATR_RISK_SIZING_BASELINE_SL_PCT=0.015 \\
+      SYMBOL=SOL/USDT python atr_oos_validation.py
 """
 import logging
 import os
@@ -41,13 +57,21 @@ TIMEFRAME  = os.getenv("BACKTEST_TIMEFRAME", "4h")
 FEE        = float(os.getenv("BACKTEST_FEE_PCT", "0.008"))
 TOTAL_LIMIT = int(os.getenv("BACKTEST_LIMIT", "5000"))
 
+# Opt-in, default off — see module docstring. Mirrors ATR_SIZING_ENABLED /
+# calc_trade_qty_atr_risk() exactly; this does not add a new sizing method,
+# it exercises the one that's already live for BTC/CAD.
+ATR_RISK_SIZING = os.getenv("ATR_RISK_SIZING", "false").strip().lower() in ("1", "true", "yes")
+ATR_RISK_SIZING_BASELINE_SL_PCT = float(os.getenv("ATR_RISK_SIZING_BASELINE_SL_PCT", "0.015"))
+
 MIN_PF     = 1.2
 MIN_TRADES = 10
 MAX_SL     = 0.70
 
 REPORT_PATH = os.path.join(
     "logs",
-    f"atr_oos_{SYMBOL.split('/')[0]}_{ATR_MULT}_{datetime.now(timezone.utc).strftime('%Y%m%d')}.md",
+    f"atr_oos_{SYMBOL.split('/')[0]}_{ATR_MULT}"
+    f"{'_sized' if ATR_RISK_SIZING else ''}"
+    f"_{datetime.now(timezone.utc).strftime('%Y%m%d')}.md",
 )
 
 
@@ -93,6 +117,8 @@ def run_period(candles, stop_loss_pct: float, atr_sl_mult: float) -> dict:
         volume_k                  = cfg.strategy.volume_k,
         atr_volatile_multiplier   = cfg.strategy.atr_volatile_multiplier,
         atr_sl_mult               = atr_sl_mult,
+        atr_risk_sizing            = ATR_RISK_SIZING,
+        atr_sizing_baseline_sl_pct = ATR_RISK_SIZING_BASELINE_SL_PCT,
     )
 
     m        = metrics_mod.compute(result)
@@ -153,6 +179,20 @@ def main() -> None:
         f"EMA spread>={cfg.strategy.min_ema_spread_pct*100:.1f}%, "
         f"RSI filter={'on' if cfg.strategy.rsi_filter_enabled else 'off'}), fee {FEE*100:.2f}%, "
         f"TP {cfg.backtest.take_profit_pct*100:.0f}%.",
+        f"Sizing: "
+        + (
+            f"ATR risk-capped (ATR_RISK_SIZING=true, baseline_sl_pct="
+            f"{ATR_RISK_SIZING_BASELINE_SL_PCT*100:.2f}%) — position size = "
+            f"(cash × risk_pct × baseline_sl_pct) / (ATR × mult), min()-capped "
+            f"against flat notional, on the ATRx{ATR_MULT} rows only (the "
+            f"fixed1.5% rows below are always flat notional regardless of this "
+            f"flag). Matches config.calc_trade_qty_atr_risk(), live for BTC/CAD "
+            f"since 2026-07-17."
+            if ATR_RISK_SIZING else
+            f"flat notional (cash × risk_pct / price) on every row — "
+            f"ATR_RISK_SIZING not set, same methodology as the original "
+            f"2026-07-17 run."
+        ),
         f"Gate: PF >= {MIN_PF}, trades >= {MIN_TRADES}, SL rate <= {MAX_SL*100:.0f}%.",
         "",
         "| Period | Window | Trades | Win% | PF | SL rate | Return | Verdict |",

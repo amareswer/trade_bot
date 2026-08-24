@@ -1,6 +1,6 @@
 ---
 name: multi-symbol-validation
-description: "Symbol ranking, fee constraint, and expansion decisions from 2026-06-11 multi-symbol backtest. 2026-08-20 addendum: live investigation into BTC/CAD's 7-week zero-BUY drought confirms and extends the original 'BTC is weak now' finding — MTF daily-trend veto data, blocked-gate distribution, real price characterization."
+description: "Symbol ranking, fee constraint, and expansion decisions from 2026-06-11 multi-symbol backtest. 2026-08-20 addendum: live investigation into BTC/CAD's 7-week zero-BUY drought confirms and extends the original 'BTC is weak now' finding — MTF daily-trend veto data, blocked-gate distribution, real price characterization. 2026-08-24 addendum: SOL's ATR×2.0 OOS-HOLDS result re-confirmed with dollar-risk-capped position sizing applied — precondition #6 (SL-distance-based sizing) specifically exercised for SOL for the first time; SOL remains blocked on capital and BTC/CAD's own fill-count gate regardless."
 metadata:
   type: project
 ---
@@ -83,6 +83,64 @@ refetch + watchdog/breaker log grep) — re-run it before assuming either "the s
 broken" or "nothing to see here." A shifting blocked-gate bottleneck tracking real measured
 ADX is the signature of genuine chop; a gate stuck on one label regardless of market
 conditions would be the signature of an actual misconfiguration.
+
+## SOL/CAD SL-distance-based sizing precondition — 2026-08-24 (built AND validated, still blocked on unrelated preconditions)
+
+**Task framing corrected first — important.** The request that triggered this session
+described SL-distance-based position sizing as "the unmet precondition" for SOL/other
+ATR-stop symbols. That's stale: `config.calc_trade_qty_atr_risk()` — the exact standard
+formula (`position_size = risk_budget / stop_distance`, `min()`-capped against flat notional
+so a wider stop sizes DOWN, never up) — was already built generically and confirmed
+symbol-agnostic on **2026-07-21**, and has been **live for BTC/CAD since 2026-07-17**
+(`ATR_SIZING_ENABLED=true`). No new sizing logic was written this session. CLAUDE.md's
+"Preconditions for any USD pair promotion" list #6 already said this before today; today's
+work didn't change that fact, it exercised it against SOL specifically for the first time.
+
+**What was actually missing:** the mechanism existed, but had never been *combined* with
+SOL's own 2026-07-17 ATR×2.0 OOS-HOLDS result. Read `atr_oos_validation.py` (the script that
+produced that HOLDS result) and confirmed it calls `bot.backtest.engine.run()` without
+`atr_risk_sizing=True` — the engine has supported this flag since 2026-07-17 too (implements
+the identical formula), the script just never passed it. So SOL's validated ATR-stop edge had
+only ever been tested with flat notional sizing — the exact gap the original task description
+was worried about, just one level more specific than "the sizing mechanism doesn't exist."
+
+**Fix: added an opt-in `ATR_RISK_SIZING` env flag to `atr_oos_validation.py`** (default off —
+a bare re-run reproduces the original 2026-07-17 methodology unchanged), wiring the existing
+engine parameter through. No change to `bot/strategy/*`, `config.py`, or any live `.env` value.
+
+**BTC/CAD regression check (first, before touching SOL):**
+- Canonical fingerprint (`EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py`) reproduced
+  **exactly**: 31 trades, PF 2.19, hash `b30f2f9e769c8d41` — this command already runs with
+  `atr_risk_sizing=True` baked in via `engine_kwargs_from_cfg` (reads `ATR_SIZING_ENABLED`
+  from live `.env`), so this alone is the honest "does BTC's already-sizing-inclusive live
+  behavior still reproduce" check.
+- Same-window OOS split, sizing on vs. off (isolating the sizing effect from data drift):
+  TRAIN PF 1.77→1.73, VALIDATION PF 3.61→4.14 — same trade counts, same win/SL rates, sizing
+  barely perturbs BTC's numbers either direction. Consistent with BTC's ATR-implied stop
+  distance sitting close to its flat-notional baseline most of the time (same pattern found
+  for most of the stock bot's "PASS" symbols in the 2026-08-24 AMD sizing investigation —
+  sizing only bites hard when a symbol's realized volatility runs well above the baseline).
+
+**SOL/USDT test — still HOLDS with sizing applied:**
+- Same-window comparison (2024-05-13 → 2026-08-24, matching the current live data, not the
+  exact 2026-07-17 window — some natural edge decay visible in both sized and unsized variants
+  vs. the original report, expected with 5 more weeks of data): unsized TRAIN PF 1.27 /
+  VALIDATION PF 1.38 → **sized TRAIN PF 1.32 / VALIDATION PF 1.46**, same trade count (37/27
+  train, 26/21 validation) in both. Sizing did not clip SOL's edge — if anything it improved
+  PF slightly here, since SOL's higher-ATR entries getting sized down apparently didn't
+  disproportionately hit its winning trades.
+- **Both TRAIN and VALIDATION clear the PF≥1.2 gate, but narrowly** — this is not a wide-margin
+  pass. Full detail: `logs/atr_oos_SOL_2.0_sized_20260824.md` (also
+  `logs/atr_oos_BTC_2.0_sized_20260824.md`, `logs/atr_oos_SOL_2.0_20260824.md` for the
+  same-day unsized comparison baseline).
+
+**Conclusion — restated explicitly so this isn't misread:** precondition #6 is satisfied, both
+generically (already was, since 2026-07-21) and now specifically for SOL's ATR-stop
+combination (new as of today). **This does not unblock SOL.** Preconditions #2 (BTC/CAD's own
+live gate: ≥15 fills + PF≥1.2, currently 0/15 — BTC/CAD has never traded since this precondition
+list was written) and #3 (capital ≥$500 CAD for the new symbol slot, currently ~$146 available)
+remain separately, entirely unmet, and neither this session's work nor the OOS HOLDS result
+changes either of them. No `.env` or `UNIVERSE_WHITELIST` change was made.
 
 ## Decisions
 
