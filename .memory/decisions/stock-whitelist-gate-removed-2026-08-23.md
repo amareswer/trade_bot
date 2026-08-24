@@ -110,7 +110,7 @@ detail on all of them (screener filter, sizing audit, threshold audit, gate audi
    math over candle closes already fetched for whatever `executor.positions_snapshot()`
    actually holds — no symbol list anywhere in either path. No gap found.
 
-### AI shadow-vote review criteria (new decision, 2026-08-23)
+### Post-whitelist review checkpoint — AI shadow-vote + risk-threshold adequacy (new decision, 2026-08-23)
 
 **Why this exists:** `stock_bot/main.py`'s rule-BUY path already logs an "AI shadow vote"
 (`reason += f" | ai={verdict.signal}{verdict.confidence}"`) on every trade, with an existing
@@ -120,7 +120,20 @@ RULE_WHITELIST was removed and doesn't distinguish backtested-PASS symbols from 
 opened universe. This section adds that distinction, as a documented, dated decision made
 BEFORE any bad outcome — not decided retroactively after one (the user's explicit ask).
 
-**Trigger for a review of whether to reinstate a lighter validation gate:**
+The same checkpoint also covers whether the kill-switch/drawdown thresholds still fit.
+`PAPER_DAILY_LOSS_PCT=0.03` (set 2026-06-19), `PAPER_WEEKLY_LOSS_PCT=0.05`,
+`PAPER_DRAWDOWN_HALT_PCT=0.15`, `PAPER_KILL_SWITCH_PCT=0.20` (all three set 2026-08-05,
+commit `7d7c90fc`) were sized for a 4-symbol validated universe (MRNA, AMD, RY, PLTR) —
+the opened-up universe changes the risk profile these thresholds were originally calibrated
+against, so their continued adequacy deserves the same look rather than a separate one.
+This is one unified review moment, not two independent triggers: entry-quality (is the AI
+shadow vote predictive on non-backtested symbols) and loss-limit adequacy (are the existing
+thresholds still sized right for a wider, less-vetted symbol set) are two questions asked at
+the same checkpoint, from the same trade sample, at the same time.
+
+**Trigger for this review (both entry-quality and loss-limit adequacy — reinstating a lighter
+validation gate is one possible outcome; retuning the risk thresholds is another; neither is
+automatic):**
 - **Sample size: ≥15 completed round-trips** on the non-backtested-symbol population
   specifically (i.e., rule BUYs on any symbol NOT in {MRNA, AMD, RY.TO, PLTR} — the only 4
   that ever passed a `stock_backtest.py` walk-forward). 15 mirrors the crypto bot's own
@@ -135,11 +148,15 @@ BEFORE any bad outcome — not decided retroactively after one (the user's expli
   - AI-disagreement trades on non-backtested symbols underperform AI-agreement trades by a
     wide margin (the existing "~30 trades, agreed vs disagreed" comparison above, evaluated
     early — at 15 trades — specifically for this population, not deferred to 30).
-- **What "review" means:** re-evaluate whether to reinstate a lighter validation gate for
-  non-backtested symbols (e.g., a single-window `stock_backtest.py` PASS instead of the full
-  4-window RULE_WHITELIST bar, or an ATR%/liquidity-scaled position size floor). This is a
-  decision to make WITH the user at that point — not a rule to auto-revert RULE_WHITELIST
-  removal on its own trigger. No code currently computes this split automatically; it would
-  need a query against `paper_trades.csv`/`ibkr_trades.csv` filtered by symbol ∉
-  {MRNA,AMD,RY.TO,PLTR}, which does not exist yet — flagged for whenever this trigger
-  condition is actually reached, not built preemptively.
+- **What "review" means:** at the same checkpoint, (1) re-evaluate whether to reinstate a
+  lighter validation gate for non-backtested symbols (e.g., a single-window
+  `stock_backtest.py` PASS instead of the full 4-window RULE_WHITELIST bar, or an
+  ATR%/liquidity-scaled position size floor), AND (2) re-evaluate whether
+  `PAPER_DAILY_LOSS_PCT`/`PAPER_WEEKLY_LOSS_PCT`/`PAPER_DRAWDOWN_HALT_PCT`/
+  `PAPER_KILL_SWITCH_PCT` still fit a wider, less-vetted symbol set — review, not necessarily
+  change; the thresholds may well turn out still adequate. Both are decisions to make WITH
+  the user at that point — not a rule to auto-revert RULE_WHITELIST removal or auto-tighten
+  the risk thresholds on its own trigger. No code currently computes the entry-quality split
+  automatically; it would need a query against `paper_trades.csv`/`ibkr_trades.csv` filtered
+  by symbol ∉ {MRNA,AMD,RY.TO,PLTR}, which does not exist yet — flagged for whenever this
+  trigger condition is actually reached, not built preemptively.
