@@ -172,9 +172,9 @@ need the full narrative behind any decision below.
 
 ---
 
-## Test Suite Manifest (reconciled 2026-08-18)
+## Test Suite Manifest (reconciled 2026-08-18, count updated 2026-08-24)
 
-Expected total: **629 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-11s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later.)
+Expected total: **647 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-11s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later. 2026-08-24: 629→639, +10 for CapitalPool per-symbol slot caps — this line and the table row below were caught stale during a "what's missing" self-audit in the same session that added the tests; the manifest count and the actual suite had already diverged by the time that session's own report was written. Same self-audit then found the config-layer half of that same feature — `_slot_caps_by_base()` — had zero test coverage at all; closed it same-day, 639→647.)
 
 **Directory layout (2026-08-18):** all 54 files moved out of repo root into `tests/{crypto,stock,shared}/` for
 a cleaner root — 54 files loose alongside `bot/`, `stock_bot/`, `config.py`, etc. had gotten hard to scan.
@@ -199,7 +199,7 @@ now `.parent.parent.parent`. Verified before/after: same 526 collected, same 526
 |------|-------|----------------|
 | `tests/shared/test_indicators.py` | 30 | RSI, EMA, ADX, MACD, ATR calculations; regime-classification self-referential-ATR-baseline regression (2026-08-20 — `_classify_regime()` contract check + a mutation-verified test driving real `evaluate()` end to end) |
 | `tests/crypto/test_live_executor.py` | 63 | LiveExecutor: dry-run, market/limit orders, urgent-exit bypass, fee deduction, state save/load, pre-trade min-size guard, restart recovery (seeds position manager + state machine), native stop-loss backstop (placement, cancel, resync, failure alerting, dry-run/flag-off no-ops, restart reconciliation), native TRAILING stop-loss backstop (placement w/ trailingPercent param, priority over static, cancel, resync-on-quantity-change, failure alerting, dry-run no-op, state persist/restore — added 2026-08-19), `native_stop_price` property, multi-stop-order ambiguity detection on startup (alerts on 2+ stop-type orders resting, ignores unrelated non-stop open orders — added 2026-08-20), slippage guard (BUY/SELL unfavorable trip, within-threshold, favorable-direction, disabled, dry-run no-ops), restart-startup resting-stop quantity reconciliation (resize under-sized static/trailing, leave over-sized alone, no-op on match/unknown-qty) + untracked-but-real resting stop adoption (single static, single trailing, multiple-not-adopted, none-found-unchanged — both added 2026-08-20 follow-up) |
-| `tests/crypto/test_capital_pool.py` | 19 | CapitalPool: slot allocation, slot cap, release, edge cases |
+| `tests/crypto/test_capital_pool.py` | 37 | CapitalPool: slot allocation, slot cap, release, edge cases. +10 (2026-08-24): per-symbol slot caps (`slot_caps` dict, `slot_cash_for()`) — no-override backward compat, single-symbol-dict matches old single-shared-cap exactly, untouched-symbol falls back to shared default, two-symbols-both-fit, insufficient-total-so-second-gets-remainder, pre-allocation order-dependence, zero=uncapped-per-symbol, property readable, negative-cap validation, release-then-reallocate cycle. +8 (2026-08-24, same-day follow-up — closes a coverage gap found by a "what's missing" self-audit): `config._slot_caps_by_base()` env-var scanner — empty when unset, parses multiple `MAX_SLOT_CASH_CAD_<BASE>` overrides, base uppercased, ignores unrelated keys (incl. the old shared `MAX_SLOT_CASH_CAD`), invalid value raises naming the key; `PortfolioConfig` accepts/validates `max_slot_cash_cad_by_base`, rejects negative, defaults to an empty dict |
 | `tests/crypto/test_correlation.py` | 17 | Pearson correlation, pct_returns, fetch_correlation |
 | `tests/stock/test_stock_correlation.py` | 5 | `stock_bot/risk/correlation.py`: `fetch_correlation_from_closes` — no-network wrapper reusing bot/risk/correlation.py's pearson/pct_returns unchanged |
 | `tests/stock/test_stock_correlation_gate.py` | 8 | `stock_bot.main._check_correlation_gate`: blocks on >0.70 correlation with an open position, allows when uncorrelated/no positions/adding to self-held symbol, fails open on missing candle data (candidate or peer), case-insensitive symbol matching, source-inspection guard confirms `run()` still calls it and blocks on a hit |
@@ -256,9 +256,12 @@ now `.parent.parent.parent`. Verified before/after: same 526 collected, same 526
 | `tests/crypto/test_grid_dca_experiment.py` | 12 | `grid_dca_experiment.py` standalone backtest engines (crypto research tooling, not the live pipeline): grid strategy fills/reopens/floor-stop, capital split across slots, fee math on both legs, DCA safety-order averaging + cycle restart, empty-candle edge cases |
 | `tests/shared/test_telegram_retry.py` | 3 | `TelegramAlerter._send()` retry (added 2026-08-17, closes known-gaps #17): healthy send calls `requests.post` once with no retry, a transient failure recovers on retry, a persistent failure still degrades to a warning-only no-raise after exhausting attempts |
 
-Run: `python -m pytest --tb=short -q` — must show **629 passed**. (This line had drifted to a
+Run: `python -m pytest --tb=short -q` — must show **647 passed**. (This line had drifted to a
 stale "543 passed" — corrected 2026-08-23 to match the manifest total above, which was
-already at 605 before this session's +2. Not investigated why the two numbers had diverged.)
+already at 605 before this session's +2. Not investigated why the two numbers had diverged.
+2026-08-24: 629→639→647 for the CapitalPool per-symbol-cap tests plus the config-layer
+coverage gap found right after — caught by a "what's missing" self-audit, not by re-running
+the suite in the session that made the change.)
 
 ---
 

@@ -2412,3 +2412,58 @@ placeholder with SOL's actual researched minimum.** Two deliverables:
    Full working, the per-scenario table, and the raw script output:
    `.memory/decisions/multi-symbol-validation.md`, "CapitalPool per-symbol slot caps + Kraken
    SOL/CAD real minimum-viable slot" section.
+
+**Third follow-up, same day: general "what's missing" self-audit caught two loose ends from
+the work above.** (1) CLAUDE.md's Test Suite Manifest still said 629/`test_capital_pool.py`=19
+— the 10 new tests from the second follow-up were never reflected in the manifest itself, only
+reported in that session's own chat summary. (2) `_slot_caps_by_base()` (the `config.py`
+env-var scanner backing the whole per-symbol-cap feature) had **zero** direct test coverage —
+only the `CapitalPool` class itself was tested; the config-layer half that actually reads
+`MAX_SLOT_CASH_CAD_<BASE>` from the environment was untested. Closed both: manifest corrected
+to the real count, +8 new tests for `_slot_caps_by_base()`/`PortfolioConfig` (empty-when-unset,
+multi-override parse, uppercasing, unrelated-key exclusion, invalid-value error naming the
+key, `PortfolioConfig` accept/validate/default-empty). Suite 639→**647**, all passing;
+strategy hash re-confirmed unchanged (`b30f2f9e769c8d41`, 31 trades, PF 2.19) — config.py/test
+file only, no `bot/strategy/*` touched. Also spot-checked live `.env` against every documented
+value in CLAUDE.md's "Current Live Configuration" tables (~25 keys, risk/exchange/execution) —
+no drift found, all match. One pre-existing, unrelated item noted but not touched:
+`.env.example` doesn't mirror `MAX_SLOT_CASH_CAD` (or several other documented keys) at all —
+predates this session, flagged not fixed.
+
+### Follow-up, same day: the two flagged items above, actually addressed
+
+User asked to fix both. Investigated each rather than assuming either was still open:
+
+**Telegram control connection errors (today's 12:38/13:13 events) — already fixed, confirmed
+by log evidence, nothing to change.** Traced the full history in `logs/trade_bot.log` (covers
+2026-08-21 onward — older history is rotated away): a rapid burst of `NameResolutionError`s at
+2026-08-21 17:58:40–43 hit BOTH `bot.alerts.telegram` (7 lines, bounded — its own
+`fetch_with_retry` wrapper, added for gap #17, capped it) and `bot.alerts.telegram_control`
+(1206 lines in ~3 seconds — no backoff existed yet for that poller at the time); a second rapid
+burst of 502s at 2026-08-23 21:33:05–08 (~400ms apart, no pacing) was `telegram_control` again,
+still pre-fix — the crypto bot restarted 12 minutes later at 21:45:20, which is exactly when
+the 2026-08-23 `error_backoff_s` hot-loop fix (documented in CLAUDE.md) went live. Today's two
+events are singletons, ~35 minutes apart, each followed by clean recovery with no cascade —
+exactly what the fix is supposed to produce. **Conclusion: not a live bug, already resolved by
+the 2026-08-23 patch; the historical bursts found were evidence of the pre-fix behavior, not a
+regression.** Gap #17's own open question (root cause of why DNS/connection blips seem to hit
+the crypto bot specifically, never confirmed against the stock bot in the current log window
+since `logs/stock_bot.log` only goes back to 2026-08-24 13:40) remains genuinely unresolved —
+no code fix exists for an unknown root cause; flagged as still open, not touched, most likely
+to resolve on its own once/if this moves off a personal machine and onto the deferred VPS
+(Roadmap item F).
+
+**`.env.example` — real gap, fixed.** A full key-by-key diff against `.env` (not just the one
+`MAX_SLOT_CASH_CAD` line spotted in the audit) found **22 missing keys** — not just cosmetic:
+`NATIVE_STOP_LOSS_ENABLED`, `ATR_SIZING_ENABLED`, `CANDLE_MINUTES`, `ORDER_TYPE`,
+`TRAILING_STOP_PCT`/`TRAILING_STOP_ACTIVATION_PCT`, `TELEGRAM_ENABLED`/
+`TELEGRAM_CONTROL_ENABLED`/`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`, `HEARTBEAT_URL`,
+`LIVE_TRADING`, `DRY_RUN`, `MAX_SLOT_CASH_CAD`, `REGIME_EMA_PERIOD`/
+`REGIME_EMA_SLOPE_FILTER`/`REGIME_MONITOR_INTERVAL`, `ADX_MAX`, `VOLUME_K`,
+`DOGE_VOL_MIN_CAD` — a new setup built from this template would have no idea these features
+exist. Added all of them with safe, conservative defaults (matching `config.py`'s own code
+defaults — features off, not the live-tuned `.env` values) plus explanatory comments, a new
+`MAX_SLOT_CASH_CAD_<BASE>` line documenting today's per-symbol-cap capability, and a closing
+note pointing at CLAUDE.md's "Current Live Configuration" as the actual source of truth for
+live-tuned numbers (this file is explicitly a "recommended starting point" template, not a
+live mirror, per its own header). Docs-only — no code touched, suite still 647/647.

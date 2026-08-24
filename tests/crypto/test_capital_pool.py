@@ -1,6 +1,7 @@
 """Unit tests for CapitalPool."""
 import pytest
 from bot.portfolio.capital_pool import CapitalPool
+from config import PortfolioConfig, _slot_caps_by_base
 
 
 def test_slot_cash_divides_evenly():
@@ -236,3 +237,59 @@ def test_release_then_reallocate_with_per_symbol_cap():
     # amount, but slot_cash_for() reports what a *fresh* allocation would be
     # worth right now (BTC's slot is free again).
     assert sol_slot_now == pytest.approx(100.0)
+
+
+# ── config.py: MAX_SLOT_CASH_CAD_<BASE> env-var scanner (added 2026-08-24) ──
+# Gap closed 2026-08-24: these were missing entirely when the CapitalPool
+# feature landed — only the CapitalPool class itself had tests, not the
+# config-layer piece that actually populates slot_caps from .env. Caught
+# during a "what's missing" self-audit in a later session, not the one that
+# wrote the function.
+
+def test_slot_caps_by_base_empty_when_unset(monkeypatch):
+    """No MAX_SLOT_CASH_CAD_* vars at all — an .env with only the old shared
+    MAX_SLOT_CASH_CAD must parse to an empty per-symbol dict."""
+    monkeypatch.delenv("MAX_SLOT_CASH_CAD_BTC", raising=False)
+    monkeypatch.delenv("MAX_SLOT_CASH_CAD_SOL", raising=False)
+    assert _slot_caps_by_base() == {}
+
+
+def test_slot_caps_by_base_parses_multiple_overrides(monkeypatch):
+    monkeypatch.setenv("MAX_SLOT_CASH_CAD_BTC", "77")
+    monkeypatch.setenv("MAX_SLOT_CASH_CAD_SOL", "45.5")
+    result = _slot_caps_by_base()
+    assert result == {"BTC": 77.0, "SOL": 45.5}
+
+
+def test_slot_caps_by_base_uppercases_the_base(monkeypatch):
+    monkeypatch.setenv("MAX_SLOT_CASH_CAD_sol", "45")
+    assert _slot_caps_by_base() == {"SOL": 45.0}
+
+
+def test_slot_caps_by_base_ignores_unrelated_keys(monkeypatch):
+    monkeypatch.setenv("MAX_SLOT_CASH_CAD", "77")   # the old shared key — not per-symbol
+    monkeypatch.setenv("MAX_SLIPPAGE_PCT", "0.01")  # unrelated key, same prefix-ish shape
+    assert _slot_caps_by_base() == {}
+
+
+def test_slot_caps_by_base_invalid_value_raises(monkeypatch):
+    monkeypatch.setenv("MAX_SLOT_CASH_CAD_SOL", "not-a-number")
+    with pytest.raises(ValueError, match="MAX_SLOT_CASH_CAD_SOL"):
+        _slot_caps_by_base()
+
+
+def test_portfolio_config_accepts_slot_caps_by_base():
+    cfg = PortfolioConfig(max_slot_cash_cad_by_base={"BTC": 77.0, "SOL": 45.0})
+    assert cfg.max_slot_cash_cad_by_base == {"BTC": 77.0, "SOL": 45.0}
+
+
+def test_portfolio_config_rejects_negative_per_base_cap():
+    with pytest.raises(ValueError):
+        PortfolioConfig(max_slot_cash_cad_by_base={"SOL": -1.0})
+
+
+def test_portfolio_config_default_slot_caps_by_base_is_empty():
+    """Backward compat: a PortfolioConfig built the old way (no per-symbol
+    kwarg at all) gets an empty dict, not None or a shared mutable default."""
+    cfg = PortfolioConfig()
+    assert cfg.max_slot_cash_cad_by_base == {}
