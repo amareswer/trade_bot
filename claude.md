@@ -1157,7 +1157,7 @@ classify ordering, confirmed manually before landing). Suite 534→536.
 |--------|--------|--------|
 | DOGE/CAD | BLOCKED | Walk-forward failed at corrected 0.8% fee on all windows. |
 | ETH/CAD | BLOCKED | Walk-forward failed on all windows; no edge on ETH over the full 2024–2026 period. |
-| SOL/CAD | BLOCKED | Walk-forward failed — all windows below 1.0. ATR×2.0 OOS validation showed genuine promise (HOLDS train→validation, 2026-07-17) and — as of 2026-08-24 — **still HOLDS once proper dollar-risk-capped position sizing is applied on top of the ATR stop** (TRAIN PF 1.32, VALIDATION PF 1.46, both ≥1.2, same trade count as unsized — narrow margin, not a blowout). This closes precondition #5 below as *specifically exercised for SOL* (the sizing mechanism itself was already built and symbol-generic since 2026-07-21 — see CLAUDE_HISTORY.md). **2026-08-24: the "BTC/CAD ≥15 fills" precondition was removed** — a deliberate correction, not a loosening (see "Preconditions for any USD pair promotion" below for the full reasoning). **SOL stays BLOCKED regardless** — capital is the sole remaining unmet precondition; the required amount was itself corrected the same day from $500 (the wrong, Stage-3 scale-up figure) to $100 (the correct Stage-1 new-symbol figure — see precondition #2 below and `.memory/decisions/multi-symbol-validation.md` for current live-capital numbers). No `.env`/`UNIVERSE_WHITELIST` change was made. |
+| SOL/CAD | BLOCKED | Walk-forward failed — all windows below 1.0. ATR×2.0 OOS validation showed genuine promise (HOLDS train→validation, 2026-07-17) and — as of 2026-08-24 — **still HOLDS once proper dollar-risk-capped position sizing is applied on top of the ATR stop** (TRAIN PF 1.32, VALIDATION PF 1.46, both ≥1.2, same trade count as unsized — narrow margin, not a blowout). This closes precondition #5 below as *specifically exercised for SOL* (the sizing mechanism itself was already built and symbol-generic since 2026-07-21 — see CLAUDE_HISTORY.md). **2026-08-24: the "BTC/CAD ≥15 fills" precondition was removed** — a deliberate correction, not a loosening (see "Preconditions for any USD pair promotion" below for the full reasoning). **SOL stays BLOCKED regardless** — capital is the sole remaining unmet precondition. The generic $500 figure was corrected the same day to the generic Stage-1 $100, then (same day, follow-up session) replaced again with a SOL-specific researched figure: real Kraken SOL/CAD minimums + the live ATR-risk sizing formula put SOL's actual minimum viable slot at **~$110–$334 CAD depending on recent volatility** (bare minimum to avoid a rejected order) — see precondition #2 below for the full derivation. `CapitalPool` also gained per-symbol slot-cap support the same session (`bot/portfolio/capital_pool.py`) so BTC's $77 and a differently-sized SOL slot can coexist in one pool without a shared-cap conflict — not wired into live `.env` yet. No `.env`/`UNIVERSE_WHITELIST` change was made. |
 
 ### Screened out — liquidity gate
 | Symbol | 24h Vol (CAD) | Gate | Reason |
@@ -1406,8 +1406,37 @@ All of the following must be met before adding any USD pair to UNIVERSE_WHITELIS
    PF≥1.3) from Capital Sizing Rules above, not the entry requirement for a symbol that has
    never traded live. A new symbol starts at Stage 1 ($100), exactly like BTC/CAD originally
    did — it earns its way to $250 then $500 only after its own live fill history clears those
-   gates, same as BTC/CAD would have to. See `.memory/decisions/multi-symbol-validation.md`
-   for the full correction and the live-capital numbers checked the same day.
+   gates, same as BTC/CAD would have to.
+
+   **SOL-specific number, replacing the "$100" placeholder above — researched 2026-08-24
+   (follow-up session, same day):** $100 is the correct GENERAL Stage-1 rule, but it is
+   **not enough for SOL specifically** to reliably avoid a min-order rejection. Kraken's
+   real SOL/CAD minimum (`ccxt load_markets()`, checked live) is `amount.min = 0.06 SOL`
+   (~$7.88 CAD notional at the time checked, price ≈$131.26) — trivial on its own. The
+   actual binding constraint is the live ATR-risk position sizer
+   (`calc_trade_qty_atr_risk()`, `RISK_PER_TRADE_PCT=0.10`, `STOP_LOSS_PCT=0.015` baseline,
+   `ATR_SL_MULT=2.0`), which caps BUY quantity by dollar-risk-at-stop — and SOL's ATR is a
+   much larger fraction of its price than BTC's, so that cap bites hard. Solving for the
+   slot cash needed to clear `amount.min` under this formula, across SOL/CAD's own last 30
+   real 4h candles (~5 days): **$110 CAD at the calmest reading observed, $240 at the
+   30-candle mean, $323 at the latest reading, $334 at the most volatile reading observed**
+   — i.e. a $100 slot would SIZE_SKIP on essentially every normal-to-current-volatility
+   day, not just occasionally. To also clear the bot's own pre-trade `MIN_SIZE_SAFETY_MARGIN`
+   guard (1.5×, an early warning before outright rejection —
+   `bot/execution/live_executor.py`), the range shifts to **~$165–$501 CAD** across the same
+   volatility window. **Fee cross-check (same logic already documented for BTC):** Kraken
+   fees are pure percentage-of-notional with no fixed per-trade floor, so round-trip fee
+   drag (~1.20% live: 0.40% maker BUY + 0.80% taker SELL, per
+   `.memory/decisions/fee-structure.md`) does not itself get worse at a smaller dollar slot
+   — SOL is not "fee-strangled" the way the original June 2026 screen found other alts to be
+   (that was a strategy-edge problem, not a sizing problem). SOL's own OOS-validated PF
+   (1.32 train / 1.46 validation, `.memory/decisions/multi-symbol-validation.md`) already
+   used `BACKTEST_FEE_PCT=0.008` per side (≈1.6% round-trip) — harsher than the real ~1.20%
+   live figure — and still cleared PF≥1.2, so fee drag is not the constraint here; the ATR-
+   risk-sizing/exchange-minimum interaction above is. This is volatility-dependent, not a
+   fixed number — re-check if SOL's realized volatility regime shifts materially before
+   trusting these figures. Full working and the raw script output:
+   `.memory/decisions/multi-symbol-validation.md`.
 3. Documented decision on CAD→USD conversion cost and ongoing FX exposure (Kraken charges
    ~0.20% conversion; USD P&L requires separate tracking from CAD base)
 4. Full 3-window walk-forward pass on the CURRENT strategy code at promotion time (a pass on
@@ -1468,7 +1497,7 @@ to live config by this edit.
 | H | Ollama Cloud key revoke | Confirmed unused 2026-07-16; user parked indefinitely — don't re-raise unprompted |
 | I | IBKR live go-live | Gate-blocked (30 paper trades + PF ≥ 1.2) — `LiveTradingGate` Gates 1-3 now CODE-ENFORCED in `IBKRExecutor.__init__()` (2026-08-20); `IBKR_ALLOW_LIVE=true` on a live port raises `ValueError` unless all three PASS. Current real status: Gate 1 15/16 (AMD fails), Gates 2-3 PENDING (insufficient live trades) |
 | J | USD symbol re-screen | Automated monthly via rescreen.py |
-| K | ATR SL experiment for SYN/LINK | SYN + SOL + BTC all OOS-validated at ATR×2.0; SOL re-confirmed 2026-08-24 with dollar-risk-capped sizing (precondition #5) — still HOLDS. **2026-08-24: BTC/CAD ≥15-fill precondition removed** (deliberate correction, see "Preconditions for any USD pair promotion") — capital (#2, corrected same day from $500 to the correct Stage-1 $100 threshold) is now the sole remaining gate for SOL; see `.memory/decisions/multi-symbol-validation.md` for current live-capital numbers |
+| K | ATR SL experiment for SYN/LINK | SYN + SOL + BTC all OOS-validated at ATR×2.0; SOL re-confirmed 2026-08-24 with dollar-risk-capped sizing (precondition #5) — still HOLDS. **2026-08-24: BTC/CAD ≥15-fill precondition removed** (deliberate correction) and capital threshold (#2) researched to a SOL-specific real figure (~$110–$334 CAD depending on volatility, from Kraken's actual SOL/CAD minimums + the live ATR-risk sizer — not the generic $100/$500 placeholders) — capital is now the sole remaining gate for SOL, and current live balance ($153.39) doesn't clear it while also preserving BTC's $77. `CapitalPool` per-symbol slot caps built the same session (not live-wired). See `.memory/decisions/multi-symbol-validation.md` |
 | — | Crypto capital gate | 0/15 live fills on BTC/CAD — strategy trades ~every 1–3 weeks; keep watching, don't force it |
 | — | Stock Phase A gate | Position book counting toward 30 completed trades, PF ≥ 1.2, win rate ≥ 30% — now the literal `LiveTradingGate` Gate 3 threshold, current status 5/30 |
 

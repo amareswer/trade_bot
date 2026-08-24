@@ -1066,32 +1066,62 @@ def run():
     else:
         _pool_total = cfg.portfolio.starting_cash
     _slot_cap = cfg.portfolio.max_slot_cash_cad
+    # Per-symbol overrides (MAX_SLOT_CASH_CAD_<BASE>, e.g. MAX_SLOT_CASH_CAD_SOL) —
+    # keyed by base asset in config, remapped here to the full symbol strings
+    # CapitalPool actually tracks. A symbol with no override falls back to the
+    # shared _slot_cap above — added 2026-08-24, no-op when .env only sets the
+    # old single MAX_SLOT_CASH_CAD (the dict below is then empty).
+    _slot_caps_by_symbol = {
+        _sym: cfg.portfolio.max_slot_cash_cad_by_base[_sym.split("/")[0].upper()]
+        for _sym in executors
+        if _sym.split("/")[0].upper() in cfg.portfolio.max_slot_cash_cad_by_base
+    }
     capital_pool = CapitalPool(
-        total_capital=_pool_total, max_concurrent=_max_conc, slot_cap=_slot_cap
+        total_capital=_pool_total, max_concurrent=_max_conc, slot_cap=_slot_cap,
+        slot_caps=_slot_caps_by_symbol,
     )
-    _slot = capital_pool.slot_cash
     _uncapped_slot = _pool_total / _max_conc
+    _per_symbol_slots: dict[str, float] = {}
     for _sym, _exc in executors.items():
+        _slot = capital_pool.slot_cash_for(_sym)
+        _per_symbol_slots[_sym] = _slot
         _exc._portfolio.cash = _slot
         if cfg.exchange.live_trading:
             try:
                 _exc._save_state()
             except Exception as e:
                 logger.warning("State save after pool init failed [%s]: %s", _sym, e)
-    _cap_note = (
-        f" (capped from ${_uncapped_slot:.2f})"
-        if _slot_cap > 0 and _uncapped_slot > _slot_cap
-        else " (uncapped)"
-    )
-    print(
-        f"\n  Capital pool: ${_pool_total:.2f} total"
-        f" / {_max_conc} slots = ${_slot:.2f} per symbol{_cap_note}\n",
-        flush=True,
-    )
-    logger.info(
-        "CapitalPool init: total=%.2f  slots=%d  slot_cash=%.2f  slot_cap=%.2f",
-        _pool_total, _max_conc, _slot, _slot_cap,
-    )
+    if _slot_caps_by_symbol:
+        # Multi-symbol per-symbol-cap case — report each slot individually
+        # rather than the single "X per symbol" line, since slots now differ.
+        _slots_desc = ", ".join(f"{s}=${v:.2f}" for s, v in _per_symbol_slots.items())
+        print(
+            f"\n  Capital pool: ${_pool_total:.2f} total"
+            f" / {_max_conc} slots — {_slots_desc}\n",
+            flush=True,
+        )
+        logger.info(
+            "CapitalPool init: total=%.2f  slots=%d  per_symbol=%s  shared_slot_cap=%.2f",
+            _pool_total, _max_conc, _per_symbol_slots, _slot_cap,
+        )
+    else:
+        # Original single-shared-cap case — output byte-identical to before
+        # this feature existed.
+        _slot = capital_pool.slot_cash
+        _cap_note = (
+            f" (capped from ${_uncapped_slot:.2f})"
+            if _slot_cap > 0 and _uncapped_slot > _slot_cap
+            else " (uncapped)"
+        )
+        print(
+            f"\n  Capital pool: ${_pool_total:.2f} total"
+            f" / {_max_conc} slots = ${_slot:.2f} per symbol{_cap_note}\n",
+            flush=True,
+        )
+        logger.info(
+            "CapitalPool init: total=%.2f  slots=%d  slot_cash=%.2f  slot_cap=%.2f",
+            _pool_total, _max_conc, _slot, _slot_cap,
+        )
     if cfg.exchange.live_trading:
         logger.info(
             "Executor cash after pool correction: %s",

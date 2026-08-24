@@ -1,6 +1,6 @@
 ---
 name: multi-symbol-validation
-description: "Symbol ranking, fee constraint, and expansion decisions from 2026-06-11 multi-symbol backtest. 2026-08-20 addendum: live investigation into BTC/CAD's 7-week zero-BUY drought confirms and extends the original 'BTC is weak now' finding — MTF daily-trend veto data, blocked-gate distribution, real price characterization. 2026-08-24 addenda: (1) SOL's ATR×2.0 OOS-HOLDS result re-confirmed with dollar-risk-capped position sizing applied; (2) fill-frequency reality check quantifies the 'BTC/CAD 15 fills' gate as an unexamined default, not a calculated one; (3) that gate REMOVED as a precondition for SOL/other new-symbol promotion — SOL now blocked on capital alone; (4) capital threshold itself corrected from $500 (wrong — Stage-3 scale-up figure) to $100 (correct — Stage-1 new-symbol figure), live balance checked ($153.39 CAD, 0 BTC), and a CapitalPool architecture constraint (no per-symbol slot cap) flagged as unresolved."
+description: "Symbol ranking, fee constraint, and expansion decisions from 2026-06-11 multi-symbol backtest. 2026-08-20 addendum: live investigation into BTC/CAD's 7-week zero-BUY drought confirms and extends the original 'BTC is weak now' finding — MTF daily-trend veto data, blocked-gate distribution, real price characterization. 2026-08-24 addenda: (1) SOL's ATR×2.0 OOS-HOLDS result re-confirmed with dollar-risk-capped position sizing applied; (2) fill-frequency reality check quantifies the 'BTC/CAD 15 fills' gate as an unexamined default, not a calculated one; (3) that gate REMOVED as a precondition for SOL/other new-symbol promotion — SOL now blocked on capital alone; (4) capital threshold itself corrected from $500 (wrong — Stage-3 scale-up figure) to $100 (correct — Stage-1 new-symbol figure), live balance checked ($153.39 CAD, 0 BTC), and a CapitalPool architecture constraint (no per-symbol slot cap) flagged as unresolved; (5) same-day follow-up: CapitalPool per-symbol slot caps BUILT (code capability, not live-wired) and the $100 Stage-1 placeholder replaced with SOL's real researched minimum (~$110-$334 CAD bare / ~$165-$501 with the bot's own safety-margin guard, volatility-dependent, from real Kraken SOL/CAD minimums + the live ATR-risk sizer) — current $153.39 balance doesn't clear it alongside BTC's $77."
 metadata:
   type: project
 ---
@@ -308,6 +308,117 @@ project, check which Capital Sizing Rules stage it actually refers to (Stage 1 $
 entry vs. Stage 2 $250 vs. Stage 3 $500 scale-up) rather than assuming a round number seen
 nearby is the right one — the same "reused number, not re-derived" failure mode as the
 fill-count correction directly above this section.
+
+## CapitalPool per-symbol slot caps + Kraken SOL/CAD real minimum-viable slot — 2026-08-24 (follow-up session, same day)
+
+Two pieces of work, requested together: (1) give `CapitalPool` the ability to hold different
+slot caps per symbol (code capability only, not wired into live `.env`), and (2) replace the
+"$100 Stage-1" placeholder from the correction directly above with SOL's actual researched
+minimum, using Kraken's real order minimums the same way `LiveExecutor`'s existing 2026-07-30
+min-size guard does.
+
+### CapitalPool per-symbol caps (code, not live config)
+
+`bot/portfolio/capital_pool.py` gained an optional `slot_caps: dict[str, float]` constructor
+param and a new `slot_cash_for(symbol)` method, alongside the original `slot_cap`/`slot_cash`
+(unchanged, still the shared default). A symbol absent from `slot_caps` falls straight through
+to the old shared computation — numerically identical, confirmed by dedicated tests and by the
+unchanged strategy fingerprint (`b30f2f9e769c8d41`, 31 trades, PF 2.19 — this is a
+`bot/portfolio/`-only change, no `bot/strategy/*` touched). When a per-symbol cap IS set, that
+symbol's target is its own cap (not an equal pool division), further bounded by whatever cash
+isn't already committed to other open slots — so an under-capitalized pool degrades instead of
+over-committing (first-allocated symbol gets priority; a later one gets whatever's left), and
+a pool whose caps sum to less than total capital leaves the surplus idle rather than force-
+splitting it. `config.py` gained a matching `MAX_SLOT_CASH_CAD_<BASE>` env-var scan (e.g.
+`MAX_SLOT_CASH_CAD_SOL=45`), falling back entirely to the existing shared `MAX_SLOT_CASH_CAD`
+when unset — an `.env` with only the old single value is untouched. `bot/main.py`'s pool-init
+block now builds a per-symbol dict from this and seeds each executor's initial cash via
+`slot_cash_for()`; the single-shared-cap startup log line is byte-identical to before when no
+per-symbol override is configured (which is the case today — nothing added to `.env` this
+session). Tests: `tests/crypto/test_capital_pool.py`, +10 (no-override backward compat,
+single-symbol-dict matches old single-shared-cap exactly, untouched-symbol falls back to
+shared default, two-symbols-both-fit, insufficient-total-so-second-gets-remainder, pre-
+allocation order-dependence documented, zero-means-uncapped-per-symbol, property readable,
+negative-cap validation, release-then-reallocate cycle). Suite 629→639.
+
+### Kraken SOL/CAD real minimum-viable slot size
+
+Queried live (`ccxt.kraken().load_markets()`, same mechanism `LiveExecutor._lookup_amt_min()`/
+`_validate_order()` already use for the 2026-07-30 min-size guard): **SOL/CAD `amount.min =
+0.06 SOL`** (~$7.88 CAD notional at the price checked, $131.26), **`cost.min = $1.00 CAD`**
+(not binding — the amount minimum is always the larger constraint here). Trivial numbers on
+their own — the real constraint is what the LIVE sizing formula actually produces at small
+slot sizes.
+
+**The binding constraint is `calc_trade_qty_atr_risk()` interacting with SOL's own volatility,
+not the exchange minimum itself.** Live formula (config.py): `qty = min(base_qty, cash ×
+RISK_PER_TRADE_PCT × STOP_LOSS_PCT / (ATR × ATR_SL_MULT))` — with live values
+`RISK_PER_TRADE_PCT=0.10`, `STOP_LOSS_PCT=0.015`, `ATR_SL_MULT=2.0`, the ATR-risk term is
+almost always the binding (smaller) one, confirmed numerically (`base_qty` came out
+3–4× larger than the ATR-capped qty at every cash level tested). Solving for the slot cash
+needed to clear `amount.min` (0.06 SOL), across SOL/CAD's real last 30 four-hour candles
+(`ccxt.fetch_ohlcv`, ~5 days, ATR(14) via `bot/indicators/indicators.py`'s own `atr()` —
+Wilder-smoothed, growing-window, same function the live bot calls):
+
+| Scenario (SOL/CAD, 4h candles) | ATR(14) | Slot cash to clear `amount.min` (bare) | Slot cash to also clear the 1.5× `MIN_SIZE_SAFETY_MARGIN` guard |
+|---|---|---|---|
+| Calmest of last 30 candles | 1.3725 | $109.80 | $164.70 |
+| 30-candle mean | 2.9956 | $239.64 | $359.46 |
+| Latest reading (at check time) | 4.0384 | $323.07 | $484.61 |
+| Most volatile of last 30 candles | 4.1715 | $333.72 | $500.58 |
+
+`MIN_SIZE_SAFETY_MARGIN=1.5` (`bot/execution/live_executor.py`, default) is the bot's own
+pre-trade early-warning threshold — a computed qty under 1.5× `amount.min` fires a Telegram
+alert before the order is even sent, distinct from the outright exchange rejection at `qty <
+amount.min` itself. Both bars are reported since "reliably avoids SIZE_SKIP/min-order
+rejection" reasonably means clearing the warning too, not just squeaking past the hard floor.
+
+**Conclusion: a $100 slot (the corrected Stage-1 figure from the earlier correction above)
+would SIZE_SKIP or trigger the min-size warning on essentially every normal-to-current-
+volatility SOL/CAD 4h candle, not just occasionally** — $100 only clears the *bare* floor at
+the calmest reading observed in the last 5 days, and doesn't clear the safety-margin guard at
+any reading in that window. The Stage-1 $100 rule is still the correct GENERAL new-symbol
+starting point (untouched for symbols whose own ATR is a smaller fraction of price) — this is
+a SOL-specific finding about how SOL's own volatility interacts with the ATR-risk sizer, not a
+change to the general rule.
+
+**Notable, worth flagging plainly:** the earlier-corrected "$500" (wrongly cited as SOL's
+threshold before being fixed to $100) turns out to sit close to the upper end of the
+*real*, volatility-driven range found here (~$334–$501 depending on which bar). Coincidence,
+not vindication — $500 was still the wrong number for the wrong reason (a misapplied
+Capital Sizing Rules stage, not a derived sizing-math result) — but worth naming so "$100" and
+"$500" aren't both treated as equally-wrong guesses; one of them happens to land in the right
+neighborhood for the wrong reason.
+
+**Fee cross-check, using the identical logic already documented for BTC
+(`.memory/decisions/fee-structure.md`):** Kraken charges pure percentage-of-notional fees with
+no fixed per-trade dollar floor (confirmed — `ccxt` market dict carries `maker`/`taker` rates
+only, no minimum-fee field; the $1 `cost.min` is an order-size floor, not a fee floor). Round-
+trip fee drag is therefore constant as a % of trade value regardless of dollar slot size — a
+$150 slot and a $500 slot pay the identical ~1.20% (0.40% maker BUY + 0.80% taker SELL, per the
+documented BUY-limit/SELL-market policy) round trip, proportionally. This means SOL is **not**
+"fee-strangled" at small slot sizes the way the original 2026-06-11 screen found other alts to
+be — that finding was about the *strategy's own edge* being too thin to survive fee drag at
+any size, a different failure mode from a sizing/exchange-minimum mismatch. Confirms this
+directly: SOL's own OOS-validated result (TRAIN PF 1.32 / VALIDATION PF 1.46, addendum above)
+already used `BACKTEST_FEE_PCT=0.008` applied per side (`atr_oos_validation.py`'s own default,
+≈1.6% modeled round-trip) — harsher than the real ~1.20% live figure — and still cleared
+PF≥1.2. Fee drag is not SOL's constraint; the ATR-risk-sizing/exchange-minimum interaction
+above is.
+
+**Live capital re-check, same session:** Kraken CAD balance unchanged since the earlier
+correction, **$153.39 CAD total, 0 BTC held**. Against the real SOL range found here
+(~$110–$334 bare, ~$165–$501 with safety margin) plus preserving BTC's $77, **$153.39 does not
+clear the low end of the bare range while also leaving BTC intact** ($77 + $110 = $187 needed
+at minimum, $153.39 available — $33.61 short even at the *calmest* observed reading; the gap
+widens to $170–$381 short at more typical/current volatility). No code or live config was
+changed to act on this — reporting only, per the task.
+
+**How to apply:** this range is volatility-derived, not a fixed constant — SOL's ATR moves
+meaningfully week to week (1.37 to 4.17 observed in just the last 5 days here). Re-run the
+same check (`ccxt.fetch_ohlcv('SOL/CAD', '4h')` + `bot.indicators.indicators.atr()` +
+`config.calc_trade_qty_atr_risk()`) close to any actual promotion decision rather than trusting
+these exact dollar figures indefinitely.
 
 ## Decisions
 

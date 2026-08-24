@@ -2342,3 +2342,73 @@ the sole unmet precondition for SOL/CAD.
 Verification: docs-only change — `git status --porcelain` shows only markdown files modified,
 no code touched, no test run needed (nothing executable changed). Full detail:
 `.memory/decisions/multi-symbol-validation.md`, "BTC/CAD 15-fill precondition removed" section.
+
+### Crypto bot: capital threshold correction (Stage-1 vs Stage-3), then CapitalPool per-symbol slot caps + real SOL minimum-viable slot size (2026-08-24, follow-up sessions same day)
+
+**First follow-up: precondition #2's dollar figure was itself wrong.** CLAUDE.md's SOL
+precondition list said "Capital ≥ $500 CAD" — that's the Stage-3 *scale-up* threshold from
+Capital Sizing Rules ($250→$500, requires 30 live trades on that specific symbol at PF≥1.3), a
+bar for a symbol that has already proven itself live twice over. SOL has never traded live at
+all — a new symbol starts at Stage 1, $100, same as BTC/CAD originally did. Traced the cause:
+the earlier same-day session that removed the BTC-fill-count coupling (directly above) carried
+the "$500" figure forward unquestioned rather than re-deriving it from Capital Sizing Rules —
+same failure shape (a number reused without re-checking source) one level downstream of what
+that session was itself fixing. Corrected to $100 in CLAUDE.md, with an explicit note that a
+new symbol's slot must not come at BTC/CAD's expense (`MAX_SLOT_CASH_CAD=77`). Live balance
+checked fresh at the same time (not the ~$146 figure carried in memory): **$153.39 CAD total,
+0 BTC held.** Preserving BTC's $77 while opening a full $100 SOL slot needs $177 total —
+$23.61 short. A second, separate finding surfaced by this same check: `CapitalPool`
+(`bot/portfolio/capital_pool.py`) has no per-symbol slot cap — one shared `slot_cap` applied
+equally to every symbol — so it structurally cannot express "BTC=$77, SOL=$100" even with
+enough total capital. Flagged, not built, in that pass. `git status --porcelain` confirmed
+docs-only (claude.md + two `.memory/` files). Full detail:
+`.memory/decisions/multi-symbol-validation.md`, "Capital threshold correction" section.
+
+**Second follow-up, same day: built the per-symbol-cap capability, then replaced the "$100"
+placeholder with SOL's actual researched minimum.** Two deliverables:
+
+1. **`CapitalPool` per-symbol slot caps (code, not live-wired).** New optional `slot_caps:
+   dict[str, float]` constructor param + a `slot_cash_for(symbol)` method, additive alongside
+   the original shared `slot_cap`/`slot_cash` (unchanged — a symbol absent from `slot_caps`
+   falls straight through to the old computation, numerically identical). When a per-symbol
+   cap IS set, that symbol's target is its own cap, bounded by whatever cash isn't already
+   committed to other open slots — an under-capitalized pool degrades gracefully (first-
+   allocated symbol gets priority; caps summing to less than total capital leave the surplus
+   idle rather than force-splitting). `config.py` gained a `MAX_SLOT_CASH_CAD_<BASE>` env-var
+   scan (e.g. `MAX_SLOT_CASH_CAD_SOL=45`), falling back to the existing shared
+   `MAX_SLOT_CASH_CAD` when unset. `bot/main.py`'s pool-init block now seeds each executor's
+   cash via `slot_cash_for()`; the startup log stays byte-identical to before when no
+   per-symbol override is configured — which is the case today, nothing was added to `.env`.
+   Verification: **639 tests passed (629 + 10 new)**, and the canonical strategy fingerprint
+   reproduced exactly (`EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py` → 31 trades, PF
+   2.19, hash `b30f2f9e769c8d41` unchanged) — expected, since this is a
+   `bot/portfolio/`-only change plus a `config.py` field addition, no `bot/strategy/*` touched.
+
+2. **Kraken SOL/CAD real minimum-viable slot, replacing the "$100" placeholder.** Queried
+   live via `ccxt.kraken().load_markets()` — the identical mechanism `LiveExecutor`'s existing
+   2026-07-30 min-size guard already uses: `amount.min = 0.06 SOL` (~$7.88 CAD notional at the
+   price checked), `cost.min = $1.00 CAD` (not binding). Trivial on their own — the real
+   constraint turned out to be the live ATR-risk sizer (`calc_trade_qty_atr_risk()`) caps
+   quantity by dollar-risk-at-stop, and SOL's ATR is a much larger fraction of its price than
+   BTC's, so that cap — not the exchange minimum — is what actually binds. Solved for the slot
+   cash needed to clear `amount.min` across SOL/CAD's real last 30 four-hour candles (fresh
+   `ccxt.fetch_ohlcv` + the bot's own `atr()`): **$110 (calmest observed) to $334 (most
+   volatile observed) CAD bare minimum, $323 at the reading current when checked** — and
+   $165–$501 to also clear the bot's own 1.5× `MIN_SIZE_SAFETY_MARGIN` pre-trade warning
+   guard, not just avoid outright rejection. A $100 slot clears essentially none of this range
+   except the single calmest bare-minimum case. Fee cross-check (identical logic already
+   documented for BTC, `.memory/decisions/fee-structure.md`): Kraken fees are pure
+   percentage-of-notional, no fixed floor, so round-trip drag (~1.20% live) doesn't get worse
+   at smaller dollar size — SOL isn't fee-strangled the way the original alt screen found other
+   symbols to be; its own OOS-validated PF (1.32/1.46) already survived a harsher modeled fee
+   (≈1.6% round-trip) than live's real ~1.20%. Live balance re-checked, unchanged at $153.39 —
+   doesn't clear even the calmest end of the real range alongside BTC's $77. Notable: the
+   earlier-corrected "$500" (wrong for the wrong reason — a misapplied Capital Sizing Rules
+   stage) happens to sit close to the upper end of this *real*, volatility-derived range — a
+   coincidence, not vindication, but worth naming so neither $100 nor $500 gets treated as
+   equally arbitrary going forward. CLAUDE.md's precondition #2 and the SOL/CAD table row
+   updated with the real figures; no `.env`, `UNIVERSE_WHITELIST`, `STARTING_CASH`, or
+   `MAX_CONCURRENT_POSITIONS` change — reporting + capability-building only, per the task.
+   Full working, the per-scenario table, and the raw script output:
+   `.memory/decisions/multi-symbol-validation.md`, "CapitalPool per-symbol slot caps + Kraken
+   SOL/CAD real minimum-viable slot" section.

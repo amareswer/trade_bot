@@ -2,10 +2,11 @@
 Capital pool — single cash pool shared across all symbols.
 
 Prevents over-commitment when multiple symbols trade simultaneously.
-Each symbol gets an equal slice (a "slot") of the total capital.
-Capital returns to the pool when a position fully closes, carrying P&L.
+By default each symbol gets an equal slice (a "slot") of the total capital,
+optionally capped by a single shared slot_cap. Capital returns to the pool
+when a position fully closes, carrying P&L.
 
-Usage:
+Usage (shared cap — original behavior, unchanged):
     pool = CapitalPool(total_capital=200.0, max_concurrent=2)
     # pool.slot_cash == 100.0
 
@@ -18,6 +19,20 @@ Usage:
 
     # Full SELL fill (position closed):
     pool.release("BTC/CAD", executor.cash)   # executor.cash after sell
+
+Usage (per-symbol caps — added 2026-08-24, for symbols with different-sized
+slots sharing one pool, e.g. BTC/CAD at $77 alongside a smaller SOL/CAD slot):
+    pool = CapitalPool(
+        total_capital=153.39, max_concurrent=2,
+        slot_caps={"BTC/CAD": 77.0, "SOL/CAD": 45.0},
+    )
+    for sym, exc in executors.items():
+        exc._portfolio.cash = pool.slot_cash_for(sym)
+
+A symbol not present in slot_caps falls back to the shared slot_cap (0 =
+uncapped) — numerically identical to the pre-existing single-cap behavior,
+so an unmodified single-symbol setup (BTC/CAD alone, MAX_SLOT_CASH_CAD=77,
+no per-symbol overrides) is untouched by this feature's existence.
 """
 from __future__ import annotations
 
@@ -33,25 +48,46 @@ class CapitalPool:
     total_capital is updated on every release() to track compounding P&L.
     slot_cash is recomputed from the current total each time, so winning
     pools grow and losing pools shrink — consistent with fixed-fractional sizing.
+
+    slot_caps (optional) lets individual symbols carry a different cap than
+    the shared slot_cap default — see slot_cash_for() for the allocation
+    semantics when caps differ per symbol.
     """
 
-    def __init__(self, total_capital: float, max_concurrent: int = 2, slot_cap: float = 0.0) -> None:
+    def __init__(
+        self,
+        total_capital: float,
+        max_concurrent: int = 2,
+        slot_cap: float = 0.0,
+        slot_caps: dict[str, float] | None = None,
+    ) -> None:
         if total_capital <= 0:
             raise ValueError("total_capital must be > 0")
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be >= 1")
         if slot_cap < 0:
             raise ValueError("slot_cap must be >= 0")
-        self._total    = total_capital
-        self._max_conc = max_concurrent
-        self._slot_cap = slot_cap   # 0 = uncapped
+        if slot_caps:
+            for sym, cap in slot_caps.items():
+                if cap < 0:
+                    raise ValueError(f"slot_caps[{sym!r}] must be >= 0")
+        self._total     = total_capital
+        self._max_conc  = max_concurrent
+        self._slot_cap  = slot_cap   # 0 = uncapped (shared fallback)
+        self._slot_caps: dict[str, float] = dict(slot_caps) if slot_caps else {}  # per-symbol overrides, 0 = uncapped
         self._slots: dict[str, float] = {}  # symbol → cash allocated to this slot
 
     # ── Properties ───────────────────────────────────────────────────────────
 
     @property
     def slot_cash(self) -> float:
-        """Cash budget per position slot (total / max_concurrent, capped at slot_cap if > 0)."""
+        """Cash budget per position slot (total / max_concurrent, capped at slot_cap if > 0).
+
+        This is the original, shared-cap-only computation — unaffected by
+        slot_caps, so existing callers that never pass a symbol keep getting
+        exactly the pre-2026-08-24 number. Use slot_cash_for(symbol) to get
+        per-symbol-aware sizing.
+        """
         base = self._total / self._max_conc
         if self._slot_cap > 0:
             return min(base, self._slot_cap)
@@ -60,6 +96,10 @@ class CapitalPool:
     @property
     def slot_cap(self) -> float:
         return self._slot_cap
+
+    @property
+    def slot_caps(self) -> dict[str, float]:
+        return dict(self._slot_caps)
 
     @property
     def total_capital(self) -> float:
@@ -82,6 +122,42 @@ class CapitalPool:
     def free_slots(self) -> int:
         return self._max_conc - len(self._slots)
 
+    # ── Slot sizing ──────────────────────────────────────────────────────────
+
+    def slot_cash_for(self, symbol: str) -> float:
+        """
+        Per-symbol-aware target slot size.
+
+        No per-symbol cap configured for `symbol`: falls straight through to
+        `slot_cash` (equal division of the pool, capped by the shared
+        slot_cap) — numerically identical to the original single-cap
+        behavior. This is what makes the feature additive: a config that
+        only ever set MAX_SLOT_CASH_CAD (no per-symbol overrides) produces
+        the exact same slot_cash_for() result as slot_cash for every symbol.
+
+        A per-symbol cap IS configured: that symbol's target is its OWN cap
+        (0 = uncapped for that symbol), not an equal division of the pool —
+        further capped by whatever cash isn't already committed to OTHER
+        currently-open slots (total_capital minus every other symbol's
+        allocated amount). This makes an under-capitalized pool degrade
+        gracefully instead of over-committing: if the sum of configured caps
+        exceeds total capital, a symbol allocated after the others already
+        hold their slots gets whatever remains rather than its full cap
+        (order of allocate() calls therefore matters when caps overcommit
+        the pool — first allocated gets priority). If the sum of caps is
+        LESS than total capital, the surplus is simply never claimed by
+        anyone and stays idle in the pool (see available_cash) instead of
+        being force-split across symbols the way equal division would.
+        """
+        cap = self._slot_caps.get(symbol)
+        if cap is None:
+            return self.slot_cash
+        already_committed = sum(v for k, v in self._slots.items() if k != symbol)
+        remaining = max(0.0, self._total - already_committed)
+        if cap <= 0:
+            return remaining   # 0 = uncapped for this symbol — bounded only by what's left
+        return min(cap, remaining)
+
     # ── Slot management ──────────────────────────────────────────────────────
 
     def can_open_position(self, symbol: str) -> bool:
@@ -100,7 +176,7 @@ class CapitalPool:
     def allocate(self, symbol: str) -> float:
         """
         Reserve a slot for symbol on confirmed BUY fill.
-        Returns cash allocated (slot_cash). No-op if already allocated.
+        Returns cash allocated (slot_cash_for(symbol)). No-op if already allocated.
         Returns 0 if pool is exhausted.
         """
         if symbol in self._slots:
@@ -111,7 +187,7 @@ class CapitalPool:
                 symbol, len(self._slots), self._max_conc,
             )
             return 0.0
-        cash = self.slot_cash
+        cash = self.slot_cash_for(symbol)
         self._slots[symbol] = cash
         logger.info(
             "CapitalPool: allocated %.2f to %s  (%d/%d slots used)",

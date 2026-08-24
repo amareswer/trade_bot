@@ -72,6 +72,32 @@ def _bool(key: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes")
 
 
+def _slot_caps_by_base() -> dict[str, float]:
+    """Scan the environment for MAX_SLOT_CASH_CAD_<BASE> overrides (e.g.
+    MAX_SLOT_CASH_CAD_BTC=77, MAX_SLOT_CASH_CAD_SOL=45), keyed by base asset
+    (uppercased — the part of the symbol before the '/'). Added 2026-08-24
+    for CapitalPool's per-symbol slot cap feature.
+
+    Falls back entirely to the shared MAX_SLOT_CASH_CAD when none are set —
+    an .env that only defines the old single value is completely unaffected;
+    this returns an empty dict and bot/main.py's CapitalPool construction
+    uses the shared cap for every symbol exactly as before.
+    """
+    prefix = "MAX_SLOT_CASH_CAD_"
+    out: dict[str, float] = {}
+    for key, raw in os.environ.items():
+        if not key.startswith(prefix):
+            continue
+        base = key[len(prefix):].strip().upper()
+        if not base:
+            continue
+        try:
+            out[base] = float(raw.strip())
+        except ValueError:
+            raise ValueError(f"Config error: {key} must be a number, got '{raw}'")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Config groups
 # ---------------------------------------------------------------------------
@@ -275,7 +301,8 @@ class PortfolioConfig:
     sim_start_price:          float = 68_500.0  # simulated feed start price
     sim_volatility:           float = 200.0     # simulated feed volatility per tick
     max_concurrent_positions: int   = 2         # MAX_CONCURRENT_POSITIONS — capital pool slots
-    max_slot_cash_cad:        float = 0.0       # MAX_SLOT_CASH_CAD — per-slot hard cap (0 = uncapped)
+    max_slot_cash_cad:        float = 0.0       # MAX_SLOT_CASH_CAD — shared per-slot hard cap (0 = uncapped)
+    max_slot_cash_cad_by_base: dict = field(default_factory=dict)  # MAX_SLOT_CASH_CAD_<BASE> overrides, e.g. {"SOL": 45.0} — falls back to max_slot_cash_cad when a base isn't listed
     live_dust_value_cad:      float = 10.0      # positions worth < this are dust — skip recovery
 
     def __post_init__(self):
@@ -285,6 +312,9 @@ class PortfolioConfig:
             raise ValueError("MAX_CONCURRENT_POSITIONS must be >= 1")
         if self.max_slot_cash_cad < 0:
             raise ValueError("MAX_SLOT_CASH_CAD must be >= 0")
+        for _base, _cap in self.max_slot_cash_cad_by_base.items():
+            if _cap < 0:
+                raise ValueError(f"MAX_SLOT_CASH_CAD_{_base} must be >= 0")
         if self.live_dust_value_cad < 0:
             raise ValueError("LIVE_DUST_VALUE_CAD must be >= 0")
 
@@ -659,6 +689,7 @@ def _load() -> AppConfig:
             sim_volatility           = _float("SIM_VOLATILITY",            200.0),
             max_concurrent_positions = _int  ("MAX_CONCURRENT_POSITIONS",  2),
             max_slot_cash_cad        = _float("MAX_SLOT_CASH_CAD",         0.0),
+            max_slot_cash_cad_by_base = _slot_caps_by_base(),
             live_dust_value_cad      = _float("LIVE_DUST_VALUE_CAD",       10.0),
         ),
         ai=AIConfig(
