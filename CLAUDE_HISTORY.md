@@ -1958,3 +1958,155 @@ Tests: `tests/stock/test_checkpoint_tracker.py`, +1 —
 must NOT contribute to a trigger under the new 5-per-side floor. The pre-existing
 `test_ai_agreement_gap_triggers_review` (8 agree vs. 7 disagree, both ≥5) needed no change.
 Suite 628→629. `bot/strategy/*` untouched, strategy hash `b30f2f9e769c8d41` unchanged.
+
+### Crypto bot: 1d swing strategy paper-observation status check — never started, re-validation now PARTIAL (2026-08-24)
+
+Investigated whether the 4-week 1d-swing paper-trade observation (`.memory/decisions/
+swing-1d-validated.md`'s documented next step after the 2026-06-23 walk-forward PASS,
+PF 2.67/2.30/1.54) had ever run, and to start it if not.
+
+**Never started.** Exhaustive search (`.memory/`, this file, `bot/main.py`, `.env`/
+`.env.example`, and a repo-wide filename search) found no swing state file, trade log, or
+live loop anywhere — only the original one-shot batch scripts (`swing_walkforward.py`,
+`swing_backtest.py`, `swing_atr_walkforward.py`). `ops/crontab.txt` (kept intentionally
+empty — cron was abandoned on this machine 2026-07-14, macOS TCC blocks it from
+`~/Desktop`, documented in that file) confirms scheduling this was never even attempted.
+
+**Before building anything, tried to reproduce the original 2026-06-23 numbers as a sanity
+check — and couldn't.** `swing_walkforward.py`'s `FIXED` dict no longer runs at all against
+current `bot.backtest.engine.run()`: 5 keys (`regime_enabled`, `bb_period`, `bb_std_dev`,
+`mr_rsi_oversold`, `mr_rsi_overbought`) raise `TypeError` — leftovers from an older engine
+signature (a coarser regime flag, a mean-reversion mode that no longer exists), unrelated to
+the 6 real trading params this strategy is defined by. Removed just those 5 dead keys from
+`swing_walkforward.py`'s `FIXED` (SL=4%/TP=25%/ADX=18/RSI-filter-on/cooldown=3/fee=0.8% —
+untouched, byte-identical to 2026-06-23) and re-ran the actual walk-forward script. Same
+underlying data confirmed (Train/Val_1 candle counts match the original exactly — 1963/547,
+ruling out a data-source difference) but materially different results:
+
+| Period | 2026-06-23 | 2026-08-24 |
+|--------|-----------|-----------|
+| Train  | 29 trades, PF 2.67, PASS | 21 trades, PF 2.99, PASS |
+| Val_1  | 8 trades, PF 2.30, PASS  | 5 trades, PF 2.08, PASS |
+| Val_2  | 5 trades, PF 1.54, PASS  | 3 trades, PF 3.06, **FAIL** (< the script's own 5-trade minimum-sample rule, regardless of PF) |
+
+`swing_walkforward.py`'s own verdict on the fixed, re-run script: **"PARTIAL: Edge degraded
+in recent regime. Do not activate."** Root cause: `bot/strategy/indicator_strategy.py` has
+genuinely changed since 2026-06-23 (the 2026-07-20 Mode A/B wiring fix and the 2026-08-20
+self-referential-ATR-regime-baseline fix are the known candidates — the latter alone moved
+the *4h* strategy's own trade count 32→31). Per this repo's own existing rule (CLAUDE.md
+Validation Discipline: a strategy-code change invalidates prior validation until walk-forward
+is re-run) — the 2026-06-23 "VALIDATED" conclusion no longer holds; current status is
+PARTIAL, not PASS.
+
+**Three confirmation checkpoints with the user, in order, before any code was written or run
+persistently:** (1) which market to paper-trade — Binance BTC/USDT chosen, matching
+`swing_walkforward.py`'s validated data source exactly, not Kraken BTC/CAD (the live 4h
+bot's market); (2) build-and-start-now vs. proposal-only — build-and-start-now chosen; (3)
+after the re-validation came back PARTIAL — re-validate-first-then-start-only-if-PASS chosen
+over "start anyway, flag the gap" or "hold off entirely." Following (3), **the observation
+was NOT started**, per the user's own condition.
+
+**What exists now, built but inert:** `swing_paper_trade.py` (repo root) — a standalone 1d
+swing paper-trading loop, modeled on `stock_bot/fast_validator.py`'s isolation pattern: own
+state (`logs/swing_state.json`), own trade log (`logs/swing_trades.csv`), never touches
+`logs/live_state_BTC_CAD.json`/`logs/risk_state.json`/`trades.db`, never imports
+`bot/main.py`. Reuses `bot.backtest.engine.run()` — the identical code path
+`swing_walkforward.py` already validates with — re-fed fresh daily candles rather than a
+separate hand-rolled live strategy implementation, specifically to avoid the live-vs-backtest
+drift bug class this codebase has been bitten by before. `FIXED` is imported directly from
+`swing_walkforward.py`, never re-typed, so the script can never silently diverge from
+whatever config is actually validated at the time it's eventually started. Runs once/day
+(sleeps to the next UTC-midnight+10min, not a busy loop); new fills are detected by
+timestamp comparison against the last one already logged (robust to the paginated fetcher's
+rolling window eventually dropping old candles, unlike a naive fill-count offset). Verified
+working end-to-end with `--once` (real Binance fetch, real engine run, correctly wrote and
+then — since it was only a mechanics test — was cleaned up): its test output
+(39 completed round-trips, the FULL backtest history since 2018, since there was no prior
+state to diff against) was deleted from `logs/swing_state.json`/`logs/swing_trades.csv`
+rather than left in place, so nothing misrepresents the observation as already having run.
+Sits inert — no scheduled task references it, nothing launches it automatically, not started
+by this session.
+
+**Not resolved, deliberately left open:** how to get Val_2 to a judgeable sample size (wait
+for more live data, adjust the window, or accept a different check) is a decision for
+whenever this is revisited, not decided here.
+
+Verification: full test suite **629 passed**, unchanged (no existing or new tests touch
+`swing_walkforward.py`/`swing_paper_trade.py` — consistent with every other standalone
+research/validation script in this repo, none of which have dedicated pytest coverage
+either). `bot/strategy/*` untouched (`git diff --stat` empty), `build_indicator_config()`
+untouched, strategy hash `b30f2f9e769c8d41` confirmed unchanged via
+`bot.strategy.fingerprint.compute_strategy_hash()`. `bot/main.py` (the live 4h bot) not
+touched at all. Full detail: `.memory/decisions/swing-1d-validated.md`, 2026-08-24 update.
+
+### Crypto bot: 1d swing SL/TP re-derived against current strategy code — still PARTIAL, not PASS (2026-08-24, second pass, same day)
+
+Direct follow-up: the entry above found the swing strategy's original 2026-06-23 SL/TP
+(4%/25%) no longer PASSes on current code — but that check reused the stale values as-given.
+This pass re-derives SL/TP from scratch instead of assuming the old winner still applies.
+
+**`swing_backtest.py` had the same dead-key issue `swing_walkforward.py` had** — confirmed by
+running it first (`TypeError: run() got an unexpected keyword argument 'regime_enabled'`),
+then removed the same 5 stale keys (`regime_enabled`, `bb_period`, `bb_std_dev`,
+`mr_rsi_oversold`, `mr_rsi_overbought`) from its `FIXED` dict. Sweep ranges (6 SL/TP
+combinations) and all other logic untouched.
+
+**Fresh sweep on current code — full table:**
+
+| SL% | TP% | Trades | PF | Verdict |
+|-----|-----|--------|-----|---------|
+| 2%  | 10% | 58 | 1.59 | PASS |
+| 3%  | 15% | 47 | 1.89 | PASS |
+| **3%** | **20%** | **42** | **2.34** | **PASS — new best** |
+| 4%  | 20% | 40 | 2.21 | PASS |
+| 4%  | 25% | 39 | 2.29 | PASS (old default, now 2nd) |
+| 5%  | 25% | 38 | 1.90 | PASS |
+
+All 6 now PASS the sweep's own gate (vs. several MARGINAL in the original 2026-06-23 sweep at
+much higher trade counts — e.g. 2%/10% was 83 trades/PF 1.30/MARGINAL then, now 58 trades/
+PF 1.59/PASS) — consistent with the strategy becoming pickier, not just noisier, since the
+2026-07-20/2026-08-20 fixes. New winner **SL=3%/TP=20%** genuinely beats the old SL=4%/TP=25%
+default (now 2nd), not a tie. ADX/RSI-filter/cooldown/fee left unchanged — no strategy-code-
+change reason found to revisit those; only SL/TP (exit params, most directly downstream of the
+strategy's now-different price paths) were re-derived.
+
+**Updated `swing_walkforward.py`'s `FIXED` to the new SL=3%/TP=20% winner and re-ran the
+3-window walk-forward:**
+
+| Period | Trades | PF | Verdict |
+|--------|--------|-----|---------|
+| Train 2017–2022  | 22 | 2.48 | PASS |
+| Val_1 2023–mid24 | 5  | 4.35 | PASS |
+| Val_2 mid24–now  | **3** | 3.28 | **FAIL** (< 5-trade minimum) |
+
+Script's verdict: **"PARTIAL: Edge degraded in recent regime. Do not activate."** Same status
+as before re-deriving, now on the correct (not stale) params. **Val_2's shortfall is confirmed
+SL/TP-independent** — the old SL=4%/TP=25% walk-forward (same day, prior pass) also produced
+exactly 3 Val_2 trades. Entry frequency in this window is governed by ADX≥18/RSI-filter/
+Mode-A/B *entry* logic, not the SL/TP *exit* params being swept — no candidate in range would
+plausibly clear 5 trades there. Per the task's explicit instruction, reported plainly and
+**not** worked around by shrinking the window, moving Val_2's end date, or lowering the
+5-trade bar. Stopped here, as instructed.
+
+**`swing_paper_trade.py` needed no code change** — it imports `FIXED` directly from
+`swing_walkforward.py` (never re-typed), so it already reflects SL=3%/TP=20% automatically;
+confirmed via direct import. Its docstring was updated to state accurately that it's built,
+reads live SL/TP from `swing_walkforward.py`, and remains **not started** — the walk-forward
+is still PARTIAL either way, and the user's standing condition (start only on a clean PASS)
+still isn't met.
+
+**Left open, not decided:** how to eventually get Val_2 to a judgeable sample size (more time,
+a deliberate window-boundary revisit, or accepting the strategy stays unvalidated for
+paper-trading until entry frequency increases) — not resolved here, per the task's own
+instruction not to force it.
+
+Also fixed while in `swing_walkforward.py`: 3 hardcoded "SL=4% TP=25%" display strings (module
+docstring + 2 console banners) that would otherwise have printed stale values forever
+regardless of what `FIXED` actually held — made dynamic, reading from `FIXED` like the rest of
+the script already did.
+
+Verification: full test suite **629 passed**, unchanged (no test touches these standalone
+scripts, same as every sibling research script). `bot/strategy/*` and
+`build_indicator_config()` untouched (`git diff --stat` empty on both), `bot/main.py`
+untouched, strategy hash `b30f2f9e769c8d41` unchanged. Full detail:
+`.memory/decisions/swing-1d-validated.md`, 2026-08-24 second update.

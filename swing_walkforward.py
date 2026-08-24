@@ -1,8 +1,11 @@
 """
 1D swing strategy walk-forward validation.
 
-Purpose: determine if SL=4% TP=25% on 1d candles has a genuine edge
-or was just riding the 2017–2026 BTC bull market.
+Purpose: determine if the FIXED config below on 1d candles has a genuine
+edge or was just riding the 2017–2026 BTC bull market. SL/TP re-derived
+2026-08-24 (see the FIXED dict's own comment) — read the actual values
+from FIXED, not this docstring, since they're expected to change whenever
+the strategy code underneath is re-validated.
 
 Splits:
   TRAIN   2017-08-17 → 2022-12-31  (bear + bull + crash — 5.5 years)
@@ -35,13 +38,32 @@ VAL2_START  = "2024-07-01"
 VAL2_END    = None           # through latest
 
 # ── Fixed config — best SL/TP from swing_backtest.py (do NOT read from .env) ─
+# 2026-08-24 (first pass): removed 5 keys (regime_enabled, bb_period,
+# bb_std_dev, mr_rsi_oversold, mr_rsi_overbought) that bot.backtest.engine.run()
+# no longer accepts — a TypeError, not a behavior change. These are leftovers
+# from an older engine signature (a mean-reversion mode / a coarser
+# regime on-off flag), unrelated to any of the 6 real trading parameters
+# this file validates.
+#
+# 2026-08-24 (second pass, same day): SL/TP re-derived from a fresh
+# swing_backtest.py sweep run against CURRENT strategy code (the stale
+# SL=4%/TP=25% winner was chosen 2026-06-23, before the 2026-07-20 Mode A/B
+# wiring fix and the 2026-08-20 self-referential-ATR-regime-baseline fix —
+# both changed bot/strategy/indicator_strategy.py's signal generation).
+# New sweep winner: SL=3%/TP=20% (PF=2.34, 42 trades, vs. SL=4%/TP=25%'s
+# now-PF=2.29/39 trades — still a strong second place, all 6 swept
+# combinations now PASS the sweep's own gate, unlike the original 2026-06-23
+# sweep which had several MARGINAL results). ADX/RSI-filter/cooldown/fee
+# left unchanged — no strategy-code-change reason found to revisit those;
+# see .memory/decisions/swing-1d-validated.md's 2026-08-24 entry for the
+# full sweep table and the walk-forward result this new SL/TP produced.
 FIXED = dict(
     strategy_mode           = "indicator",
     starting_cash           = 10_000.0,
     risk_per_trade_pct      = 0.10,
     fee_pct                 = 0.008,
-    stop_loss_pct           = 0.04,
-    take_profit_pct         = 0.25,
+    stop_loss_pct           = 0.03,
+    take_profit_pct         = 0.20,
     cooldown_ticks          = 3,
     adx_period              = 14,
     adx_threshold           = 18.0,
@@ -55,11 +77,6 @@ FIXED = dict(
     daily_loss_limit_pct    = 0.10,
     max_drawdown_pct        = 0.25,
     max_trades_per_day      = 999,
-    regime_enabled          = True,
-    bb_period               = 20,
-    bb_std_dev              = 2.0,
-    mr_rsi_oversold         = 35.0,
-    mr_rsi_overbought       = 65.0,
     atr_volatile_multiplier = 1.5,
     volume_k                = 0.0,
     macd_enabled            = True,
@@ -108,7 +125,11 @@ def main():
     _CY = "\033[96m"
 
     print(f"\n  Swing Walk-Forward — {SYMBOL} {TIMEFRAME}")
-    print(f"  Config: SL=4%  TP=25%  ADX≥18  RSI filter ON  fee=0.8%  cash=$10,000\n")
+    print(
+        f"  Config: SL={FIXED['stop_loss_pct']*100:.0f}%  TP={FIXED['take_profit_pct']*100:.0f}%  "
+        f"ADX≥{FIXED['adx_threshold']:.0f}  RSI filter {'ON' if FIXED['rsi_filter_enabled'] else 'OFF'}  "
+        f"fee={FIXED['fee_pct']*100:.1f}%  cash=${FIXED['starting_cash']:,.0f}\n"
+    )
 
     try:
         all_candles = fetch_candles_paginated(
@@ -177,7 +198,11 @@ def main():
 
     BAR = "─" * 80
     print(f"\n{_B}{BAR}{_R}")
-    print(f"  {_B}1D SWING WALK-FORWARD — BTC/USDT  (SL=4%  TP=25%  ADX≥18  fee=0.8%){_R}")
+    print(
+        f"  {_B}1D SWING WALK-FORWARD — BTC/USDT  "
+        f"(SL={FIXED['stop_loss_pct']*100:.0f}%  TP={FIXED['take_profit_pct']*100:.0f}%  "
+        f"ADX≥{FIXED['adx_threshold']:.0f}  fee={FIXED['fee_pct']*100:.1f}%){_R}"
+    )
     print(f"{BAR}")
     hdr = (
         f"  {'Period':<20} | {'Candles':>7} | {'Trades':>6} | "

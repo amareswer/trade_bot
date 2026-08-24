@@ -25,6 +25,14 @@ TIMEFRAME   = "1d"
 TOTAL_LIMIT = 5000
 
 # ── Fixed strategy settings (hardcoded — do NOT read from .env) ───────────────
+# 2026-08-24: removed 5 keys (regime_enabled, bb_period, bb_std_dev,
+# mr_rsi_oversold, mr_rsi_overbought) that bot.backtest.engine.run() no
+# longer accepts — same dead-key issue found and fixed the same day in
+# swing_walkforward.py's FIXED dict (see .memory/decisions/
+# swing-1d-validated.md's 2026-08-24 entries). Leftovers from an older
+# engine signature (a mean-reversion mode / a coarser regime on-off flag),
+# unrelated to any of the SL/TP sweep values or other real params below,
+# which are untouched.
 FIXED = dict(
     strategy_mode           = "indicator",
     starting_cash           = 10_000.0,
@@ -43,11 +51,6 @@ FIXED = dict(
     daily_loss_limit_pct    = 0.10,
     max_drawdown_pct        = 0.25,
     max_trades_per_day      = 999,
-    regime_enabled          = True,
-    bb_period               = 20,
-    bb_std_dev              = 2.0,
-    mr_rsi_oversold         = 35.0,
-    mr_rsi_overbought       = 65.0,
     atr_volatile_multiplier = 1.5,
     volume_k                = 0.0,
     macd_enabled            = True,
