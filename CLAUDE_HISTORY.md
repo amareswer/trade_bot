@@ -1676,3 +1676,174 @@ stock bot's rule-based entries going forward. This does not change crypto (`bot/
 - Full test suite: `.venv/bin/python -m pytest --tb=short -q` → **605 passed** (unchanged
   count — no test referenced `rule_whitelisted`/`_rule_whitelist`, confirmed by grep before
   the change).
+
+### Stock bot: risk-control hardening after the whitelist removal (2026-08-23, same day)
+
+Follow-up pass, explicitly requested to compensate for the RULE_WHITELIST removal above.
+`bot/strategy/*` and `build_indicator_config()` untouched throughout — strategy hash
+`b30f2f9e769c8d41` unchanged (`bot.strategy.fingerprint.compute_strategy_hash()` re-run to
+confirm). Full writeup: `.memory/decisions/stock-whitelist-gate-removed-2026-08-23.md`
+("Follow-up hardening pass" section).
+
+**1. In-distribution ATR%/liquidity filter (implemented).** `stock_bot/data/screener.py`'s
+`StockScreener.screen()` now returns `(passed, reason)` instead of a bare bool, and gained a
+new `_check_in_distribution()` check ahead of the existing RSI/MACD/price-move logic.
+`logs/stock_backtest_20260710.md` (the report naming MRNA/AMD/RY.TO/PLTR as the 4 symbols
+that PASSED) has no ATR/volume columns — it's a trade-stats table — so the actual range was
+computed directly from live 300-day daily candles (matching live `LOOKBACK_DAYS`/`INTERVAL`)
+on 2026-08-23:
+
+| Symbol | ATR% | Avg $ volume/day |
+|--------|------|-------------------|
+| MRNA   | 10.26% | $1.54B |
+| AMD    | 6.00%  | $20.86B |
+| RY.TO  | 1.73%  | $0.99B |
+| PLTR   | 4.28%  | $9.41B |
+
+Observed range: ATR% [1.73%, 10.26%], avg $ volume [$0.99B, $20.86B]. Thresholds picked with
+generous margin above/below that range (not tight to it): reject if ATR% > 3× the observed
+max (`BACKTESTED_ATR_PCT_MAX × ATR_PCT_REJECT_MULT` = 10.26 × 3.0 ≈ 30.8%, well past even
+MRNA — only catches meme-stock/pre-earnings-blowup-level chaos); reject if avg $ volume <
+$50,000,000/day (`MIN_AVG_DOLLAR_VOLUME`, about 1/20th of RY.TO's ~$989M — the thinnest of
+the 4 — only catches names genuinely illiquid relative to anything backtested). No ATR% floor
+— low volatility isn't a risk this filter needs to catch. Verified none of the 4 backtested
+symbols nor the current 16-symbol `RULE_WHITELIST` would themselves be rejected by their own
+reference filter (`test_backtested_symbols_actually_pass_the_filter`, plus manual check of
+the probe data against the whitelist). Rejection reason is a formatted string, e.g.
+`"SCREEN_SKIP: WILD ATR 80.0% is 7.8x the backtested max (10.3%, MRNA) — outside the
+validated volatility regime"`, logged at WARNING (previously the pre-existing "boring stock"
+rejections only logged at INFO/DEBUG and were dropped silently) and now surfaced in a new
+dashboard section ("🔬 Screened Out — Outside Backtested Regime") via a new `screen_skips`
+param threaded through `stock_bot/main.py` → `DashboardRenderer.render()` →
+`stock_bot/dashboard/renderer.py`'s `_screen_skips_html()`. **Scoping decision:** this filter
+only applies to symbols not already in `watchlist_set` (same gating the pre-existing screener
+already uses) — held positions and configured watchlist symbols are exempt, so a currently-
+held position can never lose its ability to generate a rules-engine SELL because of this
+filter (held symbols are added to `watchlist_set` before the scan loop runs). This does leave
+one gap, named not silently: a watchlist symbol that was never backtest-PASSed (e.g. AC.TO,
+SHOP.TO — TSX advisory-only anyway) still bypasses this new filter, same as it already bypassed
+the pre-existing screener. Tests: `tests/stock/test_screener_in_distribution.py`, 5 new cases
+(normal case passes, extreme ATR rejected with reason, illiquid symbol rejected with reason,
+insufficient-candles passthrough, sanity check that the 4 backtested symbols clear their own
+reference filter). Suite 607→612.
+
+**2. Per-symbol volatility sizing — audited, reported, NOT implemented pending a decision.**
+Current sizing in `stock_bot/main.py` (near the `executor.buy()` call): flat notional —
+`alloc = (cash + position_value) * PAPER_RISK_PCT` (0.20 live), `shares = int(alloc /
+price_cad)`. Separately, `stock_bot/config.py`'s `calc_shares_atr_risk()` — already wired
+into the same BUY path, gated behind `PAPER_ATR_SIZING_ENABLED` (default false, currently
+off) — turns out to already implement almost exactly what was asked for: algebraically,
+`capped_shares = base_shares × (baseline_sl_pct ÷ (atr_mult × ATR%))`, i.e. size ∝ 1/ATR%
+relative to a baseline (`baseline_sl_pct ÷ atr_mult` acting as the reference ATR%), and it's
+`min()`-capped against the flat notional baseline so no symbol can size UP past today's
+default — exactly the two properties requested. It does not cover liquidity, only volatility
+— a real gap if liquidity-based downsizing (not just the new hard liquidity floor above) is
+wanted too. Real example sizes computed against the live IBKR paper account
+(~$5,087 total value, `peak_equity` in `stock_bot/ibkr_state.json`, `PAPER_RISK_PCT=0.20`,
+`PAPER_STOP_LOSS_PCT=0.05`, `PAPER_ATR_SL_MULT=2.0` default) if this were turned on today:
+
+| Symbol | Price | ATR% | Flat shares (today) | ATR-capped shares (if enabled) |
+|--------|-------|------|----------------------|----------------------------------|
+| MRNA | $145.13 | 10.26% | 7 | 1 |
+| AMD  | $473.25 | 6.00%  | 2 | **0 — SIZE_SKIP** |
+| GM   | $87.93  | 2.66%  | 11 | 10 |
+
+AMD sizing to 0 at today's account size is a real, honest consequence of enabling this as-is
+— worth knowing before flipping the flag, not just an abstract formula. Presented to the user
+for a decision: (a) enable `PAPER_ATR_SIZING_ENABLED=true` as already built, (b) additionally
+add a liquidity-scaling factor (not yet built), or (c) something else. **User chose: run the
+walk-forward first** (a follow-up question, prompted by noticing enabling this also swaps the
+SL trigger — not just position size — from flat 5% to ATR×2.0 via `calc_shares_atr_risk`'s
+paired stop-distance override, and CLAUDE.md's own existing rule requires exactly that
+validation before enabling live, which had never actually been run for this specific setting).
+
+**Walk-forward built and run, same session.** `stock_bot/backtest/engine.py`'s `run_symbol()`
+had no ATR-stop mode at all — only a flat `stop_loss_pct`. Added a new optional
+`atr_sl_mult` field to `StockBacktestConfig` (default `None` = byte-for-byte identical to the
+pre-existing behavior — every one of the 11 pre-existing engine tests still passes unchanged,
+proving this); when set, each trade's SL distance is computed ONCE at entry fill as
+`min(ATR(14)*atr_sl_mult/entry_price, atr_sl_cap)` — same "known at entry, never repriced"
+semantics as the live executor's own `_atr_stop_pct`, with the same flat-stop fallback when
+ATR is unavailable (thin history). Deliberately NOT added as a flag to `stock_backtest.py`
+itself — that script's `logs/stock_backtest_latest.json` output is a fixed path
+`LiveTradingGate.check_gate1()` depends on for the CURRENT (flat-stop) live behavior, and an
+ATR-mode run must not corrupt that gate's read. Instead: a new standalone script,
+`validate_atr_sizing.py` (repo root), reusing the same engine, same walk-forward windows
+(`[0, 750, 500, 250]`), and identical PASS/FAIL gate criteria as `stock_backtest.py`, writing
+its own separate report (`logs/stock_backtest_atr_validation_<date>.md`) and touching no JSON.
+Tests: `tests/stock/test_stock_backtest_engine.py`, +3 (ATR stop overriding the flat distance
+on a candle sequence engineered so the two modes diverge — proven by running the identical
+candles through both configs and asserting different exit prices/timing; the same-candles
+flat-mode control; fallback-to-flat when history is too short for a 14-period ATR). Suite
+612→615. `bot/strategy/*` and `build_indicator_config()` untouched — only the SL/TP check
+inside `stock_bot/backtest/engine.py` changed; strategy hash `b30f2f9e769c8d41` confirmed
+unchanged via `bot.strategy.fingerprint.compute_strategy_hash()`.
+
+**Run against RULE_WHITELIST (the trusted, already-PASSED set — not the full 28-symbol
+watchlist, which includes symbols that already fail under flat stops and wouldn't answer the
+actual question), ATR(14) × 2.0 (`PAPER_ATR_SL_MULT` default), 1500 days, same $1,000/trade
+notional as `stock_backtest.py`:**
+
+**Result: 14 PASS, 2 FAIL — AMD and KO.** AMD is a genuine regression: it PASSED under the
+original flat-5%-stop backtest (`logs/stock_backtest_20260710.md`) but FAILS under ATR×2.0
+(full-window PF 1.05 < 1.2 gate, 250d window PF 0.92 < 1.2). This is the same symptom the
+Part 2 sizing example above already hinted at (AMD sizing to 0 shares at today's account
+size) — AMD's price/ATR combination genuinely does not tolerate this stop distance well. KO
+also fails (250d PF 0.56) but was never one of the original 4 backtest-PASS symbols (added
+later via the 2026-07-15 affordable-symbol screen), so it's a new finding, not a regression
+per se. The other three of the original 4 (MRNA, RY, PLTR) all still PASS cleanly. Full
+per-window table: `logs/stock_backtest_atr_validation_20260823.md` (RY's result was appended
+to that file manually after a transient yfinance fetch blip dropped it from the main batch
+run — a standalone re-fetch immediately after succeeded cleanly, RY PASS).
+
+**Decision: `PAPER_ATR_SIZING_ENABLED` NOT enabled.** The walk-forward did not produce a
+clean PASS — it found a real regression on a symbol that was part of the original trusted
+set. Enabling the flag as-is today would put AMD (and KO) live under a stop distance that
+just failed its own validation, which is exactly the outcome the existing CLAUDE.md rule
+("do not enable live without a walk-forward PASS first") exists to prevent. Left off,
+reported to the user with the concrete finding rather than silently flipping it. Options for
+the user to consider next (not decided/built): (a) leave ATR sizing off entirely, (b) enable
+it only for the 14 symbols that passed and keep AMD/KO on flat sizing (would need per-symbol
+config, not built), (c) try a different `atr_sl_mult` and re-run
+`validate_atr_sizing.py` to see if a less aggressive multiplier holds up for AMD/KO too, (d)
+something else.
+
+**3. Kill-switch/drawdown thresholds — audited, reported, NOT changed (per explicit
+instruction).** `git blame stock_bot/config.py`: `PAPER_DAILY_LOSS_PCT=0.03` — commit
+`26f175e7`, 2026-06-19 (original circuit-breaker feature). `PAPER_WEEKLY_LOSS_PCT=0.05`,
+`PAPER_DRAWDOWN_HALT_PCT=0.15`, `PAPER_KILL_SWITCH_PCT=0.20` — all three commit `7d7c90fc`,
+2026-08-05 (the four-tier breaker expansion, same day as the crypto bot's equivalent — see
+"Risk-gate config (stock bot)" in CLAUDE.md). None are set in `stock_bot/.env` — all four are
+running on `stock_bot/config.py` defaults, confirmed via grep. Matches CLAUDE.md exactly, no
+drift found. Left as-is for the user to decide whether the wider entry universe warrants
+tightening.
+
+**4. Sector/correlation/macro gate audit — confirmed generic, no hardcoded gap found.**
+`get_sector()` (`stock_bot/data/price_feed.py`) is a live `yf.Ticker(sym).info` lookup for
+ANY symbol (cached, falls back to `"other"` on failure) — used identically by both
+`stock_bot/execution/paper.py` and `stock_bot/execution/ibkr.py`'s sector-concentration gate
+(`_MAX_PER_SECTOR=2`), no symbol-keyed mapping anywhere. The correlation gate
+(`stock_bot/risk/correlation.py`'s `fetch_correlation_from_closes` + `_check_correlation_gate`
+in `main.py`) is pure Pearson math over candle closes for whatever
+`executor.positions_snapshot()` actually holds that cycle — also symbol-agnostic, no
+hardcoded pair list. Macro blackout (`_is_macro_event_blackout`) and VIX crisis mode are
+market-wide and were never per-symbol to begin with. **Conclusion: (a), not (b)** — nothing
+silently no-ops for a newly-opened symbol; both gates already work correctly for any symbol
+the newly-opened universe can produce. The one residual limitation (not a hardcoding gap): the
+correlation gate fail-opens if a held peer's candle data is missing from that cycle's
+`price_data` (e.g. a fetch failure) — a data-availability edge case, not a symbol-coverage one,
+and pre-existing/documented behavior.
+
+**5. AI shadow-vote review criteria — new documented decision, no code.** See
+`.memory/decisions/stock-whitelist-gate-removed-2026-08-23.md` for the full criteria: ≥15
+completed round-trips on symbols outside {MRNA, AMD, RY.TO, PLTR} (mirrors the crypto bot's
+own 15-fill capital-gate convention), AND either a ≥15-point win-rate gap vs. backtested-symbol
+trades, PF < 1.0 on the non-backtested population, or a wide AI-agreement/disagreement outcome
+gap (the existing "~30 trades" AI-shadow-vote comment in `main.py`, evaluated early and split
+by this population specifically). Triggers a review, not an automatic reversal — decided
+2026-08-23, before any bad outcome, per explicit instruction not to decide this retroactively.
+
+Full test suite after all of the above: **612 passed** (was 605 immediately after the
+whitelist-removal session; +5 from `test_screener_in_distribution.py`, +2 already added
+earlier the same day for the unrelated Telegram getUpdates backoff fix — see that entry
+above). `bot/strategy/*` untouched, strategy hash unchanged.

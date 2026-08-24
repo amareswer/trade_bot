@@ -30,6 +30,7 @@ from bot.strategy.indicator_strategy import IndicatorStrategy, IndicatorConfig
 from bot.strategy.threshold_strategy import Signal
 from bot.data.historical_feed import Candle as StrategyCandle
 from stock_bot.analysis.paper_report import _round_trip_commission
+from stock_bot.indicators.indicators import atr as _calc_atr
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +108,18 @@ class StockBacktestConfig:
     stop_loss_pct: float = 0.05      # same as PAPER_STOP_LOSS_PCT
     take_profit_pct: float = 0.15    # same as PAPER_TAKE_PROFIT_PCT
     indicator: IndicatorConfig = field(default_factory=IndicatorConfig)
+    # ATR-based stop distance (added 2026-08-23, mirrors PAPER_ATR_SIZING_ENABLED's
+    # paired stop-distance override in stock_bot/main.py / calc_shares_atr_risk).
+    # None (default) = unchanged flat stop_loss_pct behavior, identical to before
+    # this field existed. When set, each trade's SL distance is
+    # min(ATR(14) * atr_sl_mult / entry_price, atr_sl_cap) computed ONCE at entry
+    # fill (never repriced mid-trade — matches the live executor's own
+    # once-at-BUY _atr_stop_pct, not a rolling trailing stop) and falls back to
+    # the flat stop_loss_pct when ATR is unavailable (thin history at entry),
+    # exactly like the live sizing path's own fallback.
+    atr_sl_mult:   Optional[float] = None
+    atr_sl_cap:    float = 0.50      # sanity cap — never a stop wider than 50%,
+                                      # same cap the live executor applies
 
 
 def run_symbol(
@@ -123,11 +136,21 @@ def run_symbol(
         strategy = IndicatorStrategy(cfg.indicator)
     slip = cfg.slippage_bps / 10_000.0
 
+    # Precomputed once for the optional ATR-stop path — cheap, only actually
+    # read (via a slice up to the entry index) when a position fills and
+    # cfg.atr_sl_mult is set.
+    highs  = [c.high  for c in candles] if cfg.atr_sl_mult else None
+    lows   = [c.low   for c in candles] if cfg.atr_sl_mult else None
+    closes = [c.close for c in candles] if cfg.atr_sl_mult else None
+
     trades: list[BacktestTrade] = []
     in_pos        = False
     entry_price   = 0.0
     entry_ts: Optional[datetime] = None
     shares        = 0
+    entry_sl_pct  = cfg.stop_loss_pct   # this trade's SL distance — flat by
+                                         # default, overridden per-entry below
+                                         # when ATR-stop mode is active
     pending_entry = False
     pending_exit  = False
 
@@ -150,12 +173,20 @@ def run_symbol(
             n = int(cfg.notional / fill) if fill > 0 else 0
             if n > 0:
                 in_pos, entry_price, entry_ts, shares = True, fill, c.timestamp, n
+                entry_sl_pct = cfg.stop_loss_pct   # flat default; ATR override below
+                if cfg.atr_sl_mult:
+                    # ATR computed from candles up to and including the fill
+                    # candle — same "known at entry, never repriced" semantics
+                    # as the live executor's once-at-BUY _atr_stop_pct.
+                    atr_val = _calc_atr(highs[:i + 1], lows[:i + 1], closes[:i + 1], period=14)
+                    if atr_val and atr_val > 0 and fill > 0:
+                        entry_sl_pct = min((atr_val * cfg.atr_sl_mult) / fill, cfg.atr_sl_cap)
         elif pending_exit and in_pos:
             close_trade(c.open, c.timestamp, "strategy")
 
         # ── 2. Intra-candle SL/TP (SL first — pessimistic) ────────────────
         if in_pos:
-            sl_price = entry_price * (1 - cfg.stop_loss_pct)
+            sl_price = entry_price * (1 - entry_sl_pct)
             tp_price = entry_price * (1 + cfg.take_profit_pct)
             if c.low <= sl_price:
                 close_trade(min(c.open, sl_price), c.timestamp, "sl")

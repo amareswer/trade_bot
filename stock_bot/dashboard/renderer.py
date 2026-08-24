@@ -1100,6 +1100,28 @@ def _portfolio_overview_html(
 # Alerts panel
 # ---------------------------------------------------------------------------
 
+def _screen_skips_html(screen_skips: Optional[list[dict]]) -> str:
+    """In-distribution ATR%/liquidity filter rejections (added 2026-08-23,
+    stock_bot/data/screener.py) — the replacement safety net for the removed
+    RULE_WHITELIST gate. Without this, a rejected symbol is just silently
+    dropped from the scan; this makes the rejection visible."""
+    if not screen_skips:
+        return ""
+    rows = ""
+    for s in screen_skips:
+        rows += f"""
+      <div style="font-size:12px;color:#e3b341;padding:4px 14px">
+        🚫 <strong>{_e(s['symbol'])}</strong> ${s['price']:,.2f} — {_e(s['reason'])}
+      </div>"""
+    return f"""
+  <div style="margin-bottom:20px">
+    <h2>🔬 Screened Out — Outside Backtested Regime ({len(screen_skips)})</h2>
+    <div style="background:{_CARD_BG};border:1px solid {_BORDER};border-radius:8px;padding:6px 0">
+      {rows}
+    </div>
+  </div>"""
+
+
 def _alerts_panel_html(alerts: list[Alert]) -> str:
     if not alerts:
         return ""
@@ -1378,6 +1400,7 @@ def _build_html(
     gate_status:   Optional[dict]             = None,
     exit_bars:     Optional[dict]             = None,
     buy_alloc:     Optional[float]            = None,
+    screen_skips:  Optional[list[dict]]       = None,
 ) -> str:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1438,6 +1461,7 @@ def _build_html(
     overview_section   = _portfolio_overview_html(portfolio, paper)
     alerts_section     = _alerts_panel_html(alerts or [])
     readiness_section  = _readiness_panel_html(gate_status)
+    screen_skips_section = _screen_skips_html(screen_skips)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1459,6 +1483,7 @@ def _build_html(
 {overview_section}
 {_top_picks_html(results)}
 {readiness_section}
+{screen_skips_section}
 {watchlist_section_html}
 {universe_section_html}
 
@@ -1509,8 +1534,9 @@ class DashboardRenderer:
         gate_status:   Optional[dict]             = None,
         exit_bars:     Optional[dict]             = None,
         buy_alloc:     Optional[float]            = None,
+        screen_skips:  Optional[list[dict]]       = None,
     ) -> None:
-        html_str = _build_html(scan_results, fear_greed, self.loop_interval, portfolio, alerts, paper, ai_stats, market_status, loop_mode, gate_status, exit_bars, buy_alloc)
+        html_str = _build_html(scan_results, fear_greed, self.loop_interval, portfolio, alerts, paper, ai_stats, market_status, loop_mode, gate_status, exit_bars, buy_alloc, screen_skips)
         os.makedirs(os.path.dirname(os.path.abspath(_OUTPUT_PATH)), exist_ok=True)
         with open(_OUTPUT_PATH, "w", encoding="utf-8") as f:
             f.write(html_str)

@@ -174,7 +174,7 @@ need the full narrative behind any decision below.
 
 ## Test Suite Manifest (reconciled 2026-08-18)
 
-Expected total: **607 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-11s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later.)
+Expected total: **615 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-11s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later.)
 
 **Directory layout (2026-08-18):** all 54 files moved out of repo root into `tests/{crypto,stock,shared}/` for
 a cleaner root — 54 files loose alongside `bot/`, `stock_bot/`, `config.py`, etc. had gotten hard to scan.
@@ -224,12 +224,13 @@ now `.parent.parent.parent`. Verified before/after: same 526 collected, same 526
 | `tests/stock/test_fast_validator_exits.py` | 6 | FastValidator exits: MAX_HOLD live-price fallback, corruption guard, SL regression |
 | `tests/stock/test_paper_report.py` | 10 | Expectancy math: IBKR commission model, net-of-cost flip, report rendering, merged paper+IBKR position book, IBKR account section, active-book state synthesis, live-cash-snapshot precedence over stale fill CSV |
 | `tests/stock/test_exit_policy.py` | 11 | Stock-bot asymmetric exit bars: single-verdict exit, 2-strike SELL streak, streak resets, AC.TO incident regression |
-| `tests/stock/test_stock_backtest_engine.py` | 11 | Stock backtest engine: next-open fills, intra-candle SL/TP, gap handling, slippage/commission math, walk-forward gating |
+| `tests/stock/test_stock_backtest_engine.py` | 14 | Stock backtest engine: next-open fills, intra-candle SL/TP, gap handling, slippage/commission math, walk-forward gating. +3 (2026-08-23): optional ATR(14)×mult stop-distance mode (`StockBacktestConfig.atr_sl_mult`, default `None` = unchanged flat behavior) — ATR override diverges from the flat stop on an engineered candle sequence, same-candles flat-mode control proving the two modes are genuinely different, fallback to flat when history is too short for a 14-period ATR |
 | `tests/stock/test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last (forming candle), determinism, validated-parameter pin |
 | `tests/crypto/test_audit_scheduler.py` | 14 | In-bot audit scheduler: tests REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, monthly 1st-anchored (re-screen), missed-run catch-up |
 | `tests/crypto/test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
 | `tests/stock/test_ibkr_executor.py` | 56 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping (.TO↔TSE/CAD, bare NYSE cross-listings→NYSE), broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe (redial/never-raise/no-op), low-equity FX/margin-minimum guard (CAD exempt), starting_cash auto-rebaseline on external reset/deposit, live-cash snapshot persisted + preserved across disconnect, sector-concentration gate (reject 3rd same-sector position, allow add-on to already-held symbol, allow different sector), weekly-loss/drawdown-halt/kill-switch tiers (reject-on-trip, halt auto-lifts, kill switch sticky + persists across restart, SELL never blocked, peak-equity persistence, warning-status flag), per-position ATR stop-pct override (default/persistence/cleared-on-full-close), check_exposure projected (pending-trade-value) exposure — defaults to current-state-only, catches an oversized single BUY, allows one that stays under cap; LiveTradingGate enforcement (added 2026-08-20) — all-Gates-1-3-pass succeeds, Gate-4-fail still succeeds (not enforced), single-gate FAIL/PENDING blocks with `ValueError`, error names only the actually-failing gate(s), blocked before any TWS connection attempt, paper mode never evaluates the gate (count corrected 48→49 pre-existing then +7 new — the 48 in this manifest predated an untracked 49th test, not investigated further, same class of drift as the 2026-08-19 note above) |
 | `tests/stock/test_fx_sizing.py` | 14 | USD/CAD sizing fix (2026-07-31): `is_cad_symbol`, `get_usd_cad_rate` (fetch/fallback/cache), StockPaperExecutor mixed-currency `total_value`/`check_exposure`, sector-concentration gate (reject 3rd same-sector position, allow add-on to already-held symbol, allow different sector), check_exposure projected (pending-trade-value) exposure — defaults to current-state-only, catches an oversized single BUY, allows one that stays under cap |
+| `tests/stock/test_screener_in_distribution.py` | 5 | In-distribution ATR%/liquidity filter (added 2026-08-23, `stock_bot/data/screener.py`, the replacement safety net after RULE_WHITELIST stopped gating BUYs): normal volatility/liquidity passes with no rejection reason, extreme ATR rejected with a `SCREEN_SKIP` reason naming the symbol, illiquid symbol rejected with a `SCREEN_SKIP` reason, insufficient-candles (<15) passes through without triggering the filter, sanity check that the 4 originally-backtested symbols (MRNA/AMD/RY.TO/PLTR) clear their own reference thresholds |
 | `tests/stock/test_accuracy_tracker.py` | 18 | `LiveTradingGate` gate-repair (2026-08-20): Gate 1 (`logs/stock_backtest_latest.json` vs `RULE_WHITELIST`) — missing/malformed JSON, all-symbols-pass, one-symbol-fail, symbol-missing-from-run, non-whitelist-symbol ignored, empty-whitelist; Gate 2 (AI confidence-band edge, repurposed from the retired fast book) — pending/pass/fail on win-rate threshold, LOW/PRE-band trades excluded, structural guard confirming no `_FAST_TRADES_CSV` reference remains; Gate 3 (raised to ≥30 round-trips/PF≥1.2/win≥30%) — pending, all-three-pass, both directions of "2/3 criteria pass but still FAIL" (PF-only-failing, win-rate-only-failing) |
 | `tests/shared/test_heartbeat.py` | 8 | Heartbeat pings (bot/alerts/heartbeat.py): URL-off, success/failure never raise, healthy_fn gate |
 | `tests/stock/test_tws_monitor.py` | 6 | TwsConnectionMonitor state machine: blip tolerance, alert-once per outage, recovery notice |
@@ -254,7 +255,7 @@ now `.parent.parent.parent`. Verified before/after: same 526 collected, same 526
 | `tests/crypto/test_grid_dca_experiment.py` | 12 | `grid_dca_experiment.py` standalone backtest engines (crypto research tooling, not the live pipeline): grid strategy fills/reopens/floor-stop, capital split across slots, fee math on both legs, DCA safety-order averaging + cycle restart, empty-candle edge cases |
 | `tests/shared/test_telegram_retry.py` | 3 | `TelegramAlerter._send()` retry (added 2026-08-17, closes known-gaps #17): healthy send calls `requests.post` once with no retry, a transient failure recovers on retry, a persistent failure still degrades to a warning-only no-raise after exhausting attempts |
 
-Run: `python -m pytest --tb=short -q` — must show **607 passed**. (This line had drifted to a
+Run: `python -m pytest --tb=short -q` — must show **615 passed**. (This line had drifted to a
 stale "543 passed" — corrected 2026-08-23 to match the manifest total above, which was
 already at 605 before this session's +2. Not investigated why the two numbers had diverged.)
 
@@ -1171,12 +1172,56 @@ classify ordering, confirmed manually before landing). Suite 534→536.
 ### Current stock bot RULE_WHITELIST
 `MRNA,AMD,RY,PLTR,GLD,TD,CM,CSCO,KO,T,CAT,GOOGL,WMT,MSFT,GM,CVX` — all US-listed/API-tradeable
 (no `.TO` symbols — see TSX API block below). Watchlist is a superset including AC.TO,
-SHOP.TO, BNS, SU (advisory-only, never rule-buyable). Adding a symbol requires a fresh
-`stock_backtest.py` PASS on the current strategy hash — never by hand. Full screen history
-(affordable-symbol screen, large-cap screen, metals/currency screen) is in `CLAUDE_HISTORY.md`.
-GM,CVX added 2026-07-31 from a 20-candidate batch screen (`logs/stock_backtest_20260731.md`,
-2/20 passed — GM PF 1.31-1.94, CVX PF 1.43-inf). The other 18 (JPM, V, MA, PG, JNJ, SBUX,
-NKE, ORCL, IBM, QCOM, TXN, PYPL, UPS, PEP, VZ, ABBV, MO, F) failed and are not whitelisted.
+SHOP.TO, BNS, SU (advisory-only, never rule-buyable — TSX regulatory block, unrelated to the
+paragraph below). Full screen history (affordable-symbol screen, large-cap screen, metals/
+currency screen) is in `CLAUDE_HISTORY.md`. GM,CVX added 2026-07-31 from a 20-candidate batch
+screen (`logs/stock_backtest_20260731.md`, 2/20 passed — GM PF 1.31-1.94, CVX PF 1.43-inf).
+The other 18 (JPM, V, MA, PG, JNJ, SBUX, NKE, ORCL, IBM, QCOM, TXN, PYPL, UPS, PEP, VZ, ABBV,
+MO, F) failed and are not whitelisted.
+
+**RULE_WHITELIST no longer gates rule-based BUY entry (removed 2026-08-23).** The paragraph
+above still describes what's IN this list and how those symbols historically got there, but
+"adding a symbol requires a fresh `stock_backtest.py` PASS" is no longer true for trading
+eligibility — `stock_bot/main.py`'s `_rule_buy` now fires on `rule_v.signal == "BUY" and
+rule_v.warmed_up` alone, for ANY symbol in that cycle's scan universe (watchlist + universe
+top-movers + held positions — see "Scan universe" note below), regardless of whether it's in
+this list. Explicit user request: full-universe trading, no per-symbol backtest precondition.
+`RULE_WHITELIST` itself is still loaded and still means something — `LiveTradingGate.
+check_gate1()` (`stock_bot/analysis/accuracy_tracker.py`) still validates every symbol in it
+against the latest `stock_backtest.py` walk-forward as part of the code-enforced IBKR
+live-trading readiness gate — but it is no longer the safety net on what the paper bot can buy
+day to day. Full detail: `CLAUDE_HISTORY.md` (2026-08-23 entry) and `.memory/decisions/
+stock-whitelist-gate-removed-2026-08-23.md`.
+
+**Replacement/remaining safety net, current as of the 2026-08-23 hardening pass (same day):**
+1. **In-distribution ATR%/liquidity filter** — `stock_bot/data/screener.py` rejects a
+   non-watchlist symbol whose ATR% exceeds 3× the range observed on the 4 originally-PASSed
+   symbols (~30.8%) or whose avg $ volume is below $50M/day (~1/20th of the thinnest of the
+   4). Rejections are visible on the dashboard ("🔬 Screened Out" section), not silently
+   dropped. Held positions and watchlist symbols are exempt (same scoping as the pre-existing
+   screener) so an existing position never loses its ability to generate a rules-engine SELL.
+2. **Position sizing** — still flat notional (`PAPER_RISK_PCT=0.20` of account value).
+   `calc_shares_atr_risk()` (`stock_bot/config.py`) already exists and would size inversely to
+   ATR%, capped at the flat baseline — gated behind `PAPER_ATR_SIZING_ENABLED` (still `false`).
+   User asked for the walk-forward validation first (this also swaps the SL trigger from flat
+   5% to ATR×2.0, not just position size). Run 2026-08-23 via a new `validate_atr_sizing.py` —
+   **result: 14/16 RULE_WHITELIST symbols PASS, but AMD (one of the original 4 backtest-PASS
+   symbols) and KO both FAIL under ATR×2.0** (AMD full-window PF 1.05 < 1.2 — a genuine
+   regression from its original flat-stop PASS). Flag left **off** — enabling it as-is would
+   put a symbol live under a stop distance that just failed its own validation. See
+   CLAUDE_HISTORY.md for the full per-window table and options going forward.
+3. **Risk-gate tiers** (`PAPER_DAILY_LOSS_PCT`/`PAPER_WEEKLY_LOSS_PCT`/
+   `PAPER_DRAWDOWN_HALT_PCT`/`PAPER_KILL_SWITCH_PCT`) — audited 2026-08-23, confirmed
+   unchanged from their existing values (see "Risk-gate config (stock bot)" above), left as-is
+   pending a user decision on tightening.
+4. **Sector-concentration + correlation gates** — audited 2026-08-23, confirmed genuinely
+   generic (live `yfinance` sector lookups, Pearson correlation over fetched candles) — no
+   hardcoded symbol mapping, so both already cover the full newly-opened universe with no gap.
+5. **AI shadow-vote review criteria** — a documented, dated trigger (not yet met, not
+   automatic) for revisiting whether to reinstate a lighter validation gate: ≥15 completed
+   round-trips on symbols outside {MRNA, AMD, RY.TO, PLTR} AND a material win-rate/PF/
+   AI-agreement gap vs. the originally-backtested symbols. See `.memory/decisions/
+   stock-whitelist-gate-removed-2026-08-23.md` for the exact thresholds.
 
 ---
 

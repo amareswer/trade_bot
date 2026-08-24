@@ -193,3 +193,78 @@ def test_pf_and_win_rate_math():
     assert res.sl_exit_rate == 50.0
     wins, losses = 100.0 - res.completed[0].commission, 50.0 + res.completed[1].commission
     assert abs(res.profit_factor - wins / losses) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# ATR-based stop distance (added 2026-08-23) — validates PAPER_ATR_SIZING_ENABLED's
+# paired stop-distance override before it's enabled live. atr_sl_mult=None (the
+# default, used by every test above) must remain byte-for-byte identical to the
+# engine's pre-2026-08-23 behavior — proven by every test above still passing
+# unchanged, not re-asserted here.
+# ---------------------------------------------------------------------------
+
+def _flat_warmup(n, o=100, h=101, l=99, c=100):
+    """n identical flat candles — constant true range, so ATR converges to
+    exactly (h - l) once enough history has accumulated."""
+    return [(o, h, l, c)] * n
+
+
+def test_atr_stop_overrides_flat_stop_distance():
+    # 15 flat candles (range=2 → ATR=2 once warmed) + BUY at idx 14, entry
+    # fills idx 15 (16 candles of history at fill time — enough for ATR-14).
+    # atr_sl_mult=5.0 → ATR stop = 100*(1 - 2*5/100) = 90, vs. the flat
+    # stop_loss_pct=0.05 → 95. idx 16's low=92 sits strictly between the two:
+    # only the ATR override (not flat 5%) would leave the trade open there.
+    candles = mk_candles(
+        _flat_warmup(15) + [
+            (100, 101, 99, 100),   # 15: entry @100, ATR computed here = 2.0
+            (95, 96, 92, 93),      # 16: low=92 — below flat SL(95), above ATR SL(90)
+            (91, 92, 85, 88),      # 17: low=85 — below ATR SL(90) → exits here
+        ]
+    )
+    strat = ScriptedStrategy({14: Signal.BUY})
+    cfg = _cfg()
+    cfg.atr_sl_mult = 5.0
+
+    res = run_symbol("TEST", candles, cfg, strategy=strat)
+    t = res.completed[0]
+    assert t.exit_reason == "sl"
+    assert t.exit_price == 90.0                    # the ATR-derived level, not 95
+    assert t.exit_ts == candles[17].timestamp       # survived candle 16 — proves the override
+
+
+def test_flat_stop_still_used_as_control_on_same_candles():
+    """Same candle sequence as above, atr_sl_mult unset — must exit on candle
+    16 (flat 5% SL=95, tripped by that candle's low=92), one candle earlier
+    than the ATR-mode run. Confirms the two modes are genuinely different,
+    not just a formula that happens to agree here."""
+    candles = mk_candles(
+        _flat_warmup(15) + [
+            (100, 101, 99, 100),
+            (95, 96, 92, 93),
+            (91, 92, 85, 88),
+        ]
+    )
+    strat = ScriptedStrategy({14: Signal.BUY})
+    res = run_symbol("TEST", candles, _cfg(), strategy=strat)   # atr_sl_mult=None
+    t = res.completed[0]
+    assert t.exit_reason == "sl"
+    assert t.exit_price == 95.0
+    assert t.exit_ts == candles[16].timestamp
+
+
+def test_atr_stop_falls_back_to_flat_when_history_too_short():
+    # BUY fires immediately (idx 0) — only 2 candles of history at fill time,
+    # far short of the 15 a 14-period ATR needs. Must fall back to flat 5%.
+    candles = mk_candles([
+        (100, 101, 99, 100),   # 0: BUY
+        (100, 101, 99, 100),   # 1: entry @100 — ATR unavailable, falls back
+        (99, 100, 94, 96),     # 2: low=94 touches flat SL=95
+    ])
+    strat = ScriptedStrategy({0: Signal.BUY})
+    cfg = _cfg()
+    cfg.atr_sl_mult = 5.0
+    res = run_symbol("TEST", candles, cfg, strategy=strat)
+    t = res.completed[0]
+    assert t.exit_reason == "sl"
+    assert t.exit_price == 95.0    # flat fallback, not a fabricated ATR level

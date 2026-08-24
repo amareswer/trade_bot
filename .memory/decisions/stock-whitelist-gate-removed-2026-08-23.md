@@ -68,3 +68,78 @@ regression. Do not "fix" it without the user asking to reverse this decision.
 Test suite: 605 passed, unchanged count (no test referenced `rule_whitelisted`/
 `_rule_whitelist`, confirmed by grep before editing). Full detail: CLAUDE_HISTORY.md,
 dated entry 2026-08-23.
+
+---
+
+## Follow-up hardening pass (2026-08-23, same day)
+
+Four defensive changes made after the gate removal above, plus this section — the AI
+shadow-vote review criteria. See CLAUDE_HISTORY.md's 2026-08-23 hardening entry for full
+detail on all of them (screener filter, sizing audit, threshold audit, gate audit). Summary:
+
+1. **In-distribution ATR%/liquidity filter** added to `stock_bot/data/screener.py` —
+   rejects a symbol whose ATR% or avg $ volume is far outside the range observed on the 4
+   backtested-PASS symbols (MRNA/AMD/RY.TO/PLTR), only for symbols not already in
+   `watchlist_set` (held positions and configured watchlist symbols are exempt, same scoping
+   as the pre-existing screener). Rejection reason surfaces on the dashboard (new "🔬
+   Screened Out" section), not just logged.
+2. **Position sizing by volatility** — audited, walk-forward run, NOT enabled.
+   `stock_bot/config.py`'s `calc_shares_atr_risk()` already implements "size ∝ 1/ATR%
+   relative to a baseline, capped at the flat default" but was gated off
+   (`PAPER_ATR_SIZING_ENABLED=false`). Reported real example sizes (MRNA/AMD/GM); user then
+   asked to run the walk-forward CLAUDE.md already requires before enabling this live (it also
+   swaps the SL trigger to ATR×2.0, not just position size). Built `validate_atr_sizing.py`
+   (new standalone script — deliberately not a flag on `stock_backtest.py`, whose
+   `logs/stock_backtest_latest.json` output `LiveTradingGate.check_gate1()` depends on) and a
+   matching optional ATR-stop mode in `stock_bot/backtest/engine.py`
+   (`StockBacktestConfig.atr_sl_mult`, default `None` = unchanged prior behavior). **Result:
+   14/16 RULE_WHITELIST symbols PASS at ATR×2.0, but AMD and KO FAIL** — AMD is a genuine
+   regression (PASSED under the original flat-5% backtest, fails full-window PF 1.05 < 1.2
+   here). `PAPER_ATR_SIZING_ENABLED` left off. Full table: `logs/
+   stock_backtest_atr_validation_20260823.md`. See [[project_trade_bot]]/CLAUDE_HISTORY.md
+   for the complete writeup and options going forward (exclude AMD/KO, try a smaller mult,
+   or leave sizing flat).
+3. **Kill-switch/drawdown thresholds** — audited, NOT changed, per explicit instruction.
+   `PAPER_DAILY_LOSS_PCT=0.03` (2026-06-19, original), `PAPER_WEEKLY_LOSS_PCT=0.05`,
+   `PAPER_DRAWDOWN_HALT_PCT=0.15`, `PAPER_KILL_SWITCH_PCT=0.20` (all three 2026-08-05,
+   commit `7d7c90fc`) — confirmed via `git blame`, matches CLAUDE.md exactly, no drift.
+4. **Sector/correlation gate audit** — both confirmed genuinely generic/dynamic, not
+   hardcoded to the original whitelist. `get_sector()` (`stock_bot/data/price_feed.py`) is a
+   live yfinance `Ticker(sym).info` lookup for any symbol, cached; the correlation gate
+   (`stock_bot/risk/correlation.py` + `_check_correlation_gate` in `main.py`) is pure Pearson
+   math over candle closes already fetched for whatever `executor.positions_snapshot()`
+   actually holds — no symbol list anywhere in either path. No gap found.
+
+### AI shadow-vote review criteria (new decision, 2026-08-23)
+
+**Why this exists:** `stock_bot/main.py`'s rule-BUY path already logs an "AI shadow vote"
+(`reason += f" | ai={verdict.signal}{verdict.confidence}"`) on every trade, with an existing
+code comment: *"After ~30 trades, compare outcomes where the AI agreed vs disagreed — if
+agreement is predictive, the AI earns veto power."* That plan was written before
+RULE_WHITELIST was removed and doesn't distinguish backtested-PASS symbols from the newly
+opened universe. This section adds that distinction, as a documented, dated decision made
+BEFORE any bad outcome — not decided retroactively after one (the user's explicit ask).
+
+**Trigger for a review of whether to reinstate a lighter validation gate:**
+- **Sample size: ≥15 completed round-trips** on the non-backtested-symbol population
+  specifically (i.e., rule BUYs on any symbol NOT in {MRNA, AMD, RY.TO, PLTR} — the only 4
+  that ever passed a `stock_backtest.py` walk-forward). 15 mirrors the crypto bot's own
+  15-fill live capital-gate threshold (CLAUDE.md, "Capital gate evaluation") — an existing
+  convention in this codebase for "enough trades to start drawing conclusions," reused here
+  rather than inventing a new number.
+- **AND at least one of:**
+  - Win rate on non-backtested-symbol trades is **≥15 percentage points below** win rate on
+    backtested-symbol trades over the same window, OR
+  - PF on non-backtested-symbol trades is **< 1.0** while backtested-symbol PF over the same
+    window stays ≥ 1.2 (the existing Gate 3 bar), OR
+  - AI-disagreement trades on non-backtested symbols underperform AI-agreement trades by a
+    wide margin (the existing "~30 trades, agreed vs disagreed" comparison above, evaluated
+    early — at 15 trades — specifically for this population, not deferred to 30).
+- **What "review" means:** re-evaluate whether to reinstate a lighter validation gate for
+  non-backtested symbols (e.g., a single-window `stock_backtest.py` PASS instead of the full
+  4-window RULE_WHITELIST bar, or an ATR%/liquidity-scaled position size floor). This is a
+  decision to make WITH the user at that point — not a rule to auto-revert RULE_WHITELIST
+  removal on its own trigger. No code currently computes this split automatically; it would
+  need a query against `paper_trades.csv`/`ibkr_trades.csv` filtered by symbol ∉
+  {MRNA,AMD,RY.TO,PLTR}, which does not exist yet — flagged for whenever this trigger
+  condition is actually reached, not built preemptively.

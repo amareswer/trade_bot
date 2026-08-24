@@ -212,7 +212,12 @@ def _fetch_symbol_data(
     """
     Fetch candles + compute indicators. Returns:
       None                    — no data (market closed / unknown symbol)
-      {"screened": True, ...} — screener rejected this symbol
+      {"screened": True, ...} — screener rejected this symbol. "screen_reason"
+                                 is only populated when the rejection is the
+                                 in-distribution ATR%/liquidity filter
+                                 (stock_bot/data/screener.py) — surfaced on
+                                 the dashboard; the pre-existing "boring
+                                 stock" rejections stay silent as before.
       full data dict          — ready for research + AI
     """
     if market_status is not None:
@@ -239,8 +244,10 @@ def _fetch_symbol_data(
     macd_val  = calc_macd(closes)
     atr_val   = calc_atr(highs, lows, closes, period=14)
 
-    if symbol not in watchlist_set and screener is not None and not screener.screen(symbol, candles):
-        return {"screened": True, "price": closes[-1]}
+    if symbol not in watchlist_set and screener is not None:
+        _screen_ok, _screen_reason = screener.screen(symbol, candles)
+        if not _screen_ok:
+            return {"screened": True, "price": closes[-1], "screen_reason": _screen_reason}
 
     return {
         "screened":    False,
@@ -1098,6 +1105,7 @@ def run() -> None:
         cycle_symbols = list(dict.fromkeys(all_symbols + held_symbols))
         watchlist_set |= set(held_symbols)
         scan_results: list[ScanResult] = []
+        screen_skips: list[dict]       = []   # in-distribution filter rejections — dashboard visibility
 
         # Reset per-cycle state
         _fv_earnings_blocked = set()
@@ -1234,7 +1242,18 @@ def run() -> None:
                     continue
 
                 if data.get("screened"):
-                    print(f"  {symbol:<10}  ${data['price']:>10,.2f}  — no signal (screened out)")
+                    _reason = data.get("screen_reason")
+                    if _reason:
+                        # In-distribution ATR%/liquidity rejection — visible, not
+                        # just dropped (logs/HISTORY: whitelist gate removed
+                        # 2026-08-23, this filter is the replacement safety net).
+                        print(f"  {symbol:<10}  ${data['price']:>10,.2f}  — {_reason}")
+                        logger.warning(_reason)
+                        screen_skips.append({
+                            "symbol": symbol, "price": data["price"], "reason": _reason,
+                        })
+                    else:
+                        print(f"  {symbol:<10}  ${data['price']:>10,.2f}  — no signal (screened out)")
                     print(f"  {'─' * 70}")
                     continue
 
@@ -1708,6 +1727,7 @@ def run() -> None:
                     "rule_mode":     cfg.rule_trading_enabled,
                 },
                 buy_alloc     = _buy_alloc,
+                screen_skips  = screen_skips,
             )
         except Exception as exc:
             logger.warning("Dashboard render failed: %s", exc)
