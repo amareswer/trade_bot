@@ -1611,3 +1611,68 @@ SYN, LINK, XRP, BTC. Report: `logs/atr_sl_experiment_20260704.md`.
   adopted live entry above). SYN/LINK remain conditional candidates: all USD preconditions
   above + fresh per-symbol walk-forward at the chosen mult + SL-distance-based position
   sizing (built generically 2026-07-17, confirmed symbol-generic 2026-07-21).
+
+### Stock bot: RULE_WHITELIST gate removed from BUY logic (2026-08-23)
+
+**Change:** `stock_bot/main.py`'s `_rule_buy` no longer requires
+`symbol.upper() in _rule_whitelist`. It now fires on `rule_v.signal == "BUY" and
+rule_v.warmed_up` alone — a rule-based BUY now applies to ANY symbol in that cycle's scan
+universe, not just the symbols that previously passed a `stock_backtest.py` walk-forward and
+got added to `RULE_WHITELIST`.
+
+**Reason:** explicit user request — full-universe trading without per-symbol backtest
+validation as a precondition for entry. This is a deliberate policy reversal of the
+whitelist-gating discipline documented throughout the rest of this file and CLAUDE.md (e.g.
+the XRP/CAD incident above, where a stale-validation symbol traded live for weeks before
+being caught) — the walk-forward-before-whitelisting discipline is NOT being applied to the
+stock bot's rule-based entries going forward. This does not change crypto (`bot/`) at all;
+`UNIVERSE_WHITELIST=BTC/CAD` and its walk-forward-gated re-entry rules are untouched.
+
+**What was removed / left alone:**
+- `stock_bot/main.py`: the local `_rule_whitelist` set (built from
+  `cfg.rule_whitelist_str`), the `_rule_buy` whitelist check, the "(not in RULE_WHITELIST —
+  no entry)" console note, and the `rule_whitelisted` field passed into `ScanResult` were all
+  removed — nothing else in `main.py` referenced them.
+- `stock_bot/dashboard/renderer.py`: `ScanResult.rule_whitelisted` field removed;
+  `_rule_summary_html()`'s "📐 Rule Signals" strip and the per-card "📐 Rules:" tag both
+  dropped the "(not whitelisted — no entry)" branch — a rule BUY now always shows "→ buying"
+  (still subject to the existing `buy_alloc` SIZE_SKIP check in the summary strip, which is
+  a sizing constraint, not a whitelist one, and was left unchanged).
+- `stock_bot/config.py`'s `rule_whitelist_str` loading (`RULE_WHITELIST` env var) is
+  UNCHANGED and still required — `LiveTradingGate.check_gate1()`
+  (`stock_bot/analysis/accuracy_tracker.py`) still reads it directly via
+  `_load_stock_config().rule_whitelist_str` to validate that every whitelisted symbol passed
+  the latest `stock_backtest.py` walk-forward, as part of the code-enforced IBKR
+  live-trading readiness gate in `IBKRExecutor.__init__()`. That gate is unrelated to paper
+  BUY entry and was not touched.
+- No file under `bot/strategy/` or `build_indicator_config()` was touched — the strategy
+  fingerprint (`b30f2f9e769c8d41`) is unaffected, no walk-forward re-run needed.
+
+**What now gates a new BUY, post-change:**
+1. The rule signal itself (`rule_signal()` in `stock_bot/strategy/rules.py`, unchanged Mode
+   A/B logic) must say BUY and be warmed up.
+2. The five paper/IBKR risk-gate tiers in `stock_bot/execution/` (`PAPER_DAILY_LOSS_PCT`,
+   `PAPER_WEEKLY_LOSS_PCT`, `PAPER_DRAWDOWN_HALT_PCT`, `PAPER_KILL_SWITCH_PCT`, plus the
+   sector-concentration/correlation/macro-blackout/VIX-crisis gates) — all untouched by this
+   change, still the real safety net on any new entry. (Note: `RISK_MAX_POSITION_PCT` /
+   `RISK_DAILY_LOSS_LIMIT` / `RISK_MAX_DRAWDOWN` / `RISK_MAX_TRADES_PER_DAY` /
+   `COOLDOWN_TICKS` are crypto-bot (`bot/risk/risk_manager.py`, root `config.py`) env-var
+   names, not stock-bot ones — confirmed via `grep`, they don't exist in `stock_bot/`. Those
+   crypto files were not touched by this change either way.)
+3. **The scan universe itself** — with per-symbol backtest validation gone, this is the only
+   remaining filter on which symbols ever reach `rule_signal()` at all. Built in
+   `stock_bot/main.py`'s `run()`: `cycle_symbols = watchlist_symbols + top_movers (deduped) +
+   held_symbols`. `watchlist_symbols` = `cfg.watchlist` (user-configured, `.env`
+   `WATCHLIST`/`get_watchlist()`). `top_movers` = `StockUniverse.get_universe()` (S&P500 +
+   TSX60 constituent list) filtered by `.pre_filter(raw_symbols, cfg.universe_size,
+   market_status=...)`, capped to `UNIVERSE_SIZE` (default 20) symbols/day, refreshed once
+   daily — only active when `UNIVERSE_ENABLED=true` (default false). Within a cycle, any
+   symbol not already in `watchlist_set` additionally has to pass
+   `StockScreener.screen(symbol, candles)` in `_fetch_symbol_data()` (min price, RSI extreme,
+   recent MACD cross, or a large single-candle price move — a liquidity/momentum filter, not
+   a strategy-edge validation) before candles are computed at all. TSX (`.TO`) symbols remain
+   permanently advisory-only regardless of any of this — CIRO DMR 3200 blocks API orders on
+   Canadian exchanges, unrelated to and unaffected by this change.
+- Full test suite: `.venv/bin/python -m pytest --tb=short -q` → **605 passed** (unchanged
+  count — no test referenced `rule_whitelisted`/`_rule_whitelist`, confirmed by grep before
+  the change).

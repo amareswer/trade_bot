@@ -764,11 +764,11 @@ def run() -> None:
         streak_min_conf     = cfg.paper_sell_streak_min_conf,
         streak_cycles       = cfg.paper_sell_streak_cycles,
     )
-    # Symbols whose rule-based walk-forward PASSED (stock_backtest.py) —
-    # only these may be BOUGHT by the rules. Exits apply to anything held.
-    _rule_whitelist: set[str] = {
-        s.strip().upper() for s in cfg.rule_whitelist_str.split(",") if s.strip()
-    }
+    # NOTE: RULE_WHITELIST no longer gates rule-based BUYs (removed 2026-08-23 —
+    # see CLAUDE_HISTORY.md). cfg.rule_whitelist_str is still loaded and still
+    # consulted by LiveTradingGate.check_gate1() (stock_bot/analysis/
+    # accuracy_tracker.py) for IBKR live-trading readiness — an unrelated,
+    # code-enforced gate this change does not touch.
 
     _fast_enabled       = _os.getenv("FAST_ENABLED", "false").strip().lower() in ("1", "true", "yes")
     _fast_loop_interval = int(_os.getenv("FAST_LOOP_INTERVAL", "300").strip() or "300")
@@ -1292,8 +1292,6 @@ def run() -> None:
                     _rv_note = ""
                     if not rule_v.warmed_up:
                         _rv_note = "  (warming up — need more history)"
-                    elif rule_v.signal == "BUY" and symbol.upper() not in _rule_whitelist:
-                        _rv_note = "  (not in RULE_WHITELIST — no entry)"
                     _rv_parts = [f"📐 RULES: {rule_v.signal}"]
                     if rule_v.rsi is not None:
                         _rv_parts.append(f"RSI={rule_v.rsi:.1f}")
@@ -1318,7 +1316,7 @@ def run() -> None:
                         )
 
                 _rule_buy  = (rule_v is not None and rule_v.signal == "BUY"
-                              and rule_v.warmed_up and symbol.upper() in _rule_whitelist)
+                              and rule_v.warmed_up)
                 _rule_sell = rule_v is not None and rule_v.signal == "SELL"
                 _ai_buy    = (
                     verdict is not None
@@ -1606,7 +1604,6 @@ def run() -> None:
                         verdict      = verdict,
                         source       = "watchlist" if symbol in cfg.watchlist else "universe",
                         rule_verdict = rule_v,
-                        rule_whitelisted = symbol.upper() in _rule_whitelist,
                     ))
 
             except Exception as exc:

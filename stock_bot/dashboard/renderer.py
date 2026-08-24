@@ -69,7 +69,6 @@ class ScanResult:
     verdict:      AIVerdict
     source:       str = "watchlist"     # "watchlist" | "universe"
     rule_verdict: object = None         # RuleVerdict — the trade trigger (rule mode)
-    rule_whitelisted: bool = False      # True = rules may BUY this symbol
 
 
 # ---------------------------------------------------------------------------
@@ -538,8 +537,8 @@ def _rule_summary_html(
 ) -> str:
     """The DECIDER strip — rule-based signals that actually trigger trades.
     Only rendered when at least one result carries a rule verdict.
-    buy_alloc = current per-trade dollar allocation; a whitelisted BUY whose
-    share price exceeds it will SIZE_SKIP, so the label must not say "buying"."""
+    buy_alloc = current per-trade dollar allocation; a BUY whose share price
+    exceeds it will SIZE_SKIP, so the label must not say "buying"."""
     held = held or set()
     with_rules = [r for r in results if r.rule_verdict is not None]
     if not with_rules:
@@ -551,9 +550,7 @@ def _rule_summary_html(
         sig = rv.signal if rv.signal in groups else "HOLD"
         label = r.symbol
         if sig == "BUY":
-            if not r.rule_whitelisted:
-                label += " (not whitelisted — no entry)"
-            elif buy_alloc is not None and 0 < buy_alloc < r.price:
+            if buy_alloc is not None and 0 < buy_alloc < r.price:
                 label += (
                     f" ⚠ signal valid, can't fill — 1 share ${r.price:,.0f}"
                     f" > ${buy_alloc:,.0f} allocation"
@@ -819,7 +816,7 @@ def _stock_card_html(r: ScanResult, pos: Optional[PortfolioPosition] = None, ext
         rv       = r.rule_verdict
         rv_color = _SIG_COLOR.get(rv.signal, _MUTED)
         if rv.signal == "BUY":
-            wl_note = " → will buy" if r.rule_whitelisted else " (not whitelisted — no entry)"
+            wl_note = " → will buy"
         elif rv.signal == "SELL":
             wl_note = " → exits if held"
         else:
