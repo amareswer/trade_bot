@@ -540,3 +540,62 @@ breakers + per-symbol position-size cap, confirmed via `bot/main.py`'s single gl
 `RiskManager` instance covering all executors, no per-symbol construction needed), and SYN
 (OOS-validated at ATR×2.0 same as SOL, but no capital research or live-config action was
 taken for it in this session — still just a documented candidate).
+
+## SYN/USD — groundwork done, NOT promoted — 2026-08-25 (same day, later)
+
+User asked to prepare the next candidate ahead of an actual decision. Same three-step process
+as SOL, research only — no `.env`/`UNIVERSE_WHITELIST` change, no live config touched.
+
+**1. Fresh walk-forward, current strategy hash** (`SYMBOL=SYN/USDT ATR_MULT=2.0
+ATR_RISK_SIZING=true python atr_oos_validation.py`, same script/methodology as SOL):
+```
+TRAIN      ATRx2.0    trades=20   win=55%  PF=1.75  SL=25%  → PASS
+VALIDATION ATRx2.0    trades=21   win=57%  PF=1.75  SL=29%  → PASS
+HOLDS — validation PF 1.75 >= 1.2 (train was 1.75)
+```
+Stronger and more stable than SOL's result (PF 1.32→1.46, SL 48%/52%) — SYN's SL-exit rate is
+roughly half SOL's. Flat-SL comparison run in the same pass FAILED both windows (83%/77%
+SL-exit) — consistent with the original 2026-07 screen finding, confirms ATR stop is doing
+real work here, not a fluke. Report: `logs/atr_oos_SYN_2.0_sized_20260825.md`.
+
+**2. FX-conversion precondition — genuinely applies here (unlike SOL/CAD).** `SYN/USD` is
+real, active, spot on Kraken (`ccxt.load_markets()` confirmed) — but this account holds CAD,
+not USD (`check_kraken_balance.py`: CAD + ETH only, no USD). Kraken carries a direct `USD/CAD`
+spot market, maker AND taker both **0.20%** (confirmed live via `load_markets()`, not the
+assumed figure from memory) — this is the actual conversion cost, one-way. A CAD→USD
+conversion at position-open time (and USD→CAD again if capital is ever pulled back) is a
+real, one-time ~0.20%-per-leg cost, separate from and on top of the existing ~1.2%
+round-trip trading fee. Ongoing USD-denominated P&L would need its own tracking, separate
+from the CAD-denominated BTC/SOL book — not yet built, not hard, just not done.
+
+**3. Capital-sizing — SYN needs MORE than SOL did, not less.** Kraken's real SYN/USD minimum:
+`amount.min = 60 SYN` (~$6.60 USD notional at the $0.11 price checked), `cost.min = $0.50`
+(not binding, same pattern as SOL). SYN's low unit price means the ATR-risk sizer's dollar
+cap has to buy proportionally more units to clear that 60-unit floor. Solved across SYN/USD's
+real last 30 4h candles (Kraken `fetch_ohlcv` + `bot.indicators.indicators.atr()`, same
+method as SOL):
+
+| Scenario (SYN/USD, 4h) | ATR(14) | Slot to clear `amount.min` (bare) | + 1.5× safety margin |
+|---|---|---|---|
+| Calmest of last 30 | 0.00312 | $249.93 | $374.90 |
+| 30-candle mean | 0.00449 | $359.43 | $539.14 |
+| Latest reading | 0.00366 | $292.64 | $438.95 |
+| Most volatile of last 30 | 0.00574 | $459.56 | $689.33 |
+
+**Fee cross-check:** `atr_oos_validation.py`'s own `BACKTEST_FEE_PCT=0.008`/side (≈1.6% round
+trip, harsher than the real ~1.2% live figure) was already baked into the PF=1.75 result
+above — same conclusion as SOL, fee drag is not the constraint, sizing/exchange-minimum is.
+
+**Flag worth surfacing now, not burying:** live 24h volume checked at the same time —
+**$49,371 USD**, sitting essentially AT the $50,000/day liquidity gate this whole framework
+uses, not comfortably above it the way SOL/BTC are. This is a single point-in-time ticker
+read, not a trend — could be a quiet day, could be real decay since the original June 2026
+screen (which required clearing $50k to even get walk-forwarded). Re-check this specifically,
+not just the ATR/volatility numbers, before ever treating SYN as ready — a symbol hovering at
+the liquidity floor is a different kind of risk than the capital-sizing gap SOL had.
+
+**Bottom line: SYN/USD is NOT promoted, and capital doesn't support it right now regardless.**
+BTC ($77) + SOL ($376) already commit $453 of the $553.39 balance — only ~$100 uncommitted,
+against a $250-$690 need depending on volatility/margin comfort. Needs its own deposit,
+same as SOL did, before this becomes actionable — not something to trade off against SOL's
+existing capital. Everything above is groundwork for a future decision, not a promotion.
