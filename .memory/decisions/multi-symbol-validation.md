@@ -483,3 +483,60 @@ actually does. Full detail: CLAUDE_HISTORY.md.
 Running ETH on Kraken at 0.80% would still be net-negative. The fee is the problem, not the symbol. Confirm the fee-dict structure and find a path below 0.20% before any expansion.
 
 **How to apply:** When planning multi-symbol expansion, lead with ETH. Do not include LINK. Treat SOL/BNB as second phase after ETH is validated live. Never add a symbol just because it performed well in the recent backtest window — check full-history PF first.
+
+## SOL/CAD PROMOTED to live trading — 2026-08-25
+
+The capital gap flagged throughout this file (BTC's $77 + SOL's ~$110–$334/$165–$501
+range vs. the $153.39 balance on hand) closed via a real $400 CAD deposit. Verified live
+against Kraken (`check_kraken_balance.py`, new read-only `fetch_balance()` script, no
+orders/state writes) rather than trusting the arithmetic: **$553.39 CAD total**, matching
+$153.39 + $400 exactly.
+
+All remaining preconditions were re-checked same-day, not assumed from the 2026-08-24 result:
+- **Walk-forward** re-run fresh (`SYMBOL=SOL/USDT ATR_MULT=2.0 ATR_RISK_SIZING=true python
+  atr_oos_validation.py`): TRAIN PF 1.32 / VALIDATION PF 1.46, both ≥1.2 — identical to
+  2026-08-24 (strategy code unchanged in between), but run again per the "a pass on an older
+  hash doesn't count" rule rather than reused. Report: `logs/atr_oos_SOL_2.0_sized_20260825.md`.
+- **FX-conversion precondition (#3)** confirmed N/A, not just skipped — queried
+  `ccxt.kraken().load_markets()` directly: `SOL/CAD` is `quote: CAD`, a real direct spot
+  market, same as `BTC/CAD`. No USD leg, no conversion cost, nothing to document.
+
+**Live config applied:**
+```
+UNIVERSE_WHITELIST=BTC/CAD,SOL/CAD
+MAX_SLOT_CASH_CAD_SOL=376        # BTC's $77 shared-cap fallback untouched
+MAX_CONCURRENT_POSITIONS=2       # was 1 — required, or CapitalPool.allocate() blocks the
+                                  # second slot regardless of the per-symbol cap existing
+STARTING_CASH=553.39             # inert for real live trading (LiveExecutor._sync_cash()
+                                  # overrides with the real balance) but kept accurate per
+                                  # the existing "raise together" hard rule
+MONITOR_SYMBOLS=BTC/CAD,SOL/CAD  # regime_monitor.py
+```
+`$376` sits inside the researched safe range with room to spare (clears the bare exchange
+minimum across the full observed volatility range; clears the 1.5× safety-margin guard
+except at the single most-volatile reading on record) while leaving ~$100 of the $553.39
+uncommitted as buffer, rather than capping SOL at the full $476.39 available.
+
+Verified before treating this as done: `CapitalPool(total_capital=553.39, max_concurrent=2,
+slot_cap=77.0, slot_caps={'SOL/CAD': 376.0})` gives BTC/CAD → $77.00, SOL/CAD → $376.00
+independently (SOL's slot doesn't shrink once BTC's is allocated) — matches the intended
+per-symbol-cap semantics, not a coincidence of the numbers.
+
+**One casualty, fixed same session:** `tests/crypto/test_capital_pool.py::
+test_slot_caps_by_base_ignores_unrelated_keys` assumed no `MAX_SLOT_CASH_CAD_<BASE>` key
+exists in the real environment — true until this promotion, false after. Not a code bug in
+`_slot_caps_by_base()` itself, a test-isolation gap it happened to expose; fixed with an
+explicit `monkeypatch.delenv("MAX_SLOT_CASH_CAD_SOL")` in that one test. Suite count
+unchanged (666), full run reconfirmed green after the fix.
+
+**Both symbols now start their live-fill capital gates independently and from zero.**
+SOL/CAD has 0/15 fills toward its own $376→ next-tier gate, same three-criteria bar as
+BTC/CAD (live PF≥1.2, shadow match≥95%, fee/slippage on-spec) — not a shared counter with
+BTC/CAD's own 0/15.
+
+**What was deliberately NOT touched:** `regime_monitor.py`'s `MONITOR_WATCHLIST` (XRP/CAD
+stays watchlist-only), `RiskManager` config (already symbol-generic — shared aggregate
+breakers + per-symbol position-size cap, confirmed via `bot/main.py`'s single global
+`RiskManager` instance covering all executors, no per-symbol construction needed), and SYN
+(OOS-validated at ATR×2.0 same as SOL, but no capital research or live-config action was
+taken for it in this session — still just a documented candidate).

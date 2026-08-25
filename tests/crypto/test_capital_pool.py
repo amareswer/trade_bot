@@ -267,6 +267,10 @@ def test_slot_caps_by_base_uppercases_the_base(monkeypatch):
 
 
 def test_slot_caps_by_base_ignores_unrelated_keys(monkeypatch):
+    # Real .env carries MAX_SLOT_CASH_CAD_SOL since SOL/CAD's 2026-08-25 promotion —
+    # explicitly cleared so this test still verifies "no per-symbol override" in
+    # isolation, not "whatever happens to be in the real environment right now".
+    monkeypatch.delenv("MAX_SLOT_CASH_CAD_SOL", raising=False)
     monkeypatch.setenv("MAX_SLOT_CASH_CAD", "77")   # the old shared key — not per-symbol
     monkeypatch.setenv("MAX_SLIPPAGE_PCT", "0.01")  # unrelated key, same prefix-ish shape
     assert _slot_caps_by_base() == {}
