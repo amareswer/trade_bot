@@ -660,6 +660,72 @@ def _mark_positions_to_market(executor, price_data: dict[str, dict | None]) -> N
     executor.refresh_position_marks(live_price_map)
 
 
+def _update_ai_health(
+    ai_health: dict,
+    success: bool,
+    consecutive_failures: int,
+    threshold: int,
+    notifier,
+    detail: str = "",
+) -> int:
+    """One AI-health evaluation, called once per scan cycle that actually
+    attempted at least one AI call (skip calling this on a cycle where
+    everything was gated out — e.g. all-RANGING or market closed — that's
+    not a signal either way).
+
+    Mirrors bot/main.py's `_update_auth_health()` (built 2026-08-18 after
+    the Kraken auth outage went undetected for days). Added 2026-08-25 to
+    close the stock-bot analog of that same gap: the AI provider
+    (nvidia_nim) has degraded three separate times on this project — each
+    one only ever caught by manually testing the API by hand, never by
+    anything the bot itself surfaced. `_ai_failed_n`/`_ai_nvidia_n`/
+    `_ai_fallback_n` were already being computed every cycle (Phase 3, main
+    loop) but only ever printed to the console, never alerted.
+
+    Deliberately NOT wired into either heartbeat's healthy_fn — unlike the
+    Kraken auth case, AI here is advisory-only (RULE_TRADING_ENABLED=true
+    means the rule engine trades regardless of AI's state), so a degraded
+    AI provider should not page "the bot is down." It gets its own
+    edge-triggered ops_alert instead, kept distinct from a real outage.
+
+    Alerts once per ok->failing / failing->ok transition (edge-triggered,
+    not every cycle). Returns the new consecutive_failures count: 0 on
+    success, or after `threshold` consecutive fully-failed cycles have just
+    been evaluated (whether or not that evaluation produced a fresh alert).
+    """
+    if success:
+        if not ai_health["ok"]:
+            ai_health["ok"] = True
+            notifier.ops_alert(
+                "AI provider RECOVERED",
+                "nvidia_nim (or its fallback) is producing verdicts again. "
+                "Rule-based trading was unaffected throughout — this only "
+                "restores the AI shadow-vote data.",
+            )
+        return 0
+
+    consecutive_failures += 1
+    if consecutive_failures >= threshold:
+        logger.warning(
+            "AI health: %d consecutive fully-failed scan cycles — "
+            "nvidia_nim (and any configured fallback) unreachable",
+            consecutive_failures,
+        )
+        if ai_health["ok"]:
+            ai_health["ok"] = False
+            notifier.ops_alert(
+                "AI provider degraded",
+                f"{consecutive_failures} consecutive scan cycles with zero "
+                f"successful AI calls{f' ({detail})' if detail else ''}. "
+                "Rule-based BUY/SELL signals are unaffected — this only "
+                "means the AI shadow-vote log is going dark. If this "
+                "persists, check the provider/credentials the same way the "
+                "prior nvidia_nim degradations were diagnosed.",
+            )
+        consecutive_failures = 0
+    return consecutive_failures
+
+
 def _run_news_scan(symbols: list[str]) -> None:
     """
     Lightweight pre/after-hours news scan — no prices, no AI, no trades.
@@ -892,6 +958,12 @@ def run() -> None:
     from bot.alerts.liveness import LivenessTracker
     _liveness = LivenessTracker()
     _LIVENESS_MAX_STALE_S = 1800   # 30 min — AI calls have been observed taking ~13 min
+
+    # AI provider health (see _update_ai_health docstring) — tracked across
+    # cycles, evaluated once per cycle that actually attempted an AI call.
+    _ai_health = {"ok": True}
+    _ai_consecutive_failures = 0
+    _AI_HEALTH_THRESHOLD = 3   # consecutive fully-failed cycles before alerting
     _hb_interval = int(os.getenv("HEARTBEAT_INTERVAL_S", "60"))
     start_heartbeat_thread(
         os.getenv("HEARTBEAT_URL", ""),
@@ -1231,6 +1303,13 @@ def run() -> None:
         _ai_nvidia_n   = sum(1 for v in ai_verdicts.values() if v.provider == "nvidia_nim")
         _ai_fallback_n = sum(1 for v in ai_verdicts.values() if v.provider == "openrouter")
         _ai_failed_n   = sum(1 for v in ai_verdicts.values() if v.provider in ("unavailable", "unknown"))
+        _ai_attempted_n = _ai_nvidia_n + _ai_fallback_n + _ai_failed_n
+        if _ai_attempted_n > 0:
+            _ai_consecutive_failures = _update_ai_health(
+                _ai_health, _ai_nvidia_n + _ai_fallback_n > 0,
+                _ai_consecutive_failures, _AI_HEALTH_THRESHOLD, notifier,
+                detail=f"{_ai_failed_n}/{_ai_attempted_n} calls failed this cycle",
+            )
 
         # ── Phase 4: print results + paper trading + build scan list ────────
         for symbol in cycle_symbols:

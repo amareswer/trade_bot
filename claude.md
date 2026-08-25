@@ -174,7 +174,7 @@ need the full narrative behind any decision below.
 
 ## Test Suite Manifest (reconciled 2026-08-18, count updated 2026-08-24)
 
-Expected total: **658 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-13s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later. 2026-08-24: 629→639, +10 for CapitalPool per-symbol slot caps — this line and the table row below were caught stale during a "what's missing" self-audit in the same session that added the tests; the manifest count and the actual suite had already diverged by the time that session's own report was written. Same self-audit then found the config-layer half of that same feature — `_slot_caps_by_base()` — had zero test coverage at all; closed it same-day, 639→647. Then 647→658, +11 for `rescreen.py`'s new USD leg + the `_alert()` nested-config bugfix — new file `tests/crypto/test_rescreen.py`, this script's first-ever test coverage.)
+Expected total: **666 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-13s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later. 2026-08-24: 629→639, +10 for CapitalPool per-symbol slot caps — this line and the table row below were caught stale during a "what's missing" self-audit in the same session that added the tests; the manifest count and the actual suite had already diverged by the time that session's own report was written. Same self-audit then found the config-layer half of that same feature — `_slot_caps_by_base()` — had zero test coverage at all; closed it same-day, 639→647. Then 647→658, +11 for `rescreen.py`'s new USD leg + the `_alert()` nested-config bugfix — new file `tests/crypto/test_rescreen.py`, this script's first-ever test coverage. 2026-08-25: 658→666, +8 for `stock_bot.main._update_ai_health()` — new file `tests/stock/test_ai_health.py`, found during a "what are we missing" review, not a session that was already touching this code.)
 
 **Directory layout (2026-08-18):** all 54 files moved out of repo root into `tests/{crypto,stock,shared}/` for
 a cleaner root — 54 files loose alongside `bot/`, `stock_bot/`, `config.py`, etc. had gotten hard to scan.
@@ -256,14 +256,16 @@ now `.parent.parent.parent`. Verified before/after: same 526 collected, same 526
 | `tests/crypto/test_grid_dca_experiment.py` | 12 | `grid_dca_experiment.py` standalone backtest engines (crypto research tooling, not the live pipeline): grid strategy fills/reopens/floor-stop, capital split across slots, fee math on both legs, DCA safety-order averaging + cycle restart, empty-candle edge cases |
 | `tests/crypto/test_rescreen.py` | 11 | `rescreen.py` (added 2026-08-24, first-ever coverage for this script): `_crypto_usd_whitelist()` — empty when only CAD whitelisted, filters `/USD` suffix, empty-string input, and a regression check that `_crypto_whitelist()`'s own (pre-existing) behavior is unaffected; the new USD leg — runs with `extra_env={"SCREEN_QUOTE": "USD"}`, its results land in a correctly-formatted `## crypto-usd` report section, a gate-script failure on the USD leg reports the same way the existing rc≠0 handling already does; regression check that the CAD leg's own report section/whitelist-comparison is unchanged; `RESCREEN_SKIP_USD` skip flag; `_alert()`'s nested-config-attribute bugfix (`cfg.alerts.*` not flat `cfg.*`) — no `AttributeError` swallowed, `TelegramAlerter` constructed with the correct values |
 | `tests/shared/test_telegram_retry.py` | 3 | `TelegramAlerter._send()` retry (added 2026-08-17, closes known-gaps #17): healthy send calls `requests.post` once with no retry, a transient failure recovers on retry, a persistent failure still degrades to a warning-only no-raise after exhausting attempts |
+| `tests/stock/test_ai_health.py` | 8 | `stock_bot.main._update_ai_health()` (added 2026-08-25, closes the stock-bot analog of the 2026-08-15 Kraken-auth-outage gap — nvidia_nim has degraded 3 separate times on this project, each only ever caught by manually testing the API by hand, never by the bot itself): below-threshold silence, trip-at-3-consecutive-fully-failed-cycles alert, no re-alert while still failing, recovery alert + counter reset, healthy-path never touches the notifier, blank-detail formatting; two source-inspection wiring guards — `run()` only evaluates health on a cycle that actually attempted an AI call (`_ai_attempted_n > 0`), and deliberately does NOT wire `_ai_health` into either heartbeat's `healthy_fn` (AI is advisory-only — an outage must not misreport "the bot is down") |
 
-Run: `python -m pytest --tb=short -q` — must show **658 passed**. (This line had drifted to a
+Run: `python -m pytest --tb=short -q` — must show **666 passed**. (This line had drifted to a
 stale "543 passed" — corrected 2026-08-23 to match the manifest total above, which was
 already at 605 before this session's +2. Not investigated why the two numbers had diverged.
 2026-08-24: 629→639→647 for the CapitalPool per-symbol-cap tests plus the config-layer
 coverage gap found right after — caught by a "what's missing" self-audit, not by re-running
 the suite in the session that made the change. 647→658 same day, for rescreen.py's new USD
-leg + _alert() bugfix.)
+leg + _alert() bugfix. 658→666 2026-08-25, for `_update_ai_health()` — see "AI provider
+health monitoring" below.)
 
 ---
 
@@ -980,6 +982,44 @@ drives real `evaluate()` end to end with a spike sized to land between the exclu
 self-inclusive-mean thresholds; mutation-verified to FAIL under the pre-fix append-before-
 classify ordering, confirmed manually before landing). Suite 534→536.
 
+### AI provider health monitoring (stock bot — added 2026-08-25)
+Closes a gap surfaced during a "what are we missing" review, not by a live incident this time
+— the AI provider (`nvidia_nim`) has degraded three separate times on this project already
+(see the `NVIDIA_MODEL` incident history above), and every one was only ever caught by
+manually testing the API by hand, never by anything the bot itself surfaced. `stock_bot/
+main.py`'s Phase 3 (AI calls) was already computing `_ai_nvidia_n`/`_ai_fallback_n`/
+`_ai_failed_n` every scan cycle, but only ever printing them to the console — a 4th
+degradation would have gone unnoticed the same way as the first three.
+
+New `_update_ai_health()` (`stock_bot/main.py`, same extract-for-testability pattern as
+`bot/main.py`'s `_update_auth_health()` from the 2026-08-15 Kraken auth outage): evaluated
+once per scan cycle that actually attempted at least one AI call (a cycle where everything
+was gated out — all-RANGING, market closed — is skipped, not treated as a failure or a
+success). Tracks consecutive fully-failed cycles (zero successful AI calls out of at least
+one attempted); at `_AI_HEALTH_THRESHOLD=3` consecutive fully-failed cycles, fires an
+edge-triggered `notifier.ops_alert()` (Telegram + terminal + desktop, the same channel
+`stock_bot/main.py` already uses for every other ops alert) and flips a health flag; a single
+successful cycle after that flips it back and fires one recovery alert. Alerts once per
+transition, never every cycle — same anti-spam shape as every other edge-triggered alert in
+this codebase (candle watchdog, drawdown-warning tiers, the crypto auth-health flag itself).
+
+**Deliberately NOT wired into either heartbeat's `healthy_fn`** — unlike the Kraken auth case,
+this AI is advisory-only (`RULE_TRADING_ENABLED=true` means the rule engine trades regardless
+of the AI's state), so a degraded AI provider flipping healthchecks.io unhealthy would
+misreport "the bot is down" when rule-based trading is actually unaffected. It gets its own
+distinct alert channel instead, kept separate from real-outage severity. A source-inspection
+test (`test_run_does_not_wire_ai_health_into_heartbeat`) locks this decision in so it can't
+regress by accident.
+
+Does not touch the dormant `_fallback_openrouter()` — detection only, not auto-failover. A
+4th nvidia_nim degradation will now alert immediately instead of requiring another manual
+catch, but still needs the same manual model-swap response as the first three until/unless
+the OpenRouter fallback is actually wired in. Tests: `tests/stock/test_ai_health.py`, 8 cases
+(below-threshold silence, trip-at-threshold alert, no re-alert while still failing, recovery
+alert + counter reset, healthy-path never touches the notifier, blank-detail formatting, plus
+the two wiring guards above). Suite 658→666. No `bot/strategy/*` touched — alerting/ops-layer
+only, no walk-forward needed.
+
 ### Current operational status (as of 2026-07-28)
 - **Crypto bot:** live on Kraken, BTC/CAD only, $77 slot cap, capital gate at 0/15 fills
   (strategy trades ~every 1–3 weeks; two BUY signals fired since 2026-07-05, both lost to
@@ -1064,7 +1104,9 @@ classify ordering, confirmed manually before landing). Suite 534→536.
   found during this investigation is still unwired (zero call sites, no test coverage) — a
   live `OPENROUTER_API_KEY` sits unused in root `.env` that could auto-switch providers on a
   future nvidia_nim outage instead of requiring this same manual model-swap dance again. Not
-  acted on yet — flagged, not fixed. Daily-loss breaker now marks open positions to
+  acted on yet — flagged, not fixed. **Detection of a future degradation WAS closed 2026-08-25**
+  (see "AI provider health monitoring" below) — the auto-failover itself remains unbuilt, but a
+  4th degradation will now alert instead of requiring another manual catch. Daily-loss breaker now marks open positions to
   live scan-cycle prices every cycle (`refresh_position_marks()`), not just at fill time —
   was previously stale between fills, could under-detect real intraday drawdown. Restarted
   2026-07-28 (PID 25877) after an apparent ~6h scan-loop stall turned out most likely to be
