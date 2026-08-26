@@ -174,7 +174,7 @@ need the full narrative behind any decision below.
 
 ## Test Suite Manifest (reconciled 2026-08-18, count updated 2026-08-24)
 
-Expected total: **666 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-13s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later. 2026-08-24: 629→639, +10 for CapitalPool per-symbol slot caps — this line and the table row below were caught stale during a "what's missing" self-audit in the same session that added the tests; the manifest count and the actual suite had already diverged by the time that session's own report was written. Same self-audit then found the config-layer half of that same feature — `_slot_caps_by_base()` — had zero test coverage at all; closed it same-day, 639→647. Then 647→658, +11 for `rescreen.py`'s new USD leg + the `_alert()` nested-config bugfix — new file `tests/crypto/test_rescreen.py`, this script's first-ever test coverage. 2026-08-25: 658→666, +8 for `stock_bot.main._update_ai_health()` — new file `tests/stock/test_ai_health.py`, found during a "what are we missing" review, not a session that was already touching this code.)
+Expected total: **674 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-26s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later. 2026-08-24: 629→639, +10 for CapitalPool per-symbol slot caps — this line and the table row below were caught stale during a "what's missing" self-audit in the same session that added the tests; the manifest count and the actual suite had already diverged by the time that session's own report was written. Same self-audit then found the config-layer half of that same feature — `_slot_caps_by_base()` — had zero test coverage at all; closed it same-day, 639→647. Then 647→658, +11 for `rescreen.py`'s new USD leg + the `_alert()` nested-config bugfix — new file `tests/crypto/test_rescreen.py`, this script's first-ever test coverage. 2026-08-25: 658→666, +8 for `stock_bot.main._update_ai_health()` — new file `tests/stock/test_ai_health.py`, found during a "what are we missing" review, not a session that was already touching this code. 2026-08-26: 666→674, +8 for the crypto dashboard multi-symbol combine — new file `tests/crypto/test_dashboard_renderer.py`, `bot/dashboard/renderer.py`'s first-ever test coverage, found while fixing the single-symbol dashboard gap SOL/CAD's promotion exposed.)
 
 **Directory layout (2026-08-18):** all 54 files moved out of repo root into `tests/{crypto,stock,shared}/` for
 a cleaner root — 54 files loose alongside `bot/`, `stock_bot/`, `config.py`, etc. had gotten hard to scan.
@@ -257,8 +257,9 @@ now `.parent.parent.parent`. Verified before/after: same 526 collected, same 526
 | `tests/crypto/test_rescreen.py` | 11 | `rescreen.py` (added 2026-08-24, first-ever coverage for this script): `_crypto_usd_whitelist()` — empty when only CAD whitelisted, filters `/USD` suffix, empty-string input, and a regression check that `_crypto_whitelist()`'s own (pre-existing) behavior is unaffected; the new USD leg — runs with `extra_env={"SCREEN_QUOTE": "USD"}`, its results land in a correctly-formatted `## crypto-usd` report section, a gate-script failure on the USD leg reports the same way the existing rc≠0 handling already does; regression check that the CAD leg's own report section/whitelist-comparison is unchanged; `RESCREEN_SKIP_USD` skip flag; `_alert()`'s nested-config-attribute bugfix (`cfg.alerts.*` not flat `cfg.*`) — no `AttributeError` swallowed, `TelegramAlerter` constructed with the correct values |
 | `tests/shared/test_telegram_retry.py` | 3 | `TelegramAlerter._send()` retry (added 2026-08-17, closes known-gaps #17): healthy send calls `requests.post` once with no retry, a transient failure recovers on retry, a persistent failure still degrades to a warning-only no-raise after exhausting attempts |
 | `tests/stock/test_ai_health.py` | 8 | `stock_bot.main._update_ai_health()` (added 2026-08-25, closes the stock-bot analog of the 2026-08-15 Kraken-auth-outage gap — nvidia_nim has degraded 3 separate times on this project, each only ever caught by manually testing the API by hand, never by the bot itself): below-threshold silence, trip-at-3-consecutive-fully-failed-cycles alert, no re-alert while still failing, recovery alert + counter reset, healthy-path never touches the notifier, blank-detail formatting; two source-inspection wiring guards — `run()` only evaluates health on a cycle that actually attempted an AI call (`_ai_attempted_n > 0`), and deliberately does NOT wire `_ai_health` into either heartbeat's `healthy_fn` (AI is advisory-only — an outage must not misreport "the bot is down") |
+| `tests/crypto/test_dashboard_renderer.py` | 8 | `bot/dashboard/renderer.py` (added 2026-08-26, first-ever coverage for this module — 0 tests existed before, part of why the single-symbol dashboard gap below went unnoticed): the multi-symbol combine (`write_multi()`, replacing the old single-symbol-only `dashboard.html` render path that left SOL/CAD with zero dashboard visibility after its promotion) — both symbols render on one shared page shell (one `<html>`/`<style>`, not two documents), single-symbol case still works, list order is the render order, the position-protection panel appears only inside the symbol actually holding a position (not leaking across symbol blocks when one is flat and one isn't — the real cross-contamination risk this refactor had to avoid), no panel when flat, fills/fees render for the correct symbol, the single-symbol `write()` wrapper produces equivalent content to `write_multi()` with a one-element list (not a diverging second code path), parent-directory auto-creation |
 
-Run: `python -m pytest --tb=short -q` — must show **666 passed**. (This line had drifted to a
+Run: `python -m pytest --tb=short -q` — must show **674 passed**. (This line had drifted to a
 stale "543 passed" — corrected 2026-08-23 to match the manifest total above, which was
 already at 605 before this session's +2. Not investigated why the two numbers had diverged.
 2026-08-24: 629→639→647 for the CapitalPool per-symbol-cap tests plus the config-layer
@@ -268,7 +269,10 @@ leg + _alert() bugfix. 658→666 2026-08-25, for `_update_ai_health()` — see "
 health monitoring" below. Same day, later: SOL/CAD's promotion added `MAX_SLOT_CASH_CAD_SOL`
 to real `.env`, which broke `test_slot_caps_by_base_ignores_unrelated_keys`'s assumption that
 no per-symbol override exists in the environment — test-isolation gap, not a code bug; fixed
-by explicitly `delenv`-ing that key in the test. Count unchanged, still 666.)
+by explicitly `delenv`-ing that key in the test. Count unchanged, still 666.
+2026-08-26: 666→674, +8 for the crypto dashboard multi-symbol combine — new file
+`tests/crypto/test_dashboard_renderer.py`. See "Crypto dashboard — multi-symbol combine"
+below.)
 
 ---
 
@@ -1053,6 +1057,51 @@ the OpenRouter fallback is actually wired in. Tests: `tests/stock/test_ai_health
 alert + counter reset, healthy-path never touches the notifier, blank-detail formatting, plus
 the two wiring guards above). Suite 658→666. No `bot/strategy/*` touched — alerting/ops-layer
 only, no walk-forward needed.
+
+### Crypto dashboard — multi-symbol combine (added 2026-08-26)
+`dashboard.html` (the detailed per-tick page `unified_dashboard.py` embeds) was hardcoded to
+render only `_active_symbol` — always the first entry in `UNIVERSE_WHITELIST`, i.e. BTC/CAD.
+When SOL/CAD went live (2026-08-25) it had zero visibility on this page despite holding a
+real position from its first fill — found the next day while checking on the fill. Root
+cause went deeper than the render call itself: `tick_log`/the "sticky" indicator display
+values (`_dash_signal`/`_dash_rsi`/etc.) were shared module-level state written only for the
+active symbol, and the fixed-alias `executor`/`state_machine`/`position_manager` variables
+the render closure read from were permanently bound to `_active_symbol` at startup — a
+second symbol wasn't just unrendered, the plumbing had no way to render it correctly even if
+un-gated.
+
+**Fix, by explicit request ("crypto all together in one page" — a single combined page was
+chosen over separate per-symbol pages after discussing the tradeoff: separate pages would
+have been the smaller change, but a single page needing no tab-switching to see both symbols
+at once was worth the larger one):**
+- `bot/dashboard/renderer.py` rewritten around a new `write_multi(path, exchange, strategy,
+  tick, symbols: list[dict], ...)` — one shared page shell (title/style/exchange header,
+  built once) wrapping one full content block per symbol (position-protection panel, metric
+  cards, state/indicator/regime row, candle table, fills table, tick log table — all the
+  same per-symbol detail as before, just stacked instead of single). The single-symbol
+  `write()` signature is kept as a thin wrapper (`write_multi(symbols=[one dict])`) — not
+  used by the live bot today (always ≥1 symbol via the list form) but kept for any future
+  single-symbol caller.
+- `bot/main.py`: `tick_log` entries now carry a `"sym"` tag (`candle_log` already did);
+  the sticky display values moved from module-level globals into `symbol_state[sym]['dash_*']`
+  — genuinely per-symbol now, not shared/stale across symbols; `_render_dashboard(sym, ...)`
+  takes an explicit symbol, updates that symbol's entry in a new `_dash_snapshots` cache, and
+  re-renders the FULL combined page from `_dash_snapshots` on every call — so the page always
+  reflects the latest known state for every symbol, not just whichever one just ticked. The
+  `if sym == _active_symbol:` gates were removed from the tick-log/dashboard path specifically
+  (three call sites) while left untouched on the *console* print calls they used to also
+  guard (`display.next_candle()` stays active-symbol-only — a deliberate, narrower console UX
+  choice, not an oversight).
+- Verified with a real two-symbol smoke test before landing (one flat symbol, one holding a
+  position, same page) — confirmed one shared `<html>`/`<style>` (not two documents), correct
+  symbol ordering, and specifically that the position-protection panel renders inside the
+  holding symbol's block only, not leaking into the flat symbol's section — the concrete
+  cross-contamination risk this stacked-fragment design had to avoid.
+- `unified_dashboard.py` needed no change — it already just embeds `dashboard.html` via one
+  iframe; that page now contains both symbols on its own.
+- Tests: `tests/crypto/test_dashboard_renderer.py` (new file, 8 cases — this module's
+  first-ever coverage, itself part of why the gap went unnoticed for a full day). Suite
+  666→674. No `bot/strategy/*` touched — dashboard/display-layer only, no walk-forward needed.
 
 ### Current operational status (as of 2026-07-28)
 - **Crypto bot:** live on Kraken, BTC/CAD ($77 slot cap) + SOL/CAD ($376 slot cap, added

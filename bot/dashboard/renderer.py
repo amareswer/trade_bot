@@ -1,10 +1,18 @@
 """
 HTML dashboard renderer.
 
-Writes a single self-contained dashboard.html after every tick.
+Writes a single self-contained dashboard.html after every tick, combining
+ALL live crypto symbols onto one page (added 2026-08-26, when SOL/CAD joined
+BTC/CAD live — the page used to be single-symbol only, and SOL/CAD had zero
+visibility on it despite holding a real position). One shared page shell
+(title/style/exchange header) wraps one full content block per symbol,
+stacked in order.
 The page auto-refreshes at the configured interval — open once, stays current.
 
-write() is the only public function.
+write_multi() is the primary public function (multi-symbol, current call
+site: bot/main.py). write() is a thin single-symbol convenience wrapper
+around it (symbols=[one dict]) — kept for any future single-symbol caller,
+not used by the live bot today.
 """
 from __future__ import annotations
 
@@ -20,6 +28,34 @@ DEFAULT_PATH = os.path.join(
 # ---------------------------------------------------------------------------
 # Public
 # ---------------------------------------------------------------------------
+
+def write_multi(
+    path:            str,
+    exchange:        str,
+    strategy:        str,
+    tick:            int,
+    symbols:         list[dict],   # one dict per symbol — see _render_symbol_block() for keys
+    refresh_s:       int   = 30,
+    live_trading:    bool  = False,
+    dry_run:         bool  = False,
+) -> None:
+    """Render ALL symbols onto one page. `symbols` is a list of dicts, each
+    with the same per-symbol keys write()'s single-symbol signature used to
+    take directly: symbol, price, signal, rsi, trend, state, cooldown,
+    last_trade, cash, position, avg_entry, unrealized_pnl, realized_pnl,
+    total_value, fills, tick_log, candle_log, stop_loss_pct, take_profit_pct,
+    fees_paid, rsi_filter_enabled, volume_k. Order in the list is the order
+    rendered on the page — callers control symbol ordering (e.g. active
+    symbol first)."""
+    html = _render_page(
+        exchange=exchange, strategy=strategy, tick=tick,
+        refresh_s=refresh_s, live_trading=live_trading, dry_run=dry_run,
+        symbols=symbols,
+    )
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+
 
 def write(
     path:            str,
@@ -52,26 +88,24 @@ def write(
     rsi_filter_enabled: bool  = True,
     volume_k:           float = 0.0,
 ) -> None:
-    html = _render(
-        exchange=exchange, symbol=symbol, strategy=strategy,
-        tick=tick, price=price, signal=signal,
-        rsi=rsi, trend=trend, state=state,
-        cooldown=cooldown, last_trade=last_trade,
-        cash=cash, position=position, avg_entry=avg_entry,
-        unrealized_pnl=unrealized_pnl, realized_pnl=realized_pnl,
-        total_value=total_value,
-        fills=fills, tick_log=tick_log,
-        candle_log=candle_log or [],
-        refresh_s=refresh_s,
-        live_trading=live_trading, dry_run=dry_run,
-        stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct,
-        fees_paid=fees_paid,
-        rsi_filter_enabled=rsi_filter_enabled,
-        volume_k=volume_k,
+    """Single-symbol convenience wrapper around write_multi() — not used by
+    the live bot (which always has >=1 symbol via write_multi()), kept for
+    any future single-symbol caller."""
+    write_multi(
+        path=path, exchange=exchange, strategy=strategy, tick=tick,
+        refresh_s=refresh_s, live_trading=live_trading, dry_run=dry_run,
+        symbols=[{
+            "symbol": symbol, "price": price, "signal": signal, "rsi": rsi,
+            "trend": trend, "state": state, "cooldown": cooldown,
+            "last_trade": last_trade, "cash": cash, "position": position,
+            "avg_entry": avg_entry, "unrealized_pnl": unrealized_pnl,
+            "realized_pnl": realized_pnl, "total_value": total_value,
+            "fills": fills, "tick_log": tick_log, "candle_log": candle_log or [],
+            "stop_loss_pct": stop_loss_pct, "take_profit_pct": take_profit_pct,
+            "fees_paid": fees_paid, "rsi_filter_enabled": rsi_filter_enabled,
+            "volume_k": volume_k,
+        }],
     )
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(html)
 
 
 # ---------------------------------------------------------------------------
@@ -116,8 +150,11 @@ def _pct_color(pct: float, warn: float = 1.0, danger: float = 0.5) -> str:
     return "#3fb950"
 
 
-def _render(**kw) -> str:
-    now       = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def _render_symbol_block(**kw) -> str:
+    """One symbol's full content block: mini-header, position-protection
+    panel, metric cards, state/indicator/regime row, candle table, fills
+    table, tick log table. No <html>/<head>/<body> — that's shared page
+    shell, built once by _render_page() regardless of symbol count."""
     rsi_str   = f"{kw['rsi']:.1f}" if kw['rsi'] is not None else "—"
     trend_str = kw['trend'] or "—"
     pos_str   = f"{kw['position']:.6f}" if kw['position'] > 0 else "—"
@@ -125,17 +162,6 @@ def _render(**kw) -> str:
     rsi_col   = _rsi_color(kw['rsi'])
     trend_col = _trend_color(kw['trend'])
     cd_str    = f"({kw['cooldown']} left)" if kw['cooldown'] > 0 else ""
-
-    # ── Mode badge ─────────────────────────────────────────────────────────
-    if kw['live_trading'] and not kw['dry_run']:
-        mode_badge = '<span class="badge" style="background:#f8514933;color:#f85149;border:1px solid #f8514966;font-size:13px">● LIVE</span>'
-        mode_text  = "Live Trading"
-    elif kw['dry_run']:
-        mode_badge = '<span class="badge" style="background:#d2992233;color:#d29922;border:1px solid #d2992266;font-size:13px">◌ DRY RUN</span>'
-        mode_text  = "Dry Run"
-    else:
-        mode_badge = '<span class="badge" style="background:#8b949e22;color:#8b949e;border:1px solid #8b949e44">PAPER</span>'
-        mode_text  = "Paper Trading"
 
     # ── Position protection panel ──────────────────────────────────────────
     pos_panel = ""
@@ -385,98 +411,15 @@ def _render(**kw) -> str:
           <td>{reason_cell}</td>
         </tr>"""
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta http-equiv="refresh" content="{kw['refresh_s']}">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Trade Bot — {kw['symbol']}</title>
-  <style>
-    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", monospace;
-      background: #0d1117; color: #e6edf3; font-size: 13px;
-      padding: 20px;
-    }}
-    h2 {{ font-size: 14px; color: #8b949e; font-weight: 600;
-          text-transform: uppercase; letter-spacing: .05em; margin-bottom: 12px; }}
-    .header {{
-      display: flex; align-items: center; justify-content: space-between;
-      margin-bottom: 24px;
-    }}
-    .header-title {{ font-size: 18px; font-weight: 700; color: #e6edf3; }}
-    .header-sub   {{ font-size: 12px; color: #8b949e; margin-top: 3px; }}
-    .badge {{
-      display: inline-block; padding: 2px 10px; border-radius: 12px;
-      font-size: 12px; font-weight: 700; letter-spacing: .04em;
-    }}
-    .cards {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-      gap: 12px; margin-bottom: 24px;
-    }}
-    .card {{
-      background: #161b22; border: 1px solid #30363d;
-      border-radius: 8px; padding: 16px;
-    }}
-    .card-label {{ font-size: 11px; color: #8b949e; text-transform: uppercase;
-                   letter-spacing: .05em; margin-bottom: 6px; }}
-    .card-value {{ font-size: 22px; font-weight: 700; color: #e6edf3; }}
-    .card-sub   {{ font-size: 11px; color: #8b949e; margin-top: 4px; }}
-    .state-row {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-      gap: 12px; margin-bottom: 24px;
-    }}
-    .info-card {{
-      background: #161b22; border: 1px solid #30363d;
-      border-radius: 8px; padding: 14px 16px;
-      display: flex; flex-direction: column; gap: 6px;
-    }}
-    .info-row {{ display: flex; justify-content: space-between; align-items: center; }}
-    .info-key {{ color: #8b949e; font-size: 12px; }}
-    .info-val {{ font-size: 13px; font-weight: 600; color: #e6edf3; }}
-    .section {{
-      background: #161b22; border: 1px solid #30363d;
-      border-radius: 8px; padding: 16px; margin-bottom: 20px;
-      overflow-x: auto;
-    }}
-    table {{ width: 100%; border-collapse: collapse; }}
-    th {{
-      text-align: left; padding: 6px 10px;
-      color: #8b949e; font-size: 11px; font-weight: 600;
-      text-transform: uppercase; letter-spacing: .04em;
-      border-bottom: 1px solid #30363d;
-    }}
-    td {{
-      padding: 7px 10px; border-bottom: 1px solid #21262d;
-      font-size: 12px; color: #c9d1d9;
-    }}
-    tr:last-child td {{ border-bottom: none; }}
-    tr:hover td {{ background: #1c2128; }}
-    .footer {{ color: #484f58; font-size: 11px; margin-top: 16px; text-align: right; }}
-    .pulse {{ display: inline-block; width: 8px; height: 8px; border-radius: 50%;
-              background: #3fb950; margin-right: 6px;
-              animation: pulse 2s ease-in-out infinite; }}
-    .pulse-red {{ background: #f85149; }}
-    @keyframes pulse {{
-      0%, 100% {{ opacity: 1; }}
-      50%       {{ opacity: 0.3; }}
-    }}
-  </style>
-</head>
-<body>
+    return f"""
+  <!-- ═══════════════ {kw['symbol']} ═══════════════ -->
+  <div class="symbol-block">
 
-  <!-- Header -->
-  <div class="header">
+  <!-- Symbol header -->
+  <div class="header" style="margin-bottom:16px">
     <div>
-      <div class="header-title">
-        <span class="pulse{' pulse-red' if kw['live_trading'] and not kw['dry_run'] else ''}"></span>
-        {kw['exchange'].capitalize()} &nbsp;·&nbsp; {kw['symbol']}
-        &nbsp;&nbsp;{mode_badge}
-      </div>
-      <div class="header-sub">{mode_text} &nbsp;·&nbsp; Strategy: {kw['strategy']} &nbsp;·&nbsp; Tick #{kw['tick']:,}</div>
+      <div class="header-title" style="font-size:20px">{kw['symbol']}</div>
+      <div class="header-sub">{len(kw['fills'])} fill(s) today</div>
     </div>
     <div style="text-align:right">
       <div style="font-size:26px;font-weight:700;color:#e6edf3">${kw['price']:,.2f}</div>
@@ -587,7 +530,129 @@ def _render(**kw) -> str:
     </table>
   </div>
 
-  <div class="footer">Auto-refreshes every {kw['refresh_s']}s &nbsp;·&nbsp; Last updated {now}</div>
+  </div><!-- /symbol-block -->"""
+
+
+def _render_page(*, exchange, strategy, tick, refresh_s, live_trading, dry_run, symbols: list[dict]) -> str:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    symbol_names = ", ".join(s["symbol"] for s in symbols) or "—"
+
+    # ── Mode badge (bot-wide, not per-symbol) ───────────────────────────────
+    if live_trading and not dry_run:
+        mode_badge = '<span class="badge" style="background:#f8514933;color:#f85149;border:1px solid #f8514966;font-size:13px">● LIVE</span>'
+        mode_text  = "Live Trading"
+        pulse_cls  = " pulse-red"
+    elif dry_run:
+        mode_badge = '<span class="badge" style="background:#d2992233;color:#d29922;border:1px solid #d2992266;font-size:13px">◌ DRY RUN</span>'
+        mode_text  = "Dry Run"
+        pulse_cls  = ""
+    else:
+        mode_badge = '<span class="badge" style="background:#8b949e22;color:#8b949e;border:1px solid #8b949e44">PAPER</span>'
+        mode_text  = "Paper Trading"
+        pulse_cls  = ""
+
+    symbol_blocks = "".join(_render_symbol_block(**s) for s in symbols)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="refresh" content="{refresh_s}">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Trade Bot — {symbol_names}</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", monospace;
+      background: #0d1117; color: #e6edf3; font-size: 13px;
+      padding: 20px;
+    }}
+    h2 {{ font-size: 14px; color: #8b949e; font-weight: 600;
+          text-transform: uppercase; letter-spacing: .05em; margin-bottom: 12px; }}
+    .header {{
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 24px;
+    }}
+    .header-title {{ font-size: 18px; font-weight: 700; color: #e6edf3; }}
+    .header-sub   {{ font-size: 12px; color: #8b949e; margin-top: 3px; }}
+    .badge {{
+      display: inline-block; padding: 2px 10px; border-radius: 12px;
+      font-size: 12px; font-weight: 700; letter-spacing: .04em;
+    }}
+    .cards {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 12px; margin-bottom: 24px;
+    }}
+    .card {{
+      background: #161b22; border: 1px solid #30363d;
+      border-radius: 8px; padding: 16px;
+    }}
+    .card-label {{ font-size: 11px; color: #8b949e; text-transform: uppercase;
+                   letter-spacing: .05em; margin-bottom: 6px; }}
+    .card-value {{ font-size: 22px; font-weight: 700; color: #e6edf3; }}
+    .card-sub   {{ font-size: 11px; color: #8b949e; margin-top: 4px; }}
+    .state-row {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px; margin-bottom: 24px;
+    }}
+    .info-card {{
+      background: #161b22; border: 1px solid #30363d;
+      border-radius: 8px; padding: 14px 16px;
+      display: flex; flex-direction: column; gap: 6px;
+    }}
+    .info-row {{ display: flex; justify-content: space-between; align-items: center; }}
+    .info-key {{ color: #8b949e; font-size: 12px; }}
+    .info-val {{ font-size: 13px; font-weight: 600; color: #e6edf3; }}
+    .section {{
+      background: #161b22; border: 1px solid #30363d;
+      border-radius: 8px; padding: 16px; margin-bottom: 20px;
+      overflow-x: auto;
+    }}
+    table {{ width: 100%; border-collapse: collapse; }}
+    th {{
+      text-align: left; padding: 6px 10px;
+      color: #8b949e; font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: .04em;
+      border-bottom: 1px solid #30363d;
+    }}
+    td {{
+      padding: 7px 10px; border-bottom: 1px solid #21262d;
+      font-size: 12px; color: #c9d1d9;
+    }}
+    tr:last-child td {{ border-bottom: none; }}
+    tr:hover td {{ background: #1c2128; }}
+    .footer {{ color: #484f58; font-size: 11px; margin-top: 16px; text-align: right; }}
+    .pulse {{ display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+              background: #3fb950; margin-right: 6px;
+              animation: pulse 2s ease-in-out infinite; }}
+    .pulse-red {{ background: #f85149; }}
+    @keyframes pulse {{
+      0%, 100% {{ opacity: 1; }}
+      50%       {{ opacity: 0.3; }}
+    }}
+    .symbol-block {{ margin-bottom: 40px; padding-bottom: 8px; border-bottom: 2px solid #21262d; }}
+    .symbol-block:last-of-type {{ border-bottom: none; margin-bottom: 0; }}
+  </style>
+</head>
+<body>
+
+  <!-- Shared page header (bot-wide, not per-symbol) -->
+  <div class="header">
+    <div>
+      <div class="header-title">
+        <span class="pulse{pulse_cls}"></span>
+        {exchange.capitalize()} &nbsp;·&nbsp; {len(symbols)} symbol{'s' if len(symbols) != 1 else ''}
+        &nbsp;&nbsp;{mode_badge}
+      </div>
+      <div class="header-sub">{mode_text} &nbsp;·&nbsp; Strategy: {strategy} &nbsp;·&nbsp; Tick #{tick:,} &nbsp;·&nbsp; {symbol_names}</div>
+    </div>
+  </div>
+
+  {symbol_blocks}
+
+  <div class="footer">Auto-refreshes every {refresh_s}s &nbsp;·&nbsp; Last updated {now}</div>
 
 </body>
 </html>"""

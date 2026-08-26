@@ -1277,6 +1277,18 @@ def run():
                 'drift_acked':      0.0,          # drift amount already escalated (no re-alert until it changes)
                 'last_candle_time': time.time(),  # candle watchdog timer
                 'mtf_1d_closes':    [],           # daily closes cache — refreshed at gate 2c
+                # Sticky dashboard display values (added 2026-08-26, made
+                # per-symbol for the multi-symbol dashboard combine — these
+                # used to be shared module-level globals, correct only
+                # because the dashboard only ever rendered one symbol) —
+                # updated at candle-close, read on the "between closes"
+                # dashboard-refresh ticks so the page shows the last known
+                # values rather than blanking out mid-candle.
+                'dash_signal':      "HOLD",
+                'dash_rsi':         None,
+                'dash_trend':       None,
+                'dash_filter':      "",
+                'dash_block':       "",
             }
             logger.info("Symbol ready: %s", sym)
 
@@ -1315,6 +1327,11 @@ def run():
             'drift_acked':      0.0,
             'last_candle_time': time.time(),
             'mtf_1d_closes':    [],
+            'dash_signal':      "HOLD",
+            'dash_rsi':         None,
+            'dash_trend':       None,
+            'dash_filter':      "",
+            'dash_block':       "",
         }
 
     # ── Restart recovery ──────────────────────────────────────────────────────
@@ -1396,6 +1413,13 @@ def run():
     _auth_health = {"ok": True}
     _dd_warning_active = False   # non-blocking drawdown-warning tier — alert-once-per-episode
     candle_log: deque[dict] = deque(maxlen=50)
+    # Per-symbol dashboard snapshot cache (added 2026-08-26, SOL/CAD addition —
+    # dashboard.html used to only ever render _active_symbol; now combines
+    # every live symbol on one page). Updated in-place per symbol as each
+    # ticks; write_multi() gets the merged set on every render call so the
+    # page always reflects the latest known state for ALL symbols, not just
+    # whichever one just ticked.
+    _dash_snapshots: dict[str, dict] = {}
 
     def _account_value() -> float:
         """Aggregate account value across ALL symbol slots (cash + marked positions).
@@ -1439,16 +1463,26 @@ def run():
     _partial_tp_done: bool  = False
     _atr_sl_price:    float = 0.0
 
-    # Sticky indicator values — updated each candle close, displayed between closes
-    _dash_signal = "HOLD"
-    _dash_rsi    = None
-    _dash_trend  = None
-    _dash_filter = ""
-    _dash_block  = ""
+    # Sticky indicator values now live per-symbol in symbol_state[sym]['dash_*']
+    # (see the 'dash_signal'/'dash_rsi'/etc. keys at symbol_state init) —
+    # was a set of shared module-level globals here until 2026-08-26, correct
+    # only when the dashboard rendered a single symbol.
 
-    def _render_dashboard(sig: str, rsi_v, trend_v) -> None:
+    def _render_dashboard(sym: str, sig: str, rsi_v, trend_v) -> None:
+        """Update sym's snapshot and re-render the COMBINED dashboard.html
+        (all live symbols on one page — added 2026-08-26 for the SOL/CAD
+        addition; previously only ever rendered _active_symbol, leaving
+        every other live symbol with zero dashboard visibility). Each call
+        only recomputes the calling symbol's own data; _dash_snapshots
+        retains every other symbol's last-known state so the page always
+        shows the full set, not just whoever ticked most recently."""
         if not cfg.dashboard.enabled:
             return
+        _ss    = symbol_state[sym]
+        _exc   = _ss['executor']
+        _sm    = _ss['sm']
+        _pm    = _ss['pm']
+        _price = _ss.get('last_price') or 0.0
         fills_data = [
             {
                 "time":  o.filled_at.astimezone().strftime("%H:%M:%S") if o.filled_at else "—",
@@ -1457,44 +1491,47 @@ def run():
                 "price": o.price,
                 "total": o.total_value,
                 "pnl":   next(
-                    (r.pnl for r in reversed(position_manager.history)
+                    (r.pnl for r in reversed(_pm.history)
                      if r.action == o.side.value and abs(r.price - o.price) < 0.01),
                     None,
                 ),
             }
-            for o in executor.filled_orders()
+            for o in _exc.filled_orders()
         ]
+        _dash_snapshots[sym] = {
+            "symbol":             sym,
+            "price":              _price,
+            "signal":             sig,
+            "rsi":                rsi_v,
+            "trend":              trend_v,
+            "state":              _sm.state.value,
+            "cooldown":           _sm.cooldown_remaining,
+            "last_trade":         _sm.last_trade_label,
+            "cash":               _exc.cash,
+            "position":           _pm.quantity,
+            "avg_entry":          _pm.avg_entry,
+            "unrealized_pnl":     _pm.unrealized_pnl(_price),
+            "realized_pnl":       _pm.realized_pnl,
+            "total_value":        _exc.portfolio.total_value(_price),
+            "fills":              fills_data,
+            "tick_log":           [t for t in tick_log if t.get("sym") == sym],
+            "candle_log":         [c for c in candle_log if c.get("sym") == sym],
+            "stop_loss_pct":      cfg.backtest.stop_loss_pct,
+            "take_profit_pct":    cfg.backtest.take_profit_pct,
+            "fees_paid":          getattr(_exc, "fees_paid", 0.0),
+            "rsi_filter_enabled": cfg.strategy.rsi_filter_enabled,
+            "volume_k":           cfg.strategy.volume_k,
+        }
         try:
-            _dashboard.write(
-                path            = _DASHBOARD_PATH,
-                exchange        = cfg.exchange.exchange,
-                symbol          = cfg.exchange.symbol,
-                strategy        = cfg.strategy.mode,
-                tick            = tick,
-                price           = price,
-                signal          = sig,
-                rsi             = rsi_v,
-                trend           = trend_v,
-                state           = state_machine.state.value,
-                cooldown        = state_machine.cooldown_remaining,
-                last_trade      = state_machine.last_trade_label,
-                cash            = executor.cash,
-                position        = position_manager.quantity,
-                avg_entry       = position_manager.avg_entry,
-                unrealized_pnl  = position_manager.unrealized_pnl(price),
-                realized_pnl    = position_manager.realized_pnl,
-                total_value     = executor.portfolio.total_value(price),
-                fills           = fills_data,
-                tick_log        = list(tick_log),
-                candle_log      = list(candle_log),
-                refresh_s       = cfg.dashboard.refresh_s,
-                live_trading    = cfg.exchange.live_trading,
-                dry_run         = cfg.exchange.dry_run,
-                stop_loss_pct      = cfg.backtest.stop_loss_pct,
-                take_profit_pct    = cfg.backtest.take_profit_pct,
-                fees_paid          = getattr(executor, "fees_paid", 0.0),
-                rsi_filter_enabled = cfg.strategy.rsi_filter_enabled,
-                volume_k           = cfg.strategy.volume_k,
+            _dashboard.write_multi(
+                path         = _DASHBOARD_PATH,
+                exchange     = cfg.exchange.exchange,
+                strategy     = cfg.strategy.mode,
+                tick         = tick,
+                symbols      = [_dash_snapshots[s] for s in _universe_symbols if s in _dash_snapshots],
+                refresh_s    = cfg.dashboard.refresh_s,
+                live_trading = cfg.exchange.live_trading,
+                dry_run      = cfg.exchange.dry_run,
             )
         except Exception as exc:
             logger.warning("Dashboard render failed: %s", exc)
@@ -1970,12 +2007,13 @@ def run():
                             "time":   datetime.now().strftime("%H:%M:%S"),
                             "price":  price,
                             "signal": "SELL",
-                            "rsi":    _dash_rsi,
-                            "trend":  _dash_trend,
+                            "rsi":    ss['dash_rsi'],
+                            "trend":  ss['dash_trend'],
                             "state":  ss['sm'].state.value,
                             "reason": "trail_stop" if _ic_sl else "take_profit",
+                            "sym":    sym,
                         })
-                        _render_dashboard("SELL", _dash_rsi, _dash_trend)
+                        _render_dashboard(sym, "SELL", ss['dash_rsi'], ss['dash_trend'])
                         continue  # skip candle eval for this symbol this tick
 
                 # Live mode: evaluate only when a new candle has closed
@@ -1986,17 +2024,20 @@ def run():
                     if sym == _active_symbol:
                         countdown = _candle_countdown(_LIVE_TF)
                         display.next_candle(price, tick, countdown)
-                        tick_log.append({
-                            "tick":   tick,
-                            "time":   datetime.now().strftime("%H:%M:%S"),
-                            "price":  price,
-                            "signal": _dash_signal,
-                            "rsi":    _dash_rsi,
-                            "trend":  _dash_trend,
-                            "state":  ss['sm'].state.value,
-                            "reason": _dash_filter or _dash_block,
-                        })
-                        _render_dashboard(_dash_signal, _dash_rsi, _dash_trend)
+                    # Dashboard update covers every symbol (2026-08-26) —
+                    # console countdown print above stays active-symbol-only.
+                    tick_log.append({
+                        "tick":   tick,
+                        "time":   datetime.now().strftime("%H:%M:%S"),
+                        "price":  price,
+                        "signal": ss['dash_signal'],
+                        "rsi":    ss['dash_rsi'],
+                        "trend":  ss['dash_trend'],
+                        "state":  ss['sm'].state.value,
+                        "reason": ss['dash_filter'] or ss['dash_block'],
+                        "sym":    sym,
+                    })
+                    _render_dashboard(sym, ss['dash_signal'], ss['dash_rsi'], ss['dash_trend'])
                     continue  # no new candle for this symbol
                 ss['last_ts_ms'] = new_ts
                 ss['last_candle_time'] = time.time()
@@ -2576,24 +2617,26 @@ def run():
                 cash           = ss['executor'].cash,
             )
 
-            # ── 11. Tick log + dashboard (active symbol only) ─────────
-            if sym == _active_symbol:
-                _dash_signal = final_signal.value
-                _dash_rsi    = rsi_val
-                _dash_trend  = trend_val
-                _dash_filter = filter_reason
-                _dash_block  = block_reason
-                tick_log.append({
-                    "tick":   tick,
-                    "time":   datetime.now().strftime("%H:%M:%S"),
-                    "price":  price,
-                    "signal": final_signal.value,
-                    "rsi":    rsi_val,
-                    "trend":  trend_val,
-                    "state":  ss['sm'].state.value,
-                    "reason": filter_reason or block_reason,
-                })
-                _render_dashboard(final_signal.value, rsi_val, trend_val)
+            # ── 11. Tick log + dashboard (every symbol — 2026-08-26: used to
+            # be active-symbol-only; the dashboard now covers all live
+            # symbols on one page) ─────────────────────────────────────────
+            ss['dash_signal'] = final_signal.value
+            ss['dash_rsi']    = rsi_val
+            ss['dash_trend']  = trend_val
+            ss['dash_filter'] = filter_reason
+            ss['dash_block']  = block_reason
+            tick_log.append({
+                "tick":   tick,
+                "time":   datetime.now().strftime("%H:%M:%S"),
+                "price":  price,
+                "signal": final_signal.value,
+                "rsi":    rsi_val,
+                "trend":  trend_val,
+                "state":  ss['sm'].state.value,
+                "reason": filter_reason or block_reason,
+                "sym":    sym,
+            })
+            _render_dashboard(sym, final_signal.value, rsi_val, trend_val)
 
         # ── End of per-symbol loop ────────────────────────────────────
         _liveness.touch()
