@@ -599,3 +599,49 @@ BTC ($77) + SOL ($376) already commit $453 of the $553.39 balance — only ~$100
 against a $250-$690 need depending on volatility/margin comfort. Needs its own deposit,
 same as SOL did, before this becomes actionable — not something to trade off against SOL's
 existing capital. Everything above is groundwork for a future decision, not a promotion.
+
+## Post-promotion multi-symbol audit + fixes — 2026-08-25 (same day, evening)
+
+Read-only audit of the newly-exercised multi-symbol path first (user request), fixes applied
+after (second explicit request). **Trading-path mechanics all verified correct** — BUY sizing
+uses per-symbol slot cash ($376 for SOL, not the shared $77 cap), tick loop iterates all
+symbols, risk gates are per-slot/per-symbol where they should be and aggregate where they
+should be, CapitalPool allocate/release wired on fills, shadow audit + dashboard +
+in-bot regime monitor all pick up the whitelist dynamically. Findings fixed:
+
+1. **`live_comparison.py` stale baseline** — its hardcoded `_BASELINE` still carried the
+   2026-06-19 result (58 trades, PF 1.79) through four subsequent strategy-hash changes.
+   Updated to the current canonical fingerprint (31 trades, PF 2.19, win 38.7%, max DD
+   −1.74%, return −0.08%, validated 2026-08-20, hash `b30f2f9e769c8d41`) — numbers
+   reproduced by actually running `EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py`
+   the same evening, not copied from the doc.
+2. **`live_comparison.py` symbol blending** — it aggregated ALL fills in `trades.db`
+   against the BTC-only baseline. Now filters to the baseline's base asset (`--base`
+   override available), printing what was excluded. Smoke-run immediately proved the point
+   retroactively: 2 old DOGE/CAD fills (from before DOGE was blocked) had been silently
+   blending into the "BTC" comparison all along — now correctly excluded, 8/10 fills compared.
+3. **`regime_monitor.py` standalone missed `.env`** — no `load_dotenv()`, so a bare
+   `python regime_monitor.py` fell back to the BTC/CAD default regardless of
+   MONITOR_SYMBOLS in `.env` (the in-bot subprocess path was never affected — it passes
+   symbols explicitly). Added `load_dotenv()`; standalone run confirmed both symbols now
+   monitored. Stale "BTC/CAD" docstring fixed too.
+4. **Dashboard "Gates at a Glance" label** hardcoded "BTC/CAD" — now built from
+   `_whitelist()` dynamically.
+5. **`.env` `MAX_SLOT_CASH_CAD` comment** still described the "$100 capital / 1 slot" world
+   — rewritten for the per-symbol-override reality.
+
+**Known-stale, needs a restart to fix (bot holds it in memory):** `logs/risk_state.json`
+`week_open_value=77.0` predates the $400 deposit — the weekly-loss breaker is inert until
+Monday's ISO-week rollover (a >5% weekly loss would be measured against $77, not $453).
+`peak_value`/`day_open_value` self-correct (peak on first evaluate, day_open at UTC
+midnight); `week_open_value` does NOT until Monday. Fix requires stop-bot → patch file →
+start-bot sequencing because any in-flight save (fills, midnight rollover) rewrites the
+file from stale memory. Left for the user to run (they handle restarts). Not urgent while
+both positions are flat.
+
+**By-design, not fixed:** first SOL BUY at recent volatility will fire the 1.5×
+min-size-margin Telegram warning (qty ~0.07 SOL vs 0.06 min — above the hard floor, below
+the margin) — matches the sizing research exactly, order still places.
+
+Suite re-run after all fixes: 666 passed. No `bot/strategy/*` touched — no walk-forward
+needed.

@@ -476,7 +476,13 @@ def _book_gates_section() -> str:
         '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));'
         'gap:12px;margin-bottom:24px">'
         + block("Crypto · Live", g["sells"], 15, g["pf"], crypto_wr,
-                "BTC/CAD · gate: PF ≥ 1.2 + shadow ≥ 95%")
+                # Symbol list from the live whitelist, not hardcoded — was a
+                # literal "BTC/CAD" until SOL/CAD's 2026-08-25 addition made
+                # the label stale. (The 15-fill gate itself is per-symbol; the
+                # counts here still aggregate all crypto fills — see
+                # _read_gate_stats.)
+                f"{' + '.join(_whitelist()) or 'BTC/CAD'}"
+                " · gate: PF ≥ 1.2 + shadow ≥ 95%")
         + block(
             "Position Book · IBKR" if _stock_executor_type() == "ibkr"
             else "Position Book · Paper",

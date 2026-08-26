@@ -1092,9 +1092,21 @@ class LiveExecutor:
             )
 
             try:
+                # postOnly (not timeInForce="PO") — found 2026-08-26 after
+                # SOL/CAD's first live BUY silently fell back to market.
+                # ccxt's Kraken adapter passes timeInForce through nearly
+                # verbatim into Kraken's own `timeinforce` field, which only
+                # accepts GTC/IOC/GTD — "PO" isn't one, so Kraken rejected
+                # every attempt with EGeneral:Invalid arguments:timeinforce,
+                # silently falling back to market every time since this was
+                # introduced (commit 08644b1f, 2026-06-22). postOnly=True is
+                # ccxt's actual unified param for this (translates to
+                # oflags=post) — verified against the real installed ccxt via
+                # verify_kraken_postonly_param.py (no network calls in the
+                # assertion itself; only the one public load_markets() call).
                 raw = self._exchange.create_order(
                     self.symbol, "limit", side, quantity, limit_price,
-                    {"timeInForce": "PO"},
+                    {"postOnly": True},
                 )
                 order_id = str(raw.get("id", ""))
             except ccxt.InvalidOrder:

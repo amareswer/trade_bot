@@ -670,8 +670,11 @@ def test_limit_order_fills_on_first_attempt(mock_cfg, mock_sleep, tmp_path):
     # create_order called exactly once with type='limit'
     mock_ex.create_order.assert_called_once()
     assert mock_ex.create_order.call_args[0][1] == "limit"
-    # Post-only flag sent
-    assert mock_ex.create_order.call_args[0][5] == {"timeInForce": "PO"}
+    # Post-only flag sent — postOnly=True, NOT timeInForce="PO" (found
+    # 2026-08-26: the latter is invalid on Kraken's real API and was
+    # silently falling back to market every time since 2026-06-22; this
+    # test had been locking in the buggy value along with the code)
+    assert mock_ex.create_order.call_args[0][5] == {"postOnly": True}
     # Maker fee deducted
     assert abs(ex.fees_paid - 0.360) < 1e-6
     # No market-order fallback — fetch_order never needed
@@ -813,7 +816,7 @@ def test_limit_order_po_rejection_retries_with_tighter_offset(mock_cfg, mock_sle
 @patch("time.sleep")
 @patch("bot.execution.live_executor.cfg")
 def test_order_type_limit_buy_uses_post_only_and_bid_price(mock_cfg, mock_sleep, tmp_path):
-    """BUY with order_type='limit' must use price*0.998 and timeInForce=PO."""
+    """BUY with order_type='limit' must use price*0.998 and postOnly=True."""
     mock_cfg.exchange.limit_order_enabled = False  # use simple path, not limit-chase
     ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, order_type="limit", tmp_path=tmp_path)
 

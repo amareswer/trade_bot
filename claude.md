@@ -303,6 +303,37 @@ TAKE_PROFIT_PCT=0.10
 ORDER_TYPE=limit / LIMIT_ORDER_ENABLED=true   # BUY entries limit-chase for maker rate;
                               # ALL SL/TP exits forced to market via urgent=True
 ```
+**Post-only param bug, live 2026-06-22 → found and fixed 2026-08-26.** The limit-chase
+BUY path (`_place_limit_order()`, `bot/execution/live_executor.py`) had been sending
+`{"timeInForce": "PO"}` to request a post-only limit order — ccxt's Kraken adapter passes
+`timeInForce` through nearly verbatim into Kraken's own `timeinforce` field, which only
+accepts `GTC`/`IOC`/`GTD`; `"PO"` isn't one, so Kraken rejected every single attempt with
+`EGeneral:Invalid arguments:timeinforce`, silently falling back to a plain market order
+every time — invisible for over two months because it degrades gracefully (no crash, no
+alert). Found via SOL/CAD's first live fill (2026-08-26, BUY 0.080808 @ $134.02) showing
+exactly this fallback in the log. **Practical effect: every BUY entry (and every non-urgent
+strategy-driven SELL) since 2026-06-22 paid market/taker fees (~0.80%) instead of the
+intended maker fees (~0.25–0.40%)** — the "limit-chase for maker rate" line above was never
+actually true in practice, though the code's *intent* and the rest of the retry/reprice
+logic around it were sound. Fixed: `{"postOnly": True}` (ccxt's actual unified param,
+translates to Kraken's `oflags=post`) — verified two ways before landing: (1) local, no
+real-order-placement proof via `verify_kraken_postonly_param.py` (`ccxt.kraken.
+order_request()`, pure request-dict builder, only network call is the public
+`load_markets()`) showing the buggy call produces both the invalid `timeinforce='PO'` *and*
+a correctly-derived `oflags='post'` — ccxt's own unified layer partially recognizes `"PO"`
+as post-only shorthand, which is *why* the bug was subtle rather than obviously broken —
+while the fixed call produces a clean request with `oflags='post'` and no `timeinforce`
+field at all; (2) a real authenticated `validate=true` round-trip against Kraken's live
+AddOrder endpoint (`verify_kraken_postonly_live_validate.py`, same zero-execution technique
+already used for the trailing-stop feature) — PASS, `id: None` (nothing executed), Kraken's
+own engine echoed back a well-formed `'buy 2.65609 SOLCAD @ limit 138.74'` with no error.
+A sibling, already-correct code path (the non-chase "simple" limit-order path, used when
+`LIMIT_ORDER_ENABLED=false` but `ORDER_TYPE=limit`) already used `{"postOnly": True}`
+correctly — the bug was confined to the limit-chase path alone. Tests: `tests/crypto/
+test_live_executor.py` — 1 test (`test_limit_order_fills_on_first_attempt`) had been
+asserting the buggy value and was silently locking in the bug; corrected to assert
+`{"postOnly": True}`. Suite unaffected in count (666), one assertion fixed. No
+`bot/strategy/*` touched — no walk-forward needed, this is execution-layer only.
 
 ### Risk-gate config (live — RiskManager, `bot/risk/risk_manager.py`)
 ```

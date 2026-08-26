@@ -1,5 +1,6 @@
 """
-regime_monitor.py — BTC/CAD live strategy regime health check (XRP/CAD on watchlist).
+regime_monitor.py — live strategy regime health check for all traded symbols
+(BTC/CAD + SOL/CAD as of 2026-08-25; XRP/CAD on watchlist).
 
 Fetches the last 200 × 1h Kraken candles per symbol and reports four metrics:
 
@@ -33,6 +34,15 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load .env so a STANDALONE run (`python regime_monitor.py`) picks up
+# MONITOR_SYMBOLS/MONITOR_WATCHLIST from it, same as the in-bot subprocess
+# path (which inherits the bot's env and passes MONITOR_SYMBOLS explicitly).
+# Before 2026-08-25 a bare standalone run silently fell back to the BTC/CAD
+# default regardless of what .env said.
+load_dotenv()
 
 from bot.exchanges.retry import fetch_with_retry
 

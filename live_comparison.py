@@ -18,22 +18,35 @@ import sys
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
-# Validated backtest baseline (from CLAUDE.md — 2026-06-19)
+# Validated backtest baseline — the CURRENT canonical strategy fingerprint
+# (CLAUDE.md, hash b30f2f9e769c8d41, re-stamped 2026-08-20 after the
+# self-referential ATR regime-baseline fix; numbers reproduced by running
+# `EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py` on 2026-08-25).
+# This block had drifted: it still carried the 2026-06-19 result (58 trades,
+# PF 1.79) through four subsequent strategy-hash changes — corrected 2026-08-25.
+# If the canonical fingerprint in CLAUDE.md changes again, update this too.
 # ---------------------------------------------------------------------------
 _BASELINE = {
     "symbol":      "BTC/USDT",
     "timeframe":   "4h",
     "candles":     5000,
-    "trades":      58,
-    "win_rate":    0.328,
-    "pf":          1.79,
-    "max_dd_pct":  -5.12,
-    "return_pct":  -4.70,
+    "trades":      31,
+    "win_rate":    0.387,
+    "pf":          2.19,
+    "max_dd_pct":  -1.74,
+    "return_pct":  -0.08,
     "fee_pct":     0.8,
     "stop_loss":   1.5,
     "take_profit": 10.0,
-    "validated":   "2026-06-19",
+    "validated":   "2026-08-20",
 }
+
+# The baseline above is BTC-only (Binance BTC/USDT is the standing walk-forward
+# proxy for live Kraken BTC/CAD — see CLAUDE.md "Exchange Setup"). With more
+# than one live symbol (SOL/CAD added 2026-08-25), blending all fills into one
+# metric set would compare a mixed book against a BTC-only baseline. Fills are
+# therefore filtered to this base asset by default (--base to override).
+_BASELINE_BASE = "BTC"
 
 _GR = "\033[92m"
 _RD = "\033[91m"
@@ -216,13 +229,26 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Live vs Backtest comparison")
     parser.add_argument("--db",         default="logs/trades.db", help="SQLite database path")
     parser.add_argument("--min_trades", type=int, default=10,     help="Minimum fills before showing comparison")
+    parser.add_argument("--base",       default=_BASELINE_BASE,
+                        help="Base asset to compare (fills for other symbols are "
+                             "excluded — the baseline is single-symbol)")
     args = parser.parse_args()
 
-    fills   = _load_fills(args.db)
-    metrics = _compute_live_metrics(fills)
+    all_fills = _load_fills(args.db)
+    base      = args.base.strip().upper()
+    fills     = [f for f in all_fills
+                 if (f["symbol"] or "").split("/")[0].upper() == base]
+    excluded  = len(all_fills) - len(fills)
+    metrics   = _compute_live_metrics(fills)
 
     print(f"\n  Database:    {os.path.abspath(args.db)}")
-    print(f"  Total fills: {len(fills)}  (BUY + SELL)")
+    print(f"  Total fills: {len(all_fills)}  (BUY + SELL)")
+    if excluded:
+        _other = sorted({f["symbol"] for f in all_fills
+                         if (f["symbol"] or "").split("/")[0].upper() != base})
+        print(f"  {_DIM}Comparing {base} fills only ({len(fills)}) — {excluded} fill(s) "
+              f"for other symbols excluded ({', '.join(_other)}): the baseline is "
+              f"{_BASELINE['symbol']}-only. Use --base to compare another symbol.{_R}")
     _print_report(metrics, args.min_trades)
 
 
