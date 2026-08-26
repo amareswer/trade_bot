@@ -174,7 +174,7 @@ need the full narrative behind any decision below.
 
 ## Test Suite Manifest (reconciled 2026-08-18, count updated 2026-08-24)
 
-Expected total: **674 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-26s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later. 2026-08-24: 629→639, +10 for CapitalPool per-symbol slot caps — this line and the table row below were caught stale during a "what's missing" self-audit in the same session that added the tests; the manifest count and the actual suite had already diverged by the time that session's own report was written. Same self-audit then found the config-layer half of that same feature — `_slot_caps_by_base()` — had zero test coverage at all; closed it same-day, 639→647. Then 647→658, +11 for `rescreen.py`'s new USD leg + the `_alert()` nested-config bugfix — new file `tests/crypto/test_rescreen.py`, this script's first-ever test coverage. 2026-08-25: 658→666, +8 for `stock_bot.main._update_ai_health()` — new file `tests/stock/test_ai_health.py`, found during a "what are we missing" review, not a session that was already touching this code. 2026-08-26: 666→674, +8 for the crypto dashboard multi-symbol combine — new file `tests/crypto/test_dashboard_renderer.py`, `bot/dashboard/renderer.py`'s first-ever test coverage, found while fixing the single-symbol dashboard gap SOL/CAD's promotion exposed.)
+Expected total: **676 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-26s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later. 2026-08-24: 629→639, +10 for CapitalPool per-symbol slot caps — this line and the table row below were caught stale during a "what's missing" self-audit in the same session that added the tests; the manifest count and the actual suite had already diverged by the time that session's own report was written. Same self-audit then found the config-layer half of that same feature — `_slot_caps_by_base()` — had zero test coverage at all; closed it same-day, 639→647. Then 647→658, +11 for `rescreen.py`'s new USD leg + the `_alert()` nested-config bugfix — new file `tests/crypto/test_rescreen.py`, this script's first-ever test coverage. 2026-08-25: 658→666, +8 for `stock_bot.main._update_ai_health()` — new file `tests/stock/test_ai_health.py`, found during a "what are we missing" review, not a session that was already touching this code. 2026-08-26: 666→674, +8 for the crypto dashboard multi-symbol combine — new file `tests/crypto/test_dashboard_renderer.py`, `bot/dashboard/renderer.py`'s first-ever test coverage, found while fixing the single-symbol dashboard gap SOL/CAD's promotion exposed. Then 674→676, +2 for the stock bot's RULES-decision log-visibility fix — new file `tests/stock/test_rules_log_visibility.py`, found while answering a "why didn't it buy X" question with no log evidence available to check.)
 
 **Directory layout (2026-08-18):** all 54 files moved out of repo root into `tests/{crypto,stock,shared}/` for
 a cleaner root — 54 files loose alongside `bot/`, `stock_bot/`, `config.py`, etc. had gotten hard to scan.
@@ -258,8 +258,9 @@ now `.parent.parent.parent`. Verified before/after: same 526 collected, same 526
 | `tests/shared/test_telegram_retry.py` | 3 | `TelegramAlerter._send()` retry (added 2026-08-17, closes known-gaps #17): healthy send calls `requests.post` once with no retry, a transient failure recovers on retry, a persistent failure still degrades to a warning-only no-raise after exhausting attempts |
 | `tests/stock/test_ai_health.py` | 8 | `stock_bot.main._update_ai_health()` (added 2026-08-25, closes the stock-bot analog of the 2026-08-15 Kraken-auth-outage gap — nvidia_nim has degraded 3 separate times on this project, each only ever caught by manually testing the API by hand, never by the bot itself): below-threshold silence, trip-at-3-consecutive-fully-failed-cycles alert, no re-alert while still failing, recovery alert + counter reset, healthy-path never touches the notifier, blank-detail formatting; two source-inspection wiring guards — `run()` only evaluates health on a cycle that actually attempted an AI call (`_ai_attempted_n > 0`), and deliberately does NOT wire `_ai_health` into either heartbeat's `healthy_fn` (AI is advisory-only — an outage must not misreport "the bot is down") |
 | `tests/crypto/test_dashboard_renderer.py` | 8 | `bot/dashboard/renderer.py` (added 2026-08-26, first-ever coverage for this module — 0 tests existed before, part of why the single-symbol dashboard gap below went unnoticed): the multi-symbol combine (`write_multi()`, replacing the old single-symbol-only `dashboard.html` render path that left SOL/CAD with zero dashboard visibility after its promotion) — both symbols render on one shared page shell (one `<html>`/`<style>`, not two documents), single-symbol case still works, list order is the render order, the position-protection panel appears only inside the symbol actually holding a position (not leaking across symbol blocks when one is flat and one isn't — the real cross-contamination risk this refactor had to avoid), no panel when flat, fills/fees render for the correct symbol, the single-symbol `write()` wrapper produces equivalent content to `write_multi()` with a one-element list (not a diverging second code path), parent-directory auto-creation |
+| `tests/stock/test_rules_log_visibility.py` | 2 | Wiring guard (added 2026-08-26): the per-symbol `📐 RULES:` decision line (BUY/SELL/HOLD + RSI/ADX/trend/regime — "why did/didn't the bot buy symbol X today") was console-`print()`-only, never reaching `logs/stock_bot.log`, found while answering exactly that question with no log evidence to check. Source-inspection guard confirms `run()` now also `logger.info()`s it, with the symbol name embedded (the console print relies on a separate header line printed just before it for symbol context, which doesn't survive being read out of that order in a log file) |
 
-Run: `python -m pytest --tb=short -q` — must show **674 passed**. (This line had drifted to a
+Run: `python -m pytest --tb=short -q` — must show **676 passed**. (This line had drifted to a
 stale "543 passed" — corrected 2026-08-23 to match the manifest total above, which was
 already at 605 before this session's +2. Not investigated why the two numbers had diverged.
 2026-08-24: 629→639→647 for the CapitalPool per-symbol-cap tests plus the config-layer
@@ -272,7 +273,8 @@ no per-symbol override exists in the environment — test-isolation gap, not a c
 by explicitly `delenv`-ing that key in the test. Count unchanged, still 666.
 2026-08-26: 666→674, +8 for the crypto dashboard multi-symbol combine — new file
 `tests/crypto/test_dashboard_renderer.py`. See "Crypto dashboard — multi-symbol combine"
-below.)
+below. Then 674→676, +2 for the stock bot RULES-decision log-visibility fix — new file
+`tests/stock/test_rules_log_visibility.py`.)
 
 ---
 
@@ -1102,6 +1104,24 @@ at once was worth the larger one):**
 - Tests: `tests/crypto/test_dashboard_renderer.py` (new file, 8 cases — this module's
   first-ever coverage, itself part of why the gap went unnoticed for a full day). Suite
   666→674. No `bot/strategy/*` touched — dashboard/display-layer only, no walk-forward needed.
+
+### Stock bot RULES-decision log visibility (added 2026-08-26)
+The per-symbol rule-signal summary printed every scan cycle (`📐 RULES: BUY/SELL/HOLD` +
+RSI/ADX/trend/regime — `stock_bot/main.py`, `run()`) was `print()`-only, never written to
+`logs/stock_bot.log`. Found when asked "why isn't the stock bot buying other stocks" and
+today's actual market-hours log had zero evidence to check — only whichever terminal
+happened to be running the bot at the time carried that output, and it was gone once that
+terminal's scrollback was gone. Fixed: the same line is now also `logger.info("RULES [%s]:
+...", symbol, ...)`, with the symbol name embedded explicitly — the console `print()` relies
+on a separate header line printed just before it in the same terminal for symbol context,
+which doesn't survive being read out of that visual order in a log file. The adjacent
+SCREEN_SKIP-with-reason path was checked too and was already fine — `screener.py`'s
+`_reason` string already embeds the symbol name and was already `logger.warning()`'d; this
+fix only covers the RULES line, which was the actual gap. Tests: `tests/stock/
+test_rules_log_visibility.py` (new file, 2 cases — source-inspection wiring guards, same
+pattern as the VIX/macro/correlation/AI-health guards elsewhere in this manifest, since
+`run()` needs a live yfinance/IBKR stack to exercise behaviorally). Suite 674→676. No
+`bot/strategy/*` touched — logging-visibility only, no walk-forward needed.
 
 ### Current operational status (as of 2026-07-28)
 - **Crypto bot:** live on Kraken, BTC/CAD ($77 slot cap) + SOL/CAD ($376 slot cap, added

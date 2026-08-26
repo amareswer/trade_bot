@@ -1402,6 +1402,17 @@ def run() -> None:
                     if rule_v.regime:
                         _rv_parts.append(rule_v.regime)
                     print(f"  {'  '.join(_rv_parts)}{_rv_note}")
+                    # Mirrored to the log file (added 2026-08-26) — this line
+                    # used to be console-only (print()), so "why didn't it
+                    # buy symbol X today" was only answerable from whichever
+                    # terminal happened to have the scrollback, not from
+                    # logs/stock_bot.log. Symbol is included here (the print
+                    # above relies on a symbol header printed just before it
+                    # in the console, which doesn't carry over to a log file
+                    # read out of that visual order).
+                    logger.info(
+                        "RULES [%s]: %s%s", symbol, '  '.join(_rv_parts), _rv_note,
+                    )
 
                 # AI exit policy runs on EVERY verdict (a HOLD/BUY verdict
                 # breaks a SELL streak). With rule trading on, AI cannot OPEN
