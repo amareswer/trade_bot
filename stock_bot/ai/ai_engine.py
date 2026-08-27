@@ -1,11 +1,20 @@
 """
 AI analysis engine for the stock bot — multi-provider, advisory only.
 
-Supports four providers (set AI_PROVIDER in stock_bot/.env):
-  nvidia_nim         — nvidia/nemotron-3-ultra-550b-a55b via NVIDIA NIM  (NVIDIA_API_KEY)
-  openrouter         — meta-llama/llama-3.3-70b-instruct:free via openrouter.ai
-  ollama_local       — any Ollama model running locally  (OLLAMA_BASE_URL)
-  ollama_cloud/cloud — any Ollama model via ollama.com   (OLLAMA_CLOUD_API_KEY)
+Providers (set AI_PROVIDER in stock_bot/.env):
+  nvidia_nim         — model from NVIDIA_MODEL, via NVIDIA NIM   (NVIDIA_API_KEY, stock_bot/.env)
+  mistral            — model from MISTRAL_MODEL (default mistral-small-latest),
+                       via api.mistral.ai's free "Experiment" tier  (MISTRAL_API_KEY, root .env)
+  openrouter         — model from OPENROUTER_MODEL, via openrouter.ai  (OPENROUTER_API_KEY, root .env)
+  ollama_local       — any Ollama model running locally   (OLLAMA_BASE_URL)
+  ollama_cloud/cloud — any Ollama model via ollama.com     (OLLAMA_CLOUD_API_KEY)
+
+Auto-failover (opt-in): set AI_FALLBACK_PROVIDER (mistral | openrouter) in the
+root .env. After _FALLBACK_AFTER consecutive API failures the engine switches to
+that provider for the rest of the session and fires (via main.py's per-cycle
+_update_ai_health) a Telegram alert — closes the "manually swap the model on
+every nvidia_nim degradation" gap (4 of those so far, see stock_bot/.env's
+NVIDIA_MODEL history). Off unless AI_FALLBACK_PROVIDER is set.
 
 Failure modes:
   - Missing credentials → returns HOLD, confidence=0, reasoning="AI unavailable"
@@ -60,16 +69,21 @@ def _store_verdict(symbol: str, verdict: AIVerdict) -> None:
     if len(history) > _MEMORY_MAX:
         _signal_memory[key] = history[-_MEMORY_MAX:]
 
-# Load root .env for OPENROUTER_API_KEY — kept separate from stock_bot/.env
+# Load root .env for OPENROUTER_API_KEY / MISTRAL_API_KEY — kept separate from
+# stock_bot/.env (NVIDIA_API_KEY lives there).
 _ROOT_ENV = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..", ".env")
 )
 load_dotenv(dotenv_path=_ROOT_ENV, override=False)
 
-_MODEL       = "meta-llama/llama-3.3-70b-instruct:free"  # OpenRouter default
-_MAX_TOKENS  = 2048
-_TEMPERATURE = 0.3
-_TIMEOUT_S   = 20
+# OpenRouter default — may be stale (their free model roster changes; the
+# 2026-era `...:free` slug 404'd). Override with OPENROUTER_MODEL in root .env.
+_MODEL                 = "meta-llama/llama-3.3-70b-instruct:free"
+_MISTRAL_MODEL_DEFAULT = "mistral-small-latest"
+_MAX_TOKENS   = 2048
+_TEMPERATURE  = 0.3
+_TIMEOUT_S    = 20
+_FALLBACK_AFTER = 5   # consecutive API failures before switching to AI_FALLBACK_PROVIDER
 
 
 def _hold_verdict(symbol: str, reason: str, provider: str = "unavailable") -> AIVerdict:
@@ -208,14 +222,32 @@ class AIEngine:
     def __init__(self) -> None:
         self._ready    = False
         self._provider = os.getenv("AI_PROVIDER", "openrouter").strip().lower()
+        # Auto-failover state (see module docstring). Off unless the env var is set.
+        self._primary_provider     = self._provider
+        self._fallback_provider    = os.getenv("AI_FALLBACK_PROVIDER", "").strip().lower()
+        self._fallback_active      = False
+        self._consecutive_failures = 0
+        self._last_call_failed     = False
 
         if self._provider == "openrouter":
-            self._model   = _MODEL
+            self._model   = os.getenv("OPENROUTER_MODEL", _MODEL).strip()
             api_key       = os.getenv("OPENROUTER_API_KEY", "").strip()
             if not api_key:
                 logger.warning("Stock AI disabled — OPENROUTER_API_KEY not set in root .env")
                 return
             self._base_url = "https://openrouter.ai/api/v1/chat/completions"
+            self._headers  = {
+                "Content-Type":  "application/json",
+                "Authorization": f"Bearer {api_key}",
+            }
+
+        elif self._provider == "mistral":
+            self._model   = os.getenv("MISTRAL_MODEL", _MISTRAL_MODEL_DEFAULT).strip()
+            api_key       = os.getenv("MISTRAL_API_KEY", "").strip()
+            if not api_key:
+                logger.warning("Stock AI disabled — MISTRAL_API_KEY not set in root .env")
+                return
+            self._base_url = "https://api.mistral.ai/v1/chat/completions"
             self._headers  = {
                 "Content-Type":  "application/json",
                 "Authorization": f"Bearer {api_key}",
@@ -254,7 +286,9 @@ class AIEngine:
                     "run: pip install openai"
                 )
                 return
-            self._model    = os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b").strip()
+            # Default is a placeholder — NVIDIA_MODEL is always set in stock_bot/.env
+            # (its value has changed 4x as models hit end-of-life; see that file).
+            self._model    = os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-nano-30b-a3b").strip()
             self._api_key  = api_key
             self._base_url = "https://integrate.api.nvidia.com/v1"
             print(f"  AI provider: nvidia_nim")
@@ -264,7 +298,7 @@ class AIEngine:
         else:
             logger.warning(
                 "Stock AI disabled — unknown AI_PROVIDER=%r "
-                "(valid: openrouter | ollama_local | ollama_cloud | cloud | nvidia_nim)",
+                "(valid: nvidia_nim | mistral | openrouter | ollama_local | ollama_cloud | cloud)",
                 self._provider,
             )
             return
@@ -279,6 +313,10 @@ class AIEngine:
     def _rate_limit_sleep(self) -> None:
         if self._provider == "openrouter":
             time.sleep(4)
+        elif self._provider == "mistral":
+            # Free "Experiment" tier is ~1 req/s. Calls are already sequential
+            # per symbol; 2s keeps a full universe pass comfortably under that.
+            time.sleep(2.0)
         elif self._provider == "nvidia_nim":
             # 2026-07-27: raised from 3.0s after mistral-nemotron hit repeated
             # RateLimitError 429s at 3s spacing (69 of 103 failures in one
@@ -286,66 +324,82 @@ class AIEngine:
             # headroom in practice. 6s keeps a 26-symbol pass under ~7rpm.
             time.sleep(6.0)
 
-    def _fallback_to_openrouter(self) -> None:
-        api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-        if not api_key:
-            logger.warning(
-                "openrouter fallback unavailable — OPENROUTER_API_KEY not set in root .env"
-            )
-            self._ready = False
-            return
-        self._provider = "openrouter"
-        self._model    = _MODEL
-        self._base_url = "https://openrouter.ai/api/v1/chat/completions"
-        self._headers  = {
-            "Content-Type":  "application/json",
-            "Authorization": f"Bearer {api_key}",
-        }
-
-    def _fallback_openrouter(self, symbol: str, prompt: str) -> "AIVerdict":
-        """Switch permanently to openrouter and attempt this symbol's call.
-
-        Sleeps 4s after the call regardless of outcome so the next symbol
-        doesn't flood openrouter either.
+    def _switch_to_fallback(self) -> bool:
+        """Reconfigure the engine to AI_FALLBACK_PROVIDER for the rest of the
+        session. One-way, once. Only HTTP providers (mistral, openrouter) can be
+        a fallback target — ollama_cloud/nvidia_nim use different clients.
+        Returns True iff the switch happened.
         """
-        self._fallback_to_openrouter()
-        if not self._ready:
-            return _hold_verdict(symbol, "AI unavailable")
-        try:
-            payload = {
-                "model":       self._model,
-                "messages":    [{"role": "user", "content": prompt}],
-                "max_tokens":  _MAX_TOKENS,
-                "temperature": _TEMPERATURE,
-            }
-            resp = _requests.post(
-                self._base_url,
-                headers = self._headers,
-                json    = payload,
-                timeout = _TIMEOUT_S,
+        if self._fallback_active or not self._fallback_provider:
+            return False
+        fp = self._fallback_provider
+        if fp == "mistral":
+            key = os.getenv("MISTRAL_API_KEY", "").strip()
+            if not key:
+                logger.warning("AI failover unavailable — MISTRAL_API_KEY not set in root .env")
+                return False
+            self._model    = os.getenv("MISTRAL_MODEL", _MISTRAL_MODEL_DEFAULT).strip()
+            self._base_url = "https://api.mistral.ai/v1/chat/completions"
+        elif fp == "openrouter":
+            key = os.getenv("OPENROUTER_API_KEY", "").strip()
+            if not key:
+                logger.warning("AI failover unavailable — OPENROUTER_API_KEY not set in root .env")
+                return False
+            self._model    = os.getenv("OPENROUTER_MODEL", _MODEL).strip()
+            self._base_url = "https://openrouter.ai/api/v1/chat/completions"
+        else:
+            logger.warning(
+                "AI_FALLBACK_PROVIDER=%r not supported (mistral | openrouter only)", fp,
             )
-            resp.raise_for_status()
-            raw = resp.json()["choices"][0]["message"]["content"] or ""
-        except Exception as exc:
-            logger.warning("openrouter fallback also failed for %s: %s", symbol, exc)
-            time.sleep(4.0)
-            return _hold_verdict(symbol, "AI unavailable")
-        time.sleep(4.0)
-        try:
-            verdict          = _parse(raw, symbol)
-            verdict.symbol   = symbol
-            verdict.provider = "openrouter"
-            logger.info(
-                "AI verdict for %s (openrouter fallback): %s conf=%d style=%s",
-                symbol, verdict.signal, verdict.confidence, verdict.trading_style,
-            )
-            _store_verdict(symbol, verdict)
-            return verdict
-        except Exception as exc:
-            logger.warning("AI parse failed for %s (%s) | raw=%r", symbol, exc, raw[:120])
-            return _hold_verdict(symbol, "AI parse error")
+            return False
+        self._headers = {
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {key}",
+        }
+        logger.error(
+            "AI FAILOVER: %s failed %d consecutive calls — switching to %s (%s) "
+            "for the rest of this session",
+            self._primary_provider, self._consecutive_failures, fp, self._model,
+        )
+        self._provider        = fp
+        self._fallback_active = True
+        self._consecutive_failures = 0
+        return True
 
     def analyze(
+        self,
+        symbol:          str,
+        candle,
+        indicators:      dict,
+        research:        ResearchReport,
+        stop_loss_pct:   float = 0.05,
+        take_profit_pct: float = 0.12,
+    ) -> AIVerdict:
+        """Analyze one symbol → AIVerdict. Never raises. Triggers the one-shot
+        failover to AI_FALLBACK_PROVIDER after _FALLBACK_AFTER consecutive API
+        failures (not parse errors — those are a prompt/model issue a failover
+        won't fix)."""
+        if not self.enabled:
+            return _hold_verdict(symbol, "AI unavailable — provider not configured")
+
+        verdict = self._analyze_once(
+            symbol, candle, indicators, research, stop_loss_pct, take_profit_pct,
+        )
+        if not self._last_call_failed:
+            self._consecutive_failures = 0
+            return verdict
+
+        self._consecutive_failures += 1
+        if (self._consecutive_failures >= _FALLBACK_AFTER
+                and not self._fallback_active
+                and self._switch_to_fallback()):
+            # Retry this same symbol once on the new provider.
+            return self._analyze_once(
+                symbol, candle, indicators, research, stop_loss_pct, take_profit_pct,
+            )
+        return verdict
+
+    def _analyze_once(
         self,
         symbol:          str,
         candle,
@@ -360,6 +414,8 @@ class AIEngine:
         """
         if not self.enabled:
             return _hold_verdict(symbol, "AI unavailable — provider not configured")
+
+        self._last_call_failed = False   # set True only on an API error, not a parse error
 
         prompt = build_prompt(symbol, candle, indicators, research,
                               stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct,
@@ -412,6 +468,7 @@ class AIEngine:
                         "nvidia_nim returned no choices for %s (empty generation "
                         "or content filter) — treating as unavailable", symbol,
                     )
+                    self._last_call_failed = True
                     return _hold_verdict(symbol, "AI returned empty response")
                 # Extract reasoning if present (ignore it)
                 reasoning = getattr(
@@ -453,6 +510,7 @@ class AIEngine:
                 resp.raise_for_status()
                 raw = resp.json()["choices"][0]["message"]["content"] or ""
         except Exception as exc:
+            self._last_call_failed = True
             if self._provider == "nvidia_nim":
                 logger.warning(
                     "nvidia_nim FULL ERROR for %s: %s: %s",

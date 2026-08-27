@@ -169,6 +169,22 @@ suite 697→698.
 **IBKR remaining deferred:** nothing material left — the order path, state save, and reconnect
 probe are all handled. The stock bot's IBKR executor is now readiness-hardened.
 
+**AI auto-failover (Mistral) — BUILT 2026-08-27 (user: "we can use mistral.ai free API
+right" → "yes").** New `mistral` provider in `stock_bot/ai/ai_engine.py` (OpenAI-compatible
+`api.mistral.ai/v1/chat/completions`, free "Experiment" tier — verified via web search:
+~1 req/s, ~1B tokens/mo, no card; ~10x this bot's realistic volume, and beats OpenRouter's
+50/day free cap). One-shot `_switch_to_fallback()`: after `_FALLBACK_AFTER=5` consecutive
+nvidia_nim *API* failures (not parse errors), switch to `AI_FALLBACK_PROVIDER` for the rest of
+the session + retry the current symbol. `_update_ai_health`'s Telegram alert still fires.
+nvidia_nim stays primary. Removed the dead `_fallback_openrouter()`/`_fallback_to_openrouter()`
+(zero callers). Fixed stale model strings; made `OPENROUTER_MODEL` env-configurable;
+`stock_bot/main.py` `_ai_fallback_n` now counts any non-primary provider. Tests: new file `tests/stock/test_ai_failover.py`, 8 cases.
+Suite 698→706. **ACTIVATED same day** — user provided a Mistral key; added to root `.env`
+`MISTRAL_API_KEY` + `stock_bot/.env` `AI_FALLBACK_PROVIDER=mistral` (both gitignored).
+Verified live before enabling: key auth OK, `mistral-small-latest` available, real round-trip
+through `_parse()` → BUY 85 / SELL 90 (correct, ~1.2s). Takes effect on next stock-bot
+restart. Advisory-layer only — no walk-forward.
+
 **IB Gateway + IBC headless deploy — SCOPED + DOCUMENTED 2026-08-27 (not executed).**
 Roadmap item G. Key finding: **no bot code change needed** — `IBKRExecutor` already connects
 by host:port and `_LIVE_PORTS`/docstring already cover Gateway. Pure infra. Written:

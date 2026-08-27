@@ -1386,8 +1386,14 @@ def run() -> None:
                 _liveness.touch()
         _ai_elapsed    = time.time() - _ai_start
         _ai_nvidia_n   = sum(1 for v in ai_verdicts.values() if v.provider == "nvidia_nim")
-        _ai_fallback_n = sum(1 for v in ai_verdicts.values() if v.provider == "openrouter")
         _ai_failed_n   = sum(1 for v in ai_verdicts.values() if v.provider in ("unavailable", "unknown"))
+        # Any non-primary provider that actually answered = a failover verdict
+        # (mistral / openrouter / ollama_*). Primary is nvidia_nim; "skipped" is
+        # gated-out, not attempted.
+        _ai_fallback_n = sum(
+            1 for v in ai_verdicts.values()
+            if v.provider not in ("nvidia_nim", "unavailable", "unknown", "skipped")
+        )
         _ai_attempted_n = _ai_nvidia_n + _ai_fallback_n + _ai_failed_n
         if _ai_attempted_n > 0:
             _ai_consecutive_failures = _update_ai_health(
@@ -1833,7 +1839,12 @@ def run() -> None:
             print(f"  ── AI Summary {'─' * 39}")
             print(f"  ✅ nvidia_nim:   {_ai_nvidia_n} calls succeeded")
             if _ai_fallback_n:
-                print(f"  ⚠️  openrouter:   {_ai_fallback_n} fallbacks used")
+                _fb_prov = next(
+                    (v.provider for v in ai_verdicts.values()
+                     if v.provider not in ("nvidia_nim", "unavailable", "unknown", "skipped")),
+                    "fallback",
+                )
+                print(f"  ⚠️  {_fb_prov}:   {_ai_fallback_n} failover calls used")
             if _ai_failed_n:
                 print(f"  ❌ unavailable:   {_ai_failed_n} failed")
             print(f"  ⏱  Total AI time: {_ai_elapsed:.1f}s")
