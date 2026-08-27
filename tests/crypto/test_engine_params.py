@@ -195,13 +195,19 @@ def test_every_shared_strategy_field_reaches_the_backtest():
 
 
 def test_validation_scripts_use_the_builder():
-    """backtest.py, walkforward.py, and validate_symbol.py must not regrow
-    hand-listed arg drift. validate_symbol.py joined this list 2026-07-30
-    after being found hand-listing its own config block — missing
-    macd_enabled=True (live since 2026-07-20) and the live ATR×2.0 SL (live
-    since 2026-07-17), the same drift class documented above for the other
-    two scripts. So a fourth script can't reopen this gap silently."""
-    for script in ("backtest.py", "walkforward.py", "validate_symbol.py"):
+    """backtest.py, walkforward.py, validate_symbol.py, and screen_universe.py
+    must not regrow hand-listed arg drift. validate_symbol.py joined this
+    list 2026-07-30 after being found hand-listing its own config block —
+    missing macd_enabled=True (live since 2026-07-20) and the live ATR×2.0 SL
+    (live since 2026-07-17), the same drift class documented above for the
+    other two scripts. screen_universe.py joined 2026-08-26 for the identical
+    reason — found hand-listing its own kwargs, missing macd_enabled + the 7
+    Mode A/B entry params + atr_risk_sizing/atr_sizing_baseline_sl_pct, this
+    time caught by a live disagreement with validate_symbol.py over LINK/USD's
+    walk-forward verdict (PASS under the stale kwargs, FAIL under the correct
+    ones) rather than by this test — which is exactly why it's added now, so
+    a fifth script can't reopen this gap silently again."""
+    for script in ("backtest.py", "walkforward.py", "validate_symbol.py", "screen_universe.py"):
         source = (REPO_ROOT / script).read_text()
         assert "engine_kwargs_from_cfg" in source, (
             f"{script} no longer uses engine_kwargs_from_cfg() — "

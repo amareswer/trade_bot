@@ -2541,3 +2541,60 @@ modified, `tests/crypto/test_rescreen.py` new — no other files in the code dif
 both corrected to describe what the code now actually does, plus a new "Automated USD
 re-screen" subsection with the full load-impact numbers. Full trail:
 `.memory/decisions/multi-symbol-validation.md`.
+
+### screen_universe.py's own engine-kwargs drift bug — found and fixed 2026-08-26
+
+Surfaced while manually re-verifying "other coins" (DOGE, XRP, ETH, PEPE, XDC, LINK, SYN) at
+the user's request, using `validate_symbol.py` symbol-by-symbol, then cross-checking with a
+fresh full-universe `screen_universe.py` run (CAD + USD legs) to see if anything wider existed.
+The two scripts disagreed on LINK/USD: `validate_symbol.py` said FAIL (5000c PF 0.98);
+`screen_universe.py` said PASS (5000c PF 1.38). Same underlying Binance LINK/USDT candles,
+same nominal strategy hash — they should never disagree.
+
+**Root cause: `screen_universe.py`'s `_run_window()` hand-listed its own `engine.run()` kwargs
+instead of using the shared `engine_kwargs_from_cfg()` builder** (`bot/backtest/params.py`) —
+exactly the anti-pattern that builder's own docstring exists to prevent, and the same drift
+class already fixed in `validate_symbol.py` on 2026-07-30. Diffing the two kwarg lists found
+9 missing fields: `macd_enabled` (live since 2026-07-20), all 7 Mode A/B entry params
+(`pullback_rsi_min/max`, `breakout_rsi_min/max`, `breakout_lookback`,
+`max_price_extension_pct`, `breakout_adx_threshold` — live since 2026-07-20 alongside
+macd_enabled), and `atr_risk_sizing`/`atr_sizing_baseline_sl_pct`. `screen_universe.py` had
+never been updated when `validate_symbol.py` got this same fix — it was validating a more
+permissive, no-MACD-confirmation, no-Mode-A/B strategy shape than what's actually live, for
+every walk-forward it has ever run since 2026-07-20.
+
+**Practical exposure, traced before assuming the worst:** despite the bug existing for over a
+month, no actual promotion decision was made on a false result. The CAD leg only ever has ≤2
+non-decided candidates (PEPE, XDC), both hard liquidity fails regardless of strategy kwargs —
+the bug never reached the walk-forward stage for CAD. The USD leg's automation
+(`rescreen.py`'s `SCREEN_QUOTE=USD` call) wasn't added until 2026-08-24, and the monthly
+scheduler hadn't fired with it even once before this fix (next fire ~2026-09-01) — so no
+automated USD report was ever generated or acted on under the buggy kwargs either. The only
+manual ad-hoc USD screens on record (`screen_results_usd_20260703.md`,
+`screen_results_usd_20260716.md`) both predate the 2026-07-20 macd_enabled/Mode-A/B addition
+that created the drift in the first place, so they aren't "wrong" relative to what existed
+when they ran. This bug was caught before it ever produced an acted-upon result — not a
+retroactive correction of a real decision.
+
+**Fix:** `screen_universe.py`'s `_run_window()` now calls `engine_kwargs_from_cfg(cfg)` and
+overrides only `symbol`/`timeframe`/`fee_pct`/`max_drawdown_pct` per window, same pattern as
+`validate_symbol.py`'s `run_backtest_window()`. Re-ran the full USD screen before/after the
+fix to see the concrete effect: LINK/USD flipped PASS→FAIL (the false positive that surfaced
+the bug), PENGU/USD flipped FAIL→PASS (1.09→1.32 on the full window) — confirming this is a
+genuine two-different-strategies difference, not a one-directional bias. PUMP/USD passed
+cleanly both times (PF 1.83–2.04 across all three windows, 20–29% SL rate) and is now the one
+fresh, still-standing USD candidate from this pass — informational only, not promoted (same
+full precondition list as SYN/USD: its own capital, FX-conversion accounting, and Kraken
+liquidity/spread re-check before it could ever be considered).
+
+**Regression guard:** `test_validation_scripts_use_the_builder()`
+(`tests/crypto/test_engine_params.py`) — which already source-inspects backtest.py,
+walkforward.py, and validate_symbol.py for `engine_kwargs_from_cfg` usage — is exactly the
+test that should have caught this, and didn't, because `screen_universe.py` was never added
+to its script list. Added now. Suite count unchanged (extends an existing test, not a new
+one); docstring updated to record why a 4th script needed adding reactively instead of being
+caught proactively.
+
+**No `bot/strategy/*` touched, no hash change, no walk-forward re-stamp needed** — this was a
+validation-tooling bug (what config a screen tests against), not a change to the strategy
+itself. `UNIVERSE_WHITELIST`/`.env` untouched throughout.

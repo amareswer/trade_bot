@@ -42,6 +42,7 @@ from pathlib import Path
 import ccxt
 
 from config import cfg
+from bot.backtest.params import engine_kwargs_from_cfg
 from bot.data.historical_feed import fetch_candles_paginated
 from bot.backtest import engine, metrics as metrics_mod
 from bot.strategy.fingerprint import compute_strategy_hash
@@ -194,44 +195,23 @@ def _run_window(candles: list, n: int) -> dict:
     if len(window) < 100:
         return {"trades": 0, "pf": 0.0, "sl_rate": 0.0, "usable": False}
 
-    result = engine.run(
-        candles                  = window,
-        symbol                   = "SCREEN",
-        timeframe                = SCREEN_TIMEFRAME,
-        strategy_mode            = cfg.strategy.mode,
-        starting_cash            = cfg.portfolio.starting_cash,
-        risk_per_trade_pct       = cfg.risk.risk_per_trade_pct,
-        fee_pct                  = SCREEN_FEE,
-        cooldown_ticks           = cfg.risk.cooldown_ticks,
-        rsi_period               = cfg.strategy.rsi_period,
-        rsi_oversold             = cfg.strategy.rsi_oversold,
-        rsi_overbought           = cfg.strategy.rsi_overbought,
-        fast_ema_period          = cfg.strategy.fast_ema_period,
-        slow_ema_period          = cfg.strategy.slow_ema_period,
-        adx_period               = cfg.strategy.adx_period,
-        adx_threshold            = cfg.strategy.adx_threshold,
-        adx_max                  = cfg.strategy.adx_max,
-        min_ema_spread_pct       = cfg.strategy.min_ema_spread_pct,
-        max_ema_spread_pct       = cfg.strategy.max_ema_spread_pct,
-        rsi_filter_enabled       = cfg.strategy.rsi_filter_enabled,
-        buy_threshold            = cfg.strategy.buy_threshold,
-        sell_threshold           = cfg.strategy.sell_threshold,
-        max_position_pct         = cfg.risk.max_position_pct,
-        daily_loss_limit_pct     = cfg.risk.daily_loss_limit_pct,
-        max_drawdown_pct         = 0.25,
-        max_trades_per_day       = cfg.risk.max_trades_per_day,
-        stop_loss_pct            = cfg.backtest.stop_loss_pct,
-        take_profit_pct          = cfg.backtest.take_profit_pct,
-        trail_stop_pct           = cfg.backtest.trail_stop_pct,
-        trail_stop_activation_pct= cfg.backtest.trail_stop_activation_pct,
-        partial_tp_pct           = cfg.backtest.partial_tp_pct,
-        partial_tp_size          = cfg.backtest.partial_tp_size,
-        regime_ema_period        = cfg.strategy.regime_ema_period,
-        regime_ema_slope_filter  = cfg.strategy.regime_ema_slope_filter,
-        volume_k                 = cfg.strategy.volume_k,
-        atr_volatile_multiplier  = cfg.strategy.atr_volatile_multiplier,
-        atr_sl_mult              = cfg.backtest.atr_sl_mult,
+    # Full live config (MACD, ATR SL/sizing, Mode A/B entry params, everything)
+    # via the shared builder — only the per-run symbol/timeframe/fee are
+    # overridden. Previously hand-listed here and had drifted from the live
+    # strategy (missing macd_enabled, the 7 Mode A/B entry params, and
+    # atr_risk_sizing/atr_sizing_baseline_sl_pct) — the same drift class
+    # bot/backtest/params.py's docstring documents for backtest.py/
+    # walkforward.py, and validate_symbol.py was already fixed for on
+    # 2026-07-30. Fixed 2026-08-27 after a same-session cross-check showed
+    # this script and validate_symbol.py disagreeing on LINK/USD's verdict.
+    kwargs = engine_kwargs_from_cfg(cfg)
+    kwargs.update(
+        symbol           = "SCREEN",
+        timeframe        = SCREEN_TIMEFRAME,
+        fee_pct          = SCREEN_FEE,
+        max_drawdown_pct = 0.25,
     )
+    result = engine.run(candles=window, **kwargs)
 
     m        = metrics_mod.compute(result)
     sells    = [f for f in result.fills if f.side == "SELL"]

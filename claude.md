@@ -239,7 +239,7 @@ now `.parent.parent.parent`. Verified before/after: same 526 collected, same 526
 | `tests/stock/test_stock_atr_sizing.py` | 7 | Stock-bot analog: `StockConfig.calc_shares_atr_risk` (whole-share sizing) — same invariant, opt-in via PAPER_ATR_SIZING_ENABLED (default false) |
 | `tests/stock/test_stock_telegram.py` | 7 | Stock→Telegram relay: root-.env credential sourcing, ops_alert/fill forwarding, HIGH-only filter, channel-off no-ops |
 | `tests/shared/test_crash_hardening.py` | 9 | atomic_write_json (valid/replace/no-tmp/parents/old-file-preserved), send_now sync + disabled, crash-alert helpers never raise |
-| `tests/crypto/test_engine_params.py` | 8 | `engine_kwargs_from_cfg` builder: keys accepted by engine.run, ATR keys sourced from cfg, previously-drifted keys present, macd_enabled + Mode A/B entry params sourced from cfg, generic parity test (every StrategyConfig∩IndicatorConfig field reaches the backtest), both validation scripts use the builder |
+| `tests/crypto/test_engine_params.py` | 8 | `engine_kwargs_from_cfg` builder: keys accepted by engine.run, ATR keys sourced from cfg, previously-drifted keys present, macd_enabled + Mode A/B entry params sourced from cfg, generic parity test (every StrategyConfig∩IndicatorConfig field reaches the backtest), validation scripts use the builder — now 4 scripts (backtest.py, walkforward.py, validate_symbol.py, and `screen_universe.py` added 2026-08-26 after it was caught hand-listing stale kwargs — see CLAUDE_HISTORY.md) |
 | `tests/stock/test_alert_evaluator.py` | 4 | AlertEvaluator EARNINGS_SOON: held-vs-not-held priority/message, live-executor-only held-position source (no static PORTFOLIO tracker) |
 | `tests/crypto/test_crypto_telegram.py` | 2 | TelegramAlerter.fill() reason line: included when given, omitted when absent |
 | `tests/shared/test_liveness.py` | 7 | LivenessTracker (bot/alerts/liveness.py): touch/is_alive/staleness boundary, simulated hang between touches |
@@ -1303,19 +1303,19 @@ pattern as the VIX/macro/correlation/AI-health guards elsewhere in this manifest
 ### Watchlist (not yet tradeable — monitored for re-validation)
 | Symbol | Status | Reason |
 |--------|--------|--------|
-| XRP/CAD | WATCHLIST | Walk-forward failed on current Mode A/B strategy: 87% SL-exit rate. Re-entry requires a full 3-window walk-forward pass on current strategy code. |
+| XRP/CAD | WATCHLIST | Walk-forward failed on current Mode A/B strategy: 87% SL-exit rate. Re-entry requires a full 3-window walk-forward pass on current strategy code. Re-verified 2026-08-26 via `validate_symbol.py XRP`: still fails (5000c PF 0.99, 3000c PF 0.50); Kraken liquidity also now narrowly fails on spread alone (0.18% vs 0.15% max, volume itself is fine at $709k). |
 
 ### Blocked (walk-forward failed)
 | Symbol | Status | Reason |
 |--------|--------|--------|
-| DOGE/CAD | BLOCKED | Walk-forward failed at corrected 0.8% fee on all windows. |
-| ETH/CAD | BLOCKED | Walk-forward failed on all windows; no edge on ETH over the full 2024–2026 period. |
+| ETH/CAD | BLOCKED | Walk-forward failed on all windows; no edge on ETH over the full 2024–2026 period. Re-verified 2026-08-26 via `validate_symbol.py ETH`: still fails (5000c PF 0.67); Kraken liquidity itself is clean (passes both volume and spread) — this is purely a strategy-edge failure, not a market-structure one. |
 
 ### Screened out — liquidity gate
 | Symbol | 24h Vol (CAD) | Gate | Reason |
 |--------|--------------|------|--------|
-| PEPE/CAD | $1,659 | $50,000 | Failed liquidity gate — walk-forward not run |
-| XDC/CAD | $10,288 | $50,000 | Failed liquidity gate — walk-forward not run |
+| DOGE/CAD | $6,228 | $50,000 | **Moved here 2026-08-26** (was miscategorized under "Blocked (walk-forward failed)" — that reason had gone stale). Fresh `validate_symbol.py DOGE` run: Kraken liquidity now fails hard (volume $6,228 vs $50k required, spread 1.01% vs 0.15% max) — but walk-forward on the current strategy code actually **passes** the two reliable windows (5000c PF 1.41, 3000c PF 1.42; only the 1000c window is unreliable at 5 trades). The blocker today is market structure (Kraken's DOGE/CAD order book is too thin/wide), not strategy edge — re-check liquidity before re-litigating this if Kraken volume ever recovers. |
+| PEPE/CAD | $941 (was $1,659) | $50,000 | Failed liquidity gate — re-verified 2026-08-26: volume dropped further, spread now also checked (1.52%, fails). Walk-forward also now run (wasn't before) and fails too (5000c PF 0.82, 3000c PF 0.81) — no edge here even setting liquidity aside. |
+| XDC/CAD | $25,709 (was $10,288) | $50,000 | Failed liquidity gate — re-verified 2026-08-26: volume roughly doubled but still well under the gate; spread also fails (0.34%). Walk-forward still can't be run — no XDC/USDT market on Binance. |
 
 ### Implementation
 - `.env`: `UNIVERSE_WHITELIST=BTC/CAD,SOL/CAD` (SOL/CAD added 2026-08-25)
@@ -1664,6 +1664,25 @@ most) had been silently raising `AttributeError`, caught and reduced to a consol
 reads, since this runs unattended. Fixed; the monthly markdown report itself was never affected by
 this, only the Telegram push. Tests: `tests/crypto/test_rescreen.py` (new file, 11 cases). Full
 trail: CLAUDE_HISTORY.md, `.memory/decisions/multi-symbol-validation.md`.
+
+**`screen_universe.py` engine-kwargs drift bug — found and fixed 2026-08-26.** The script this
+whole automated leg depends on had been hand-listing its own `engine.run()` kwargs instead of
+using the shared `engine_kwargs_from_cfg()` builder, missing `macd_enabled`, all 7 Mode A/B
+entry params, and `atr_risk_sizing`/`atr_sizing_baseline_sl_pct` — every walk-forward it ran
+since 2026-07-20 was validating a more permissive strategy shape than what's actually live.
+Caught via a live disagreement with `validate_symbol.py` over LINK/USD (PASS under the stale
+kwargs vs. FAIL under the correct ones). Traced impact: no automated USD report had actually
+run yet under this bug (the leg above was only added 2026-08-24, monthly scheduler hadn't
+fired since), and the CAD leg's only 2 non-decided candidates (PEPE, XDC) fail on liquidity
+before ever reaching the walk-forward step — so no past promotion decision was made on a false
+result. Fixed to use the shared builder, same pattern as `validate_symbol.py`. Re-running the
+USD screen before/after confirmed a real, two-directional effect (not a one-sided bug):
+LINK/USD flipped PASS→FAIL, PENGU/USD flipped FAIL→PASS. Current fresh USD candidate:
+**PUMP/USD** (PF 1.83–2.04 across all 3 windows, 20–29% SL rate, $6.2M/day volume) —
+informational only, not promoted; same full precondition list as SYN/USD applies before it
+could ever be considered. `test_validation_scripts_use_the_builder()`
+(`tests/crypto/test_engine_params.py`) — which should have caught this — now also covers
+`screen_universe.py`. Full trail: CLAUDE_HISTORY.md.
 
 ### Re-screen triggers
 - Strategy code change (new hash after walk-forward) — re-screen all alts before assuming new results
