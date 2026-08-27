@@ -16,6 +16,7 @@ Keep alive on Mac:
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import logging.handlers
 import os
@@ -810,8 +811,34 @@ def _run_news_scan(symbols: list[str]) -> None:
 # Main loop
 # ---------------------------------------------------------------------------
 
-_last_universe_refresh = None                                        # datetime | None
-_UNIVERSE_REFRESH_HOUR = int(_os.getenv("UNIVERSE_REFRESH_HOUR", "16"))  # 4pm ET default
+_last_universe_refresh = None                                        # datetime | None — last SUCCESSFUL daily refresh
+_last_universe_attempt = None                                        # datetime | None — throttles failed retries
+_UNIVERSE_REFRESH_HOUR = int(_os.getenv("UNIVERSE_REFRESH_HOUR", "16"))  # legacy — refresh is now first-LIVE-cycle-of-day, not a fixed hour
+_UNIVERSE_RETRY_COOLDOWN_S = 900   # min seconds between top-movers pre_filter attempts while it keeps failing
+_MOVERS_STATE_FILE = _os.path.join(_os.path.dirname(__file__), "universe_movers.json")
+
+
+def _load_persisted_movers(today_iso: str) -> list[str]:
+    """Today's persisted top-movers list, or [] if the file is missing, stale
+    (different date), or unreadable. Lets a restart keep the wider scan universe
+    instead of dropping back to watchlist-only until the next daily refresh."""
+    try:
+        with open(_MOVERS_STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("date") == today_iso and isinstance(data.get("movers"), list):
+            return [str(s) for s in data["movers"]]
+    except (OSError, ValueError, TypeError):
+        pass
+    return []
+
+
+def _persist_movers(today_iso: str, movers: list[str]) -> None:
+    """Best-effort — a write failure never blocks the scan loop."""
+    try:
+        from bot.atomic_json import atomic_write_json
+        atomic_write_json(_MOVERS_STATE_FILE, {"date": today_iso, "movers": list(movers)})
+    except Exception as exc:                                   # noqa: BLE001
+        logger.warning("Could not persist universe movers: %s", exc)
 
 
 def _handle_sigterm(sig, frame):
@@ -821,7 +848,7 @@ def _handle_sigterm(sig, frame):
 
 
 def run() -> None:
-    global _last_universe_refresh
+    global _last_universe_refresh, _last_universe_attempt
     _setup_logging()
     _signal_module.signal(_signal_module.SIGTERM, _handle_sigterm)
     cfg = load()
@@ -841,6 +868,16 @@ def run() -> None:
     else:
         _universe = None
     top_movers: list[str] = []
+
+    # Restore today's top-movers across a restart so the bot doesn't drop back to
+    # watchlist-only until the next daily refresh (it restarts often — VPS deploys,
+    # config changes, incident recovery).
+    if _universe is not None:
+        _today_et = datetime.now(_pytz.timezone("US/Eastern")).date().isoformat()
+        top_movers = _load_persisted_movers(_today_et)
+        if top_movers:
+            _last_universe_refresh = datetime.now(_pytz.timezone("US/Eastern"))
+            logger.info("Universe: restored %d persisted movers for %s", len(top_movers), _today_et)
 
     all_symbols = list(dict.fromkeys(watchlist_symbols + top_movers))
 
@@ -929,8 +966,8 @@ def run() -> None:
     print(f"  {'─' * 45}")
     print(f"  My Watchlist : {', '.join(watchlist_symbols)}")
     if cfg.universe_enabled:
-        print(f"  Universe     : S&P500 + TSX60 → top {cfg.universe_size} movers (refreshes at {_UNIVERSE_REFRESH_HOUR}:00 ET)")
-        print(f"  Top Movers   : {', '.join(top_movers) if top_movers else '(waiting for first refresh)'}")
+        print(f"  Universe     : S&P500 + TSX60 → top {cfg.universe_size} movers (refreshes on the first scan cycle each day)")
+        print(f"  Top Movers   : {', '.join(top_movers) if top_movers else '(restoring / first refresh pending)'}")
     print(f"  Screener  : {'enabled' if screener else 'disabled'}")
     print(f"  Interval  : {cfg.interval}   Lookback: {cfg.lookback_days}d   Loop: {cfg.loop_interval}s")
     if ai_engine and ai_engine.enabled:
@@ -1209,30 +1246,46 @@ def run() -> None:
         print(f"  {'Symbol':<10}  {'Price':>10}  {'RSI':^7}  {'Trend':<10}  {'ADX':^13}  MACD")
         print(f"  {'─'*10}  {'─'*10}  {'─'*7}  {'─'*10}  {'─'*13}  {'─'*30}")
 
-        # Refresh universe once per day at UNIVERSE_REFRESH_HOUR ET
+        # Refresh the top-movers universe once per trading day, on the first
+        # LIVE scan cycle of the day.
+        #
+        # This used to be gated on the ET clock hour matching
+        # _UNIVERSE_REFRESH_HOUR (16), which was UNREACHABLE: this block only
+        # runs in LIVE mode (market open), but by 16:00 ET the market is closed
+        # and the loop is already in AFTER_HOURS mode and has `continue`d.
+        # Result: the refresh never fired and the bot ran watchlist-only
+        # indefinitely (found 2026-08-27 — 179 "waiting" log lines, 0
+        # "refreshed", across 3 days). pre_filter ranks on 30-day daily bars /
+        # 5-day momentum / 20-day avg volume, so a partial current-day candle is
+        # immaterial and a mid-session refresh is fine.
         if cfg.universe_enabled and _universe is not None:
-            if (now_et.hour == _UNIVERSE_REFRESH_HOUR
-                    and (_last_universe_refresh is None
-                         or _last_universe_refresh.date() != now_et.date())):
+            _needs_refresh = (_last_universe_refresh is None
+                              or _last_universe_refresh.date() != now_et.date())
+            _retry_ok = (_last_universe_attempt is None
+                         or (now_et - _last_universe_attempt).total_seconds() >= _UNIVERSE_RETRY_COOLDOWN_S)
+            if _needs_refresh and _retry_ok:
+                _last_universe_attempt = now_et
                 raw_symbols = _universe.get_universe()
-                top_movers  = _universe.pre_filter(raw_symbols, cfg.universe_size, market_status=market_status)
-                all_symbols = list(dict.fromkeys(watchlist_symbols + top_movers))
-                # Only mark today's refresh done when pre_filter returned real scored data.
-                # Fallback symbols mean the circuit breaker was active — leave
-                # _last_universe_refresh unset so the bot retries every cycle until real
-                # data arrives instead of running on stale fallback symbols for 24h.
+                _fresh = _universe.pre_filter(raw_symbols, cfg.universe_size, market_status=market_status)
                 _fallback_slice = list(_UNIVERSE_FALLBACK[:cfg.universe_size])
-                if top_movers != _fallback_slice:
+                if _fresh and _fresh != _fallback_slice:
+                    top_movers  = _fresh
+                    all_symbols = list(dict.fromkeys(watchlist_symbols + top_movers))
                     _last_universe_refresh = now_et
+                    _persist_movers(now_et.date().isoformat(), top_movers)
+                    logger.info("Universe refreshed: %d movers — %s",
+                                len(top_movers), ", ".join(top_movers))
+                    print(f"  Universe refreshed: {len(top_movers)} movers")
+                    print(f"  My Watchlist : {', '.join(watchlist_symbols)}")
+                    print(f"  Top Movers   : {', '.join(top_movers)}")
                 else:
+                    # Keep whatever top_movers we already had (persisted or from a
+                    # prior success) — a transient pre_filter failure must not wipe
+                    # the scan universe. Retries are throttled by _retry_ok above.
                     logger.warning(
-                        "Universe refresh returned fallback symbols — will retry next cycle"
+                        "Universe refresh returned no/fallback symbols — keeping %d "
+                        "existing movers, retry in %ds", len(top_movers), _UNIVERSE_RETRY_COOLDOWN_S
                     )
-                print(f"  Universe refreshed: {len(top_movers)} new movers")
-                print(f"  My Watchlist : {', '.join(watchlist_symbols)}")
-                print(f"  Top Movers   : {', '.join(top_movers)}")
-            elif not top_movers:
-                logger.info("Universe: waiting for %d:00 ET refresh", _UNIVERSE_REFRESH_HOUR)
 
         watchlist_set = set(cfg.watchlist)
         # Held positions must always stay in the scan and bypass the screener:

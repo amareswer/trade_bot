@@ -66,3 +66,13 @@ def _block_real_stock_bot_file_writes(tmp_path, monkeypatch):
                 monkeypatch.setattr(_mod, _attr, str(tmp_path / f"{_prefix}_{_attr}.default"))
         if hasattr(_mod, "_RESET_FLAG"):
             monkeypatch.setattr(_mod, "_RESET_FLAG", str(tmp_path / f"{_prefix}_reset.default"))
+
+    # stock_bot/main.py persists the daily top-movers universe here; redirect it
+    # so a test exercising that path can't touch the real file (same rationale
+    # as the settlement-CSV redirect above).
+    try:
+        import stock_bot.main as _main_mod
+        monkeypatch.setattr(_main_mod, "_MOVERS_STATE_FILE",
+                            str(tmp_path / "universe_movers.default.json"))
+    except Exception:
+        pass

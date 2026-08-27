@@ -65,3 +65,4 @@ stock_bot/ibkr_trades.csv
 stock_bot/ibkr_state.json
 stock_bot/paper_trades_settlement.csv
 stock_bot/ibkr_trades_settlement.csv
+stock_bot/universe_movers.json
