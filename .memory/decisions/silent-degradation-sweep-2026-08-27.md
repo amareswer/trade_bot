@@ -196,8 +196,18 @@ tick, SOL/CAD closed +$1.27/+10.9% (fill #2, first round-trip). **Fix:**
 `LiveExecutor.execute()` cancels any resting native stop BEFORE a SELL (all 3 exit paths, at
 the executor layer); rejected SELL → `_rearm_native_stop_after_failed_sell()` re-places a
 static stop at its prior level (trailing → "NAKED POSITION" alert, trailing is dormant).
-Tests +3 (`test_live_executor.py` 65→68). Suite 706→709. No `bot/strategy/*`. **REQUIRES a
-crypto-bot restart** — running process (PID 47305, from 09:16) has the buggy code.
+Tests +3 (`test_live_executor.py` 65→68). Suite 706→709. No `bot/strategy/*`. Restarted ~13:xx.
+
+**Post-mortem (user: "how would we know this on a VPS?"):** the deadlock rejected ~200 exits
+over 8 min with ZERO Telegram alert. Two gaps fixed:
+1. `bot/main.py` SL/TP block had no `else` for a rejected/None urgent exit — silent retry
+   loop. Now edge-escalated `alerter.error()` via `ss['exit_fail_count']` (1st/3rd/10th/then
+   every 20th). Strategy-SELL path already alerted; only SL/TP-family was silent.
+2. `TelegramAlerter.error()`/`.message()` had no throttle — identical body within 600s now
+   suppressed. Stuck loop → 1 page not 200.
+Tests: `test_crypto_telegram.py` +4, new `test_exit_fail_alert.py` +3. Suite 712→719.
+**Still open for VPS-readiness (not built):** scheduled health digest, generic stuck-loop
+detector, remote-reachable dashboards.
 
 **IB Gateway + IBC headless deploy — SCOPED + DOCUMENTED 2026-08-27 (not executed).**
 Roadmap item G. Key finding: **no bot code change needed** — `IBKRExecutor` already connects

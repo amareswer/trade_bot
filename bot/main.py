@@ -1342,6 +1342,7 @@ def run():
                 # the raw signal is no longer BUY. Not persisted — resets on
                 # restart (same as the other per-process flags above).
                 'last_buy_block_alert': "",
+                'exit_fail_count': 0,   # consecutive failed urgent SL/TP exits (edge-alert)
             }
             logger.info("Symbol ready: %s", sym)
 
@@ -1386,6 +1387,7 @@ def run():
             'dash_filter':      "",
             'dash_block':       "",
             'last_buy_block_alert': "",   # edge-trigger for the blocked-BUY alert
+            'exit_fail_count': 0,         # consecutive failed urgent SL/TP exits (edge-alert)
         }
 
     # ── Restart recovery ──────────────────────────────────────────────────────
@@ -2044,6 +2046,32 @@ def run():
                                     exchange    = cfg.exchange.exchange,
                                     reason      = _ic_reason_label,
                                 )
+                                ss['exit_fail_count'] = 0
+                            else:
+                                # The urgent SL/TP exit did NOT go through
+                                # (rejected / unconfirmed / exception). This is
+                                # an emergency — the position is stuck and the
+                                # stop/target can't be honoured. Silent until
+                                # 2026-08-27: the native-stop deadlock rejected
+                                # 200 exits over 8 min with zero alert. Edge-
+                                # escalated (1st, 3rd, 10th, then every 20th
+                                # failure) so a persistent problem keeps nagging
+                                # without spamming every ~30s tick.
+                                ss['exit_fail_count'] += 1
+                                _n = ss['exit_fail_count']
+                                _rr = getattr(_ic_order, 'reject_reason', None) or "no order returned"
+                                _fail_kind = "STOP-LOSS" if _ic_sl else "TAKE-PROFIT"
+                                logger.error(
+                                    "SL/TP EXIT FAILED [%s] #%d (%s): %s (price=%.2f)",
+                                    sym, _n, _fail_kind, _rr, price,
+                                )
+                                if _n in (1, 3, 10) or _n % 20 == 0:
+                                    alerter.error(
+                                        f"SL/TP EXIT FAILED [{sym}] ({_n} consecutive): {_rr}. "
+                                        f"Price {price:,.2f}, entry {_ic_entry:,.2f}. The "
+                                        f"position is stuck — the stop/target cannot execute. "
+                                        f"Check Kraken for a resting order holding the balance."
+                                    )
                         else:
                             logger.warning(
                                 "SL/TP SELL halted (RISK_HALT_BLOCKS_STOPS=true) [%s]", sym,

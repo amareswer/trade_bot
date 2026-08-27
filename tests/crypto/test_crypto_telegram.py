@@ -47,6 +47,47 @@ def test_fill_omits_reason_line_when_absent():
     assert "Reason:" not in text
 
 
+# ---------------------------------------------------------------------------
+# Duplicate-alert throttle (2026-08-27): a stuck retry loop rejected 200
+# identical exits over 8 min — error()/message() must page once, not 200x.
+# ---------------------------------------------------------------------------
+
+def test_error_suppresses_identical_message_within_window():
+    t = TelegramAlerter("123:fake", "42", enabled=True)
+    with patch.object(t, "_send_async") as mock_send:
+        t.error("SL/TP EXIT FAILED [SOL/CAD]: Insufficient funds")
+        t.error("SL/TP EXIT FAILED [SOL/CAD]: Insufficient funds")
+        t.error("SL/TP EXIT FAILED [SOL/CAD]: Insufficient funds")
+        assert mock_send.call_count == 1
+
+
+def test_error_sends_a_different_message():
+    t = TelegramAlerter("123:fake", "42", enabled=True)
+    with patch.object(t, "_send_async") as mock_send:
+        t.error("problem A")
+        t.error("problem B")
+        assert mock_send.call_count == 2
+
+
+def test_error_resends_after_the_throttle_window():
+    import bot.alerts.telegram as tg
+    t = TelegramAlerter("123:fake", "42", enabled=True)
+    with patch.object(t, "_send_async") as mock_send:
+        t.error("recurring problem")
+        # fast-forward past the window by ageing the dedup entry
+        t._dup_seen = {k: v - tg._DUP_ALERT_THROTTLE_S - 1 for k, v in t._dup_seen.items()}
+        t.error("recurring problem")
+        assert mock_send.call_count == 2
+
+
+def test_message_also_deduplicates():
+    t = TelegramAlerter("123:fake", "42", enabled=True)
+    with patch.object(t, "_send_async") as mock_send:
+        t.message("IBKR data sync failing")
+        t.message("IBKR data sync failing")
+        assert mock_send.call_count == 1
+
+
 if __name__ == "__main__":
     import sys
     failures = 0

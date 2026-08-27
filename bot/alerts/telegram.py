@@ -24,12 +24,18 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from datetime import datetime
 from typing import Optional
 
 from bot.exchanges.retry import fetch_with_retry
 
 logger = logging.getLogger(__name__)
+
+# An identical error()/message() body re-sent within this window is suppressed —
+# a stuck retry loop (2026-08-27: 200 "Insufficient funds" rejections in 8 min
+# from the native-stop deadlock) should page once, not 200 times.
+_DUP_ALERT_THROTTLE_S = 600
 
 
 class TelegramAlerter:
@@ -50,6 +56,23 @@ class TelegramAlerter:
             )
         if self._enabled:
             logger.info("Telegram alerter ready — chat_id=%s", self._chat_id)
+
+        self._dup_lock  = threading.Lock()
+        self._dup_seen: dict[str, float] = {}   # message body -> last-sent monotonic time
+
+    def _is_duplicate(self, body: str) -> bool:
+        """True if this exact body was sent within _DUP_ALERT_THROTTLE_S. Prunes
+        stale entries as it goes. Thread-safe (sends come from daemon threads)."""
+        now = time.monotonic()
+        with self._dup_lock:
+            self._dup_seen = {
+                k: t for k, t in self._dup_seen.items()
+                if now - t < _DUP_ALERT_THROTTLE_S
+            }
+            if body in self._dup_seen:
+                return True
+            self._dup_seen[body] = now
+            return False
 
     # ------------------------------------------------------------------
     # Public API
@@ -101,6 +124,10 @@ class TelegramAlerter:
     def message(self, text: str) -> None:
         """Generic pre-formatted message (used by the stock bot's notifier —
         its alert taxonomy doesn't map onto the typed methods above)."""
+        if self._is_duplicate(text):
+            logger.info("Telegram message suppressed (duplicate within %ds): %s",
+                        _DUP_ALERT_THROTTLE_S, text[:120])
+            return
         self._send_async(text)
 
     def send_now(self, text: str) -> None:
@@ -112,6 +139,10 @@ class TelegramAlerter:
         self._send(text)
 
     def error(self, message: str) -> None:
+        if self._is_duplicate(message):
+            logger.info("Telegram error suppressed (duplicate within %ds): %s",
+                        _DUP_ALERT_THROTTLE_S, message[:120])
+            return
         msg = f"⚠️ BOT ERROR\n{message}\n{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
         self._send_async(msg)
 
