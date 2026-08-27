@@ -713,3 +713,45 @@ SOL (promoted, done) > SYN (parked, gap ~$150-$590) > PUMP (parked, gap ~$685-$1
 PUMP having the cleanest liquidity and lowest SL-exit rate of the three. Everything above is
 groundwork for a future deposit decision, not a promotion. No `.env`/`UNIVERSE_WHITELIST`
 change made.
+
+## USD candidates status re-check + FX-build decision — 2026-08-27 (Track 2)
+
+User delegated broadly improving the bots (4-track plan, see
+[[silent-degradation-sweep-2026-08-27]]); Track 2 = get SYN/USD + PUMP/USD promotion-ready.
+
+**Re-checked what's actually still open (not capital):**
+
+1. **Walk-forward — confirmed current, no re-run needed.** Strategy hash `b30f2f9e769c8d41`
+   unchanged since 2026-08-20. SYN (2026-08-25) and PUMP (2026-08-26) walk-forwards were both
+   already run on this exact hash. Still valid: SYN HOLDS (PF 1.75/1.75), PUMP PASSES
+   (PF 2.04/2.04/2.14). Nothing in `bot/strategy/*` touched since.
+
+2. **Liquidity — BOTH now pass, as of 2026-08-27** (live Kraken `fetch_ticker`, single
+   point-in-time):
+   - SYN/USD: spread **0.0907%** (≤0.15% ✓), 24h quote vol **$109,565** (≥$50k ✓) — a
+     genuine change from 2026-08-26 when spread failed at 0.179%. SYN's liquidity has
+     bounced around the floor on every reading; treat as "clean today, re-check at
+     promotion time," not "resolved."
+   - PUMP/USD: spread **0.0627%**, vol **$6.1M** — clean, consistent with prior reads.
+
+3. **FX-conversion build — the real remaining non-capital gap, and it is NOT trivial.**
+   The 2026-08-25 note called this "not hard, just not done" — that's optimistic. The
+   Kraken account holds **CAD only**. Trading a USD-quoted pair requires the bot to
+   actually execute a CAD→USD conversion on Kraken's `USD/CAD` market (0.20%/leg) before
+   the first BUY, hold USD, and convert back on capital withdrawal — a real capital-movement
+   step the bot does not do today. Plus: `_sync_cash` per quote currency, `_account_value()`
+   + all aggregate risk breakers converting each sub-book to a common CAD base, a separate
+   USD P&L book + settlement/FX records, dashboard/alert currency labels, and tests for all
+   of it. The stock bot's `is_cad_symbol()`/`get_usd_cad_rate()` pattern
+   (`stock_bot/data/price_feed.py`) is a partial precedent for the *reporting* conversion but
+   NOT the execution step (IBKR is natively multi-currency; Kraken here is not). This is a
+   multi-session feature.
+
+**Decision: FX-build DEFERRED, not started.** Building a multi-currency accounting +
+CAD↔USD conversion layer speculatively — for symbols with a $150–$1,518 capital gap and no
+deposit planned — is premature per the project's own rules (no premature optimization, simple
+before complex, discuss before building). SYN/USD and PUMP/USD are now **validation-complete
+and liquidity-clean**; the two remaining gates (capital + FX build) are BOTH contingent on a
+deposit decision. **When the user decides to fund a USD symbol, the FX build is the immediate
+next task** — nothing else about these two symbols needs work. No `.env`/`UNIVERSE_WHITELIST`
+change.

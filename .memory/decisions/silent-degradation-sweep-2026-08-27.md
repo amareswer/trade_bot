@@ -63,5 +63,38 @@ a full live stack). Suite 678→680.
 - CLAUDE.md updated: Test Suite Manifest (676→680), "Post-only param bug" section
   got a monitoring addendum + a "second sweep fix" subsection.
 
+## Track 2 — SYN/USD + PUMP/USD (2026-08-27, concluded)
+
+Re-checked: walk-forwards confirmed current on hash b30f2f9e769c8d41 (no re-run needed).
+Liquidity re-checked live — BOTH now pass (SYN spread 0.091% / vol $109k, back above the
+floor it failed 2026-08-26; PUMP 0.063% / $6.1M). Both symbols are now
+**validation-complete + liquidity-clean**. Two remaining gates — capital ($150-$1,518 gap)
+AND a real CAD↔USD multi-currency/FX-conversion build (NOT trivial: Kraken account is
+CAD-only, needs an actual on-exchange conversion step) — are BOTH contingent on a deposit.
+**FX-build DEFERRED, not started** (premature to build speculatively). When the user funds a
+USD symbol, the FX build is the immediate next task. Full detail:
+[[multi-symbol-validation]] "USD candidates status re-check + FX-build decision — 2026-08-27".
+
+## Track 4 — blocked-BUY Telegram alert (2026-08-27, DONE)
+
+Found live while looking for a Track 4 gap: `logs/live_signals.csv` showed SOL/CAD firing
+BUY signals on 2026-08-27 04:00 + 08:00 UTC, both `blocked_gate=state_machine` — which turned
+out to be correct (SOL/CAD DOES hold a position from its first fill 2026-08-26, BUY 0.080808
+@ $134.02; CLAUDE.md's "zero live fills" line for SOL is stale). No bug — but the pattern
+exposed the gap: a blocked BUY is only visible if you go read the CSV. That's exactly the
+2026-08-18 incident (bot flat through a $90k→$108k rally, a real BUY vetoed by the MTF gate,
+nobody knew).
+
+New `bot.main._evaluate_blocked_buy_alert()` — edge-triggered `alerter.error()` when the raw
+strategy signal is BUY but an external gate holds it. One alert per fresh (symbol, gate)
+block, re-alerts on gate change, clears when the BUY clears / raw signal stops being BUY.
+Strategy-internal HOLDs never reach it. Called once per candle close after the
+`live_signals.csv` write. Tests: new file `tests/crypto/test_blocked_buy_alert.py`, 7 cases.
+Suite 680→687. No `bot/strategy/*` touched.
+
+**Note for later:** CLAUDE.md "Current operational status" still says SOL/CAD has 0 live
+fills — it has 1 (2026-08-26). Not corrected in this session; flag if it matters.
+
 Related: [[execution_layer]], [[fee-structure]], [[2026-08-18-missed-buy-signal]]
-(that investigation is why the MTF gate's blocked-reason labels exist), [[known-gaps]].
+(that investigation is why the MTF gate's blocked-reason labels exist), [[known-gaps]],
+[[multi-symbol-validation]].

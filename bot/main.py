@@ -725,6 +725,54 @@ def _update_auth_health(
 
 
 # ---------------------------------------------------------------------------
+# Blocked-BUY alert (extracted for unit-testability). The 2026-08-18 incident
+# — the bot sat flat through a $90k→$108k BTC rally while a real BUY signal
+# fired on 08-18 and was correctly vetoed by the MTF daily-trend gate — was
+# only recoverable after the fact from logs/live_signals.csv; nothing pushed
+# it. This closes that: when the raw strategy signal is BUY but a gate blocks
+# it, fire ONE Telegram alert, edge-triggered on (symbol, gate) so a
+# persistently-blocked signal (e.g. SOL firing BUY every 4h while already
+# holding) doesn't spam. Strategy-internal HOLDs (RSI/ADX/MACD/trend not
+# aligned) are NOT blocked BUYs and never reach here — raw_signal is only BUY
+# once the strategy itself wants in.
+# ---------------------------------------------------------------------------
+_BUY_BLOCK_REASONS = {
+    "state_machine":   "already holding a position, or in post-trade cooldown",
+    "capital_pool":    "no capital slot free (raise STARTING_CASH / add a deposit)",
+    "risk_manager":    "a risk breaker is active (halt / daily-loss / drawdown / kill-switch / trade-cap / position-size)",
+    "correlation":     "too correlated (>0.70) with an already-open position",
+    "candle_watchdog": "the candle feed is stale — BUYs paused until it recovers",
+    "mtf_trend":       "the daily (1D) trend is BEARISH",
+    "external_signal": "the external-signal gate rejected the entry",
+    "regime":          "the market regime is not favourable for a new entry",
+}
+
+
+def _evaluate_blocked_buy_alert(
+    ss: dict, sym: str, raw_signal_was_buy: bool, block_gate: str, alerter,
+) -> None:
+    """Edge-triggered Telegram alert for a strategy BUY that a gate blocked.
+
+    Fires once when (sym, block_gate) first blocks a BUY and again only if the
+    blocking gate changes. Clears ss['last_buy_block_alert'] the moment the
+    strategy stops signalling BUY or the BUY goes through, so the next fresh
+    block re-alerts.
+    """
+    if not (raw_signal_was_buy and block_gate):
+        ss['last_buy_block_alert'] = ""
+        return
+    if ss.get('last_buy_block_alert') == block_gate:
+        return
+    ss['last_buy_block_alert'] = block_gate
+    why = _BUY_BLOCK_REASONS.get(block_gate, block_gate)
+    alerter.error(
+        f"BUY signal blocked [{sym}]: the strategy wants to enter but the "
+        f"'{block_gate}' gate is holding it — {why}. No further alert unless the "
+        f"blocking gate changes or the BUY clears. See logs/live_signals.csv."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Manual halt flag file (extracted for unit-testability)
 # ---------------------------------------------------------------------------
 _HALT_FLAG_PATH = os.path.join(_log_dir, "HALT")
@@ -1289,6 +1337,11 @@ def run():
                 'dash_trend':       None,
                 'dash_filter':      "",
                 'dash_block':       "",
+                # Edge-trigger for the blocked-BUY Telegram alert: the gate name
+                # last alerted for this symbol. Cleared when a BUY is approved or
+                # the raw signal is no longer BUY. Not persisted — resets on
+                # restart (same as the other per-process flags above).
+                'last_buy_block_alert': "",
             }
             logger.info("Symbol ready: %s", sym)
 
@@ -1332,6 +1385,7 @@ def run():
             'dash_trend':       None,
             'dash_filter':      "",
             'dash_block':       "",
+            'last_buy_block_alert': "",   # edge-trigger for the blocked-BUY alert
         }
 
     # ── Restart recovery ──────────────────────────────────────────────────────
@@ -2455,6 +2509,16 @@ def run():
                             _buy_block_gate,
                             _signal_final_str,
                         ])
+
+                # Edge-triggered Telegram alert when the strategy signals BUY
+                # but a gate holds it — closes the 2026-08-18 "sat flat through
+                # a rally, nobody knew a BUY had been vetoed" gap.
+                _evaluate_blocked_buy_alert(
+                    ss, sym,
+                    raw_signal_was_buy=(_signal_raw_for_csv == Signal.BUY),
+                    block_gate=(_buy_block_gate if not (approval and final_signal == Signal.BUY) else ""),
+                    alerter=alerter,
+                )
 
             # ── 8. Display tick (active symbol only) ──────────────────
             if sym == _active_symbol:
