@@ -726,37 +726,60 @@ def _update_ai_health(
     return consecutive_failures
 
 
+_BLOCKED_BUY_ABSENT_CYCLES_TO_CLEAR = 3   # a symbol must be gone this many cycles before a
+                                          # reappearance re-alerts — debounces marginal
+                                          # setups that flap BUY/HOLD cycle to cycle
+
+
 def _evaluate_blocked_rule_buys_alert(current: dict, state: dict, notifier) -> None:
-    """End-of-cycle edge-triggered ops_alert for rule BUY signals a gate held.
+    """End-of-cycle ops_alert for rule BUY signals a gate held — debounced.
 
-    `current` is {symbol: gate_label} built during the scan loop. `state` is a
-    single-key dict persisted across cycles (`state['seen']`) holding the last
-    reported {symbol: label}. Fires ONE ops_alert only when that mapping
-    changes — a new symbol blocked, a symbol's blocking gate changed, or the
-    set cleared — so a stable "market's NEUTRAL, 6 symbols want in" situation
-    is one message, not one every loop interval. Nothing to report and nothing
-    changed → silent.
+    `current` is {symbol: gate_label} built during the scan loop. `state` carries
+    `state['alerted']` = {symbol: {'gate': str, 'absent': int}} across cycles.
 
-    The stock universe is ~40 symbols vs the crypto bot's 2, so this is a
-    per-cycle digest rather than the crypto bot's per-(symbol,gate) alert —
-    same intent (the recurring "why didn't it buy X"), scaled for breadth.
+    Alerts (one digest of the current set) only when a symbol is NEWLY blocked or
+    its blocking gate changed. A symbol dropping OUT of the set does NOT alert and
+    is NOT forgotten immediately — it must be absent `_BLOCKED_BUY_ABSENT_CYCLES_TO_CLEAR`
+    consecutive cycles before it's cleared, so a marginal setup that flaps
+    BUY↔HOLD every other cycle (2026-08-27: BNS/GM near the MAX_EXPOSURE ceiling)
+    alerts once, not on every toggle. One "all clear" when the set fully empties.
     """
-    prev = state.get("seen", {})
-    if current == prev:
-        return
-    state["seen"] = dict(current)
-    if not current:
+    alerted: dict = state.setdefault("alerted", {})
+
+    fresh = []   # symbols that should trigger an alert this cycle
+    for sym, gate in current.items():
+        rec = alerted.get(sym)
+        if rec is None or rec["gate"] != gate:
+            fresh.append(sym)
+        alerted[sym] = {"gate": gate, "absent": 0}
+
+    # Age out symbols no longer blocked; only truly forget after N absent cycles.
+    for sym in list(alerted):
+        if sym in current:
+            continue
+        alerted[sym]["absent"] += 1
+        if alerted[sym]["absent"] >= _BLOCKED_BUY_ABSENT_CYCLES_TO_CLEAR:
+            del alerted[sym]
+
+    if not alerted and not current and state.pop("_had_blocks", False):
         notifier.ops_alert(
             "Rule BUY signals no longer blocked",
-            "Every rule BUY signal that a gate was holding has now either "
-            "cleared the gate or stopped signalling.",
+            "Every rule BUY signal that a gate was holding has cleared the gate "
+            "or stopped signalling.",
         )
         return
-    lines = [f"• {sym}: {label}" for sym, label in sorted(current.items())]
+
+    if current:
+        state["_had_blocks"] = True
+    if not fresh:
+        return
+
+    lines = [f"• {sym}: {gate}" for sym, gate in sorted(current.items())]
     notifier.ops_alert(
         f"{len(current)} rule BUY signal(s) blocked by a gate",
-        "The rules wanted to enter these but a gate held them this cycle "
-        "(no further alert unless this set changes):\n" + "\n".join(lines),
+        "The rules wanted to enter these but a gate held them "
+        "(no further alert unless a new symbol is blocked or its gate changes):\n"
+        + "\n".join(lines),
     )
 
 
@@ -1001,7 +1024,7 @@ def run() -> None:
     # Blocked rule-BUY digest state — {symbol: gate_label} last reported, so the
     # end-of-cycle ops_alert only fires when the set changes (see
     # _evaluate_blocked_rule_buys_alert).
-    _blocked_rule_buys_state: dict = {"seen": {}}
+    _blocked_rule_buys_state: dict = {}   # {alerted: {sym: {gate, absent}}, _had_blocks: bool}
     _ibkr_sync_ok_prev: bool = True   # edge-trigger for the IBKR data-sync alert
     _ibkr_csv_ok_prev:  bool = True   # edge-trigger for the ibkr_trades.csv write alert
     _hb_interval = int(os.getenv("HEARTBEAT_INTERVAL_S", "60"))
