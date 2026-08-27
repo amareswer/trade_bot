@@ -1060,6 +1060,13 @@ alert + counter reset, healthy-path never touches the notifier, blank-detail for
 the two wiring guards above). Suite 658→666. No `bot/strategy/*` touched — alerting/ops-layer
 only, no walk-forward needed.
 
+**Prediction confirmed, 2026-08-27:** the "a 4th degradation would have gone unnoticed" concern
+above played out for real the very next day — `meta/llama-3.1-8b-instruct` hit end-of-life
+2026-08-26, and this monitor caught it automatically (alert fired 15:56 UTC the same day the
+model died), the first of the four nvidia_nim incidents ever caught without manually testing
+the API by hand. See the "Current operational status" stock bot entry and `stock_bot/.env`'s
+`NVIDIA_MODEL` comment for the swap details (now on `nvidia/nemotron-3-nano-30b-a3b`).
+
 ### Crypto dashboard — multi-symbol combine (added 2026-08-26)
 `dashboard.html` (the detailed per-tick page `unified_dashboard.py` embeds) was hardcoded to
 render only `_active_symbol` — always the first entry in `UNIVERSE_WHITELIST`, i.e. BTC/CAD.
@@ -1122,6 +1129,20 @@ test_rules_log_visibility.py` (new file, 2 cases — source-inspection wiring gu
 pattern as the VIX/macro/correlation/AI-health guards elsewhere in this manifest, since
 `run()` needs a live yfinance/IBKR stack to exercise behaviorally). Suite 674→676. No
 `bot/strategy/*` touched — logging-visibility only, no walk-forward needed.
+
+### Stock bot scan universe widened (2026-08-27)
+`UNIVERSE_SIZE` (top movers scanned per cycle, on top of the 28 `WATCHLIST` symbols) raised
+15 → 30, user request — wanted more candidates evaluated per cycle. **Scan breadth only, not
+a loosened entry bar or a day-trading change**: the rule signal's own criteria (ADX/RSI/trend/
+EMA-spread thresholds) and the in-distribution ATR%/liquidity screener (`SCREENER_ENABLED`,
+same filter documented under "Current stock bot RULE_WHITELIST" above) are both unchanged —
+more symbols get checked against the identical bar, nothing gets waved through. `CANDLE`
+timeframe/interval untouched (`interval=1d`, per the standing "no day-trading" policy). No
+`bot/strategy/*` touched, no walk-forward needed. Prompted by a conversation pushing for
+faster/bigger short-term profit ("make as much as we can in 2 days," "buy whatever's giving
+money") — that framing was declined (would mean forcing unvalidated trades or day-trading,
+both explicitly ruled out elsewhere in this file); widening the scan was the one legitimate
+lever that increases opportunity without touching the validated strategy or risk gates.
 
 ### Current operational status (as of 2026-07-28)
 - **Crypto bot:** live on Kraken, BTC/CAD ($77 slot cap) + SOL/CAD ($376 slot cap, added
@@ -1196,20 +1217,27 @@ pattern as the VIX/macro/correlation/AI-health guards elsewhere in this manifest
   retired (`FAST_ENABLED=false`) — position book (rule-based, Mode A/B) is the only active
   book. TSX symbols are **permanently** advisory-only — CIRO regulation blocks API orders on
   Canadian exchanges (never re-add `.TO` symbols to RULE_WHITELIST). AI provider `nvidia_nim`,
-  model `meta/llama-3.1-8b-instruct` (swapped 2026-08-07 — see `stock_bot/.env` comment above
-  `NVIDIA_MODEL` for the full incident history: this is the **third** model on this account to
-  degrade the same way, ~5h of 100% `APITimeoutError`/`DEGRADED` on the prior model
-  `mistral-nemotron`, verified provider-side via direct API calls bypassing the bot's own code
-  before swapping. Picked deliberately small this time on the theory that congestion here
-  tracks model popularity/size, not account quota — the code's own hardcoded fallback default,
-  `nvidia/nemotron-3-ultra-550b-a55b`, was re-tested at the same time and is NOT reliable
-  either, 1/3 calls timing out at the full 20s). AI is advisory-only throughout — zero trading
-  impact during the outage, `RULE_TRADING_ENABLED` signals were unaffected the whole time.
-  The dormant `_fallback_openrouter()`/`_fallback_to_openrouter()` in `stock_bot/ai/ai_engine.py`
-  found during this investigation is still unwired (zero call sites, no test coverage) — a
-  live `OPENROUTER_API_KEY` sits unused in root `.env` that could auto-switch providers on a
-  future nvidia_nim outage instead of requiring this same manual model-swap dance again. Not
-  acted on yet — flagged, not fixed. **Detection of a future degradation WAS closed 2026-08-25**
+  model `nvidia/nemotron-3-nano-30b-a3b` (swapped 2026-08-27 — see `stock_bot/.env` comment
+  above `NVIDIA_MODEL` for the full incident history: this is the **fourth** model on this
+  account to fail, but the first time the cause was genuine end-of-life rather than capacity
+  congestion — `meta/llama-3.1-8b-instruct` (live since 2026-08-07) returned a real `410 Gone`
+  from NVIDIA on 2026-08-26, "reached its end of life." **First degradation ever caught
+  automatically** — the 2026-08-25 `_update_ai_health()` monitor fired within the same scan
+  session the model died (15:56 UTC, 2026-08-26), no manual discovery needed this time.
+  Queried NVIDIA's live model catalog and verified the replacement directly before swapping:
+  `nvidia/nemotron-3-nano-30b-a3b` — 5/5 calls succeeded, 0.4-0.5s latency, and round-tripped
+  cleanly through the bot's real `_parse()` with a realistic JSON-verdict prompt (3/3 correct).
+  Two other catalog candidates (mistral-7b-instruct-v0.3, granite-3.0-8b-instruct) turned out
+  not enabled on this account (404). AI is advisory-only throughout — zero trading impact
+  during the outage, `RULE_TRADING_ENABLED` signals were unaffected the whole time.
+  OpenRouter was re-researched as an independent provider this time (this codebase already has
+  a full implementation + a live `OPENROUTER_API_KEY` in root `.env`): its own hardcoded free
+  model is now ALSO discontinued (404), and more importantly its free tier caps at 50
+  requests/day unless $10 in lifetime credits has been purchased (then 1000/day) — likely too
+  low for a single scan pass over this bot's ~28-40 symbol universe, so staying on nvidia_nim
+  remains the right call; the dormant `_fallback_openrouter()`/`_fallback_to_openrouter()` in
+  `stock_bot/ai/ai_engine.py` is still unwired and would need its own model-string fix before
+  it could ever work — flagged, not fixed. **Detection of a future degradation WAS closed 2026-08-25**
   (see "AI provider health monitoring" below) — the auto-failover itself remains unbuilt, but a
   4th degradation will now alert instead of requiring another manual catch. Daily-loss breaker now marks open positions to
   live scan-cycle prices every cycle (`refresh_position_marks()`), not just at fill time —
