@@ -726,6 +726,40 @@ def _update_ai_health(
     return consecutive_failures
 
 
+def _evaluate_blocked_rule_buys_alert(current: dict, state: dict, notifier) -> None:
+    """End-of-cycle edge-triggered ops_alert for rule BUY signals a gate held.
+
+    `current` is {symbol: gate_label} built during the scan loop. `state` is a
+    single-key dict persisted across cycles (`state['seen']`) holding the last
+    reported {symbol: label}. Fires ONE ops_alert only when that mapping
+    changes — a new symbol blocked, a symbol's blocking gate changed, or the
+    set cleared — so a stable "market's NEUTRAL, 6 symbols want in" situation
+    is one message, not one every loop interval. Nothing to report and nothing
+    changed → silent.
+
+    The stock universe is ~40 symbols vs the crypto bot's 2, so this is a
+    per-cycle digest rather than the crypto bot's per-(symbol,gate) alert —
+    same intent (the recurring "why didn't it buy X"), scaled for breadth.
+    """
+    prev = state.get("seen", {})
+    if current == prev:
+        return
+    state["seen"] = dict(current)
+    if not current:
+        notifier.ops_alert(
+            "Rule BUY signals no longer blocked",
+            "Every rule BUY signal that a gate was holding has now either "
+            "cleared the gate or stopped signalling.",
+        )
+        return
+    lines = [f"• {sym}: {label}" for sym, label in sorted(current.items())]
+    notifier.ops_alert(
+        f"{len(current)} rule BUY signal(s) blocked by a gate",
+        "The rules wanted to enter these but a gate held them this cycle "
+        "(no further alert unless this set changes):\n" + "\n".join(lines),
+    )
+
+
 def _run_news_scan(symbols: list[str]) -> None:
     """
     Lightweight pre/after-hours news scan — no prices, no AI, no trades.
@@ -964,6 +998,10 @@ def run() -> None:
     _ai_health = {"ok": True}
     _ai_consecutive_failures = 0
     _AI_HEALTH_THRESHOLD = 3   # consecutive fully-failed cycles before alerting
+    # Blocked rule-BUY digest state — {symbol: gate_label} last reported, so the
+    # end-of-cycle ops_alert only fires when the set changes (see
+    # _evaluate_blocked_rule_buys_alert).
+    _blocked_rule_buys_state: dict = {"seen": {}}
     _hb_interval = int(os.getenv("HEARTBEAT_INTERVAL_S", "60"))
     start_heartbeat_thread(
         os.getenv("HEARTBEAT_URL", ""),
@@ -1180,6 +1218,11 @@ def run() -> None:
         watchlist_set |= set(held_symbols)
         scan_results: list[ScanResult] = []
         screen_skips: list[dict]       = []   # in-distribution filter rejections — dashboard visibility
+        # {symbol: GATE_LABEL} for rule BUY signals a gate held this cycle —
+        # end-of-cycle edge-triggered ops_alert so "the rules wanted in but X
+        # blocked it" isn't print()-only (the recurring "why didn't it buy Y"
+        # question). Parallel to the crypto bot's _evaluate_blocked_buy_alert.
+        _blocked_rule_buys: dict[str, str] = {}
 
         # Reset per-cycle state
         _fv_earnings_blocked = set()
@@ -1471,6 +1514,8 @@ def run() -> None:
                                 f"event on {_macro_event} | {_trigger} blocked"
                             )
                             print(f"  {'─' * 70}")
+                            if _rule_buy:
+                                _blocked_rule_buys[symbol] = "MACRO_BLACKOUT"
                             # Market-wide, not per-symbol — reuses the earnings-block
                             # set so the swing book also sits out (see its comment above).
                             _fv_earnings_blocked.add(symbol.upper())
@@ -1488,6 +1533,8 @@ def run() -> None:
                                 f"{_trigger} blocked"
                             )
                             print(f"  {'─' * 70}")
+                            if _rule_buy:
+                                _blocked_rule_buys[symbol] = "EARNINGS_BLACKOUT"
                             # Also block swing book from entering this symbol
                             _fv_earnings_blocked.add(symbol.upper())
                             continue
@@ -1496,6 +1543,8 @@ def run() -> None:
                             logger.info("REGIME_SKIP: %s — market is %s", symbol, _cycle_regime)
                             print(f"  📛 REGIME_SKIP: {symbol} — market is {_cycle_regime}")
                             _regime_ok = False
+                            if _rule_buy:
+                                _blocked_rule_buys[symbol] = f"REGIME_SKIP (market {_cycle_regime})"
                         if _cycle_crisis_mode:
                             logger.info(
                                 "VIX_CRISIS_SKIP: %s — VIX %.1f >= %.0f",
@@ -1503,6 +1552,8 @@ def run() -> None:
                             )
                             print(f"  🚨 VIX CRISIS: {symbol} — VIX {_vix_now:.1f} >= {cfg.vix_crisis_threshold:.0f} — no new BUYs")
                             _regime_ok = False
+                            if _rule_buy:
+                                _blocked_rule_buys[symbol] = f"VIX_CRISIS (VIX {_vix_now:.0f})"
                         _fv_occupied = fast_validator.state.open_symbols() if fast_validator else set()
                         if symbol.upper() in _fv_occupied:
                             logger.info(
@@ -1536,14 +1587,20 @@ def run() -> None:
                             alloc   = (executor.cash + pos_val) * cfg.paper_risk_pct
                             if not executor.check_exposure(_price_map_now, pending_trade_value=alloc):
                                 print(f"  📄 SKIP: {symbol} — max exposure ({cfg.paper_max_exposure_pct*100:.0f}%) reached")
+                                if _rule_buy:
+                                    _blocked_rule_buys[symbol] = "MAX_EXPOSURE"
                             elif len(executor.positions_snapshot()) >= cfg.paper_max_positions:
                                 print(f"  📄 SKIP: {symbol} — max {cfg.paper_max_positions} positions reached")
+                                if _rule_buy:
+                                    _blocked_rule_buys[symbol] = "MAX_POSITIONS"
                             elif _corr_peer is not None:
                                 logger.warning(
                                     "CORRELATION GATE: %s blocked — correlation %.2f with open %s",
                                     symbol, _corr_val, _corr_peer,
                                 )
                                 print(f"  📄 SKIP: {symbol} — correlation {_corr_val:.2f} with open {_corr_peer} (> {CORRELATION_THRESHOLD:.2f})")
+                                if _rule_buy:
+                                    _blocked_rule_buys[symbol] = f"CORRELATION ({_corr_val:.2f} with {_corr_peer})"
                             else:
                                 price_cad = (
                                     execution_price if is_cad_symbol(symbol)
@@ -1587,6 +1644,8 @@ def run() -> None:
                                         f"({cfg.paper_risk_pct*100:.0f}% risk) can't buy "
                                         f"1 share @ ${execution_price:,.2f}"
                                     )
+                                    if _rule_buy:
+                                        _blocked_rule_buys[symbol] = "SIZE_SKIP (allocation < 1 share)"
                                 if shares > 0:
                                     if _rule_buy:
                                         reason = (f"RULE BUY rsi={rule_v.rsi:.0f} "
@@ -1784,6 +1843,14 @@ def run() -> None:
             logger.info("Alerts: %d triggered this cycle", len(alerts))
         except Exception as exc:
             logger.warning("Alert evaluation/notification failed: %s", exc)
+
+        # Blocked rule-BUY digest — edge-triggered ops_alert (see helper).
+        try:
+            _evaluate_blocked_rule_buys_alert(
+                _blocked_rule_buys, _blocked_rule_buys_state, notifier,
+            )
+        except Exception as exc:
+            logger.warning("Blocked rule-BUY digest failed: %s", exc)
 
         # Write dashboard
         try:

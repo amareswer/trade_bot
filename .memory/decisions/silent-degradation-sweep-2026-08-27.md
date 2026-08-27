@@ -122,6 +122,31 @@ selective. No actionable fix.** Evidence (all re-verified, not assumed):
 Full trail: [[multi-symbol-validation]] "BTC/CAD live signal drought" section,
 2026-08-27 re-confirmation addendum.
 
+## Stock bot — same review extended (2026-08-27, "how about stock bot")
+
+**State check:** stock bot live on IBKR paper, holding 1 position (T, 28 sh @ $25.75), realized
++$2.81 since the $5000 rebase, gate at ~5/30. Trades ~1/week (CM/RY/CM/T since 2026-07-20) —
+NOT starved like crypto, no selectivity concern. nemotron model swap confirmed active
+(`nvidia/nemotron-3-nano-30b-a3b`); the 2026-08-25 `_update_ai_health` monitor fired correctly
+on the 08-26 nvidia_nim EOL. paper_state.json is stale/inert (switched to IBKR 2026-07-17).
+
+**Observability fix — blocked rule-BUY digest.** Same gap as the crypto bot: a rule BUY
+signal that fires and gets held by a gate (MACRO/EARNINGS_BLACKOUT, REGIME_SKIP, VIX_CRISIS,
+MAX_EXPOSURE, MAX_POSITIONS, CORRELATION, SIZE_SKIP) was `print()`-only — gone with the
+terminal. The 2026-08-26 RULES-log fix made the *signal* visible but not the *block*. New
+`stock_bot.main._evaluate_blocked_rule_buys_alert()` — end-of-cycle DIGEST (universe ~40
+symbols, so one summary message, not per-symbol), edge-triggered on the `{symbol: gate}`
+mapping. Also covers the SPY-regime-fetch-failure path (regime → UNKNOWN → REGIME_SKIP for
+every rule BUY, digest names it). 8 one-line `if _rule_buy:` additions at the gate sites +
+one cycle-end call. Tests: new file `tests/stock/test_blocked_rule_buys_alert.py`, 7 cases.
+Suite 687→694. No strategy files touched.
+
+**Silent-degradation sweep (stock):** lower stakes than crypto — IBKR is paper-only and
+code-gate-blocked from live (LiveTradingGate). The IBKR executor's `logger.warning`-only
+paths (account/position sync failures, CSV write failures, order timeouts) are worth
+hardening *when IBKR goes live*, deferred until then. The one live-relevant path — SPY regime
+fetch failure blocking all BUYs — is now surfaced by the digest above.
+
 Related: [[execution_layer]], [[fee-structure]], [[2026-08-18-missed-buy-signal]]
 (that investigation is why the MTF gate's blocked-reason labels exist), [[known-gaps]],
-[[multi-symbol-validation]].
+[[multi-symbol-validation]], [[stock-bot]].
