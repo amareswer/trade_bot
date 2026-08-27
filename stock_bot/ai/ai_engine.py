@@ -385,7 +385,12 @@ class AIEngine:
         verdict = self._analyze_once(
             symbol, candle, indicators, research, stop_loss_pct, take_profit_pct,
         )
-        if not self._last_call_failed:
+        # A model that returns unparseable garbage every call (2026-08-27:
+        # nemotron rambled its reasoning and truncated before the JSON, 75%
+        # failure) is functionally as dead as one that's down — both are fixed
+        # by switching providers. So sustained parse failures trigger the
+        # failover too, not just API errors.
+        if not (self._last_call_failed or self._last_call_parse_failed):
             self._consecutive_failures = 0
             return verdict
 
@@ -415,7 +420,8 @@ class AIEngine:
         if not self.enabled:
             return _hold_verdict(symbol, "AI unavailable — provider not configured")
 
-        self._last_call_failed = False   # set True only on an API error, not a parse error
+        self._last_call_failed       = False   # True on an API/transport error
+        self._last_call_parse_failed = False   # True when a response came back but _parse raised
 
         prompt = build_prompt(symbol, candle, indicators, research,
                               stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct,
@@ -453,9 +459,14 @@ class AIEngine:
                 completion = client.chat.completions.create(
                     model       = self._model,
                     messages    = [{"role": "user", "content": prompt}],
-                    temperature = 1,
+                    temperature = _TEMPERATURE,
                     top_p       = 1,
-                    max_tokens  = 1024,
+                    # 2026-08-27: was 1024 — a reasoning model (nemotron) spends
+                    # that on chain-of-thought in the response body and truncates
+                    # before the JSON. 4096 gives it room. (nemotron is off as of
+                    # this date — mistral is primary — but keep the headroom for
+                    # any future nvidia model used as a fallback.)
+                    max_tokens  = 4096,
                     stream      = False,
                 )
                 # 2026-07-23: completion.choices can come back None/empty (content
@@ -493,8 +504,9 @@ class AIEngine:
                     return verdict
                 except Exception as parse_exc:
                     logger.warning("AI parse failed for %s (%s) | raw=%r", symbol, parse_exc, response_text[:120])
+                    self._last_call_parse_failed = True
                     return _hold_verdict(symbol, "AI parse error")
-            else:  # openrouter | ollama_local
+            else:  # openrouter | ollama_local | mistral
                 payload = {
                     "model":       self._model,
                     "messages":    [{"role": "user", "content": prompt}],
@@ -543,4 +555,5 @@ class AIEngine:
             return verdict
         except Exception as exc:
             logger.warning("AI parse failed for %s (%s) | raw=%r", symbol, exc, raw[:120])
+            self._last_call_parse_failed = True
             return _hold_verdict(symbol, "AI parse error")

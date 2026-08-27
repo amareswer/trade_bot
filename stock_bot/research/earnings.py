@@ -41,6 +41,12 @@ _EARNINGS_FAILURE_TTL = 3600   # 1 hour — a fetch failure is usually transient
 
 logger = logging.getLogger(__name__)
 
+# ETFs / commodity trusts have no earnings — yfinance returns a 404 for
+# quoteSummary and prints "symbol may be delisted" every cycle (misleading log
+# noise + a wasted rate-limited call). Short-circuit them. Extend as ETFs enter
+# the whitelist/watchlist.
+_NO_EARNINGS_SYMBOLS = {"GLD", "SLV", "GLDM", "IAU", "PAXG", "FXE", "UUP", "SPY", "QQQ"}
+
 
 @dataclass
 class EarningsInfo:
@@ -66,6 +72,9 @@ def fetch_earnings(symbol: str) -> EarningsInfo:
     Fetch earnings data for `symbol` via yfinance. Cached for 24 hours.
     Returns EarningsInfo with all-None fields on failure.
     """
+    if symbol.upper() in _NO_EARNINGS_SYMBOLS:
+        return EarningsInfo(earnings_note="ETF — no earnings")
+
     cached = _earnings_cache.get(symbol)
     if cached is not None:
         info, ts, was_success = cached

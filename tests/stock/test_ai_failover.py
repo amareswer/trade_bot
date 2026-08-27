@@ -135,7 +135,11 @@ def test_switch_to_fallback_is_one_way(monkeypatch):
     assert e._switch_to_fallback() is False   # already switched
 
 
-def test_parse_error_does_not_trigger_failover(monkeypatch):
+def test_sustained_parse_failures_trigger_failover(monkeypatch):
+    """2026-08-27: nemotron returned unparseable reasoning-text ~75% of calls.
+    A model that answers with garbage every time is as dead as one that's down —
+    both are fixed by switching providers, so sustained parse failures now
+    trigger the failover too (they used to be exempt)."""
     monkeypatch.setenv("AI_PROVIDER", "mistral")
     monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
     monkeypatch.setenv("AI_FALLBACK_PROVIDER", "openrouter")
@@ -146,9 +150,39 @@ def test_parse_error_does_not_trigger_failover(monkeypatch):
         status_code = 200
         def raise_for_status(self): pass
         def json(self):
-            return {"choices": [{"message": {"content": "not json at all"}}]}
+            return {"choices": [{"message": {"content": "not json at all — just prose"}}]}
 
-    with patch("stock_bot.ai.ai_engine._requests.post", return_value=_Garbage()):
-        for _ in range(_FALLBACK_AFTER + 2):
+    _ok = type("_OK", (), {
+        "status_code": 200, "raise_for_status": lambda s: None,
+        "json": lambda s: {"choices": [{"message": {"content":
+            '{"signal": "HOLD", "confidence": 40, "reasoning": "x"}'}}]},
+    })()
+
+    posts = [_Garbage()] * _FALLBACK_AFTER + [_ok]
+    with patch("stock_bot.ai.ai_engine._requests.post", side_effect=posts):
+        for _ in range(_FALLBACK_AFTER - 1):
             _analyze(e)
-    assert e._fallback_active is False   # parse errors ≠ API failures
+        assert e._fallback_active is False
+        v = _analyze(e)   # the _FALLBACK_AFTER-th parse failure trips the switch + retry
+    assert e._fallback_active is True and e._provider == "openrouter"
+    assert v.provider == "openrouter" and v.signal == "HOLD"
+
+
+def test_one_off_parse_failure_does_not_trigger_failover(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER", "mistral")
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("AI_FALLBACK_PROVIDER", "openrouter")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    e = AIEngine()
+
+    def _mk(content):
+        return type("_R", (), {
+            "status_code": 200, "raise_for_status": lambda s: None,
+            "json": lambda s, c=content: {"choices": [{"message": {"content": c}}]},
+        })()
+
+    seq = [_mk("garbage")] + [_mk('{"signal":"HOLD","confidence":30,"reasoning":"x"}')] * 4
+    with patch("stock_bot.ai.ai_engine._requests.post", side_effect=seq):
+        for _ in range(5):
+            _analyze(e)
+    assert e._fallback_active is False   # a clean parse resets the counter

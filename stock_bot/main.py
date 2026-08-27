@@ -1408,19 +1408,27 @@ def run() -> None:
                     logger.warning("AI failed for %s: %s", sym, exc)
                 _liveness.touch()
         _ai_elapsed    = time.time() - _ai_start
-        _ai_nvidia_n   = sum(1 for v in ai_verdicts.values() if v.provider == "nvidia_nim")
+        _ai_primary    = getattr(ai_engine, "_primary_provider", "nvidia_nim")
+        # Verdicts from the configured primary provider. (Name kept as
+        # `_ai_nvidia_n` for the dashboard/test that read it — it's a count now,
+        # the provider is `_ai_primary`.)
+        _ai_nvidia_n   = sum(1 for v in ai_verdicts.values() if v.provider == _ai_primary)
         _ai_failed_n   = sum(1 for v in ai_verdicts.values() if v.provider in ("unavailable", "unknown"))
-        # Any non-primary provider that actually answered = a failover verdict
-        # (mistral / openrouter / ollama_*). Primary is nvidia_nim; "skipped" is
-        # gated-out, not attempted.
+        # A non-primary provider that actually answered = a failover verdict.
+        # "skipped" is gated-out, not attempted.
         _ai_fallback_n = sum(
             1 for v in ai_verdicts.values()
-            if v.provider not in ("nvidia_nim", "unavailable", "unknown", "skipped")
+            if v.provider not in (_ai_primary, "unavailable", "unknown", "skipped")
         )
         _ai_attempted_n = _ai_nvidia_n + _ai_fallback_n + _ai_failed_n
         if _ai_attempted_n > 0:
+            # Healthy = the MAJORITY of attempted calls produced a real verdict.
+            # 2026-08-27: nemotron parse-failed ~75% of calls but a handful
+            # succeeded, so an "any success = healthy" check stayed silent
+            # through a broken model.
+            _ai_ok_n = _ai_nvidia_n + _ai_fallback_n
             _ai_consecutive_failures = _update_ai_health(
-                _ai_health, _ai_nvidia_n + _ai_fallback_n > 0,
+                _ai_health, _ai_ok_n * 2 >= _ai_attempted_n,
                 _ai_consecutive_failures, _AI_HEALTH_THRESHOLD, notifier,
                 detail=f"{_ai_failed_n}/{_ai_attempted_n} calls failed this cycle",
             )
@@ -1860,11 +1868,11 @@ def run() -> None:
         # ── AI call summary ───────────────────────────────────────────────────
         if cfg.ai_enabled and ai_engine:
             print(f"  ── AI Summary {'─' * 39}")
-            print(f"  ✅ nvidia_nim:   {_ai_nvidia_n} calls succeeded")
+            print(f"  ✅ {_ai_primary}:   {_ai_nvidia_n} calls succeeded")
             if _ai_fallback_n:
                 _fb_prov = next(
                     (v.provider for v in ai_verdicts.values()
-                     if v.provider not in ("nvidia_nim", "unavailable", "unknown", "skipped")),
+                     if v.provider not in (_ai_primary, "unavailable", "unknown", "skipped")),
                     "fallback",
                 )
                 print(f"  ⚠️  {_fb_prov}:   {_ai_fallback_n} failover calls used")

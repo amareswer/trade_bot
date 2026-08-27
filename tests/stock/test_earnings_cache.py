@@ -118,6 +118,18 @@ def test_concurrent_fetches_are_serialized_by_the_lock():
     )
 
 
+def test_etf_symbols_short_circuit_without_a_yfinance_call():
+    """GLD & other ETFs have no earnings — yfinance 404s + prints 'may be
+    delisted' every cycle. Skip the call entirely (2026-08-27)."""
+    _reset_cache()
+    with patch.object(earnings_mod, "fetch_with_retry") as mock_fetch:
+        info = fetch_earnings("GLD")
+    mock_fetch.assert_not_called()
+    assert info.next_earnings_date is None
+    assert "ETF" in info.earnings_note
+    assert "GLD" not in earnings_mod._earnings_cache   # not even cached
+
+
 if __name__ == "__main__":
     import sys
     failures = 0
