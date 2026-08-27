@@ -753,6 +753,63 @@ def test_limit_order_falls_back_to_market_after_max_retries(mock_cfg, mock_sleep
 
 @patch("time.sleep")
 @patch("bot.execution.live_executor.cfg")
+def test_maker_fallback_fires_telegram_alert(mock_cfg, mock_sleep, tmp_path):
+    """A post-only limit that degrades to a market order fires a MAKER FALLBACK
+    Telegram alert — the post-only fee bug hid for 2 months because this path
+    was logger.warning only (2026-08-27)."""
+    _limit_cfg(mock_cfg, enabled=True, timeout_s=0, max_retries=1)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+    mock_ex.fetch_order_book.return_value   = _ob()
+    mock_ex.price_to_precision.return_value = "90009.0"
+
+    open_raw   = {"id": "limit-0X", "status": "open", "filled": 0.0, "average": None, "fee": {}}
+    market_raw = {"id": "mkt-001", "status": "closed", "filled": 0.001, "type": "market",
+                  "average": 90000.0, "fee": {"cost": 0.72, "currency": "CAD"}}
+    mock_ex.create_order.side_effect = [
+        {**open_raw, "id": "limit-01"},
+        {**open_raw, "id": "limit-02"},
+        market_raw,
+    ]
+    mock_ex.fetch_order.side_effect = lambda oid, _sym: {
+        "id": oid, "status": "canceled", "type": "limit",
+        "filled": 0.0, "amount": 0.001, "average": None, "fee": {},
+    }
+
+    with patch.object(ex._alerter, "error") as mock_alert:
+        order = ex.execute(Signal.BUY, 90000.0, 0.001)
+
+    assert order is not None and order.status == OrderStatus.FILLED
+    assert mock_alert.called, "MAKER FALLBACK alert must fire on maker→taker degradation"
+    assert "MAKER FALLBACK" in mock_alert.call_args[0][0]
+    assert "timed out" in mock_alert.call_args[0][0]
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_maker_fallback_no_alert_on_clean_limit_fill(mock_cfg, mock_sleep, tmp_path):
+    """A post-only limit that fills normally must NOT fire the MAKER FALLBACK alert."""
+    _limit_cfg(mock_cfg, enabled=True, timeout_s=30)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+    mock_ex.fetch_order_book.return_value  = _ob()
+    mock_ex.price_to_precision.return_value = "90009.0"
+    mock_ex.create_order.return_value = {
+        "id": "limit-001", "status": "closed", "filled": 0.001, "type": "limit",
+        "average": 90009.0, "fee": {"cost": 0.360, "currency": "CAD"},
+    }
+
+    with patch.object(ex._alerter, "error") as mock_alert:
+        order = ex.execute(Signal.BUY, 90000.0, 0.001)
+
+    assert order is not None and order.status == OrderStatus.FILLED
+    assert not any(
+        "MAKER FALLBACK" in str(c) for c in mock_alert.call_args_list
+    ), "clean limit fill must not trigger the maker-fallback alert"
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
 def test_limit_order_disabled_uses_market(mock_cfg, mock_sleep, tmp_path):
     """LIMIT_ORDER_ENABLED=false → existing market path used, create_order called with type='market'."""
     _limit_cfg(mock_cfg, enabled=False)

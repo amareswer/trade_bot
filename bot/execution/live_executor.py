@@ -171,6 +171,9 @@ class LiveExecutor:
         self._native_stop_order_id:    str | None   = None
         self._native_stop_price:       float | None = None
         self._native_stop_is_trailing: bool         = False
+        # Set by _place_limit_order when a post-only limit silently degrades to
+        # a market (taker) order; read + cleared once per fill in execute().
+        self._maker_fallback_reason:   str | None   = None
         self._alerter = TelegramAlerter(
             cfg.alerts.telegram_bot_token,
             cfg.alerts.telegram_chat_id,
@@ -1063,6 +1066,7 @@ class LiveExecutor:
         tick_pct         = cfg.exchange.limit_chase_tick_pct
         timeout_attempts = 0
         max_attempts     = cfg.exchange.limit_chase_max_retries + 1
+        self._maker_fallback_reason = None
 
         while timeout_attempts < max_attempts:
             # Fetch orderbook and compute limit price — network errors fall back immediately.
@@ -1083,6 +1087,7 @@ class LiveExecutor:
                     "_place_limit_order: %s (%s) — falling back to market order",
                     type(exc).__name__, exc,
                 )
+                self._maker_fallback_reason = f"orderbook fetch failed ({type(exc).__name__})"
                 return self._exchange.create_order(self.symbol, "market", side, quantity)
 
             logger.warning(
@@ -1119,6 +1124,7 @@ class LiveExecutor:
                 )
                 if tick_pct < _MIN_TICK_PCT:
                     logger.warning("spread too tight for post-only, using market")
+                    self._maker_fallback_reason = "spread too tight for post-only"
                     return self._exchange.create_order(self.symbol, "market", side, quantity)
                 continue
             except Exception as exc:
@@ -1126,6 +1132,7 @@ class LiveExecutor:
                     "_place_limit_order: %s (%s) — falling back to market order",
                     type(exc).__name__, exc,
                 )
+                self._maker_fallback_reason = f"exchange rejected limit order ({type(exc).__name__})"
                 return self._exchange.create_order(self.symbol, "market", side, quantity)
 
             # Quick return if exchange already shows the order as closed
@@ -1188,6 +1195,9 @@ class LiveExecutor:
             "limit chase failed after %d retries, falling back to market order",
             cfg.exchange.limit_chase_max_retries,
         )
+        self._maker_fallback_reason = (
+            f"limit chase timed out after {cfg.exchange.limit_chase_max_retries} retries"
+        )
         return self._exchange.create_order(self.symbol, "market", side, quantity)
 
     # ── Core execution ────────────────────────────────────────────────
@@ -1206,6 +1216,10 @@ class LiveExecutor:
         spend minutes repricing while the stop level runs away.
         """
         from bot.strategy.threshold_strategy import Signal
+
+        # Cleared per call so a stale flag from a prior order (e.g. one that
+        # hit the qty=0 guard after a fallback) can't misfire on this one.
+        self._maker_fallback_reason = None
 
         if signal not in (Signal.BUY, Signal.SELL):
             return None
@@ -1458,6 +1472,27 @@ class LiveExecutor:
                 logger.warning("Fee dict from exchange: %s", fee_data)
                 fee_cost     = float(fee_data.get("cost") or 0.0)
                 fee_currency = fee_data.get("currency") or quote
+
+                # Maker→taker silent-degradation guard. _place_limit_order sets
+                # this whenever a post-only limit fell back to a market (taker)
+                # order — the fill went through but at ~2x the fee. The
+                # logger.warning inside that method names the path; this raises
+                # it to a Telegram alert so it can't hide for months again (the
+                # 2026-06→08 post-only bug did exactly that).
+                if self._maker_fallback_reason:
+                    logger.warning(
+                        "MAKER FALLBACK [%s]: %s post-only limit degraded to a "
+                        "market order — %s",
+                        self.symbol, side.value, self._maker_fallback_reason,
+                    )
+                    self._alerter.error(
+                        f"MAKER FALLBACK [{self.symbol}]: {side.value} was meant to "
+                        f"be a post-only limit (maker fee ~0.25-0.40%) but filled as "
+                        f"a market (taker) order (~0.80%) — {self._maker_fallback_reason}. "
+                        f"The trade went through; this is a fee/execution alert, not "
+                        f"a block."
+                    )
+                    self._maker_fallback_reason = None
 
             except ccxt.InsufficientFunds as exc:
                 logger.error("Insufficient funds: %s", exc)

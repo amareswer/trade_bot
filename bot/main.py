@@ -2111,19 +2111,32 @@ def run():
             # the active symbol's daily trend to every symbol.)
             # BUY signals are rare, so this is at most one extra API call per
             # BUY-signal candle. On fetch failure fall back to the cached
-            # closes; with no cache the gate fails open (same as before).
+            # closes; with no cache the gate fails open (same as before) — but
+            # that's a risk gate silently bypassed on a live BUY, so alert.
             if is_indicator and raw_signal == Signal.BUY and live_exchange is not None:
                 try:
                     _raw_1d = live_exchange.fetch_ohlcv(sym, timeframe="1d", limit=30)
                     if _raw_1d:
                         ss['mtf_1d_closes'] = [float(r[4]) for r in _raw_1d[:-1]]
                 except Exception as _mtf_exc:
+                    _mtf_has_cache = bool(ss['mtf_1d_closes'])
                     logger.warning(
                         "MTF gate [%s]: daily fetch failed (%s) — %s",
                         sym, _mtf_exc,
-                        "using cached closes" if ss['mtf_1d_closes']
+                        "using cached closes" if _mtf_has_cache
                         else "no cache, gate skipped",
                     )
+                    if not _mtf_has_cache:
+                        try:
+                            alerter.error(
+                                f"MTF GATE BYPASSED [{sym}]: daily-candle fetch failed "
+                                f"({type(_mtf_exc).__name__}) and no cached closes exist — "
+                                f"the 1D BEARISH veto was skipped and this BUY proceeded "
+                                f"unchecked by it. Fail-open is by design; this alert is so "
+                                f"it isn't silent."
+                            )
+                        except Exception:
+                            pass
                 if ss['mtf_1d_closes']:
                     _mtf_trend = _trend_fn(ss['mtf_1d_closes'])
                     if _mtf_trend == "BEARISH":
