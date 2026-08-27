@@ -15,6 +15,7 @@ cancel-race guard (a fill racing the cancel is recorded, never dropped —
 import asyncio
 import csv
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -69,6 +70,12 @@ class FakeIB:
                              'Submitted' status before the real fill lands,
                              instead of jumping straight from 'Cancelled' to
                              'Filled'
+      "flicker_cancel_then_slow_fill" — same Error 10349 quirk, but the silent
+                             resubmit takes ~0.9s to fill (BNS 2026-08-27 took
+                             ~8.3s live) — well past a short _fill_timeout_s
+      "flicker_cancel_no_resubmit" — order flickers to 'Cancelled' with zero
+                             fill and never resubmits or fills (a genuine dead
+                             cancel — the executor must give up, not hang)
     """
 
     def __init__(self, accounts=("DUQ273338",), cash=100_000.0,
@@ -133,6 +140,18 @@ class FakeIB:
                 self._fill(trade, order)
 
             asyncio.ensure_future(_resubmit_then_fill())
+        elif self.fill_mode == "flicker_cancel_then_slow_fill":
+            trade.orderStatus.status = "Cancelled"
+
+            async def _slow_resubmit_then_fill():
+                await asyncio.sleep(0.2)
+                trade.orderStatus.status = "PreSubmitted"   # alive again, unfilled
+                await asyncio.sleep(0.7)
+                self._fill(trade, order)
+
+            asyncio.ensure_future(_slow_resubmit_then_fill())
+        elif self.fill_mode == "flicker_cancel_no_resubmit":
+            trade.orderStatus.status = "Cancelled"   # dead — never resubmits/fills
         return trade
 
     def cancelOrder(self, order):
@@ -520,6 +539,46 @@ def test_flicker_cancel_resubmit_then_fill_is_recorded(executors):
     assert order.price == 212.13
     assert order.quantity == 4
     assert fake.cancelled == []    # never initiated a cancel ourselves
+
+
+def test_flicker_cancel_then_slow_resubmit_fill_is_recorded(executors, monkeypatch):
+    # BNS, 2026-08-27: the same Error 10349 quirk as the two RY incidents
+    # above, but the silent resubmit took ~8.3s to fill — past the old
+    # hardcoded 5s grace window. The executor gave up, alerted "order ended
+    # 'PreSubmitted' with no fill", and never recorded the fill while the
+    # broker held 7 BNS. The resubmit-grace window must be (a) generous enough
+    # for a multi-second resubmit and (b) independent of _fill_timeout_s, so a
+    # short fill timeout cannot truncate it. fill_timeout_s here (0.3s) is far
+    # shorter than the ~0.9s resubmit fill delay.
+    monkeypatch.setattr(ibkr_mod, "_CANCEL_RESUBMIT_GRACE_S", 3.0)
+    fake = FakeIB(fill_mode="flicker_cancel_then_slow_fill", fill_price=92.96)
+    ex = make_executor(fake, fill_timeout_s=0.3)
+    executors.append(ex)
+    t0 = time.monotonic()
+    order = ex.buy("BNS", 7, 93.0, reason="test")
+    elapsed = time.monotonic() - t0
+    assert order.status == OrderStatus.FILLED
+    assert order.price == 92.96
+    assert order.quantity == 7
+    assert fake.cancelled == []       # never initiated a cancel ourselves
+    assert elapsed > 0.3              # waited past _fill_timeout_s for the resubmit
+
+
+def test_flicker_cancel_no_resubmit_gives_up_after_grace(executors, monkeypatch):
+    # The other side of the BNS fix: a genuine dead 'Cancelled' with no
+    # resubmit must not hang the scan loop. Once _CANCEL_RESUBMIT_GRACE_S
+    # elapses with no fill, give up and report REJECTED.
+    monkeypatch.setattr(ibkr_mod, "_CANCEL_RESUBMIT_GRACE_S", 0.4)
+    fake = FakeIB(fill_mode="flicker_cancel_no_resubmit", fill_price=93.0)
+    ex = make_executor(fake, fill_timeout_s=5.0)   # long — grace must gate, not this
+    executors.append(ex)
+    t0 = time.monotonic()
+    order = ex.buy("BNS", 7, 93.0, reason="test")
+    elapsed = time.monotonic() - t0
+    assert order.status == OrderStatus.REJECTED
+    assert "no fill" in order.reject_reason
+    assert fake.cancelled == []       # already 'Cancelled' — nothing to cancel
+    assert elapsed < 3.0              # gave up on the grace window, not fill_timeout_s
 
 
 # ---------------------------------------------------------------------------

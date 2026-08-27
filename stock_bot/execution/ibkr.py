@@ -106,6 +106,16 @@ def _next_business_day(d: date) -> date:
 _LIVE_PORTS = {7496, 4001}   # TWS live, IB Gateway live
 _PAPER_ACCOUNT_PREFIX = "DU"
 
+# IBKR Error 10349 ("Order TIF was set to DAY based on order preset") flips a
+# freshly-placed market order to 'Cancelled' with zero fill, then silently
+# resubmits the SAME order, which fills for real seconds later (observed:
+# RY 2026-07-31 ~0.7s, RY 2026-08-19 ~2.4s, BNS 2026-08-27 ~8.3s). An unfilled
+# 'Cancelled'/'ApiCancelled' is therefore not trusted as terminal — we keep
+# polling this long past the first flicker sighting for the resubmit to fill.
+# Deliberately independent of _fill_timeout_s: the resubmit routinely lands
+# after the original fill deadline. Sized well above the worst case seen.
+_CANCEL_RESUBMIT_GRACE_S = 20.0
+
 # LiveTradingGate gates enforced before a live-port connection is allowed.
 # Gate 4 (infrastructure importability) is deliberately excluded — see the
 # class docstring's "Safety guards" section for why.
@@ -431,13 +441,47 @@ class IBKRExecutor(StockExecutorBase):
         order = MarketOrder(action, qty)
         trade = self._ib.placeOrder(qualified[0], order)
 
+        # Wait for a real fill or a genuine terminal state.
+        #
+        # IBKR Error 10349 makes trade.isDone() go True on a transient,
+        # zero-fill 'Cancelled' a beat after placement, then the same order is
+        # silently resubmitted and fills seconds later (see _CANCEL_RESUBMIT_
+        # GRACE_S above for the incident history). A plain `while not
+        # trade.isDone()` collapses the wait on that flicker and loses the
+        # resubmit's fill — the order gets logged/alerted as "rejected" while
+        # the position is actually open and unrecorded (RY 2026-07-31/08-19,
+        # BNS 2026-08-27). So an *unfilled* 'Cancelled'/'ApiCancelled' is not
+        # treated as terminal: keep polling for the resubmit's fill for
+        # _CANCEL_RESUBMIT_GRACE_S past the first flicker sighting. Any fill, or
+        # any other done-state, ends the wait.
+        def _has_fill() -> bool:
+            return bool(trade.fills) or float(trade.orderStatus.filled or 0.0) > 0
+
         deadline = self._loop.time() + self._fill_timeout_s
-        while not trade.isDone() and self._loop.time() < deadline:
+        resubmit_grace_until = None
+        while True:
+            if _has_fill():
+                break
+            if resubmit_grace_until is not None:
+                # A 10349 flicker was already seen — the silent resubmit governs
+                # now. Wait out _CANCEL_RESUBMIT_GRACE_S regardless of the
+                # resubmit's current status (Cancelled/PreSubmitted/Submitted)
+                # or the original fill deadline: the resubmit can land well
+                # after _fill_timeout_s (BNS ~8.3s), and a short fill timeout
+                # (tests, or a tight config) must not truncate it.
+                if self._loop.time() >= resubmit_grace_until:
+                    break   # resubmit never filled — genuinely dead
+            elif trade.isDone():
+                if trade.orderStatus.status not in ("Cancelled", "ApiCancelled"):
+                    break   # genuine terminal state, no fill
+                resubmit_grace_until = self._loop.time() + _CANCEL_RESUBMIT_GRACE_S
+            elif self._loop.time() >= deadline:
+                break   # order still live but past the fill deadline
             await asyncio.sleep(0.25)
 
-        if not trade.isDone():
-            # Timeout: cancel, then wait for the order's actual fate — a fill
-            # can race the cancel and must be recorded, never dropped.
+        if not _has_fill() and not trade.isDone():
+            # True timeout with the order still live: cancel, then wait for its
+            # actual fate — a fill can still race the cancel, never dropped.
             logger.warning(
                 "IBKR %s %s ×%d not done after %.0fs — cancelling",
                 action, symbol, qty, self._fill_timeout_s,
@@ -445,31 +489,6 @@ class IBKRExecutor(StockExecutorBase):
             self._ib.cancelOrder(order)
             cancel_deadline = self._loop.time() + 15.0
             while not trade.isDone() and self._loop.time() < cancel_deadline:
-                await asyncio.sleep(0.25)
-        elif (trade.orderStatus.status in ("Cancelled", "ApiCancelled")
-                and not trade.fills and float(trade.orderStatus.filled or 0.0) <= 0):
-            # IBKR can report an unprompted, transient 'Cancelled' status (e.g.
-            # Error 10349 "Order TIF was set to DAY based on order preset")
-            # before silently resubmitting the same order, which then fills
-            # normally a moment later (RY, 2026-07-31: order read 'Cancelled'
-            # with zero fill, logged/alerted as rejected, then filled 4sh
-            # @ $210.55 ~700ms afterward with nothing left recording it).
-            # Don't trust an unfilled 'Cancelled' at face value — give it a
-            # short grace window to reveal whether it's actually still alive.
-            #
-            # The resubmit doesn't necessarily sit in 'Cancelled' for the
-            # whole window — it can cycle through PreSubmitted/Submitted
-            # (order alive again, still unfilled) before the fill lands
-            # (RY, 2026-08-19: left 'Cancelled' for 'Submitted' within
-            # ~350ms, then filled ~2.4s later — a loop gated on "still
-            # Cancelled" exited the instant status moved off it, treating a
-            # live-but-unfilled order as resolved and dropping the same
-            # fill again). Wait on an actual fill, not a specific status,
-            # so any resubmit path is covered.
-            grace_deadline = self._loop.time() + 5.0
-            while (not trade.fills
-                    and float(trade.orderStatus.filled or 0.0) <= 0
-                    and self._loop.time() < grace_deadline):
                 await asyncio.sleep(0.25)
 
         status = trade.orderStatus.status
