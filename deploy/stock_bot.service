@@ -1,0 +1,63 @@
+# /etc/systemd/system/stock_bot.service
+#
+# Stock trading bot — trades IBKR paper (account DUQ273338) through a headless
+# IB Gateway managed by IBC. See deploy/IBKR_GATEWAY_SETUP.md for the Gateway
+# side. The bot itself needs NO code change to talk to Gateway instead of TWS —
+# it already connects by host:port and IBKRExecutor supports both.
+#
+# Install:
+#   sudo cp deploy/stock_bot.service /etc/systemd/system/stock_bot.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now stock_bot
+#   sudo journalctl -u stock_bot -f
+
+[Unit]
+Description=Stock Trading Bot (IBKR paper via IB Gateway)
+After=network-online.target
+Wants=network-online.target
+# If IBC/Gateway runs as its own systemd unit, uncomment:
+#   After=ibc.service
+#   Wants=ibc.service
+# If it runs as a Docker container (recommended path), uncomment:
+#   After=docker.service
+#   Wants=docker.service
+# Either way, the ExecStartPre port-wait below is the real readiness gate.
+
+# Crash-loop detection is in-process (stock_bot/main.py → startup_timestamps +
+# Telegram alert), so never let systemd give up restarting.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/trade_bot
+
+# stock_bot/config.py loads stock_bot/.env itself via python-dotenv, which
+# correctly handles the inline "# ..." comments in that file. systemd's own
+# EnvironmentFile parser does NOT strip inline comments on older systemd, so
+# do NOT add `EnvironmentFile=` here — let the app read its own .env.
+
+# Block startup until IB Gateway's API port is actually accepting connections.
+# IBC takes ~30-60s after launch to finish logging in and open the socket;
+# starting the bot into a refused port just spams the reconnect loop. Waits
+# up to 120s, then fails with a clear message (systemd will retry per
+# RestartSec). Port 4002 = IB Gateway paper; use 4001 for live.
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/4002) 2>/dev/null && exec 3>&- && exit 0; sleep 2; done; echo "IB Gateway API port 4002 not reachable after 120s — is IBC/Gateway up?" >&2; exit 1'
+
+ExecStart=/opt/trade_bot/venv/bin/python -m stock_bot.main
+Restart=always
+RestartSec=30
+
+StandardOutput=journal
+StandardError=journal
+
+# Stock bot is heavier than the crypto bot: yfinance + pandas + a 5-worker
+# fetch/research pool + per-cycle AI calls over ~40 symbols.
+MemoryMax=1G
+CPUQuota=60%
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

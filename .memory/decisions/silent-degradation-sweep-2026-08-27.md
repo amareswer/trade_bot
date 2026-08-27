@@ -167,8 +167,23 @@ warning-only (tax file, not gate schema, docstring already says best-effort). +1
 suite 697→698.
 
 **IBKR remaining deferred:** nothing material left — the order path, state save, and reconnect
-probe are all handled. The stock bot's IBKR executor is now readiness-hardened. Next
-readiness item is infra: IB Gateway + IBC for headless (VPS) operation — not started.
+probe are all handled. The stock bot's IBKR executor is now readiness-hardened.
+
+**IB Gateway + IBC headless deploy — SCOPED + DOCUMENTED 2026-08-27 (not executed).**
+Roadmap item G. Key finding: **no bot code change needed** — `IBKRExecutor` already connects
+by host:port and `_LIVE_PORTS`/docstring already cover Gateway. Pure infra. Written:
+`deploy/IBKR_GATEWAY_SETUP.md` (Docker path via `gnzsnz/ib-gateway-docker` recommended; native
+Gateway+IBC+Xvfb+systemd path as alternative; 2FA handling — paper logins usually have none;
+IBKR's forced daily ~23:45 restart handled by IBC's AutoRestartTime + the bot's existing
+try_reconnect; verification via `ibkr_smoke.py --port 4002`) and `deploy/stock_bot.service`
+(systemd unit, uses an API-port TCP wait as `ExecStartPre` readiness gate rather than a blind
+sleep, no `EnvironmentFile=` because `stock_bot/config.py` loads its own `.env` and systemd's
+parser chokes on that file's inline comments, MemoryMax 1G since stock bot is heavier).
+`deploy/VPS_SETUP.md` got a scope note (it's crypto-only). The only bot edit when executed:
+`IBKR_PORT=7497 → 4002` in `stock_bot/.env`. Est. ~4h + a day's observation (Docker path).
+Deferred with the rest of VPS migration — crypto bot moves first (real money, no local broker
+software). Also flagged in the doc: test yfinance from the VPS IP before committing the stock
+bot (datacenter IPs get rate-limited harder by Yahoo — the 2026-08-05 outage class).
 
 Related: [[execution_layer]], [[fee-structure]], [[2026-08-18-missed-buy-signal]]
 (that investigation is why the MTF gate's blocked-reason labels exist), [[known-gaps]],

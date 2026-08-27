@@ -3,6 +3,12 @@
 Provider-agnostic instructions for deploying on any Linux VPS.
 Oracle Cloud ARM (aarch64 / Ampere A1) specifics noted inline.
 
+> **Scope: crypto bot only.** This guide covers `bot.main` (Kraken, plain HTTPS,
+> no local broker software). The **stock bot** (`stock_bot.main`, IBKR) additionally
+> needs a headless IB Gateway managed by IBC — see
+> **`deploy/IBKR_GATEWAY_SETUP.md`** and the `deploy/stock_bot.service` unit. The
+> two bots can run on the same VPS or be split (crypto on VPS, stock elsewhere).
+
 ---
 
 ## Prerequisites
