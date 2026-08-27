@@ -482,10 +482,18 @@ transient unfilled `Cancelled`/`ApiCancelled` as terminal — on the first flick
 `_CANCEL_RESUBMIT_GRACE_S` (20s, **independent of `_fill_timeout_s`**) window and keeps
 polling for the resubmit's fill regardless of its interim status; a genuine dead `Cancelled`
 with no resubmit gives up after that window instead of hanging. The old separate 5s grace
-`elif` block is gone (folded into the main loop). **Prevention still open:** the root trigger
-is a TWS order preset forcing TIF=DAY — clear it in TWS Global Config → Presets, or set an
-explicit `order.tif` on the `MarketOrder`, so 10349 never fires. Tests:
+`elif` block is gone (folded into the main loop). Tests:
 `tests/stock/test_ibkr_executor.py` +2 (60→62). Suite 731→733. No strategy files touched.
+
+**Prevention — DONE (2026-08-27, same session).** `_place_market_async` now builds
+`MarketOrder(action, qty, tif="DAY")` instead of leaving `tif=""`. Empty TIF makes TWS apply
+a preset default and, when that's an adjustment, flag the order `Cancelled` + silently
+resubmit (the 10349 trigger). Sending the value TWS picks anyway — `DAY`, correct for
+fill-immediately market orders, not `GTC` — removes the adjustment so 10349 never fires.
+Covers BUY and SELL (one shared order-build path). The grace-window fix above stays as a
+backstop for any other resubmit cause. Asserted in
+`test_buy_fills_at_broker_price_not_request_price` (`placed_order.tif == "DAY"`) — folded
+into that test, count still 62/733.
 
 ### Risk-gate config (live — RiskManager, `bot/risk/risk_manager.py`)
 ```

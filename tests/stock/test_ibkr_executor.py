@@ -374,8 +374,13 @@ def test_buy_fills_at_broker_price_not_request_price(executors, tmp_path):
     assert order.total_value == round(3 * 101.25, 2)
 
     # contract routed as TSX
-    contract, _, _ = fake.placed[0]
+    contract, placed_order, _ = fake.placed[0]
     assert (contract.symbol, contract.currency) == ("CM", "CAD")
+
+    # tif set explicitly to "DAY" — heads off IBKR Error 10349 ("Order TIF was
+    # set to DAY based on order preset"), the cancel/resubmit trigger behind
+    # the RY 2026-07-31/08-19 and BNS 2026-08-27 dropped-fill incidents
+    assert placed_order.tif == "DAY"
 
     # CSV row appended with frozen 9-column schema
     with open(tmp_path / "ibkr_trades.csv") as f:

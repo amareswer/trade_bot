@@ -438,7 +438,17 @@ class IBKRExecutor(StockExecutorBase):
         if not qualified:
             raise RuntimeError(f"IBKR could not qualify contract for {symbol}")
 
-        order = MarketOrder(action, qty)
+        # tif="DAY" set explicitly to head off IBKR Error 10349 ("Order TIF was
+        # set to DAY based on order preset"): with no tif on the wire, TWS
+        # applies a preset default and, if that involves an adjustment, flags
+        # the order 'Cancelled' + silently resubmits — the cancel/resubmit race
+        # the wait loop below has to absorb (RY 2026-07-31/08-19, BNS
+        # 2026-08-27). Sending the value TWS would pick anyway removes the
+        # adjustment, so the warning/resubmit never fires. DAY (not GTC) is
+        # correct here — these are market orders meant to fill immediately; an
+        # unfilled one should expire, not rest overnight. The grace-window
+        # handling stays as a backstop for any other resubmit cause.
+        order = MarketOrder(action, qty, tif="DAY")
         trade = self._ib.placeOrder(qualified[0], order)
 
         # Wait for a real fill or a genuine terminal state.
