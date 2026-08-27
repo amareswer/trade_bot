@@ -990,6 +990,134 @@ def _help_crypto_text() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Daily health digest — a proactive once-a-day both-bots status push, so a VPS
+# deployment gives a "yes it's fine" every morning (and its absence is itself a
+# signal) instead of only reactive alerts. Built 2026-08-27 after the native-
+# stop deadlock ran 8 min invisibly.
+# ---------------------------------------------------------------------------
+
+def _recent_error_count(log_path: str, ref: datetime, hours: int = 24,
+                        max_bytes: int = 800_000) -> int:
+    """Count ' ERROR ' log lines in the last `hours` before `ref` (naive local
+    time, matching the log's own timestamp format). Reads only the file tail."""
+    try:
+        size = os.path.getsize(log_path)
+        with open(log_path, "rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+                f.readline()   # drop the partial first line
+            data = f.read().decode("utf-8", "replace")
+    except OSError:
+        return 0
+    cutoff = ref - timedelta(hours=hours)
+    n = 0
+    for line in data.splitlines():
+        if " ERROR " not in line:
+            continue
+        try:
+            ts = datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        if ts >= cutoff:
+            n += 1
+    return n
+
+
+def _health_digest_text(
+    now: datetime, crypto_status: str, stock_status: str,
+    open_orders: list, crypto_errs: int, stock_errs: int,
+    attention: list[str],
+) -> str:
+    """Pure composer for the daily digest — attention header + both bots +
+    open-order list + 24h error counts."""
+    head = "⚠️ NEEDS ATTENTION" if attention else "✅ all systems normal"
+    parts = [
+        "📋 DAILY HEALTH DIGEST",
+        now.strftime("%Y-%m-%d %H:%M local"),
+        head,
+    ]
+    if attention:
+        parts.append("• " + "\n• ".join(attention))
+    parts += ["", crypto_status]
+    if open_orders:
+        parts.append("")
+        parts.append(f"Open exchange orders ({len(open_orders)}):")
+        for o in open_orders[:8]:
+            parts.append(
+                f"  {o.get('symbol','?')} {o.get('type','?')} "
+                f"{o.get('side','?')} {o.get('amount','?')}"
+            )
+    else:
+        parts.append("\nOpen exchange orders: none")
+    parts += ["", stock_status, ""]
+    parts.append(f"Errors last 24h — crypto: {crypto_errs}  stock: {stock_errs}")
+    return "\n".join(parts)
+
+
+def _maybe_send_health_digest(
+    executors: dict, symbol_state: dict, risk, alerter,
+    live_trading: bool, dry_run: bool, now: datetime,
+) -> None:
+    """Once/day at HEALTH_DIGEST_TIME (local, default 08:00; 'off' disables).
+    Records the run date BEFORE composing so a send failure can't re-fire every
+    tick. Never raises."""
+    _time = os.getenv("HEALTH_DIGEST_TIME", "08:00").strip()
+    if _time.lower() in ("", "off", "0", "false"):
+        return
+    try:
+        state: dict = {}
+        if os.path.exists(_AUDIT_STATE_PATH):
+            with open(_AUDIT_STATE_PATH, encoding="utf-8") as f:
+                state = json.load(f) or {}
+        if not _audit_due(state.get("health_digest"), now, _time):
+            return
+        state["health_digest"] = now.date().isoformat()
+        from bot.atomic_json import atomic_write_json
+        atomic_write_json(_AUDIT_STATE_PATH, state, indent=0)
+    except Exception as exc:
+        logger.warning("Health digest schedule check failed: %s", exc)
+        return
+
+    try:
+        crypto_status = _status_crypto_text(
+            executors, symbol_state, risk, live_trading, dry_run,
+        )
+        stock_status = _status_stock_text()
+        try:
+            _ex = next(iter(executors.values()))._exchange
+            open_orders = _ex.fetch_open_orders() or []
+        except Exception:
+            open_orders = []
+        crypto_errs = _recent_error_count(os.path.join(_log_dir, "trade_bot.log"), now)
+        stock_errs  = _recent_error_count(
+            os.path.join(os.path.dirname(_log_dir), "logs", "stock_bot.log"), now,
+        )
+
+        attention: list[str] = []
+        if risk.config.halt:
+            attention.append("manual HALT is engaged")
+        if risk.kill_switch_tripped:
+            attention.append("kill switch TRIPPED (sticky)")
+        for _sym, _ss in symbol_state.items():
+            if _ss.get("exit_fail_count", 0) > 0:
+                attention.append(f"{_sym}: {_ss['exit_fail_count']} failed SL/TP exits")
+            if _ss.get("candle_feed_stale"):
+                attention.append(f"{_sym}: candle feed stale")
+        if crypto_errs >= 20:
+            attention.append(f"{crypto_errs} crypto errors in 24h")
+        if stock_errs >= 20:
+            attention.append(f"{stock_errs} stock errors in 24h")
+
+        alerter.message(_health_digest_text(
+            now, crypto_status, stock_status, open_orders,
+            crypto_errs, stock_errs, attention,
+        ))
+        logger.info("Daily health digest sent (%d attention item(s))", len(attention))
+    except Exception as exc:
+        logger.warning("Health digest compose/send failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
@@ -2764,6 +2892,12 @@ def run():
                     ),
                     trade_count  = risk.fills_today_for(_dp_sym),
                 )
+
+        # Daily both-bots health digest (local-time scheduled, once/day).
+        _maybe_send_health_digest(
+            executors, symbol_state, risk, alerter,
+            cfg.exchange.live_trading, cfg.exchange.dry_run, datetime.now(),
+        )
 
     display.stopped(
         ticks        = tick,
