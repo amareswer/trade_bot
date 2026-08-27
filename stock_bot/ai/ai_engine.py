@@ -9,12 +9,13 @@ Providers (set AI_PROVIDER in stock_bot/.env):
   ollama_local       — any Ollama model running locally   (OLLAMA_BASE_URL)
   ollama_cloud/cloud — any Ollama model via ollama.com     (OLLAMA_CLOUD_API_KEY)
 
-Auto-failover (opt-in): set AI_FALLBACK_PROVIDER (mistral | openrouter) in the
-root .env. After _FALLBACK_AFTER consecutive API failures the engine switches to
-that provider for the rest of the session and fires (via main.py's per-cycle
-_update_ai_health) a Telegram alert — closes the "manually swap the model on
-every nvidia_nim degradation" gap (4 of those so far, see stock_bot/.env's
-NVIDIA_MODEL history). Off unless AI_FALLBACK_PROVIDER is set.
+Auto-failover (opt-in): set AI_FALLBACK_PROVIDER (mistral | openrouter | nvidia_nim)
+in the .env. After _FALLBACK_AFTER consecutive API failures — or sustained parse
+failures — the engine switches to that provider for the rest of the session and
+fires (via main.py's per-cycle _update_ai_health) a Telegram alert — closes the
+"manually swap the model on every nvidia_nim degradation" gap (4 of those so far,
+see stock_bot/.env's NVIDIA_MODEL history). Off unless AI_FALLBACK_PROVIDER is set.
+The primary and fallback must differ (fallback == primary is a no-op).
 
 Failure modes:
   - Missing credentials → returns HOLD, confidence=0, reasoning="AI unavailable"
@@ -326,11 +327,17 @@ class AIEngine:
 
     def _switch_to_fallback(self) -> bool:
         """Reconfigure the engine to AI_FALLBACK_PROVIDER for the rest of the
-        session. One-way, once. Only HTTP providers (mistral, openrouter) can be
-        a fallback target — ollama_cloud/nvidia_nim use different clients.
+        session. One-way, once. Supported targets: mistral / openrouter (HTTP)
+        and nvidia_nim (OpenAI SDK client). ollama_* are not switchable targets.
         Returns True iff the switch happened.
         """
         if self._fallback_active or not self._fallback_provider:
+            return False
+        if self._fallback_provider == self._primary_provider:
+            logger.warning(
+                "AI_FALLBACK_PROVIDER == AI_PROVIDER (%s) — no fallback to switch to",
+                self._primary_provider,
+            )
             return False
         fp = self._fallback_provider
         if fp == "mistral":
@@ -347,15 +354,32 @@ class AIEngine:
                 return False
             self._model    = os.getenv("OPENROUTER_MODEL", _MODEL).strip()
             self._base_url = "https://openrouter.ai/api/v1/chat/completions"
+        elif fp == "nvidia_nim":
+            key = os.getenv("NVIDIA_API_KEY", "").strip()
+            if not key:
+                logger.warning("AI failover unavailable — NVIDIA_API_KEY not set in stock_bot/.env")
+                return False
+            try:
+                from openai import OpenAI as _OpenAIClient
+            except ImportError:
+                logger.warning("AI failover unavailable — openai package required for nvidia_nim")
+                return False
+            self._openai_cls = _OpenAIClient
+            self._api_key    = key
+            self._model      = os.getenv("NVIDIA_MODEL", "deepseek-ai/deepseek-v4-pro-0813").strip()
+            self._base_url   = "https://integrate.api.nvidia.com/v1"
+            # _analyze_once's nvidia_nim branch uses the OpenAI client, not
+            # self._headers — nothing else to set.
         else:
             logger.warning(
-                "AI_FALLBACK_PROVIDER=%r not supported (mistral | openrouter only)", fp,
+                "AI_FALLBACK_PROVIDER=%r not supported (mistral | openrouter | nvidia_nim)", fp,
             )
             return False
-        self._headers = {
-            "Content-Type":  "application/json",
-            "Authorization": f"Bearer {key}",
-        }
+        if fp != "nvidia_nim":
+            self._headers = {
+                "Content-Type":  "application/json",
+                "Authorization": f"Bearer {key}",
+            }
         logger.error(
             "AI FAILOVER: %s failed %d consecutive calls — switching to %s (%s) "
             "for the rest of this session",

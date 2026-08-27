@@ -174,7 +174,15 @@ need the full narrative behind any decision below.
 
 ## Test Suite Manifest (reconciled 2026-08-18, count updated 2026-08-24)
 
-Expected total: **745 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-26s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later. 2026-08-24: 629→639, +10 for CapitalPool per-symbol slot caps — this line and the table row below were caught stale during a "what's missing" self-audit in the same session that added the tests; the manifest count and the actual suite had already diverged by the time that session's own report was written. Same self-audit then found the config-layer half of that same feature — `_slot_caps_by_base()` — had zero test coverage at all; closed it same-day, 639→647. Then 647→658, +11 for `rescreen.py`'s new USD leg + the `_alert()` nested-config bugfix — new file `tests/crypto/test_rescreen.py`, this script's first-ever test coverage. 2026-08-25: 658→666, +8 for `stock_bot.main._update_ai_health()` — new file `tests/stock/test_ai_health.py`, found during a "what are we missing" review, not a session that was already touching this code. 2026-08-26: 666→674, +8 for the crypto dashboard multi-symbol combine — new file `tests/crypto/test_dashboard_renderer.py`, `bot/dashboard/renderer.py`'s first-ever test coverage, found while fixing the single-symbol dashboard gap SOL/CAD's promotion exposed. Then 674→676, +2 for the stock bot's RULES-decision log-visibility fix — new file `tests/stock/test_rules_log_visibility.py`, found while answering a "why didn't it buy X" question with no log evidence available to check. 2026-08-27: 676→678, +2 for the maker→taker silent-fallback alert in `bot/execution/live_executor.py` (`tests/crypto/test_live_executor.py` 63→65) — a silent-degradation bug sweep prompted by the 2026-08-26 post-only fee bug, which hid for 2 months precisely because the maker→taker fallback was `logger.warning`-only. Then 678→680, +2 for the MTF-gate fail-open alert — new file `tests/crypto/test_mtf_gate_alert.py`, from the same sweep. Then 680→687, +7 for the blocked-BUY Telegram alert (`bot.main._evaluate_blocked_buy_alert`) — new file `tests/crypto/test_blocked_buy_alert.py`, Track 4 (observability); closes the 2026-08-18 "sat flat through a rally, nobody knew a BUY had been vetoed" gap. Then 687→694, +7 for the stock-bot analog — `stock_bot.main._evaluate_blocked_rule_buys_alert`, an end-of-cycle blocked-rule-BUY ops_alert digest — new file `tests/stock/test_blocked_rule_buys_alert.py`, from extending the same observability review to the stock bot. Then 694→697, +3 for IBKRExecutor TWS-query resilience (`tests/stock/test_ibkr_executor.py` 56→59) — `accountValues()`/`positions()` now serve a last-good cache on a transient failure instead of a fabricated 0.0/{}, from a stock-bot-readiness hardening pass. Then 697→698, +1 for `ibkr_trades.csv` write resilience (59→60) — a failed append buffers the real filled-trade row and retries, not silently drops it. Then 698→706, +8 for the Mistral AI provider + auto-failover (new file `tests/stock/test_ai_failover.py`) — `AI_PROVIDER=mistral` support and a one-shot switch to `AI_FALLBACK_PROVIDER` after 5 consecutive nvidia_nim API failures, closing the "manually swap NVIDIA_MODEL on every degradation" gap. Then 706→709, +3 for the native-stop pre-cancel-on-SELL fix (`tests/crypto/test_live_executor.py` 65→68) — a live SOL/CAD incident where the resting native stop reserved 100% of the coins so every TP/SL SELL failed "Insufficient funds" in a retry loop. Then 709→712, +3 for debouncing the blocked-rule-BUY digest (`tests/stock/test_blocked_rule_buys_alert.py` 7→10) — BNS/GM flapped the MAX_EXPOSURE gate BUY↔HOLD every other cycle and each toggle re-alerted. Then 712→719, +7 for VPS-observability hardening from the native-stop incident post-mortem: +4 `TelegramAlerter` duplicate-alert throttle (`tests/crypto/test_crypto_telegram.py`) and +3 the SL/TP-exit-failure alert (new file `tests/crypto/test_exit_fail_alert.py`) — that incident rejected ~200 exits over 8 min with ZERO Telegram alert. Then 719→729, +10 for the daily health digest (new file `tests/crypto/test_health_digest.py`) — a proactive once-a-day both-bots status push so a VPS deployment gives a "yes it is fine" every morning. Then 729→731, +2 for the AI provider swap fallout (nvidia_nim → mistral: nemotron rambled reasoning-text and parse-failed ~75% of calls; failover now triggers on sustained parse failures + the health check needs a MAJORITY of calls to succeed; `fetch_earnings` short-circuits ETFs). Then 731→733, +2 for the IBKR Error 10349 slow-resubmit fill fix (`tests/stock/test_ibkr_executor.py` 60→62) — BNS 2026-08-27: a 10349 TIF-preset cancel/resubmit filled ~8.3s later, past the old hardcoded 5s grace window, so the executor alerted "order ended 'PreSubmitted' with no fill" and never recorded a real 7-share fill. Then 733→745, +12 for the top-movers universe refresh fix (new file `tests/stock/test_universe_refresh.py`) — the refresh was gated on an unreachable clock hour (16:00 ET, when the loop is already in AFTER_HOURS mode) so it NEVER fired: 179 "waiting" log lines / 0 "refreshed" across 3 days, bot scanned watchlist-only its entire history. Now first-LIVE-cycle-of-day + persisted across restarts.)
+Expected total: **760 tests** (verified via `pytest --collect-only -q`; table sum below checked to match exactly). If `pytest --collect-only -q` reports a different number, a file has an import error, was deleted, was added without a manifest update, or was excluded from the runner. Investigate before trusting any green suite result. Suite runtime is ~9-26s — if it takes minutes, a test is reading live `.env` config. (2026-08-19: baseline checked at 527 immediately before that session's 7 new tests were added — one higher than the 526 this manifest previously claimed; not investigated further, flagging in case it matters later. 2026-08-24: 629→639, +10 for CapitalPool per-symbol slot caps — this line and the table row below were caught stale during a "what's missing" self-audit in the same session that added the tests; the manifest count and the actual suite had already diverged by the time that session's own report was written. Same self-audit then found the config-layer half of that same feature — `_slot_caps_by_base()` — had zero test coverage at all; closed it same-day, 639→647. Then 647→658, +11 for `rescreen.py`'s new USD leg + the `_alert()` nested-config bugfix — new file `tests/crypto/test_rescreen.py`, this script's first-ever test coverage. 2026-08-25: 658→666, +8 for `stock_bot.main._update_ai_health()` — new file `tests/stock/test_ai_health.py`, found during a "what are we missing" review, not a session that was already touching this code. 2026-08-26: 666→674, +8 for the crypto dashboard multi-symbol combine — new file `tests/crypto/test_dashboard_renderer.py`, `bot/dashboard/renderer.py`'s first-ever test coverage, found while fixing the single-symbol dashboard gap SOL/CAD's promotion exposed. Then 674→676, +2 for the stock bot's RULES-decision log-visibility fix — new file `tests/stock/test_rules_log_visibility.py`, found while answering a "why didn't it buy X" question with no log evidence available to check. 2026-08-27: 676→678, +2 for the maker→taker silent-fallback alert in `bot/execution/live_executor.py` (`tests/crypto/test_live_executor.py` 63→65) — a silent-degradation bug sweep prompted by the 2026-08-26 post-only fee bug, which hid for 2 months precisely because the maker→taker fallback was `logger.warning`-only. Then 678→680, +2 for the MTF-gate fail-open alert — new file `tests/crypto/test_mtf_gate_alert.py`, from the same sweep. Then 680→687, +7 for the blocked-BUY Telegram alert (`bot.main._evaluate_blocked_buy_alert`) — new file `tests/crypto/test_blocked_buy_alert.py`, Track 4 (observability); closes the 2026-08-18 "sat flat through a rally, nobody knew a BUY had been vetoed" gap. Then 687→694, +7 for the stock-bot analog — `stock_bot.main._evaluate_blocked_rule_buys_alert`, an end-of-cycle blocked-rule-BUY ops_alert digest — new file `tests/stock/test_blocked_rule_buys_alert.py`, from extending the same observability review to the stock bot. Then 694→697, +3 for IBKRExecutor TWS-query resilience (`tests/stock/test_ibkr_executor.py` 56→59) — `accountValues()`/`positions()` now serve a last-good cache on a transient failure instead of a fabricated 0.0/{}, from a stock-bot-readiness hardening pass. Then 697→698, +1 for `ibkr_trades.csv` write resilience (59→60) — a failed append buffers the real filled-trade row and retries, not silently drops it. Then 698→706, +8 for the Mistral AI provider + auto-failover (new file `tests/stock/test_ai_failover.py`) — `AI_PROVIDER=mistral` support and a one-shot switch to `AI_FALLBACK_PROVIDER` after 5 consecutive nvidia_nim API failures, closing the "manually swap NVIDIA_MODEL on every degradation" gap. Then 706→709, +3 for the native-stop pre-cancel-on-SELL fix (`tests/crypto/test_live_executor.py` 65→68) — a live SOL/CAD incident where the resting native stop reserved 100% of the coins so every TP/SL SELL failed "Insufficient funds" in a retry loop. Then 709→712, +3 for debouncing the blocked-rule-BUY digest (`tests/stock/test_blocked_rule_buys_alert.py` 7→10) — BNS/GM flapped the MAX_EXPOSURE gate BUY↔HOLD every other cycle and each toggle re-alerted. Then 712→719, +7 for VPS-observability hardening from the native-stop incident post-mortem: +4 `TelegramAlerter` duplicate-alert throttle (`tests/crypto/test_crypto_telegram.py`) and +3 the SL/TP-exit-failure alert (new file `tests/crypto/test_exit_fail_alert.py`) — that incident rejected ~200 exits over 8 min with ZERO Telegram alert. Then 719→729, +10 for the daily health digest (new file `tests/crypto/test_health_digest.py`) — a proactive once-a-day both-bots status push so a VPS deployment gives a "yes it is fine" every morning. Then 729→731, +2 for the AI provider swap fallout (nvidia_nim → mistral: nemotron rambled reasoning-text and parse-failed ~75% of calls; failover now triggers on sustained parse failures + the health check needs a MAJORITY of calls to succeed; `fetch_earnings` short-circuits ETFs). Then 731→733, +2 for the IBKR Error 10349 slow-resubmit fill fix (`tests/stock/test_ibkr_executor.py` 60→62) — BNS 2026-08-27: a 10349 TIF-preset cancel/resubmit filled ~8.3s later, past the old hardcoded 5s grace window, so the executor alerted "order ended 'PreSubmitted' with no fill" and never recorded a real 7-share fill. Then 733→745, +12 for the top-movers universe refresh fix (new file `tests/stock/test_universe_refresh.py`) — the refresh was gated on an unreachable clock hour (16:00 ET, when the loop is already in AFTER_HOURS mode) so it NEVER fired: 179 "waiting" log lines / 0 "refreshed" across 3 days, bot scanned watchlist-only its entire history. Now first-LIVE-cycle-of-day + persisted across restarts. Then 745→749, +4 for
+`nvidia_nim` as an auto-failover TARGET (`tests/stock/test_ai_failover.py` 9→13) — `_switch_to_fallback()`
+now supports `AI_FALLBACK_PROVIDER=nvidia_nim` (was mistral/openrouter only), so mistral-primary can fail
+over to a probed-and-verified NVIDIA model (`deepseek-ai/deepseek-v4-pro-0813`, the only reliably-deployed
+one of 84 catalog models); + a fallback==primary no-op guard. Then 749→760, +11 for the generic
+stuck-loop detector — new file `tests/shared/test_stuck_loop.py` (10) + `tests/crypto/test_health_digest.py`
+10→11 — `bot/alerts/stuck_loop.StuckLoopDetector`, an error-string-agnostic "same operation failing
+repeatedly" watchdog wired into `bot/main.py`'s primary execute() path + the health digest; complements
+the per-case counters (exit_fail_count etc.) by catching the NEXT stuck-loop class.)
 
 **Directory layout (2026-08-18):** all 54 files moved out of repo root into `tests/{crypto,stock,shared}/` for
 a cleaner root — 54 files loose alongside `bot/`, `stock_bot/`, `config.py`, etc. had gotten hard to scan.
@@ -243,8 +251,9 @@ now `.parent.parent.parent`. Verified before/after: same 526 collected, same 526
 | `tests/stock/test_alert_evaluator.py` | 4 | AlertEvaluator EARNINGS_SOON: held-vs-not-held priority/message, live-executor-only held-position source (no static PORTFOLIO tracker) |
 | `tests/crypto/test_crypto_telegram.py` | 2 | TelegramAlerter.fill() reason line: included when given, omitted when absent |
 | `tests/shared/test_liveness.py` | 7 | LivenessTracker (bot/alerts/liveness.py): touch/is_alive/staleness boundary, simulated hang between touches |
+| `tests/shared/test_stuck_loop.py` | 10 | `StuckLoopDetector` (bot/alerts/stuck_loop.py, added 2026-08-27): generic error-string-agnostic "same operation keeps failing" watchdog. `record(key, ok, detail)` — no alert below threshold, fires exactly at threshold, a success resets the streak, re-alerts on the escalation cadence (5, then every 20) not every failure, detail included (last wins), keys independent, stale keys pruned after `ttl_s` (fresh failure after prune starts at 1), alerter exception never propagates, `failing_keys()` excludes below-threshold, bad config rejected. Complements the per-case counters (exit_fail_count / drift_count / _auth_health) by catching the NEXT stuck-loop class |
 | `tests/stock/test_ai_engine_timeout.py` | 2 | nvidia_nim AI client is constructed with `timeout=_TIMEOUT_S`; empty `completion.choices` degrades to a HOLD verdict instead of raising TypeError |
-| `tests/stock/test_ai_failover.py` | 8 | Mistral provider + auto-failover (added 2026-08-27 — see "AI provider auto-failover" below): `AI_PROVIDER=mistral` configures the OpenAI-compatible endpoint / disabled without `MISTRAL_API_KEY` / a call produces a `provider="mistral"` verdict; auto-failover — switches to `AI_FALLBACK_PROVIDER` only after `_FALLBACK_AFTER` (5) consecutive API failures and the retry succeeds on the new provider, no switch without `AI_FALLBACK_PROVIDER` set, no switch when the fallback key is missing, `_switch_to_fallback()` is one-way (2nd call returns False), a parse error does NOT count as an API failure (a failover wouldn't fix it) |
+| `tests/stock/test_ai_failover.py` | 13 | Mistral provider + auto-failover (added 2026-08-27 — see "AI provider auto-failover" below): `AI_PROVIDER=mistral` configures the OpenAI-compatible endpoint / disabled without `MISTRAL_API_KEY` / a call produces a `provider="mistral"` verdict; auto-failover — switches to `AI_FALLBACK_PROVIDER` only after `_FALLBACK_AFTER` (5) consecutive API failures and the retry succeeds on the new provider, no switch without `AI_FALLBACK_PROVIDER` set, no switch when the fallback key is missing, `_switch_to_fallback()` is one-way (2nd call returns False), a parse error does NOT count as an API failure (a failover wouldn't fix it). +4 (2026-08-27, later): `nvidia_nim` as a failover TARGET — `_switch_to_fallback()` reconfigures the OpenAI-SDK client (base_url, `_openai_cls`, `NVIDIA_MODEL`) not just HTTP headers; an end-to-end run where mistral 503s every call → after threshold switches to `deepseek-ai/deepseek-v4-pro-0813` and the retry produces an `nvidia_nim` verdict; switch refused when `NVIDIA_API_KEY` missing; fallback==primary is a logged no-op |
 | `tests/stock/test_earnings_cache.py` | 4 | Earnings-fetch cache: failures use a short 1h TTL (retry soon) vs successes using the full 24h TTL, boundary behavior for both, concurrent fetches serialized by `_yf_lock` |
 | `tests/stock/test_yf_client_retry.py` | 4 | `fetch_with_retry`: generic exceptions now retried with a short delay (not zero retries), give up after max_attempts, short delay ≠ rate-limit backoff, rate-limit path unchanged |
 | `tests/stock/test_research_aggregator_timeout.py` | 1 | Per-source research-fetch timeout: earnings gets a wider budget (45s) than news (15s) |
@@ -265,7 +274,7 @@ now `.parent.parent.parent`. Verified before/after: same 526 collected, same 526
 | `tests/crypto/test_blocked_buy_alert.py` | 7 | `bot.main._evaluate_blocked_buy_alert` (added 2026-08-27, Track 4 observability — closes the 2026-08-18 "bot sat flat through a $90k→$108k BTC rally, nobody knew a real BUY had been vetoed" gap; that incident's fix was logging + `live_signals.csv` only, nothing pushed it): edge-triggered `alerter.error()` when the raw strategy signal is BUY but a gate holds it — alerts once, no re-alert while the same (symbol, gate) blocks, re-alerts when the gate changes, clears the flag when the raw signal stops being BUY or the BUY clears (fresh block after that re-alerts), no alert when the BUY is approved, unknown gate still alerts with the raw name, source-inspection guard that `run()` calls it from the candle-close branch after the CSV write |
 | `tests/stock/test_blocked_rule_buys_alert.py` | 10 | `stock_bot.main._evaluate_blocked_rule_buys_alert` (added 2026-08-27, stock-bot analog of the crypto blocked-BUY alert — the recurring "why didn't the bot buy X" question, previously answerable only from console `print()` output): end-of-cycle **debounced digest** (universe is ~40 symbols, not 2) — one `notifier.ops_alert` listing every symbol whose rule BUY a gate held this cycle (MACRO/EARNINGS_BLACKOUT, REGIME_SKIP, VIX_CRISIS, MAX_EXPOSURE/MAX_POSITIONS, CORRELATION, SIZE_SKIP). Alerts only on a **newly** blocked symbol or a changed gate; a symbol dropping out does NOT alert and is NOT forgotten for `_BLOCKED_BUY_ABSENT_CYCLES_TO_CLEAR=3` cycles, so a marginal setup flapping BUY↔HOLD every other cycle (BNS/GM near the MAX_EXPOSURE ceiling, 2026-08-27) alerts once not per toggle. Distinct all-clear when the set fully empties, silent when nothing's blocked, re-alerts a symbol that returns after aging out; source-inspection guard that `run()` collects `_blocked_rule_buys` at the gate sites (inside an `if _rule_buy:` guard) and calls the evaluator at cycle end |
 
-Run: `python -m pytest --tb=short -q` — must show **745 passed**. (This line had drifted to a
+Run: `python -m pytest --tb=short -q` — must show **760 passed**. (This line had drifted to a
 stale "543 passed" — corrected 2026-08-23 to match the manifest total above, which was
 already at 605 before this session's +2. Not investigated why the two numbers had diverged.
 2026-08-24: 629→639→647 for the CapitalPool per-symbol-cap tests plus the config-layer
@@ -805,12 +814,29 @@ logs (`_recent_error_count`, tail-read only). A `✅ all systems normal` / `⚠�
 ATTENTION` header is driven by: manual halt, tripped kill-switch, any symbol's
 `exit_fail_count > 0`, a stale candle feed, or ≥20 errors/24h in either log. The point is a
 VPS deployment gets a proactive "it's fine" every morning — and its *absence* is itself a
-signal — instead of only reactive alerts. Tests: new `tests/crypto/test_health_digest.py`,
-10 cases. Suite 719→729.
+signal — instead of only reactive alerts. Tests: `tests/crypto/test_health_digest.py`
+(10→11, +1 for the stuck-loop attention item 2026-08-27). Suite 719→729.
 
-Still open (VPS-readiness, not built): a generic stuck-loop detector (same action failing N
-times → alarm regardless of the specific error), and remote-reachable dashboards (currently
-local HTML files — need a tiny auth'd HTTP server or a hosted status page).
+### Generic stuck-loop detector (crypto — BUILT 2026-08-27)
+Closes the VPS-readiness gap flagged just below: the 2026-08-27 native-stop deadlock rejected
+~200 SL/TP exits over 8 min, and the fix added a `exit_fail_count` edge-alert for *that one
+path* — but a dozen other operations (strategy order placement, Kraken auth, candle fetch,
+native-stop sync) could get stuck the same way, each needing its own hand-rolled counter.
+`bot/alerts/stuck_loop.StuckLoopDetector` is the generic primitive: `record(key, ok, detail)`
+per attempt; a key that fails `threshold` (5) times in a row fires one `alerter.error()`, then
+re-alerts every `re_alert_every` (20) failures so a persistent problem keeps nagging without
+spamming every tick; any success resets that key; keys idle for `ttl_s` (1h) are pruned.
+Thread-safe, alerter-fault-tolerant, **error-string-agnostic by design** — it catches the
+*next* stuck-loop class, not just the ones already special-cased. Wired into `bot/main.py`:
+one `stuck_detector.record(f"execute:{sym}:{signal}", ok=<FILLED>, ...)` after the primary
+strategy-driven `execute()` (the genuine gap — the SL/TP path already has `exit_fail_count`,
+left as-is to avoid double-alerting), and `failing_keys()` feeds the daily health digest's
+"NEEDS ATTENTION" list. Tests: new `tests/shared/test_stuck_loop.py` (10). Suite 749→760.
+No `bot/strategy/*` touched. **Follow-up not done:** the stock-bot analog (wire it around
+`stock_bot/main.py`'s `executor.buy()`/`sell()`).
+
+Still open (not built): remote-reachable dashboards (currently local HTML files — need a
+tiny auth'd HTTP server or a hosted status page).
 
 ### Slippage guard (crypto — post-fill alert, on by default)
 ```
@@ -1309,7 +1335,10 @@ above played out for real the very next day — `meta/llama-3.1-8b-instruct` hit
 2026-08-26, and this monitor caught it automatically (alert fired 15:56 UTC the same day the
 model died), the first of the four nvidia_nim incidents ever caught without manually testing
 the API by hand. See the "Current operational status" stock bot entry and `stock_bot/.env`'s
-`NVIDIA_MODEL` comment for the swap details (now on `nvidia/nemotron-3-nano-30b-a3b`).
+`NVIDIA_MODEL` comment for the swap details (nemotron-3-nano was tried and rejected same day —
+a reasoning model, parse-failed ~75%; primary is now `mistral`, `NVIDIA_MODEL` is
+`deepseek-ai/deepseek-v4-pro-0813` used only as the auto-failover target — see "AI provider
+auto-failover" → "Fallback re-established" below).
 
 ### AI provider auto-failover — Mistral (stock bot — added 2026-08-27)
 Closes the loop the health monitor above only half-closed: it *detected* a 4th degradation but
@@ -1338,11 +1367,31 @@ chain-of-thought into the response body and truncated before the JSON (**65 pars
 22 successes in one scan pass**), and even tuned (`temperature=0.3, max_tokens=4096`) it took
 9–20s/call, far too slow for the sequential ~30-symbol loop. So `AI_PROVIDER=mistral` is now
 **primary** (`stock_bot/.env`) — ~1.2s, clean JSON against the real `build_prompt()` output,
-verified end-to-end through `analyze()`. `AI_FALLBACK_PROVIDER` left unset for now (Mistral's
-free tier is reliable; the failover machinery stays available). The nvidia_nim branch's
+verified end-to-end through `analyze()`. The nvidia_nim branch's
 params were fixed anyway (`temperature` → `_TEMPERATURE` 0.3, `max_tokens` 1024 → 4096) so a
 future nvidia model used as a fallback is less broken. AI is advisory-only — the ~75%-failure
 window changed no trades, only the shadow-vote log.
+
+**Fallback re-established 2026-08-27 (later, after a live Mistral 503 blip — ~48% call
+failure for one cycle, self-recovered):** the user asked for a genuine fallback rather than
+leaving `AI_FALLBACK_PROVIDER` unset. **Probed all 84 models on NVIDIA's `/v1/models`
+catalog against the REAL `build_prompt()` + nvidia_nim branch + `_parse()` path** (scratchpad
+`nvidia_model_probe.py`, symbols NVDA/KO/TSLA/GM/CVX/AMD) — the [[verify-against-real-inputs]]
+lesson from the nemotron miss. Finding: **only 3 of the 84 are actually deployed on this
+account** — the rest return `404 "Function ... Not found for account"`. Of the 3:
+`deepseek-ai/deepseek-v4-pro-0813` (6/6 clean parse, ~12s/call), `openai/gpt-oss-20b` (6/6,
+~15s), `minimaxai/minimax-m3` (flaky, 2/6). All 3 are reasoning models (hence the latency),
+but they parse cleanly through the real path. **Picked `deepseek-v4-pro`** — set
+`NVIDIA_MODEL=deepseek-ai/deepseek-v4-pro-0813`, `AI_FALLBACK_PROVIDER=nvidia_nim`
+(`AI_PROVIDER=mistral` stays primary). ~12s/call is acceptable *here specifically* because
+the bot trades 1d candles — a slow AI phase during a Mistral outage doesn't stale any
+decision (`_LIVENESS_MAX_STALE_S=1800` already tolerates a ~13-min cycle). **Code:**
+`_switch_to_fallback()` previously only supported HTTP targets (mistral/openrouter) — added an
+`nvidia_nim` branch that reconfigures the OpenAI-SDK client (`_openai_cls`, `_api_key`,
+`_base_url`, `NVIDIA_MODEL`), plus a `fallback == primary` no-op guard (the old
+`AI_FALLBACK_PROVIDER=mistral` while `AI_PROVIDER=mistral` was a silent no-op). Verified
+end-to-end: forced the switch on a real engine, live call to deepseek-v4-pro returned
+`KO → BUY 68`. Tests: `tests/stock/test_ai_failover.py` +4 (9→13). Suite 745→749.
 
 **Two failover/health hardening changes from that incident:**
 - Failover now **also triggers on sustained parse failures** (`_last_call_parse_failed`), not
@@ -1563,9 +1612,12 @@ guards). `conftest.py`'s autouse `_block_real_stock_bot_file_writes` extended to
   2026-08-25 `_update_ai_health` monitor); its replacement `nvidia/nemotron-3-nano-30b-a3b`
   passed a shallow verification but turned out to be a *reasoning* model that parse-failed
   ~75% of real scan calls and ran 9–20s each — so Mistral (verified end-to-end, ~1.2s, clean
-  JSON) is now primary and nvidia_nim is off. `NVIDIA_MODEL` stays set in `stock_bot/.env` but
-  dormant. AI is advisory-only throughout — zero trading impact
-  during the outage, `RULE_TRADING_ENABLED` signals were unaffected the whole time.
+  JSON) is now primary. **Auto-failover target: `nvidia_nim` with `NVIDIA_MODEL=deepseek-ai/
+  deepseek-v4-pro-0813`** — established 2026-08-27 after a live Mistral 503 blip, by probing
+  all 84 NVIDIA catalog models against the real prompt path (only 3 are actually deployed on
+  the account; deepseek-v4-pro was the pick at 6/6 clean parse / ~12s). AI is advisory-only
+  throughout — zero trading impact during any of this, `RULE_TRADING_ENABLED` signals
+  unaffected.
   OpenRouter was re-researched as an independent provider this time (this codebase already has
   a full implementation + a live `OPENROUTER_API_KEY` in root `.env`): its own hardcoded free
   model is now ALSO discontinued (404), and more importantly its free tier caps at 50

@@ -47,6 +47,19 @@ class _BoomOpenAI:
     def create(self, **kw): raise RuntimeError("nvidia_nim down (410 Gone)")
 
 
+class _OKOpenAI:
+    """Fake OpenAI client → a valid JSON verdict (nvidia_nim path)."""
+    def __init__(self, **kw): self.chat = self
+    @property
+    def completions(self): return self
+    def create(self, **kw):
+        msg = SimpleNamespace(
+            content='{"signal": "HOLD", "confidence": 55, "reasoning": "ok"}',
+            reasoning_content=None,
+        )
+        return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
+
+
 # ── Mistral as a standalone provider ────────────────────────────────────────
 
 def test_mistral_provider_configures(monkeypatch):
@@ -133,6 +146,65 @@ def test_switch_to_fallback_is_one_way(monkeypatch):
     e._consecutive_failures = _FALLBACK_AFTER
     assert e._switch_to_fallback() is True
     assert e._switch_to_fallback() is False   # already switched
+
+
+# ── nvidia_nim as a fallback TARGET (2026-08-27 — mistral primary, deepseek-v4-pro fallback) ──
+
+def test_failover_to_nvidia_nim_switches_client(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER", "mistral")
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("AI_FALLBACK_PROVIDER", "nvidia_nim")
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
+    monkeypatch.setenv("NVIDIA_MODEL", "deepseek-ai/deepseek-v4-pro-0813")
+    e = AIEngine()
+    assert e._provider == "mistral"
+    e._consecutive_failures = _FALLBACK_AFTER
+    with patch("openai.OpenAI", _OKOpenAI):
+        assert e._switch_to_fallback() is True
+    assert e._provider == "nvidia_nim"
+    assert e._model == "deepseek-ai/deepseek-v4-pro-0813"
+    assert e._base_url == "https://integrate.api.nvidia.com/v1"
+    assert e._openai_cls is _OKOpenAI       # OpenAI-SDK client, not the HTTP path
+
+
+def test_failover_to_nvidia_nim_produces_a_verdict(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER", "mistral")
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("AI_FALLBACK_PROVIDER", "nvidia_nim")
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
+    monkeypatch.setenv("NVIDIA_MODEL", "deepseek-ai/deepseek-v4-pro-0813")
+    e = AIEngine()
+
+    # primary mistral fails every call → after threshold, switch + retry on nvidia
+    boom = SimpleNamespace(raise_for_status=lambda: (_ for _ in ()).throw(RuntimeError("mistral 503")))
+    with patch("stock_bot.ai.ai_engine._requests.post", return_value=boom), \
+         patch("openai.OpenAI", _OKOpenAI):
+        for _ in range(_FALLBACK_AFTER + 1):
+            v = _analyze(e)
+    assert e._fallback_active is True
+    assert e._provider == "nvidia_nim"
+    assert v.provider == "nvidia_nim" and v.signal == "HOLD" and v.confidence == 55
+
+
+def test_failover_to_nvidia_nim_needs_the_key(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER", "mistral")
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("AI_FALLBACK_PROVIDER", "nvidia_nim")
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    e = AIEngine()
+    e._consecutive_failures = _FALLBACK_AFTER
+    assert e._switch_to_fallback() is False
+    assert e._fallback_active is False
+
+
+def test_no_failover_when_fallback_equals_primary(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER", "mistral")
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("AI_FALLBACK_PROVIDER", "mistral")
+    e = AIEngine()
+    e._consecutive_failures = _FALLBACK_AFTER
+    assert e._switch_to_fallback() is False   # fallback == primary is a no-op
+    assert e._fallback_active is False
 
 
 def test_sustained_parse_failures_trigger_failover(monkeypatch):

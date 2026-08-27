@@ -79,6 +79,7 @@ from bot import display
 from bot.dashboard import renderer as _dashboard
 from bot.signals.external_signals import ExternalSignalGate, ExternalSignalsConfig as _ExtSigsCfg
 from bot.alerts.telegram import TelegramAlerter
+from bot.alerts.stuck_loop import StuckLoopDetector
 from bot.data.trade_log import TradeLog
 from bot.data.crypto_universe import CryptoUniverse
 
@@ -1057,6 +1058,7 @@ def _health_digest_text(
 def _maybe_send_health_digest(
     executors: dict, symbol_state: dict, risk, alerter,
     live_trading: bool, dry_run: bool, now: datetime,
+    stuck_detector=None,
 ) -> None:
     """Once/day at HEALTH_DIGEST_TIME (local, default 08:00; 'off' disables).
     Records the run date BEFORE composing so a send failure can't re-fire every
@@ -1103,6 +1105,9 @@ def _maybe_send_health_digest(
                 attention.append(f"{_sym}: {_ss['exit_fail_count']} failed SL/TP exits")
             if _ss.get("candle_feed_stale"):
                 attention.append(f"{_sym}: candle feed stale")
+        if stuck_detector is not None:
+            for _k, _n in stuck_detector.failing_keys().items():
+                attention.append(f"stuck loop: {_k} ({_n} consecutive failures)")
         if crypto_errs >= 20:
             attention.append(f"{crypto_errs} crypto errors in 24h")
         if stock_errs >= 20:
@@ -1385,6 +1390,11 @@ def run():
         chat_id   = cfg.alerts.telegram_chat_id,
         enabled   = cfg.alerts.telegram_enabled,
     )
+    # Generic "the same operation keeps failing" watchdog — catches a stuck
+    # retry loop (native-stop deadlock 2026-08-27 was one) regardless of the
+    # specific error string, complementing the per-case counters
+    # (exit_fail_count, drift_count, _auth_health).
+    stuck_detector = StuckLoopDetector(alerter.error)
 
     # In live mode: show real Kraken balance, not starting_cash from .env.
     # executor.cash and executor.position are already synced from the exchange
@@ -2840,6 +2850,19 @@ def run():
                             f"{_reject_reason or 'unknown reason'}"
                         )
 
+                # Generic stuck-loop watchdog: a strategy BUY/SELL that keeps
+                # failing every tick (not just SL/TP — that has its own counter).
+                _exec_filled = bool(
+                    order and order.status == OrderStatus.FILLED and order.quantity > 0
+                )
+                stuck_detector.record(
+                    f"execute:{sym}:{final_signal.value}",
+                    ok=_exec_filled,
+                    detail="" if _exec_filled else (
+                        getattr(order, "reject_reason", None) or "no order returned"
+                    ),
+                )
+
             # ── 10. Position summary ──────────────────────────────────
             display.position_line(
                 quantity       = ss['pm'].quantity,
@@ -2897,6 +2920,7 @@ def run():
         _maybe_send_health_digest(
             executors, symbol_state, risk, alerter,
             cfg.exchange.live_trading, cfg.exchange.dry_run, datetime.now(),
+            stuck_detector=stuck_detector,
         )
 
     display.stopped(

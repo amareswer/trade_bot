@@ -122,6 +122,26 @@ def test_digest_flags_halt_and_exit_failures(monkeypatch, tmp_path):
     assert "HALT is engaged" in body and "4 failed SL/TP exits" in body
 
 
+def test_digest_flags_stuck_loop(monkeypatch, tmp_path):
+    from bot.alerts.stuck_loop import StuckLoopDetector
+    risk, alerter, execs = _mk(monkeypatch, tmp_path)
+    det = StuckLoopDetector(lambda _m: None, threshold=3)
+    for _ in range(3):
+        det.record("execute:BTC/CAD:SELL", ok=False, detail="Insufficient funds")
+    monkeypatch.setenv("HEALTH_DIGEST_TIME", "08:00")
+    bot_main._maybe_send_health_digest(
+        execs, {}, risk, alerter, True, False, datetime(2026, 8, 27, 9, 0),
+        stuck_detector=det,
+    )
+    body = alerter.message.call_args[0][0]
+    assert "NEEDS ATTENTION" in body
+    assert "stuck loop: execute:BTC/CAD:SELL (3 consecutive failures)" in body
+
+
 def test_wired_into_run_loop():
     src = inspect.getsource(bot_main.run)
     assert "_maybe_send_health_digest(" in src
+    # generic stuck-loop watchdog is created and fed from the execute path
+    assert "StuckLoopDetector(alerter.error)" in src
+    assert "stuck_detector.record(" in src
+    assert "stuck_detector=stuck_detector" in src   # passed to the digest
