@@ -1858,6 +1858,92 @@ def test_native_trailing_stop_state_persists_and_restores_across_restart(tmp_pat
     mock_ex2.create_order.assert_not_called()   # confirmed still open — nothing re-placed
 
 
+# ---------------------------------------------------------------------------
+# Native stop pre-cancel on SELL (SOL/CAD incident 2026-08-27): a resting
+# native stop reserves 100% of the base asset, so every SELL for the position
+# failed "Insufficient funds" until it was cancelled — and the cancel only ran
+# AFTER a successful fill, which could never happen. execute() now cancels the
+# stop BEFORE the sell, and re-arms it if the sell is rejected.
+# ---------------------------------------------------------------------------
+
+# BTC-realistic numbers (the _make harness hard-codes symbol=BTC/CAD, whose
+# test market has a $5 min cost) — the native-stop logic itself is symbol-agnostic.
+def _seed_position_and_stop(ex, mock_ex, *, qty=0.01, entry=80_000.0, stop=78_000.0):
+    ex._portfolio.position    = qty
+    ex._portfolio._cost_basis = entry
+    mock_ex.price_to_precision.return_value = str(stop)
+    mock_ex.create_order.return_value = {"id": "stop-001"}
+    ex.sync_protective_stop(stop)
+    assert ex._native_stop_order_id == "stop-001"
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_sell_cancels_resting_native_stop_before_placing_order(mock_cfg, _s, tmp_path):
+    _limit_cfg(mock_cfg, enabled=True, timeout_s=30)
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True,
+                        starting_cash=2000.0, tmp_path=tmp_path)
+    _seed_position_and_stop(ex, mock_ex)
+    mock_ex.reset_mock()   # drop the setup's place-stop create_order call
+
+    sell_raw = {"id": "sell-001", "status": "closed", "filled": 0.01,
+                "average": 88_000.0, "type": "market", "fee": {"cost": 3.5, "currency": "CAD"}}
+    mock_ex.create_order.return_value = sell_raw
+    mock_ex.fetch_order.return_value  = sell_raw
+
+    order = ex.execute(Signal.SELL, 88_000.0, 0.01, urgent=True)
+
+    assert order is not None and order.status == OrderStatus.FILLED
+    # The resting stop was cancelled...
+    mock_ex.cancel_order.assert_called_once_with("stop-001", "BTC/CAD")
+    # ...BEFORE the sell order was placed.
+    kinds = [c[0] for c in mock_ex.method_calls if c[0] in ("cancel_order", "create_order")]
+    assert kinds[0] == "cancel_order" and "create_order" in kinds[1:]
+    assert ex._native_stop_order_id is None   # full close — stays gone
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_rejected_sell_rearms_the_native_stop(mock_cfg, _s, tmp_path):
+    _limit_cfg(mock_cfg, enabled=True, timeout_s=30)
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True,
+                        starting_cash=2000.0, tmp_path=tmp_path)
+    _seed_position_and_stop(ex, mock_ex, stop=78_000.0)
+
+    # SELL create_order raises; the follow-up _place_native_stop create_order succeeds.
+    mock_ex.create_order.side_effect = [
+        ccxt.InsufficientFunds("kraken EOrder:Insufficient funds"),
+        {"id": "stop-restored"},
+    ]
+
+    order = ex.execute(Signal.SELL, 88_000.0, 0.01, urgent=True)
+
+    assert order is not None and order.status == OrderStatus.REJECTED
+    assert ex._native_stop_order_id == "stop-restored"   # put back
+    assert ex._native_stop_price == 78_000.0             # at the prior level
+    assert ex._portfolio.position == 0.01                # still held
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_sell_with_no_resting_stop_does_not_cancel(mock_cfg, _s, tmp_path):
+    _limit_cfg(mock_cfg, enabled=True, timeout_s=30)
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True,
+                        starting_cash=2000.0, tmp_path=tmp_path)
+    ex._portfolio.position    = 0.01
+    ex._portfolio._cost_basis = 80_000.0
+    assert ex._native_stop_order_id is None
+
+    sell_raw = {"id": "sell-001", "status": "closed", "filled": 0.01,
+                "average": 88_000.0, "type": "market", "fee": {"cost": 3.5, "currency": "CAD"}}
+    mock_ex.create_order.return_value = sell_raw
+    mock_ex.fetch_order.return_value  = sell_raw
+
+    order = ex.execute(Signal.SELL, 88_000.0, 0.01, urgent=True)
+    assert order.status == OrderStatus.FILLED
+    mock_ex.cancel_order.assert_not_called()
+
+
 if __name__ == "__main__":
     import pathlib
     import shutil

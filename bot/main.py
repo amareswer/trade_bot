@@ -1992,21 +1992,21 @@ def run():
                                 ss['partial_done'] = False
                                 if not ss['pm'].has_position:
                                     capital_pool.release(sym, ss['executor'].cash)
-                                    # Best-effort cancel of the native stop backstop.
-                                    # If the native stop itself fired first (raced
-                                    # this software exit), this call cancels an
-                                    # already-filled order — harmless, logged at
-                                    # info level by _cancel_native_stop.
+                                    # execute() already cancelled the native stop
+                                    # BEFORE the SELL (2026-08-27 fix — see
+                                    # LiveExecutor.execute). This is now a
+                                    # no-op belt-and-suspenders for the full-close
+                                    # case; kept so a future refactor that skips
+                                    # the executor-side cancel still clears it.
                                     ss['executor'].sync_protective_stop(None)
                                     ss['native_stop_is_trailing'] = False
                                 else:
                                     # Urgent market SELL only partially filled — a
-                                    # residual position remains. The resting native
-                                    # stop is still sized to the ORIGINAL (larger)
-                                    # quantity, so re-sync it down to what's actually
-                                    # held. Without this the backstop would try to
-                                    # sell more than the position. Same resize the
-                                    # partial-TP and strategy-SELL paths already do.
+                                    # residual position remains. execute() cancelled
+                                    # the original (full-size) native stop before the
+                                    # sell; re-place one sized to what's actually
+                                    # still held. Same resize the partial-TP and
+                                    # strategy-SELL paths already do.
                                     _resync_native_stop(ss)
                                 _ic_reason = (
                                     "trail_stop" if (_trail_sl_level > 0 and price <= _trail_sl_level)

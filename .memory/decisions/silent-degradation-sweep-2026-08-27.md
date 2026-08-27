@@ -185,6 +185,20 @@ Verified live before enabling: key auth OK, `mistral-small-latest` available, re
 through `_parse()` → BUY 85 / SELL 90 (correct, ~1.2s). Takes effect on next stock-bot
 restart. Advisory-layer only — no walk-forward.
 
+**LIVE INCIDENT 2026-08-27 — native stop deadlocked every SELL. FIXED.** SOL/CAD's first
+position hit +10.8% TP; the urgent market SELL was rejected `EOrder:Insufficient funds` every
+~32s for 8+ min. Root cause: a resting native stop order reserves 100% of the base asset on
+Kraken (`SOL free=0 used=0.080808`), so NO sell can execute while it rests — and `bot/main.py`
+only cancelled the native stop AFTER a successful fill, an impossible order. Pure deadlock;
+same latent bug in strategy-SELL + partial-TP paths. First real exercise of native-stop +
+software TP together. Resolved live: manually cancelled the stop via ccxt → bot sold next
+tick, SOL/CAD closed +$1.27/+10.9% (fill #2, first round-trip). **Fix:**
+`LiveExecutor.execute()` cancels any resting native stop BEFORE a SELL (all 3 exit paths, at
+the executor layer); rejected SELL → `_rearm_native_stop_after_failed_sell()` re-places a
+static stop at its prior level (trailing → "NAKED POSITION" alert, trailing is dormant).
+Tests +3 (`test_live_executor.py` 65→68). Suite 706→709. No `bot/strategy/*`. **REQUIRES a
+crypto-bot restart** — running process (PID 47305, from 09:16) has the buggy code.
+
 **IB Gateway + IBC headless deploy — SCOPED + DOCUMENTED 2026-08-27 (not executed).**
 Roadmap item G. Key finding: **no bot code change needed** — `IBKRExecutor` already connects
 by host:port and `_LIVE_PORTS`/docstring already cover Gateway. Pure infra. Written:

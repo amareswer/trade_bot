@@ -736,6 +736,29 @@ class LiveExecutor:
         self._native_stop_is_trailing = False
         self._save_state()
 
+    def _rearm_native_stop_after_failed_sell(
+        self, restore: "tuple[float | None, bool]",
+    ) -> None:
+        """A SELL that we pre-cancelled the native stop for got rejected — the
+        position is now naked. Put the stop back at its previous level so it
+        isn't unprotected until the caller retries. Static stops re-place
+        cleanly; a trailing stop can't (its % isn't recoverable here) so it
+        alerts loudly instead."""
+        _price, _was_trailing = restore
+        if self._portfolio.position <= 0:
+            return
+        if _was_trailing or _price is None:
+            self._alerter.error(
+                f"NAKED POSITION [{self.symbol}]: a SELL was rejected after its "
+                f"native stop was cancelled, and the stop could not be re-armed "
+                f"(was trailing). Position is UNPROTECTED — check Kraken now."
+            )
+            return
+        logger.warning(
+            "Re-arming native stop [%s] @ %.2f after a rejected SELL", self.symbol, _price,
+        )
+        self._place_native_stop(self._portfolio.position, _price)
+
     def _place_native_stop(self, quantity: float, stop_price: float) -> None:
         # Deliberately NO retry on this create_order (unlike the read-path
         # fetch_with_retry calls elsewhere in this file): if attempt 1 times
@@ -1298,6 +1321,28 @@ class LiveExecutor:
             order_id_str = "dry_run"
 
         else:
+            # A resting native stop reserves 100% of the base asset on the
+            # exchange, so ANY SELL for the position — urgent SL/TP, strategy
+            # exit, partial TP — fails "Insufficient funds" until it's cancelled.
+            # Cancel it HERE, before placing the sell. SOL/CAD incident
+            # 2026-08-27: the cancel used to run only AFTER a successful fill
+            # (bot/main.py's SL/TP block), which could never happen while the
+            # stop held the coins — an 8-minute retry-and-reject loop against
+            # Kraken. On a full close the stop stays gone; on a partial fill
+            # main.py's _resync_native_stop re-places it smaller; on a rejected
+            # SELL _rearm_native_stop_after_failed_sell puts it back.
+            _native_stop_restore: "tuple[float | None, bool] | None" = None
+            if side == OrderSide.SELL and self._native_stop_order_id:
+                _native_stop_restore = (
+                    self._native_stop_price, self._native_stop_is_trailing,
+                )
+                logger.warning(
+                    "Cancelling resting native stop %s before %s SELL of %.8f %s",
+                    self._native_stop_order_id, "urgent" if urgent else "",
+                    quantity, self.symbol,
+                )
+                self._cancel_native_stop()
+
             try:
                 ccxt_side = "buy" if side == OrderSide.BUY else "sell"
 
@@ -1455,6 +1500,8 @@ class LiveExecutor:
                                 " — skipping fill record. Manual verification required.",
                                 _side_str, order_id_str,
                             )
+                            if _native_stop_restore is not None:
+                                self._rearm_native_stop_after_failed_sell(_native_stop_restore)
                             return None
                     else:
                         # Limit order with filled=0, or order not yet closed — do not infer.
@@ -1464,6 +1511,8 @@ class LiveExecutor:
                             " Manual verification required.",
                             _side_str, order_id_str, _last_status, _actual_type,
                         )
+                        if _native_stop_restore is not None:
+                            self._rearm_native_stop_after_failed_sell(_native_stop_restore)
                         return None
 
                 # Shared fee extraction — works for both limit-chase and market paths.
@@ -1496,6 +1545,8 @@ class LiveExecutor:
 
             except ccxt.InsufficientFunds as exc:
                 logger.error("Insufficient funds: %s", exc)
+                if _native_stop_restore is not None:
+                    self._rearm_native_stop_after_failed_sell(_native_stop_restore)
                 order = Order(
                     order_id      = "rejected",
                     symbol        = self.symbol,
@@ -1510,6 +1561,8 @@ class LiveExecutor:
                 return order
             except ccxt.BaseError as exc:
                 logger.error("ccxt order error: %s", exc)
+                if _native_stop_restore is not None:
+                    self._rearm_native_stop_after_failed_sell(_native_stop_restore)
                 order = Order(
                     order_id      = "rejected",
                     symbol        = self.symbol,
