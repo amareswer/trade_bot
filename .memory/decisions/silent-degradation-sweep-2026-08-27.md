@@ -142,10 +142,33 @@ one cycle-end call. Tests: new file `tests/stock/test_blocked_rule_buys_alert.py
 Suite 687→694. No strategy files touched.
 
 **Silent-degradation sweep (stock):** lower stakes than crypto — IBKR is paper-only and
-code-gate-blocked from live (LiveTradingGate). The IBKR executor's `logger.warning`-only
-paths (account/position sync failures, CSV write failures, order timeouts) are worth
-hardening *when IBKR goes live*, deferred until then. The one live-relevant path — SPY regime
-fetch failure blocking all BUYs — is now surfaced by the digest above.
+code-gate-blocked from live (LiveTradingGate). CSV write failures + order timeouts are worth
+hardening *when IBKR goes live*, deferred. The SPY-regime-fetch-failure path is now surfaced
+by the digest above.
+
+**IBKR TWS-query resilience — FIXED 2026-08-27 (user: "keep stock bot ready, improve it").**
+The one finding from this sweep worth fixing now rather than deferring: `IBKRExecutor.
+_account_value()` and `positions_snapshot()` returned a fabricated `0.0` / `{}` on a transient
+TWS-query failure, `logger.warning` only. Live consequences: `cash=0.0` rejects every BUY;
+empty position book blinds the SL/TP watcher to a real triggered stop AND corrupts the
+breaker equity math. Same class as the crypto `_sync_cash`/`_sync_position` gap (fixed
+2026-07-28). Fix: last-good cache served on failure (strictly safer — stale figures only ever
+cause a broker reject, which alerts), `executor.sync_healthy` edge flag, `stock_bot/main.py`
+fires an edge-triggered `ops_alert` on the failure/recovery transition. First-call-before-any-cache
+still returns `0.0`/`{}` (startup, covered by connection guards). Tests +3 (56→59), suite 694→697.
+
+**IBKR `ibkr_trades.csv` write resilience — FIXED same pass (2026-08-27, "fix whatever
+needed").** `_record_trade()`'s CSV append was `logger.warning`-and-continue on `OSError` — a
+real filled trade missing from the frozen 9-column CSV the readiness gate reads exactly →
+gate under-counts. Now `_write_trade_row()` buffers the row and retries next fill;
+`csv_write_healthy` edge-alerted from main.py like `sync_healthy`. Order-timeout path checked,
+left as-is (already raises → rejected Order → `ops_alert`). `_log_settlement_csv` left
+warning-only (tax file, not gate schema, docstring already says best-effort). +1 test (59→60),
+suite 697→698.
+
+**IBKR remaining deferred:** nothing material left — the order path, state save, and reconnect
+probe are all handled. The stock bot's IBKR executor is now readiness-hardened. Next
+readiness item is infra: IB Gateway + IBC for headless (VPS) operation — not started.
 
 Related: [[execution_layer]], [[fee-structure]], [[2026-08-18-missed-buy-signal]]
 (that investigation is why the MTF gate's blocked-reason labels exist), [[known-gaps]],

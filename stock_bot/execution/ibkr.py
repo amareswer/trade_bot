@@ -210,6 +210,32 @@ class IBKRExecutor(StockExecutorBase):
         self._state_lock = threading.Lock()
         self._reconnect_lock = threading.Lock()
 
+        # Last-good caches for the two TWS-queried views. A transient
+        # accountValues()/positions() timeout used to return a fabricated
+        # 0.0 / {} that every downstream consumer treated as truth — cash=0
+        # rejects all BUYs, and an empty position book makes the SL/TP watcher
+        # blind to a real position whose stop just triggered. Return the last
+        # known-good value instead (strictly safer: a stale cash/position only
+        # ever produces a broker-side reject, which alerts). `sync_healthy`
+        # flips false on the first failure after a success so the caller can
+        # surface it — mirrors the crypto bot's _sync_cash/_sync_position fix
+        # (2026-07-28).
+        self._acct_values_cache: list = []
+        self._positions_cache: dict[str, tuple[float, float]] = {}
+        self._acct_cache_valid: bool = False
+        self._positions_cache_valid: bool = False
+        self.sync_healthy: bool = True
+        self._sync_fail_streak: int = 0
+
+        # ibkr_trades.csv is the frozen 9-column schema the LiveTradingGate /
+        # ConfidenceBandTracker / accuracy pipeline read exactly — a lost row
+        # (disk full, path gone) means the readiness gate under-counts a real
+        # filled trade. A failed append is buffered here and retried on the
+        # next _record_trade; `csv_write_healthy` is False while the buffer is
+        # non-empty so the caller can surface it.
+        self._unwritten_csv_rows: list[list] = []
+        self.csv_write_healthy: bool = True
+
         # ── dedicated event-loop thread ──────────────────────────────────────
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
@@ -654,15 +680,47 @@ class IBKRExecutor(StockExecutorBase):
 
     # ── portfolio state (queried from IBKR) ──────────────────────────────────
 
+    def _note_sync(self, ok: bool, what: str = "") -> None:
+        """Track TWS-query health so a transient failure is visible, not silent."""
+        if ok:
+            if not self.sync_healthy:
+                logger.info("IBKR sync recovered (%s)", what or "query")
+            self.sync_healthy = True
+            self._sync_fail_streak = 0
+        else:
+            self._sync_fail_streak += 1
+            if self.sync_healthy:
+                self.sync_healthy = False
+                logger.error(
+                    "IBKR sync FAILING (%s) — serving last-good cached values; "
+                    "cash/positions may be stale until TWS responds again",
+                    what or "query",
+                )
+
     def _account_value(self, *tags: str) -> float:
-        """First matching account value (base currency preferred)."""
+        """First matching account value (base currency preferred).
+
+        On a TWS query failure, serves the last-good rows rather than a
+        fabricated 0.0 (which would reject every BUY as 'insufficient cash')."""
         try:
             async def _vals():
                 return list(self._ib.accountValues())
             rows = self._call(_vals(), timeout=10)
+            self._acct_values_cache = rows
+            self._acct_cache_valid = True
+            self._note_sync(True, "accountValues")
         except Exception as exc:
-            logger.warning("IBKR account values unavailable: %s", exc)
-            return 0.0
+            self._note_sync(False, "accountValues")
+            if self._acct_cache_valid:
+                logger.warning(
+                    "IBKR account values unavailable (%s) — using last-good cache", exc,
+                )
+                rows = self._acct_values_cache
+            else:
+                logger.warning(
+                    "IBKR account values unavailable (%s) — no cache yet, returning 0.0", exc,
+                )
+                return 0.0
         for tag in tags:
             base_row = None
             for r in rows:
@@ -724,12 +782,25 @@ class IBKRExecutor(StockExecutorBase):
         return round(self.cash + pos_value, 2)
 
     def positions_snapshot(self) -> dict[str, tuple[float, float]]:
+        """On a TWS query failure, serves the last-good position book rather
+        than {} — an empty book would make the SL/TP watcher blind to a real
+        position whose stop just triggered."""
         try:
             async def _pos():
                 return list(self._ib.positions())
             rows = self._call(_pos(), timeout=10)
+            self._note_sync(True, "positions")
         except Exception as exc:
-            logger.warning("IBKR positions unavailable: %s", exc)
+            self._note_sync(False, "positions")
+            if self._positions_cache_valid:
+                logger.warning(
+                    "IBKR positions unavailable (%s) — using last-good cache (%d held)",
+                    exc, len(self._positions_cache),
+                )
+                return dict(self._positions_cache)
+            logger.warning(
+                "IBKR positions unavailable (%s) — no cache yet, returning empty", exc,
+            )
             return {}
         snapshot: dict[str, tuple[float, float]] = {}
         for p in rows:
@@ -738,6 +809,8 @@ class IBKRExecutor(StockExecutorBase):
             sym = self.from_contract(p.contract)
             # IBKR avgCost is per share and includes commission
             snapshot[sym] = (float(p.position), round(float(p.avgCost), 6))
+        self._positions_cache = dict(snapshot)
+        self._positions_cache_valid = True
         return snapshot
 
     # ── order history ────────────────────────────────────────────────────────
@@ -1115,23 +1188,48 @@ class IBKRExecutor(StockExecutorBase):
             reason         = reason,
         )
         self._trade_log.append(trade)
-        try:
-            with open(_TRADES_CSV, "a", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow([
-                    trade.timestamp,
-                    trade.symbol,
-                    trade.side,
-                    f"{trade.shares:.4f}",
-                    f"{trade.price:.4f}",
-                    f"{trade.total_value:.2f}",
-                    f"{trade.cash_remaining:.2f}",
-                    trade.reason,
-                    confidence,
-                ])
-        except OSError as exc:
-            logger.warning("Could not write to ibkr_trades.csv: %s", exc)
+        row = [
+            trade.timestamp,
+            trade.symbol,
+            trade.side,
+            f"{trade.shares:.4f}",
+            f"{trade.price:.4f}",
+            f"{trade.total_value:.2f}",
+            f"{trade.cash_remaining:.2f}",
+            trade.reason,
+            confidence,
+        ]
+        self._write_trade_row(row)
         self._log_settlement_csv(trade, sym)
         self.save_state()
+
+    def _write_trade_row(self, row: list) -> None:
+        """Append one row to ibkr_trades.csv, flushing any buffered rows from a
+        prior failed write first. A row that still can't be written is buffered
+        (never silently dropped — it's a real filled trade the readiness gate
+        must count) and retried on the next call."""
+        pending = self._unwritten_csv_rows + [row]
+        try:
+            with open(_TRADES_CSV, "a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                for r in pending:
+                    w.writerow(r)
+            if self._unwritten_csv_rows:
+                logger.info(
+                    "ibkr_trades.csv recovered — flushed %d buffered row(s)",
+                    len(self._unwritten_csv_rows),
+                )
+            self._unwritten_csv_rows = []
+            self.csv_write_healthy = True
+        except OSError as exc:
+            self._unwritten_csv_rows = pending
+            self.csv_write_healthy = False
+            logger.error(
+                "Could not write to ibkr_trades.csv (%s) — %d filled-trade row(s) "
+                "buffered in memory, will retry next fill. The readiness gate "
+                "under-counts until this recovers.",
+                exc, len(pending),
+            )
 
     # ── internal ─────────────────────────────────────────────────────────────
 

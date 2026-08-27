@@ -1002,6 +1002,8 @@ def run() -> None:
     # end-of-cycle ops_alert only fires when the set changes (see
     # _evaluate_blocked_rule_buys_alert).
     _blocked_rule_buys_state: dict = {"seen": {}}
+    _ibkr_sync_ok_prev: bool = True   # edge-trigger for the IBKR data-sync alert
+    _ibkr_csv_ok_prev:  bool = True   # edge-trigger for the ibkr_trades.csv write alert
     _hb_interval = int(os.getenv("HEARTBEAT_INTERVAL_S", "60"))
     start_heartbeat_thread(
         os.getenv("HEARTBEAT_URL", ""),
@@ -1284,6 +1286,46 @@ def run() -> None:
         ]
 
         _mark_positions_to_market(executor, price_data)
+
+        # IBKR TWS-query health — edge-triggered ops_alert if accountValues()/
+        # positions() start failing (executor now serves last-good cache, but
+        # stale cash/positions shouldn't be silent — see IBKRExecutor._note_sync).
+        _sync_ok_now = getattr(executor, "sync_healthy", True)
+        if _sync_ok_now != _ibkr_sync_ok_prev:
+            _ibkr_sync_ok_prev = _sync_ok_now
+            if _sync_ok_now:
+                notifier.ops_alert(
+                    "IBKR data sync recovered",
+                    "accountValues()/positions() are responding again — cash and "
+                    "the position book are live rather than cached.",
+                )
+            else:
+                notifier.ops_alert(
+                    "IBKR data sync failing",
+                    "TWS is not answering accountValues()/positions(). The bot is "
+                    "running on the last-good cached cash + position book — trades "
+                    "still gate correctly but on possibly-stale figures. Check TWS.",
+                )
+
+        # ibkr_trades.csv write health — a buffered (unwritten) filled-trade row
+        # means the readiness gate under-counts until the disk recovers.
+        _csv_ok_now = getattr(executor, "csv_write_healthy", True)
+        if _csv_ok_now != _ibkr_csv_ok_prev:
+            _ibkr_csv_ok_prev = _csv_ok_now
+            if _csv_ok_now:
+                notifier.ops_alert(
+                    "ibkr_trades.csv writing again",
+                    "Buffered trade rows have been flushed to disk — the trade "
+                    "log and readiness gate are complete again.",
+                )
+            else:
+                notifier.ops_alert(
+                    "ibkr_trades.csv write failing",
+                    "A real filled trade could not be written to ibkr_trades.csv "
+                    "(disk full / path gone). The row is buffered in memory and "
+                    "retried each fill, but it's lost on a restart and the "
+                    "readiness gate under-counts until this clears. Check disk.",
+                )
 
         # ── Phase 2: research (active symbols only, parallel) ──────────────
         research_data: dict[str, ResearchReport] = {}

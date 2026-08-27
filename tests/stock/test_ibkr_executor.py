@@ -563,6 +563,93 @@ def test_positions_snapshot_maps_back_to_yfinance_symbols(executors):
     assert shares == 4.0 and cost == 168.35
 
 
+# ---------------------------------------------------------------------------
+# TWS-query resilience (2026-08-27): a transient accountValues()/positions()
+# failure must serve the last-good cache, not a fabricated 0.0 / {} that
+# rejects every BUY and blinds the SL/TP watcher to a real position.
+# ---------------------------------------------------------------------------
+
+def test_positions_snapshot_serves_last_good_cache_on_failure(executors):
+    fake = FakeIB(positions=[_cm_position(4, 168.35)])
+    ex = make_executor(fake)
+    executors.append(ex)
+    assert ex.positions_snapshot() == {"CM.TO": (4.0, 168.35)}   # primes the cache
+    assert ex.sync_healthy is True
+
+    def _boom():
+        raise TimeoutError("TWS not responding")
+    fake.positions = _boom
+
+    snap = ex.positions_snapshot()
+    assert snap == {"CM.TO": (4.0, 168.35)}, "must fall back to the last-good book"
+    assert ex.sync_healthy is False
+
+    fake.positions = lambda: [_cm_position(4, 168.35)]
+    ex.positions_snapshot()
+    assert ex.sync_healthy is True   # recovers
+
+
+def test_cash_serves_last_good_cache_on_account_values_failure(executors):
+    fake = FakeIB(cash=4004.51, net_liq=5003.02)
+    ex = make_executor(fake)
+    executors.append(ex)
+    assert ex.cash == pytest.approx(4004.51)   # primes the cache
+
+    def _boom():
+        raise TimeoutError("TWS not responding")
+    fake.accountValues = _boom
+
+    assert ex.cash == pytest.approx(4004.51), "stale cash beats a fabricated 0.0"
+    assert ex.sync_healthy is False
+
+
+def test_no_cache_yet_still_falls_back_to_zero_and_empty(executors):
+    fake = FakeIB()
+    def _boom():
+        raise TimeoutError("down from the first call")
+    fake.accountValues = _boom
+    fake.positions = _boom
+    ex = make_executor(fake)
+    executors.append(ex)
+    assert ex.cash == 0.0
+    assert ex.positions_snapshot() == {}
+    assert ex.sync_healthy is False
+
+
+# ---------------------------------------------------------------------------
+# ibkr_trades.csv write resilience (2026-08-27): a failed append must buffer
+# the real filled-trade row and retry, not silently drop it (the readiness
+# gate reads that CSV exactly).
+# ---------------------------------------------------------------------------
+
+def test_failed_trade_csv_write_buffers_and_retries(executors, tmp_path, monkeypatch):
+    fake = FakeIB(fill_price=100.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+
+    real_open = open
+    def _no_write(path, mode="r", *a, **k):
+        if str(path).endswith("ibkr_trades.csv") and "a" in mode:
+            raise OSError("disk full")
+        return real_open(path, mode, *a, **k)
+    monkeypatch.setattr("builtins.open", _no_write)
+
+    ex.buy("CM.TO", 2, 100.0, reason="test-buffered")
+    assert ex.csv_write_healthy is False
+    assert len(ex._unwritten_csv_rows) == 1
+
+    monkeypatch.setattr("builtins.open", real_open)   # disk recovers
+    ex.buy("CM.TO", 1, 100.0, reason="test-recovered")
+    assert ex.csv_write_healthy is True
+    assert ex._unwritten_csv_rows == []
+
+    import csv as _csv
+    with real_open(ibkr_mod._TRADES_CSV, newline="") as f:
+        rows = list(_csv.reader(f))
+    reasons = [r[7] for r in rows[1:]]   # skip header
+    assert "test-buffered" in reasons and "test-recovered" in reasons
+
+
 def test_realized_pnl_persists_across_instances(executors, tmp_path):
     fake = FakeIB(positions=[_cm_position(4, 168.35)], fill_price=170.0)
     ex = make_executor(fake)
