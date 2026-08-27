@@ -645,3 +645,71 @@ the margin) — matches the sizing research exactly, order still places.
 
 Suite re-run after all fixes: 666 passed. No `bot/strategy/*` touched — no walk-forward
 needed.
+
+## SYN/USD liquidity re-check — 2026-08-26 (mixed result, not resolved)
+
+Re-read SYN/USD's Kraken ticker on request. Volume concern from 2026-08-25 (sitting right at
+the $50k floor, $49,371) looks resolved on this reading — $99,389, comfortably above. But
+spread now fails narrowly, 0.179% vs the 0.15% max, which wasn't flagged as a risk before —
+single point-in-time ticker reads, one metric improved while a different one became the
+blocker. Net effect: still not clean on liquidity, just for a different reason than
+yesterday. Capital gap ($250-$690 vs ~$100 uncommitted) and the FX-conversion build are
+unchanged either way.
+
+## screen_universe.py engine-kwargs drift bug — found + fixed 2026-08-26 (surfaced PUMP/USD)
+
+Full root-cause trail is in `CLAUDE_HISTORY.md` (search "screen_universe.py's own
+engine-kwargs drift bug") — not duplicated here. Summary relevant to this file: while
+re-verifying DOGE/XRP/ETH/PEPE/XDC/LINK/SYN symbol-by-symbol via `validate_symbol.py`, a
+cross-check full-universe run of `screen_universe.py` (CAD + USD legs) disagreed with
+`validate_symbol.py` on LINK/USD's verdict. Root cause: `screen_universe.py` had been
+hand-listing its own `engine.run()` kwargs instead of using the shared
+`engine_kwargs_from_cfg()` builder, missing `macd_enabled`, all 7 Mode A/B entry params, and
+`atr_risk_sizing`/`atr_sizing_baseline_sl_pct` — validating a more permissive strategy shape
+than what's actually live, for every run since 2026-07-20. Traced impact: no past promotion
+decision was ever made on the buggy result (CAD leg's only 2 candidates fail liquidity before
+reaching walk-forward; the USD leg's automation didn't exist until 2026-08-24 and hadn't fired
+once before this fix). Fixed to use the shared builder; added `screen_universe.py` to
+`test_validation_scripts_use_the_builder()` (`tests/crypto/test_engine_params.py`) so a 5th
+script can't reopen this gap silently. Re-running the USD screen before/after the fix: LINK/USD
+flipped PASS→FAIL (the false positive that surfaced the bug), PENGU/USD flipped FAIL→PASS —
+confirms a genuine two-different-strategies difference, not a one-directional bug. PUMP/USD
+passed cleanly both times and is the one fresh candidate carried forward — sized below.
+
+## PUMP/USD — found + capital-sized, NOT promoted — 2026-08-26 (same day, later)
+
+Surfaced by the `screen_universe.py` fix above, not from a targeted search. Walk-forward on
+current strategy code (post-fix, correct kwargs): **PASSES cleanly** — 5000c PF 2.04 (20
+trades), 3000c PF 2.04 (20 trades), 1000c PF 2.14 (13 trades), SL-exit rate 20% (well under
+the 70% cap, and notably lower than SOL's 48-52% or SYN's 25-29%). Kraken liquidity
+(`ccxt.load_markets()`/`fetch_ticker`, checked live): **$6,213,623 USD/day volume, 0.041%
+spread** — both comfortably clean, unlike SYN/USD's borderline case. `amount.min = 2200
+PUMP` (~$10.63 notional at $0.0048/unit), `cost.min = $0.50` (not binding).
+
+**Capital-sizing — needs MORE than either SOL or SYN did, and by a wide margin.** Same method
+as SOL/SYN: solved `calc_trade_qty_atr_risk()`'s dollar-risk cap for the slot cash needed to
+clear `amount.min`, across PUMP/USD's real last 30 4h candles (Kraken `fetch_ohlcv` + `bot.
+indicators.indicators.atr()`, period 14):
+
+| Scenario (PUMP/USD, 4h) | ATR(14) | Slot to clear `amount.min` (bare) | + 1.5× safety margin |
+|---|---|---|---|
+| Calmest of last 30 | 0.000268 | $785.67 | $1,178.51 |
+| 30-candle mean | 0.000313 | $917.16 | $1,375.73 |
+| Latest reading | 0.000268 | $785.67 | $1,178.51 |
+| Most volatile of last 30 | 0.000368 | $1,078.99 | $1,618.48 |
+
+Why so much larger than SOL ($110-$334) or SYN ($250-$690): PUMP's exchange minimum is a
+large *unit count* (2200) against a tiny per-unit price — the ATR-risk sizer's dollar cap has
+to buy proportionally far more units to clear that floor than either SOL or SYN's minimums
+required. Fee cross-check: same `BACKTEST_FEE_PCT=0.008`/side already baked into the PF=2.04
+result above (harsher than the real ~1.2% live figure) — fee drag is not the constraint here
+either, same conclusion as SOL/SYN.
+
+**Bottom line: PUMP/USD is NOT promoted.** Against the ~$100 CAD currently uncommitted (BTC
+$77 + SOL $376 = $453 of the $553.39 balance), even the calmest-case bare minimum ($785.67) is
+~8x what's available — a substantially bigger capital ask than SYN's already-parked
+$250-$690 gap. Ranking among the three open USD candidates by capital-actionability today:
+SOL (promoted, done) > SYN (parked, gap ~$150-$590) > PUMP (parked, gap ~$685-$1,518) — despite
+PUMP having the cleanest liquidity and lowest SL-exit rate of the three. Everything above is
+groundwork for a future deposit decision, not a promotion. No `.env`/`UNIVERSE_WHITELIST`
+change made.
