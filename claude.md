@@ -1040,10 +1040,19 @@ Expected (current, since the self-referential ATR regime-baseline fix, 2026-08-2
 **31 trades, PF 2.19, 38.7% win rate.** Hash `b30f2f9e769c8d41` unchanged.
 If RSI_FILTER_ENABLED=false accidentally: trade count jumps significantly, PF drops below 1.2.
 
-Reproducible pinned-window verification (identical result to rolling run):
+Reproducible pinned-window verification (deterministic — data range fixed, so this result
+does NOT drift as calendar time passes, unlike the rolling run above):
 ```
 EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-06-20 python backtest.py
 ```
+Expected: **30 trades, PF 1.94, 40.0% win rate** (5010 candles, 2024-03-07 → 2026-06-19),
+hash `b30f2f9e769c8d41`. (Corrected 2026-08-27 — this line used to claim "identical result to
+rolling run"; that was true on 2026-08-20 when the rolling 5000-candle window happened to
+align with this pinned range, but the rolling window has since advanced to ~2024-05-16 →
+present and now covers a different slice, hence the different-but-still-valid 31/2.19/38.7%.
+Both PFs are well above the 1.72 fingerprint floor; the strategy is unchanged. Use the
+rolling run for the canonical fingerprint, this pinned run for "did my environment/data
+change break something" reproducibility.)
 
 ### Canonical strategy fingerprint (BTC/USDT)
 - **Strategy hash:** `b30f2f9e769c8d41`

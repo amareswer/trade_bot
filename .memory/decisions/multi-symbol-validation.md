@@ -84,6 +84,28 @@ broken" or "nothing to see here." A shifting blocked-gate bottleneck tracking re
 ADX is the signature of genuine chop; a gate stuck on one label regardless of market
 conditions would be the signature of an actual misconfiguration.
 
+**Re-confirmed 2026-08-27 (Track 3 of the bot-improvement mandate — see
+[[silent-degradation-sweep-2026-08-27]]).** The drought is now ~8 weeks (0 live fills, 65+
+days). Re-ran the checklist:
+- **`live_signals.csv` extended to 2026-08-27:** 187 BUY-considered-then-blocked BTC/CAD
+  candles, still only **1 raw BUY** in the whole run (the 2026-08-18 one, MTF-vetoed).
+  Blocked-gate shape unchanged: regime 64 / ADX 52 / MACD 41 / EMA_spread 24 / RSI 4 /
+  trend 2 — same rotating-bottleneck signature, no gate stuck.
+- **Shadow fidelity (`logs/shadow_report_20260826.md`): 100% (35/35 match).** The strategy
+  is executing *exactly* as backtested — zero execution drift. So the 0 fills is not a
+  mechanical/wiring fault.
+- **Backtest frequency:** 31 trades over 2024-05-16→2026-08-27 (833 days) = **1 trade per
+  ~27 days**. Live 0-in-56-days against an expected ~2 is P≈12.5% (Poisson λ≈2.08) —
+  uncommon but not remarkable for a strategy this low-frequency.
+- **ADX gate is NOT the throttle** (partial sensitivity run, research only, params NOT
+  changed): ADX_THRESHOLD 12→33 trades/PF 2.17, 15→33/PF 2.09, 18 (live)→31/PF 2.19.
+  Loosening ADX adds ~2 trades over 2+ years and *lowers* PF — it's barely costing any
+  opportunity, the selectivity is the confluence of all filters + regime, not one knob.
+- **No safe lever exists** to raise frequency: timeframe (1h FAILED walk-forward, permanent),
+  params (all walk-forward-locked), more symbols (Track 2, capital-blocked), short side
+  (impossible on Kraken spot + full revalidation). **Verdict: keep waiting, don't force it —
+  same as 2026-08-20. No code change.**
+
 ## SOL/CAD SL-distance-based sizing precondition — 2026-08-24 (built AND validated, still blocked on unrelated preconditions)
 
 **Task framing corrected first — important.** The request that triggered this session

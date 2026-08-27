@@ -92,8 +92,35 @@ Strategy-internal HOLDs never reach it. Called once per candle close after the
 `live_signals.csv` write. Tests: new file `tests/crypto/test_blocked_buy_alert.py`, 7 cases.
 Suite 680→687. No `bot/strategy/*` touched.
 
-**Note for later:** CLAUDE.md "Current operational status" still says SOL/CAD has 0 live
-fills — it has 1 (2026-08-26). Not corrected in this session; flag if it matters.
+**Corrected in this session:** CLAUDE.md "Current operational status" + the roadmap table
+said SOL/CAD had 0 live fills — it has 1 (2026-08-26 BUY @ $134.02, position still open, 0
+completed round-trips). The "Post-only param bug" section of the same file already documented
+that fill; the two had diverged. Now says 1/15.
+
+## Track 3 — crypto strategy selectivity diagnosis (2026-08-27, no code change)
+
+Question: is BTC/CAD's 0/15 fills in 65+ days a mis-calibrated filter or genuine variance?
+**Answer: genuine variance + unfavorable regime — the strategy is faithful and correctly
+selective. No actionable fix.** Evidence (all re-verified, not assumed):
+- Shadow fidelity 100% (35/35, `logs/shadow_report_20260826.md`) — strategy executes exactly
+  as backtested, zero drift.
+- Backtest frequency ~1 trade / 27 days (31 trades / 833 days). Live 0-in-56d vs expected ~2
+  is P≈12.5% — uncommon, not remarkable.
+- `live_signals.csv` (2026-07-02→08-27): 187 near-misses, only 1 raw BUY (08-18, MTF-vetoed),
+  blocked-gate distribution rotates with measured ADX = genuine chop signature, no stuck gate.
+  Confirms + extends the 2026-08-20 investigation.
+- ADX sensitivity (research, params NOT changed): loosening ADX 18→12/15 adds ~2 trades over
+  2+ years and *lowers* PF. ADX is not the throttle.
+- No safe lever: timeframe locked (1h FAILED WF), params walk-forward-locked, more symbols =
+  Track 2 (capital-blocked), shorts impossible on Kraken spot.
+- **Doc fix:** CLAUDE.md's "How to verify" pinned-window check claimed "identical result to
+  rolling run" — false since ~2026-08-20 (rolling window advanced). Pinned window now gives
+  30 trades/PF 1.94 (deterministic); rolling gives the canonical 31/PF 2.19. Both > 1.72
+  fingerprint floor, strategy unchanged. Corrected with the pinned window's own expected
+  numbers.
+
+Full trail: [[multi-symbol-validation]] "BTC/CAD live signal drought" section,
+2026-08-27 re-confirmation addendum.
 
 Related: [[execution_layer]], [[fee-structure]], [[2026-08-18-missed-buy-signal]]
 (that investigation is why the MTF gate's blocked-reason labels exist), [[known-gaps]],
