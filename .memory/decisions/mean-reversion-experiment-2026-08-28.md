@@ -1,6 +1,6 @@
 ---
 name: mean-reversion-experiment-2026-08-28
-description: A Bollinger/RSI mean-reversion "buy the chop" strategy was built and walk-forward tested as a candidate SECOND crypto strategy. FAILED decisively on BTC + SOL. Not promoted. Read before re-proposing "trade more in ranging markets".
+description: A Bollinger/RSI mean-reversion strategy was built and walk-forward tested as a candidate SECOND strategy for BOTH bots (crypto and stock). FAILED decisively on both. Not promoted. Read before re-proposing "trade more in ranging markets" / mean reversion / "buy the chop" for either bot.
 metadata:
   type: project
 ---
@@ -62,3 +62,30 @@ Related: [[multi-symbol-validation]] (same fee-drag failure mode on alts),
 `grid_dca_experiment.py` (the sibling "does a non-trend strategy clear our bar" research,
 also inconclusive/unpromoted), CLAUDE.md "Standing Policies — Investment philosophy" (the
 bots are a capped, gate-controlled experiment, not the wealth engine).
+
+---
+
+## Stock re-test — same day, ALSO FAILED
+
+The user asked the "other ways to trade" question for the stock bot too. Hypothesis: the
+crypto failure was fee-driven (1.6% round trip); IBKR's cost is ~0.2-0.4% + shorting is
+available, so maybe it clears on stocks. Built `stock_mean_reversion_experiment.py` (+20
+tests) — daily candles, 16 US `RULE_WHITELIST` symbols, IBKR `_round_trip_commission` + 15
+bps, optional SHORT leg, gated by `stock_backtest.py`'s own criteria.
+
+**Result: long-only 0/16, long+short 1/16.**
+- Long-only: nearly every symbol fails "< 10 trades full window" — ADX<20 + oversold +
+  below-band is rare on daily large-cap bars. The one that trades (AMD, 11) has PF 0.88.
+- Long+short: only PLTR passes (PF 2.00/2.14/1.68). 1-of-16 at a PF≥1.2 bar ≈ chance — a
+  multiple-testing false positive. SL-exit 74-86% on MRNA/AMD (shorting into a 2024-26
+  uptrend → stopped out). Rest PF 0.3-0.9.
+
+**The fee hypothesis is disproven.** Lower cost didn't help — the mean-reversion *entry* has
+no edge, full stop. On crypto it manifested as fees eating small wins; on stocks as the
+strategy not trading (long) or getting stopped out (short). **Rejected on both bots.**
+Report: `logs/stock_mean_reversion_experiment_20260828.md`. Suite 799→819.
+
+**PLTR note:** do NOT promote a strategy on the strength of one symbol out of a screened
+batch clearing a threshold — that's the exact selection bias
+[[expert-practices-benchmark]]'s DSR/CSCV discussion covers. If mean reversion is ever
+revisited, PLTR's lone pass is not evidence.

@@ -2635,3 +2635,40 @@ Win rate ~50% but PF ~0.3 — wins are small (a few % reversion), losses are ~4%
 strategy: no edge net of realistic cost. **Not promoted.** Report:
 `logs/mean_reversion_experiment_20260828.md`; decision record:
 `.memory/decisions/mean-reversion-experiment-2026-08-28.md`. Suite 770 -> 790.
+
+---
+
+## Stock mean-reversion experiment (2026-08-28) — FAILED, not promoted
+
+**Context:** the user asked the "are there other ways to trade" question for the stock bot
+(same as they'd asked for crypto). The crypto mean-reversion experiment above failed largely
+on the 1.6% round-trip Kraken fee swamping small reversions; the hypothesis was that on IBKR
+— round-trip cost `2 * max($1, shares*$0.005)` + 15 bps/fill ≈ 0.2–0.4% on a $1000 trade,
+an order of magnitude less — the same strategy might clear. Stocks also allow a SHORT leg
+(Kraken spot doesn't).
+
+**Method (research only, nothing live):** `stock_mean_reversion_experiment.py` +
+`tests/stock/test_stock_mean_reversion_experiment.py` (20 tests). Daily candles, yfinance,
+1500-day fetch, the 16 US-listed `RULE_WHITELIST` symbols. Pre-registered params: long =
+close < lower Bollinger(20,2σ) AND RSI(14) < 35; short = close > upper band AND RSI > 65;
+both gated ADX(14) < 20. Exit = close back to the middle band / 5% stop (matches
+`PAPER_STOP_LOSS_PCT`) / 15-day time stop. Whole shares, `int($1000/price)`, IBKR
+`_round_trip_commission` + 15 bps slippage. Gate = `stock_backtest.py`'s own (full ≥ 10
+trades, PF ≥ 1.2 in every ≥ 3-trade window, SL-exit ≤ 70%). Run both long-only and long+short.
+
+**Result — FAILED:**
+- **Long-only: 0/16.** Almost every symbol fails "< 10 trades in the full window" — the
+  ADX<20 + oversold + below-band combo is rare on daily large-cap bars. AMD is the only one
+  that trades enough (11), PF 0.88 — losing.
+- **Long + short: 1/16.** Only PLTR clears (full 20 tr / PF 2.00, 750d 13 / 2.14, 500d 8 /
+  1.68). One of sixteen at a PF ≥ 1.2 threshold is roughly chance — a textbook
+  multiple-testing false positive, exactly the selection bias the DSR/CSCV discussion in
+  CLAUDE.md is about. SL-exit rates 74–86% on MRNA/AMD show shorting overbought stocks into
+  an up-trending 2024–26 market just gets stopped out. PF mostly 0.3–0.9 across the rest.
+
+**Verdict:** the lower IBKR fees did NOT save it. The problem isn't cost — the mean-reversion
+*entry* has no edge (on crypto it was fees eating small wins; on stocks it's the strategy
+either not trading or getting stopped out). **Mean reversion is now tested and rejected on
+both bots.** Not promoted. Report: `logs/stock_mean_reversion_experiment_20260828.md`.
+Suite 799 → 819, strategy hash `b30f2f9e769c8d41` unchanged (no `bot/strategy/*` or
+`stock_bot/strategy/*` touched).
