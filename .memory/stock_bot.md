@@ -523,3 +523,20 @@ Phase A measures expectancy from 30 completed paper trades. Full notes in CLAUDE
       with check_exposure/build_paper_summary). DLTR was never down that much.
 - Exposure cap deliberately LEFT at 25% (user confirmed): buys resume when a position exits.
 - Suite = 173 tests. Bot restarted 2026-07-10 with the fix.
+
+## Daily-loss breaker → calendar-day anchored (2026-08-28)
+
+The daily-loss circuit breaker (`PAPER_DAILY_LOSS_PCT=0.03`, blocks new BUYs at >3% down)
+was anchored to `_session_start_value` — set once per process start — so a restart mid-drawdown
+forgot the day's loss, and a continuously-running bot never rolled the "daily" baseline at all.
+Fixed to mirror the executors' weekly tier + crypto `RiskManager`:
+- `_day_open_equity` / `_day_start_iso` (UTC date), **persisted** to `paper_state.json` /
+  `ibkr_state.json`, rolled on a UTC date change.
+- Paper seeds the baseline from live scan-cycle prices (`refresh_position_marks`), not
+  `__init__`'s avg_cost marks; IBKR from live TWS net-liq at connect.
+- Sticky `_daily_loss_tripped` bool removed → non-sticky recompute (mid-day recovery above
+  the threshold re-enables BUYs — same as the weekly tier and the real-money crypto bot).
+- `_session_start_value` removed entirely.
+
+Tests +7 (`test_stock_breaker.py` 14→18, `test_ibkr_executor.py` 62→65). Suite 763→770.
+Strategy hash unchanged (execution-layer only). Full detail: [[known-gaps]] #18.

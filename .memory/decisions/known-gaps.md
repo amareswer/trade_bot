@@ -681,3 +681,56 @@ machine/network) is still unknown. The retry closes the "alert silently dropped"
 short blips but would NOT have saved the 2026-08-05 ~13h continuous outage (retries exhaust in
 seconds, the outage lasted hours) — if this recurs at that scale, investigate the underlying
 resolver/process-specific cause rather than assuming the retry alone is sufficient.
+
+## 18. Stock-bot daily-loss breaker was session-lifetime, not calendar-day — RESOLVED 2026-08-28
+
+**Where:** `stock_bot/execution/paper.py` + `stock_bot/execution/ibkr.py`, `_is_daily_loss_tripped()`.
+
+**Gap:** the daily-loss circuit breaker (`PAPER_DAILY_LOSS_PCT=0.03`, blocks new BUYs when
+equity is down >3%) was anchored to `_session_start_value`, set **once per process start**
+(paper: cash + restored position marks; IBKR: TWS net-liq at connect). Two consequences:
+1. A restart mid-drawdown re-baselined to the now-lower equity → the day's loss was
+   forgotten, breaker silently re-armed at 0%. This bot restarts often (config changes,
+   incident recovery, future VPS), and the UTC day rolls at ~8pm ET so essentially every
+   next-morning restart reset the baseline.
+2. Never reset without a restart either — a bot running continuously for days never rolled
+   the "daily" baseline at all.
+Surfaced in the 2026-08-28 "gaps in the stock bot" review as the #1 item. CLAUDE.md's own
+`PAPER_DAILY_LOSS_PCT` comment already flagged it ("Session-lifetime, not calendar-day ...
+not yet unified — see roadmap") but there was no roadmap item and no fix.
+
+**Fix:** mirror the executors' own weekly tier + the crypto `RiskManager._maybe_reset_day()`:
+- New `_day_open_equity` / `_day_start_iso` (UTC `YYYY-MM-DD`), **persisted** to
+  `paper_state.json` / `ibkr_state.json` alongside the existing `week_*`/`peak_equity` fields.
+- `_maybe_roll_daily_baseline(current_total)` rolls on a UTC date change (or seeds if unset).
+  Called from `_is_daily_loss_tripped()` and — paper — `refresh_position_marks()` (the
+  once-per-cycle call carrying live prices); IBKR rolls from `_update_breaker_marks(net_liq)`
+  (connect + every buy()) since its data is always live TWS net-liq.
+- Paper's daily baseline is deliberately **not** seeded in `__init__` (which only has
+  avg_cost marks) — the first live-priced `refresh_position_marks` anchors it, so a
+  next-morning restart with a moved position anchors the new day to real mark-to-market
+  equity, not cost basis.
+- Removed the sticky `_daily_loss_tripped` bool → non-sticky pure recompute each call, same
+  as `_is_weekly_loss_tripped` and the crypto daily tier: a mid-day recovery above the
+  threshold re-enables BUYs. `_is_daily_loss_tripped()` is now silent (was a one-shot
+  WARNING); `buy()`'s existing "PAPER BUY BLOCKED ... daily loss circuit breaker" call-site
+  log is the visibility. Removed `_session_start_value` entirely (only the breaker used it).
+
+**Behaviour change to be aware of:** the daily breaker is no longer sticky-within-day. If
+equity dips >3% then recovers, BUYs resume the same day (previously blocked till restart).
+This matches the weekly tier and the real-money crypto bot; accepted as the intended
+unification, not a regression.
+
+**Tests:** +7. `tests/stock/test_stock_breaker.py` 14→18 (same-day-restart persistence +
+still-blocks, new-day roll on restart, new-day roll mid-run without restart, non-sticky
+intraday recovery). `tests/stock/test_ibkr_executor.py` 62→65 (same three, FakeIB +
+`_current_day_iso` monkeypatch to pin the date). `_current_day_iso()` is a staticmethod on
+both executors specifically so a test can pin "today". Full suite 763→**770 PASS**. Strategy
+hash unchanged (`b30f2f9e769c8d41` — `stock_bot/execution/*` + test files only, no
+`bot/strategy/*` or `stock_bot/strategy/*`, no walk-forward). CLAUDE.md updated: the
+`PAPER_DAILY_LOSS_PCT` block, both manifest rows + total, and the running manifest narrative.
+Not committed (user handles git).
+
+**Still open from the same review (not this fix):** ATR sizing dormant (AMD/KO fail ATR×2.0
+walk-forward), AMD fails LiveTradingGate Gate 1, no remote control / reachable dashboard for
+the stock bot, IB Gateway headless deploy (roadmap G), yfinance-from-datacenter-IP untested.
