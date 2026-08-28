@@ -67,6 +67,7 @@ from stock_bot.risk.vix_crisis      import is_vix_crisis
 from stock_bot.fast_validator       import FastValidator
 from stock_bot.analysis.accuracy_tracker import LiveTradingGate
 from stock_bot.analysis.checkpoint_tracker import compute_checkpoint_status
+from bot.alerts.stuck_loop import StuckLoopDetector
 
 from colorama import Fore, Style, init as _colorama_init
 _colorama_init(autoreset=True)
@@ -581,7 +582,7 @@ def _is_earnings_blackout(symbol: str, research, cfg) -> bool:
         return False
 
 
-def _check_open_positions_sl_tp(executor, cfg, notifier=None) -> None:
+def _check_open_positions_sl_tp(executor, cfg, notifier=None, stuck_detector=None) -> None:
     """
     Lightweight stop-loss / take-profit check for all open paper positions.
     Fetches only the live price (fast_info) — no OHLCV, no indicators, no AI.
@@ -609,22 +610,33 @@ def _check_open_positions_sl_tp(executor, cfg, notifier=None) -> None:
             if hasattr(executor, "get_position_stop_pct")
             else cfg.paper_stop_loss_pct
         )
-        if pct_change <= -abs(_effective_stop_pct):
-            order = executor.sell(symbol, shares, live, reason="STOP_LOSS_HIT")
-            if order.status == OrderStatus.FILLED:
-                print(f"  🛑 STOP LOSS triggered: {symbol} @ ${live:.2f} ({pct_change:+.1%})")
+        _sl_hit = pct_change <= -abs(_effective_stop_pct)
+        _tp_hit = pct_change >= cfg.paper_take_profit_pct
+        if _sl_hit or _tp_hit:
+            _kind = "STOP_LOSS_HIT" if _sl_hit else "TAKE_PROFIT_HIT"
+            order = executor.sell(symbol, shares, live, reason=_kind)
+            _filled = order.status == OrderStatus.FILLED
+            if _filled:
+                _label = "🛑 STOP LOSS" if _sl_hit else "✅ TAKE PROFIT"
+                print(f"  {_label} triggered: {symbol} @ ${live:.2f} ({pct_change:+.1%})")
                 if notifier:
                     notifier.fill("SELL", symbol, shares, live, shares * live,
                                   pnl=round((live - avg_cost) * shares, 2),
-                                  reason="stop loss")
-        elif pct_change >= cfg.paper_take_profit_pct:
-            order = executor.sell(symbol, shares, live, reason="TAKE_PROFIT_HIT")
-            if order.status == OrderStatus.FILLED:
-                print(f"  ✅ TAKE PROFIT triggered: {symbol} @ ${live:.2f} ({pct_change:+.1%})")
-                if notifier:
-                    notifier.fill("SELL", symbol, shares, live, shares * live,
-                                  pnl=round((live - avg_cost) * shares, 2),
-                                  reason="take profit")
+                                  reason="stop loss" if _sl_hit else "take profit")
+            else:
+                # Previously silent — a rejected SL/TP exit here logged nothing
+                # and alerted nothing (same latent gap the crypto native-stop
+                # deadlock exposed, 2026-08-27). At minimum log it; the
+                # stuck-loop detector escalates a persistent one.
+                logger.error(
+                    "SL/TP EXIT REJECTED %s (%s) — %s (position remains open, %s sh)",
+                    symbol, _kind, order.reject_reason, shares,
+                )
+            if stuck_detector is not None:
+                stuck_detector.record(
+                    f"sl_tp_exit:{symbol}", ok=_filled,
+                    detail="" if _filled else (order.reject_reason or "no order returned"),
+                )
 
     # INFO-level (not debug) on purpose — added 2026-08-06 after a yfinance
     # outage (fetch_candles/yf.download, "possibly delisted" for real tickers)
@@ -888,6 +900,12 @@ def run() -> None:
     renderer  = DashboardRenderer(loop_interval=cfg.loop_interval)
     evaluator = AlertEvaluator()
     notifier  = AlertNotifier(cfg)
+    # Generic "the same order keeps failing" watchdog — error-string-agnostic,
+    # complements the per-case handling. Escalates via ops_alert. Mirrors the
+    # crypto bot's bot/main.py wiring (2026-08-27).
+    stuck_detector = StuckLoopDetector(
+        lambda _m: notifier.ops_alert("STUCK LOOP", _m)
+    )
     # Executor selection: STOCK_EXECUTOR=paper (in-memory sim, default) or
     # ibkr (real fills on the TWS paper API — requires TWS running, port 7497).
     # A failed IBKR connection raises and stops startup — the bot must never
@@ -1024,7 +1042,7 @@ def run() -> None:
         while True:
             try:
                 if _get_market_status()["any_open"]:
-                    _check_open_positions_sl_tp(executor, cfg, notifier)
+                    _check_open_positions_sl_tp(executor, cfg, notifier, stuck_detector)
                     _check_drawdown_warning()
                     time.sleep(30)
                 else:
@@ -1817,6 +1835,11 @@ def run() -> None:
                                             "Order rejected",
                                             f"BUY {symbol} — {order.reject_reason}",
                                         )
+                                    stuck_detector.record(
+                                        f"buy:{symbol}",
+                                        ok=(order.status == OrderStatus.FILLED),
+                                        detail=order.reject_reason or "",
+                                    )
                     else:  # SELL
                         held = executor.position(symbol)
                         if held > 0:
@@ -1860,6 +1883,11 @@ def run() -> None:
                                     f"SELL {symbol} — {order.reject_reason} "
                                     f"— position remains open ({held:.4f} sh)",
                                 )
+                            stuck_detector.record(
+                                f"sell:{symbol}",
+                                ok=(order.status == OrderStatus.FILLED),
+                                detail=order.reject_reason or "",
+                            )
                 elif (
                     executor is not None
                     and verdict is not None

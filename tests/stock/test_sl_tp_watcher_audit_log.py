@@ -108,3 +108,42 @@ def test_no_trigger_within_bounds_does_not_sell(monkeypatch):
     ex = _executor({"RY": (4.0, 210.8)})
     main_mod._check_open_positions_sl_tp(ex, _cfg())
     ex.sell.assert_not_called()
+
+
+# ── rejected SL/TP exit — previously SILENT (2026-08-27) ─────────────────────
+
+def test_rejected_sl_tp_exit_logs_error_and_feeds_stuck_detector(monkeypatch, caplog):
+    from bot.alerts.stuck_loop import StuckLoopDetector
+    monkeypatch.setattr(main_mod, "get_live_price", lambda sym: 200.0)   # stop hit
+    ex = _executor({"RY": (4.0, 210.8)})
+    ex.sell.return_value = SimpleNamespace(
+        status=main_mod.OrderStatus.REJECTED, reject_reason="Insufficient position",
+    )
+    alerts = []
+    det = StuckLoopDetector(alerts.append, threshold=2)
+    with caplog.at_level("ERROR"):
+        for _ in range(2):
+            main_mod._check_open_positions_sl_tp(ex, _cfg(stop_loss_pct=0.05), None, det)
+    assert "SL/TP EXIT REJECTED RY" in caplog.text       # was silent before
+    assert len(alerts) == 1 and "sl_tp_exit:RY" in alerts[0]
+
+
+def test_filled_sl_tp_exit_resets_the_stuck_streak(monkeypatch):
+    from bot.alerts.stuck_loop import StuckLoopDetector
+    monkeypatch.setattr(main_mod, "get_live_price", lambda sym: 200.0)
+    ex = _executor({"RY": (4.0, 210.8)})
+    det = StuckLoopDetector(lambda _m: None, threshold=2)
+    ex.sell.return_value = SimpleNamespace(
+        status=main_mod.OrderStatus.REJECTED, reject_reason="x")
+    main_mod._check_open_positions_sl_tp(ex, _cfg(stop_loss_pct=0.05), None, det)
+    ex.sell.return_value = SimpleNamespace(status=main_mod.OrderStatus.FILLED)
+    main_mod._check_open_positions_sl_tp(ex, _cfg(stop_loss_pct=0.05), None, det)
+    assert det.snapshot() == {}                          # success cleared it
+
+
+def test_stuck_detector_wired_into_run():
+    import inspect
+    src = inspect.getsource(main_mod.run)
+    assert "StuckLoopDetector(" in src
+    assert "stuck_detector.record(" in src               # scan-loop buy/sell
+    assert "_check_open_positions_sl_tp(executor, cfg, notifier, stuck_detector)" in src
