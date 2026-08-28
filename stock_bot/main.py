@@ -831,22 +831,33 @@ _MOVERS_STATE_FILE = _os.path.join(_os.path.dirname(__file__), "universe_movers.
 _MOVER_DEAD_AFTER = 3   # consecutive no-price-data cycles before a top-mover is pruned
 
 
+_MOVER_MIN_CANDLES = 26   # a mover with fewer daily candles than this can't produce
+                          # usable indicators (matches price_feed.py's "thin history" bar)
+
+
 def _prune_dead_movers(
     top_movers:    list[str],
     price_data:    dict,
     dead_counts:   dict[str, int],
     exempt:        set[str],
+    min_candles:   int = _MOVER_MIN_CANDLES,
 ) -> tuple[list[str], list[str]]:
     """
-    Drop top-movers that keep returning no price data.
+    Drop top-movers that keep coming back unusable.
 
-    A ranked-in mover that yfinance/Yahoo can't price (e.g. BLX.TO,
-    2026-08-28) is dead weight: it can't be traded or analysed, and it logs
-    an ERROR every scan cycle. After `_MOVER_DEAD_AFTER` consecutive cycles
-    with `price_data[sym] is None` it's removed for the rest of the session
-    (re-added only if the next daily refresh ranks it back in — the caller
-    clears `dead_counts` then). `exempt` (watchlist + held positions) is
-    never pruned: their fetch failures are signal, not noise.
+    "Unusable" this cycle = `price_data[sym] is None` (yfinance/Yahoo can't
+    price it) OR a real data dict with fewer than `min_candles` candles
+    (thin/new listing — the rule can never warm up on it, and the `.TO`
+    fast_info cross-check spams a `possibly delisted` ERROR every cycle:
+    BLX.TO, 2026-08-28, ~11 candles). A `{"screened": True}` dict is left
+    alone — that's a legitimate re-evaluated-each-cycle screener outcome,
+    not dead weight.
+
+    After `_MOVER_DEAD_AFTER` consecutive unusable cycles the symbol is
+    removed for the rest of the session (re-added only if the next daily
+    refresh ranks it back in — the caller clears `dead_counts` then).
+    `exempt` (watchlist + held positions) is never pruned or counted:
+    their failures are signal, not noise.
 
     Mutates `dead_counts` in place. Returns (pruned_top_movers, dropped).
     """
@@ -856,7 +867,10 @@ def _prune_dead_movers(
         if sym in exempt:
             kept.append(sym)
             continue
-        if price_data.get(sym) is None:
+        d = price_data.get(sym)
+        thin = (isinstance(d, dict) and not d.get("screened")
+                and len(d.get("candles") or []) < min_candles)
+        if d is None or thin:
             dead_counts[sym] = dead_counts.get(sym, 0) + 1
             if dead_counts[sym] >= _MOVER_DEAD_AFTER:
                 dropped.append(sym)

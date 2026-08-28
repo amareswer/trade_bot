@@ -115,10 +115,15 @@ def test_successful_refresh_persists():
 
 # ── dead-mover pruning (BLX.TO, 2026-08-28) ─────────────────────────────────
 
+def _ok(price: float = 100.0) -> dict:
+    """A healthy _fetch_symbol_data result — enough candles for indicators."""
+    return {"screened": False, "candles": list(range(40)), "price": price}
+
+
 def test_prune_keeps_a_mover_below_the_failure_threshold():
     dead: dict[str, int] = {}
     movers = ["NVDA", "BLX.TO"]
-    price_data = {"NVDA": {"price": 1.0}, "BLX.TO": None}
+    price_data = {"NVDA": _ok(), "BLX.TO": None}
     for _ in range(_MOVER_DEAD_AFTER - 1):
         movers, dropped = _prune_dead_movers(movers, price_data, dead, set())
         assert dropped == []
@@ -129,10 +134,9 @@ def test_prune_keeps_a_mover_below_the_failure_threshold():
 def test_prune_drops_a_mover_at_the_failure_threshold():
     dead: dict[str, int] = {}
     movers = ["NVDA", "BLX.TO"]
-    price_data = {"NVDA": {"price": 1.0}, "BLX.TO": None}
-    for _ in range(_MOVER_DEAD_AFTER - 1):
+    price_data = {"NVDA": _ok(), "BLX.TO": None}
+    for _ in range(_MOVER_DEAD_AFTER):
         movers, dropped = _prune_dead_movers(movers, price_data, dead, set())
-    movers, dropped = _prune_dead_movers(movers, price_data, dead, set())
     assert dropped == ["BLX.TO"]
     assert movers == ["NVDA"]
 
@@ -140,7 +144,7 @@ def test_prune_drops_a_mover_at_the_failure_threshold():
 def test_prune_resets_the_counter_on_a_good_cycle():
     dead = {"BLX.TO": _MOVER_DEAD_AFTER - 1}
     movers, dropped = _prune_dead_movers(
-        ["BLX.TO"], {"BLX.TO": {"price": 37.2}}, dead, set()
+        ["BLX.TO"], {"BLX.TO": _ok(37.2)}, dead, set()
     )
     assert dropped == []
     assert "BLX.TO" not in dead
@@ -162,7 +166,7 @@ def test_prune_drops_multiple_dead_movers_in_one_call():
     dead = {"BLX.TO": _MOVER_DEAD_AFTER - 1, "XYZ.TO": _MOVER_DEAD_AFTER - 1}
     movers, dropped = _prune_dead_movers(
         ["NVDA", "BLX.TO", "AMD", "XYZ.TO"],
-        {"NVDA": {"p": 1}, "BLX.TO": None, "AMD": {"p": 1}, "XYZ.TO": None},
+        {"NVDA": _ok(), "BLX.TO": None, "AMD": _ok(), "XYZ.TO": None},
         dead, set(),
     )
     assert dropped == ["BLX.TO", "XYZ.TO"]
@@ -176,3 +180,37 @@ def test_run_calls_prune_and_persists_the_trimmed_list():
     tail = src[idx:idx + 500]
     assert "_persist_movers(" in tail          # a drop rewrites the on-disk list
     assert "all_symbols = list(dict.fromkeys(" in tail
+
+
+def test_prune_counts_a_thin_history_mover_as_unusable():
+    # BLX.TO returns a real dict (price is fine) but only ~11 candles — the
+    # rule can never warm up and the .TO fast_info check spams an ERROR.
+    dead: dict[str, int] = {}
+    thin = {"screened": False, "candles": list(range(11)), "price": 37.2}
+    movers = ["BLX.TO"]
+    for _ in range(_MOVER_DEAD_AFTER):
+        movers, dropped = _prune_dead_movers(movers, {"BLX.TO": thin}, dead, set())
+    assert dropped == ["BLX.TO"]
+    assert movers == []
+
+
+def test_prune_keeps_a_mover_with_enough_candles():
+    dead: dict[str, int] = {}
+    ok = {"screened": False, "candles": list(range(40)), "price": 100.0}
+    movers = ["NVDA"]
+    for _ in range(_MOVER_DEAD_AFTER + 2):
+        movers, dropped = _prune_dead_movers(movers, {"NVDA": ok}, dead, set())
+        assert dropped == []
+    assert movers == ["NVDA"] and "NVDA" not in dead
+
+
+def test_prune_leaves_a_screened_out_mover_alone():
+    # {"screened": True} is a legitimate per-cycle screener outcome, not dead
+    # weight — don't prune it (and don't index into a dict with no "candles").
+    dead: dict[str, int] = {}
+    screened = {"screened": True, "price": 5.0, "screen_reason": "illiquid"}
+    movers = ["THIN.TO"]
+    for _ in range(_MOVER_DEAD_AFTER + 2):
+        movers, dropped = _prune_dead_movers(movers, {"THIN.TO": screened}, dead, set())
+        assert dropped == []
+    assert movers == ["THIN.TO"] and "THIN.TO" not in dead
