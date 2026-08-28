@@ -196,14 +196,13 @@ class IBKRExecutor(StockExecutorBase):
         self._starting_cash: float = 0.0
         self._last_cash: float = 0.0   # last good live-cash reading, persisted for offline readers
         self._daily_loss_limit_pct: float = 0.03
-        self._daily_loss_tripped: bool = False
         self._slippage_bps: int = 0        # real broker — kept only for interface parity
 
         # Weekly loss / drawdown-from-peak breaker tiers (overridden by config
-        # via set_weekly_loss_limit / set_drawdown_limits). Unlike the daily
-        # breaker (connection-lifetime only), peak_equity/week_open_equity/
-        # kill_switch_tripped are persisted — a restart must not silently
-        # reset the all-time peak or un-trip the kill switch.
+        # via set_weekly_loss_limit / set_drawdown_limits). peak_equity/
+        # week_open_equity/day_open_equity/kill_switch_tripped are all persisted
+        # — a restart must not silently reset the all-time peak, the day's or
+        # week's loss baseline, or un-trip the kill switch.
         self._weekly_loss_limit_pct: float = 0.05
         self._drawdown_warning_pct: float = 0.10
         self._drawdown_halt_pct: float = 0.15
@@ -212,6 +211,15 @@ class IBKRExecutor(StockExecutorBase):
         self._week_open_equity: float | None = None
         self._week_start_iso: str | None = None
         self._kill_switch_tripped: bool = False
+
+        # Daily-loss breaker baseline — calendar-day-anchored (UTC), persisted
+        # and rolled over on date change, exactly like the weekly tier and the
+        # crypto RiskManager. The old _session_start_value re-baselined to the
+        # current net-liq on every reconnect, so a restart mid-drawdown forgot
+        # the day's loss. Non-sticky — recomputed each call, so a mid-day
+        # recovery above the threshold re-enables BUYs.
+        self._day_open_equity: float | None = None
+        self._day_start_iso: str | None = None
 
         # Per-position stop-loss % override (ATR-based sizing, opt-in via
         # PAPER_ATR_SIZING_ENABLED). Symbols not present here use the flat
@@ -282,8 +290,9 @@ class IBKRExecutor(StockExecutorBase):
             self.save_state()
         elif net_liq > 0:
             self._rebaseline_if_external_change(net_liq)
-        self._session_start_value = net_liq
         if net_liq > 0:
+            # Rolls the daily baseline: same-day reconnect keeps the persisted
+            # day_open, a new UTC day (or first run) seeds it to net_liq.
             self._update_breaker_marks(net_liq)
 
         self._ensure_csv_header()
@@ -870,28 +879,41 @@ class IBKRExecutor(StockExecutorBase):
         self._kill_switch_pct = kill_switch_pct
 
     def refresh_position_marks(self, prices: dict[str, float]) -> None:
-        """No-op — _is_daily_loss_tripped() always marks live via
-        _net_liquidation(). Kept for interface parity with StockPaperExecutor."""
+        """No-op — _is_daily_loss_tripped() marks live via _net_liquidation()
+        at buy() time, the only place the daily breaker gates anything. Kept
+        for interface parity with StockPaperExecutor (whose paper positions
+        need an explicit re-mark between fills)."""
         pass
 
-    def _is_daily_loss_tripped(self) -> bool:
-        if self._daily_loss_tripped:
-            return True
-        if self._session_start_value <= 0:
-            return False
-        current = self._net_liquidation()
-        if current <= 0:
-            return False
-        drawdown = (self._session_start_value - current) / self._session_start_value
-        if drawdown >= self._daily_loss_limit_pct:
-            self._daily_loss_tripped = True
-            logger.warning(
-                "IBKR daily loss limit hit: %.1f%% drawdown from session start "
-                "$%.2f → current $%.2f",
-                drawdown * 100, self._session_start_value, current,
+    def _maybe_roll_daily_baseline(self, current_value: float) -> None:
+        """Roll the daily-loss baseline on a UTC date change (or seed it if
+        unset). Mirrors the weekly block in _update_breaker_marks and
+        StockPaperExecutor._maybe_roll_daily_baseline."""
+        if current_value <= 0:
+            return
+        today = self._current_day_iso()
+        if self._day_start_iso != today:
+            self._day_start_iso = today
+            self._day_open_equity = current_value
+            logger.info(
+                "New trading day — daily-loss baseline reset | day_open=$%.2f", current_value
             )
-            return True
-        return False
+            self.save_state()
+        elif self._day_open_equity is None:
+            self._day_open_equity = current_value
+            self.save_state()
+
+    def _is_daily_loss_tripped(self) -> bool:
+        """Non-sticky — drawdown from the calendar-day open (UTC), recomputed
+        each call. A mid-day recovery above the threshold re-enables BUYs.
+        buy() logs the block at the call site."""
+        current = self._net_liquidation()
+        self._maybe_roll_daily_baseline(current)
+        base = self._day_open_equity
+        if not base or base <= 0 or current <= 0:
+            return False
+        drawdown = (base - current) / base
+        return drawdown >= self._daily_loss_limit_pct
 
     # ── Weekly loss / drawdown-from-peak breaker tiers ─────────────────────
     # current_value is optional so callers that already fetched net_liq this
@@ -903,15 +925,20 @@ class IBKRExecutor(StockExecutorBase):
         year, week, _ = datetime.now(timezone.utc).isocalendar()
         return f"{year}-W{week:02d}"
 
+    @staticmethod
+    def _current_day_iso() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
     def _update_breaker_marks(self, current_value: float) -> None:
-        """Update all-time peak equity and the week-open reference point from
-        a live net-liquidation value. Persisted immediately on change so a
-        restart can't silently reset either baseline."""
+        """Update all-time peak equity and the day-/week-open reference points
+        from a live net-liquidation value. Persisted immediately on change so a
+        restart can't silently reset any baseline."""
         if current_value <= 0:
             return
         if current_value > self._peak_equity:
             self._peak_equity = current_value
             self.save_state()
+        self._maybe_roll_daily_baseline(current_value)
         this_week = self._current_week_iso()
         if self._week_start_iso != this_week:
             self._week_start_iso = this_week
@@ -1120,6 +1147,9 @@ class IBKRExecutor(StockExecutorBase):
             _week_open                 = state.get("week_open_equity")
             self._week_open_equity     = float(_week_open) if _week_open is not None else None
             self._week_start_iso       = state.get("week_start_iso")
+            _day_open                  = state.get("day_open_equity")
+            self._day_open_equity      = float(_day_open) if _day_open is not None else None
+            self._day_start_iso        = state.get("day_start_iso")
             self._kill_switch_tripped  = bool(state.get("kill_switch_tripped", False))
             # Not filtered against live positions here (unlike paper.py) —
             # IBKR has no local position cache to check against at load time;
@@ -1157,6 +1187,8 @@ class IBKRExecutor(StockExecutorBase):
             "peak_equity": round(self._peak_equity, 6),
             "week_open_equity": self._week_open_equity,
             "week_start_iso": self._week_start_iso,
+            "day_open_equity": self._day_open_equity,
+            "day_start_iso": self._day_start_iso,
             "kill_switch_tripped": self._kill_switch_tripped,
             "position_stop_pct": self._position_stop_pct,
             "last_updated": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),

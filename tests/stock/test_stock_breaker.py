@@ -6,12 +6,21 @@ baseline was cash-only while the drawdown calc used cash + position marks —
 the breaker could never fire (current total always far above baseline).
 Baseline now includes the mark value (avg_cost) of restored positions.
 
+Change 2026-08-28: the daily-loss breaker is now anchored to the calendar
+day (UTC), not process start. `_day_open_equity` / `_day_start_iso` are
+persisted and rolled on a UTC date change — a restart mid-drawdown no longer
+forgets the day's loss. Non-sticky: recomputed each call, so a mid-day
+recovery above the threshold re-enables BUYs (matches the weekly tier and
+the crypto RiskManager).
+
 State/CSV paths are monkeypatched to a tmp dir so tests never touch the real
 paper_state.json / paper_trades.csv (see .memory/core.md rule 10).
 """
 import os
 
 import pytest
+
+import stock_bot.execution.paper as _paper_mod
 
 import stock_bot.execution.paper as paper_mod
 from stock_bot.execution.paper import StockPaperExecutor
@@ -31,28 +40,38 @@ def sandbox(tmp_path, monkeypatch):
 
 def test_fresh_session_baseline_is_cash(sandbox):
     ex = StockPaperExecutor(starting_cash=1000.0)
-    assert ex._session_start_value == 1000.0
+    # Not seeded from __init__'s avg_cost-only mark — the first live-priced
+    # refresh (or breaker check) anchors it.
+    assert ex._day_open_equity is None
     assert ex._open_position_value == 0.0
+
+    ex.refresh_position_marks({})
+    assert ex._day_open_equity == 1000.0
+    assert ex._day_start_iso == ex._current_day_iso()
 
 
 def test_breaker_fires_after_restart_with_open_positions(sandbox):
-    # Session 1: buy and persist — ~$500 cash + 10 shares near $50
+    # Session 1: buy, run one scan cycle (seeds the day baseline), persist.
     ex = StockPaperExecutor(starting_cash=1000.0)
     ex.set_daily_loss_limit(0.03)
+    ex.set_slippage_bps(0)
     order = ex.buy("TEST", 10, 50.0, reason="test")
     assert order.status.value == "FILLED"
+    ex.refresh_position_marks({"TEST": 50.0})       # a real cycle -> day_open=$1000
     ex.save_state()
 
-    # Session 2 (restart): baseline must include the restored position marks
+    # Session 2 (same-day restart): the day-open baseline must be restored
+    # from disk ($1000), not re-based to the current lower equity.
     ex2 = StockPaperExecutor(starting_cash=1000.0)
     ex2.set_daily_loss_limit(0.03)
-    assert ex2._session_start_value == pytest.approx(
-        ex2._cash + ex2._open_position_value
-    )
+    assert ex2._day_open_equity == pytest.approx(1000.0)
+    assert ex2._day_start_iso == ex2._current_day_iso()
     assert ex2._open_position_value > 0   # position marked at avg_cost, not 0
 
-    # Price drops ~14% → portfolio down ~7% from the ~$1000 baseline.
-    # Under the old cash-only baseline (~$500) this could never trip.
+    # Price drops 14% → portfolio down ~7% from the $1000 baseline.
+    # Under the old _session_start_value baseline (re-based to ~$1000 on
+    # restart from live marks) this still tripped; the point here is the
+    # baseline is the *persisted* $1000, not silently reset.
     ex2._update_position_value({"TEST": 43.0})
     assert ex2._is_daily_loss_tripped()
 
@@ -66,6 +85,97 @@ def test_breaker_silent_within_limit_after_restart(sandbox):
     ex2.set_daily_loss_limit(0.03)
     ex2._update_position_value({"TEST": 48.5})   # ~1.6% portfolio drawdown
     assert not ex2._is_daily_loss_tripped()
+
+
+# ---------------------------------------------------------------------------
+# Calendar-day anchoring (2026-08-28) — the core of the "session-lifetime ->
+# calendar-day" change. `_current_day_iso` is a staticmethod so a test can
+# pin "today" without touching the wall clock.
+# ---------------------------------------------------------------------------
+
+def _pin_day(monkeypatch, iso: str) -> None:
+    monkeypatch.setattr(_paper_mod.StockPaperExecutor, "_current_day_iso",
+                        staticmethod(lambda: iso))
+
+
+def test_daily_baseline_persists_across_same_day_restart(sandbox, monkeypatch):
+    _pin_day(monkeypatch, "2026-08-28")
+    ex = StockPaperExecutor(starting_cash=1000.0)
+    ex.set_daily_loss_limit(0.03)
+    ex.set_slippage_bps(0)
+    ex.buy("TEST", 10, 50.0, reason="test")
+    ex.refresh_position_marks({"TEST": 50.0})        # cycle 1 -> day_open=$1000
+    ex.refresh_position_marks({"TEST": 45.0})        # price crashes 10% -> total $950
+    assert ex._is_daily_loss_tripped()              # 5% > 3%
+    ex.save_state()
+
+    # Restart on the SAME day: the $1000 baseline is restored, so the still-
+    # depressed equity is still a >3% drawdown -> still blocked. (Old
+    # behaviour re-based the baseline on every restart -> drawdown reset -> a
+    # restart mid-bad-day silently re-enabled BUYs.)
+    ex2 = StockPaperExecutor(starting_cash=1000.0)
+    ex2.set_daily_loss_limit(0.03)
+    assert ex2._day_open_equity == pytest.approx(1000.0)
+    ex2.refresh_position_marks({"TEST": 45.0})
+    assert ex2._is_daily_loss_tripped()
+    order = ex2.buy("TEST2", 1, 10.0, reason="test")
+    assert order.status.value == "REJECTED"
+    assert "Daily loss limit" in order.reject_reason
+
+
+def test_daily_baseline_rolls_and_unblocks_on_new_day(sandbox, monkeypatch):
+    _pin_day(monkeypatch, "2026-08-28")
+    ex = StockPaperExecutor(starting_cash=1000.0)
+    ex.set_daily_loss_limit(0.03)
+    ex.set_slippage_bps(0)
+    ex.buy("TEST", 10, 50.0, reason="test")
+    ex.refresh_position_marks({"TEST": 50.0})        # day_open=$1000
+    ex.refresh_position_marks({"TEST": 45.0})        # total $950
+    assert ex._is_daily_loss_tripped()              # tripped on 2026-08-28
+    ex.save_state()
+
+    # New UTC day, price still $45: the first cycle rolls the baseline to the
+    # live mark-to-market total ($950), so the drawdown from the new day-open
+    # is 0 -> BUYs allowed again.
+    _pin_day(monkeypatch, "2026-08-29")
+    ex2 = StockPaperExecutor(starting_cash=1000.0)
+    ex2.set_daily_loss_limit(0.03)
+    ex2.refresh_position_marks({"TEST": 45.0})
+    assert ex2._day_open_equity == pytest.approx(950.0)
+    assert ex2._day_start_iso == "2026-08-29"
+    assert not ex2._is_daily_loss_tripped()
+
+
+def test_daily_breaker_is_not_sticky_intraday(sandbox, monkeypatch):
+    _pin_day(monkeypatch, "2026-08-28")
+    ex = StockPaperExecutor(starting_cash=1000.0)
+    ex.set_daily_loss_limit(0.03)
+    ex.set_slippage_bps(0)
+    ex.buy("TEST", 10, 50.0, reason="test")
+    ex.refresh_position_marks({"TEST": 50.0})        # day_open=$1000
+
+    ex.refresh_position_marks({"TEST": 45.0})        # 5% down -> tripped
+    assert ex._is_daily_loss_tripped()
+    ex.refresh_position_marks({"TEST": 49.0})        # recovers to 1% down
+    assert not ex._is_daily_loss_tripped()           # not sticky -> re-enabled
+
+
+def test_daily_baseline_seeds_on_new_day_while_process_stays_up(sandbox, monkeypatch):
+    # No restart — the UTC date ticks over mid-run. The next scan cycle must
+    # roll the baseline to the current live total.
+    _pin_day(monkeypatch, "2026-08-28")
+    ex = StockPaperExecutor(starting_cash=1000.0)
+    ex.set_daily_loss_limit(0.03)
+    ex.set_slippage_bps(0)
+    ex.buy("TEST", 10, 50.0, reason="test")
+    ex.refresh_position_marks({"TEST": 44.0})        # total $940, 6% down -> tripped
+    assert ex._is_daily_loss_tripped()
+
+    _pin_day(monkeypatch, "2026-08-29")
+    ex.refresh_position_marks({"TEST": 44.0})        # same equity, new day
+    assert ex._day_open_equity == pytest.approx(940.0)
+    assert ex._day_start_iso == "2026-08-29"
+    assert not ex._is_daily_loss_tripped()
 
 
 # ---------------------------------------------------------------------------

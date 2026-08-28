@@ -1034,6 +1034,80 @@ def test_ibkr_drawdown_status_warning_flag_tracks_threshold(executors):
 
 
 # ---------------------------------------------------------------------------
+# Daily-loss breaker: calendar-day anchoring (2026-08-28). Was anchored to
+# _session_start_value (set once per connect) so a restart mid-drawdown
+# forgot the day's loss. Now _day_open_equity / _day_start_iso are persisted
+# and roll on a UTC date change, matching the weekly tier + crypto RiskManager.
+# ---------------------------------------------------------------------------
+
+def _pin_ibkr_day(monkeypatch, iso: str) -> None:
+    monkeypatch.setattr(ibkr_mod.IBKRExecutor, "_current_day_iso",
+                        staticmethod(lambda: iso))
+
+
+def test_ibkr_daily_baseline_persists_across_same_day_restart(executors, sandbox, monkeypatch):
+    _pin_ibkr_day(monkeypatch, "2026-08-28")
+    fake = FakeIB(net_liq=1000.0, cash=1000.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+    ex.set_daily_loss_limit(0.03)
+    assert ex._day_open_equity == pytest.approx(1000.0)
+
+    fake._net_liq = 950.0                       # 5% down
+    assert ex._is_daily_loss_tripped()
+    ex.save_state()
+
+    # Same-day restart, equity still depressed: the $1000 baseline is restored
+    # from disk, NOT re-based to the current $950 net-liq.
+    fake2 = FakeIB(net_liq=950.0, cash=950.0)
+    ex2 = make_executor(fake2)
+    executors.append(ex2)
+    ex2.set_daily_loss_limit(0.03)
+    assert ex2._day_open_equity == pytest.approx(1000.0)
+    assert ex2._is_daily_loss_tripped()
+    order = ex2.buy("KO", 1, 60.0, reason="test")
+    assert order.status == OrderStatus.REJECTED
+    assert "Daily loss limit" in order.reject_reason
+
+
+def test_ibkr_daily_baseline_rolls_and_unblocks_on_new_day(executors, sandbox, monkeypatch):
+    _pin_ibkr_day(monkeypatch, "2026-08-28")
+    fake = FakeIB(net_liq=1000.0, cash=1000.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+    ex.set_daily_loss_limit(0.03)
+    fake._net_liq = 950.0
+    assert ex._is_daily_loss_tripped()          # tripped on the 28th
+    ex.save_state()
+
+    # New UTC day: the connect-time _update_breaker_marks rolls the baseline
+    # to the live net-liq ($950), so the drawdown from the new open is 0.
+    _pin_ibkr_day(monkeypatch, "2026-08-29")
+    fake2 = FakeIB(net_liq=950.0, cash=950.0)
+    ex2 = make_executor(fake2)
+    executors.append(ex2)
+    ex2.set_daily_loss_limit(0.03)
+    assert ex2._day_open_equity == pytest.approx(950.0)
+    assert ex2._day_start_iso == "2026-08-29"
+    assert not ex2._is_daily_loss_tripped()
+
+
+def test_ibkr_daily_baseline_rolls_mid_run_without_restart(executors, sandbox, monkeypatch):
+    _pin_ibkr_day(monkeypatch, "2026-08-28")
+    fake = FakeIB(net_liq=1000.0, cash=1000.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+    ex.set_daily_loss_limit(0.03)
+    fake._net_liq = 940.0
+    assert ex._is_daily_loss_tripped()          # 6% down on the 28th
+
+    _pin_ibkr_day(monkeypatch, "2026-08-29")    # date ticks over, process still up
+    assert not ex._is_daily_loss_tripped()      # _is_daily_loss_tripped rolls the baseline
+    assert ex._day_open_equity == pytest.approx(940.0)
+    assert ex._day_start_iso == "2026-08-29"
+
+
+# ---------------------------------------------------------------------------
 # Per-position ATR stop-loss override (opt-in ATR sizing, added 2026-08-05).
 # ---------------------------------------------------------------------------
 

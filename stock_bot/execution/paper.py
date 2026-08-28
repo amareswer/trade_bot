@@ -89,11 +89,24 @@ class StockPaperExecutor(StockExecutorBase):
         self._cash:         float                           = starting_cash
         self._positions:    dict[str, tuple[float, float]]  = {}
         self._realized_pnl: float                           = 0.0
-        self._session_start_value: float = starting_cash
         self._daily_loss_limit_pct: float = 0.03   # overridden by config
-        self._daily_loss_tripped: bool = False
         self._slippage_bps: int = 15   # 0.15% — override via set_slippage_bps()
         self._open_position_value: float = 0.0
+
+        # Daily-loss breaker baseline — calendar-day-anchored (UTC), persisted
+        # and rolled over on a date change, like the weekly tier and the crypto
+        # RiskManager. A restart mid-drawdown must NOT forget the day's loss
+        # (the old _session_start_value re-baselined every restart, turning
+        # "down 3% today" into "down 3% since last restart"). Non-sticky:
+        # recomputed each call, so BUYs resume if equity climbs back above the
+        # threshold intraday (matches the weekly tier + crypto).
+        #
+        # Seeded/rolled ONLY from refresh_position_marks() (live prices, once
+        # per scan cycle) and _is_daily_loss_tripped() — never from __init__'s
+        # avg_cost-only mark, so a next-morning restart anchors the new day to
+        # real mark-to-market equity, not cost basis.
+        self._day_open_equity: Optional[float] = None
+        self._day_start_iso: Optional[str] = None
 
         # Weekly loss / drawdown-from-peak breaker tiers (overridden by config
         # via set_weekly_loss_limit / set_drawdown_limits). Unlike the daily
@@ -125,13 +138,13 @@ class StockPaperExecutor(StockExecutorBase):
         else:
             if not self._load_state():
                 logger.info("StockPaperExecutor starting fresh | cash=$%.2f", starting_cash)
-        # Session baseline = cash + mark value of any restored positions
-        # (avg_cost until live prices arrive). Seeding _open_position_value with
-        # the same marks keeps baseline and current total consistent — a
+        # Mark restored positions at avg_cost (until live prices arrive) so the
+        # weekly baseline and current total are computed on the same basis — a
         # cash-only baseline disabled the breaker whenever a session started
-        # with open positions (current total always far above baseline).
+        # with open positions (current total always far above baseline). The
+        # daily baseline is deliberately NOT seeded here (see _day_open_equity
+        # comment above); refresh_position_marks() does it with live prices.
         self._update_position_value({})
-        self._session_start_value = self._cash + self._open_position_value
 
         self._ensure_csv_header()
         print("  Paper trading: whole shares only (no fractions)")
@@ -156,26 +169,46 @@ class StockPaperExecutor(StockExecutorBase):
         """Configure the daily loss circuit breaker (fraction, e.g. 0.03 = 3%)."""
         self._daily_loss_limit_pct = pct
 
+    @staticmethod
+    def _current_day_iso() -> str:
+        """Calendar date in UTC — the daily-loss baseline resets at UTC
+        midnight, matching _current_week_iso() and the crypto RiskManager."""
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _maybe_roll_daily_baseline(self, current_total: float) -> None:
+        """Roll the daily-loss baseline on a UTC date change (or seed it if
+        unset — first run, or a state file predating this field). Mirrors the
+        weekly-baseline block in _update_breaker_marks."""
+        today = self._current_day_iso()
+        if self._day_start_iso != today:
+            self._day_start_iso = today
+            self._day_open_equity = current_total
+            logger.info(
+                "New trading day — daily-loss baseline reset | day_open=$%.2f", current_total
+            )
+            self.save_state()
+        elif self._day_open_equity is None:
+            self._day_open_equity = current_total
+            self.save_state()
+
     def _is_daily_loss_tripped(self) -> bool:
         """
-        Returns True if total portfolio drawdown from session start exceeds the limit.
-        Total = cash + mark-to-market of open positions (cached via _update_position_value).
-        Once tripped, stays tripped for the rest of the session.
+        Returns True if total portfolio drawdown from the calendar-day open
+        exceeds the limit. Total = cash + mark-to-market of open positions
+        (cached via _update_position_value). Non-sticky — recomputed each
+        call, so a mid-day recovery above the threshold re-enables BUYs
+        (matches _is_weekly_loss_tripped and the crypto daily-loss tier).
         """
-        if self._daily_loss_tripped:
-            return True
-        if self._session_start_value <= 0:
-            return False
         current_total = self._cash + self._open_position_value
-        drawdown = (self._session_start_value - current_total) / self._session_start_value
-        if drawdown >= self._daily_loss_limit_pct:
-            self._daily_loss_tripped = True
-            logger.warning(
-                "PAPER daily loss limit hit: %.1f%% drawdown from session start $%.2f → current $%.2f",
-                drawdown * 100, self._session_start_value, current_total,
-            )
-            return True
-        return False
+        self._maybe_roll_daily_baseline(current_total)
+        base = self._day_open_equity
+        if not base or base <= 0:
+            return False
+        drawdown = (base - current_total) / base
+        # Silent like _is_weekly_loss_tripped — buy() logs the block at the
+        # call site ("PAPER BUY BLOCKED ... daily loss circuit breaker active"),
+        # and this is now recomputed every call so a warning here would spam.
+        return drawdown >= self._daily_loss_limit_pct
 
     def _update_position_value(self, prices: dict[str, float]) -> None:
         """
@@ -210,8 +243,10 @@ class StockPaperExecutor(StockExecutorBase):
 
     def _update_breaker_marks(self) -> None:
         """Update all-time peak equity and the week-open reference point from
-        the current mark-to-market total. Persisted immediately on change so
-        a restart can't silently reset either baseline."""
+        the current mark-to-market total. Persisted immediately on change so a
+        restart can't silently reset either baseline. (The daily baseline is
+        rolled separately, from refresh_position_marks / _is_daily_loss_tripped
+        — it must anchor to live prices, not __init__'s avg_cost marks.)"""
         current_total = self._cash + self._open_position_value
         if current_total > self._peak_equity:
             self._peak_equity = current_total
@@ -300,8 +335,13 @@ class StockPaperExecutor(StockExecutorBase):
         a held position that moves significantly with no new fill wouldn't
         be reflected until the next trade. Call this once per scan cycle,
         before any buy()/sell() decisions, so the breaker sees live prices.
+
+        Also seeds/rolls the daily-loss baseline: this is the once-per-cycle
+        call that carries real prices, so a UTC day rollover (or a fresh
+        start) anchors day_open to live mark-to-market equity here.
         """
         self._update_position_value(prices)
+        self._maybe_roll_daily_baseline(self._cash + self._open_position_value)
 
     def buy(
         self,
@@ -683,6 +723,10 @@ class StockPaperExecutor(StockExecutorBase):
             if self._week_open_equity is not None:
                 self._week_open_equity = float(self._week_open_equity)
             self._week_start_iso       = state.get("week_start_iso")
+            self._day_open_equity      = state.get("day_open_equity")
+            if self._day_open_equity is not None:
+                self._day_open_equity = float(self._day_open_equity)
+            self._day_start_iso        = state.get("day_start_iso")
             self._kill_switch_tripped  = bool(state.get("kill_switch_tripped", False))
             self._position_stop_pct    = {
                 sym.upper(): float(pct)
@@ -715,6 +759,8 @@ class StockPaperExecutor(StockExecutorBase):
             "peak_equity": round(self._peak_equity, 6),
             "week_open_equity": self._week_open_equity,
             "week_start_iso": self._week_start_iso,
+            "day_open_equity": self._day_open_equity,
+            "day_start_iso": self._day_start_iso,
             "kill_switch_tripped": self._kill_switch_tripped,
             "position_stop_pct": self._position_stop_pct,
             "last_updated": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
