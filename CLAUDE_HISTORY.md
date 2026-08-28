@@ -2598,3 +2598,40 @@ caught proactively.
 **No `bot/strategy/*` touched, no hash change, no walk-forward re-stamp needed** — this was a
 validation-tooling bug (what config a screen tests against), not a change to the strategy
 itself. `UNIVERSE_WHITELIST`/`.env` untouched throughout.
+
+---
+
+## Mean-reversion strategy experiment (2026-08-28) — FAILED, not promoted
+
+**Context:** during a quiet stretch (BTC/CAD 0 fills, SOL/CAD 1 fill, both bots flat for
+days) the user asked whether there are other ways to trade — whether the bots could be more
+active. The live 4h strategy is trend-following and sits flat in ranging markets by design
+(ADX >= 18 gate). Mean reversion — buy oversold dips inside a range, exit on reversion to
+the mean — is the natural complement: it trades exactly when the trend strategy doesn't.
+Built and walk-forward tested as a candidate **second** crypto strategy.
+
+**Method (research only, nothing live):** `mean_reversion_experiment.py` +
+`tests/crypto/test_mean_reversion_experiment.py` (20 tests). Same discipline as
+`grid_dca_experiment.py` — a standalone engine (not `bot/backtest/engine.py`; the stop is a
+bare price level checked intra-candle against the low, not close), parameters fixed in
+source before any result was seen. No `bot/strategy/*`, `.env`, or `bot/main.py` touched;
+strategy hash `b30f2f9e769c8d41` unchanged.
+
+**Strategy (pre-registered):** regime ADX(14) < 20; entry = close below lower
+Bollinger(20, 2.0σ) AND RSI(14) < 35 (long only); exit = close >= middle band (target) /
+-4% stop / 18-bar time stop / 1-bar cooldown. Fee 0.8%/side (1.6% round trip — the real
+live Kraken figure). Bar: PF >= 1.2 in every window with >= 10 trades, windows
+5000/3000/1000 trailing 4h candles, BTC/USDT + SOL/USDT (Binance proxies).
+
+**Result — FAILED decisively on both:**
+
+| Symbol | 5000c | 3000c | 1000c |
+|---|---|---|---|
+| BTC/USDT | PF 0.30 (20 tr, ret -28.7%) | PF 0.32 (14 tr) | PF 0.18 (4 tr) |
+| SOL/USDT | PF 0.36 (18 tr, ret -39.4%) | PF 0.73 (9 tr) | PF 0.15 (2 tr) |
+
+Win rate ~50% but PF ~0.3 — wins are small (a few % reversion), losses are ~4% (the stop) +
+1.6% fees. Same fee-drag failure mode the June 2026 USD alt screen found for the trend
+strategy: no edge net of realistic cost. **Not promoted.** Report:
+`logs/mean_reversion_experiment_20260828.md`; decision record:
+`.memory/decisions/mean-reversion-experiment-2026-08-28.md`. Suite 770 -> 790.

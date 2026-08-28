@@ -828,6 +828,43 @@ _last_universe_attempt = None                                        # datetime 
 _UNIVERSE_REFRESH_HOUR = int(_os.getenv("UNIVERSE_REFRESH_HOUR", "16"))  # legacy — refresh is now first-LIVE-cycle-of-day, not a fixed hour
 _UNIVERSE_RETRY_COOLDOWN_S = 900   # min seconds between top-movers pre_filter attempts while it keeps failing
 _MOVERS_STATE_FILE = _os.path.join(_os.path.dirname(__file__), "universe_movers.json")
+_MOVER_DEAD_AFTER = 3   # consecutive no-price-data cycles before a top-mover is pruned
+
+
+def _prune_dead_movers(
+    top_movers:    list[str],
+    price_data:    dict,
+    dead_counts:   dict[str, int],
+    exempt:        set[str],
+) -> tuple[list[str], list[str]]:
+    """
+    Drop top-movers that keep returning no price data.
+
+    A ranked-in mover that yfinance/Yahoo can't price (e.g. BLX.TO,
+    2026-08-28) is dead weight: it can't be traded or analysed, and it logs
+    an ERROR every scan cycle. After `_MOVER_DEAD_AFTER` consecutive cycles
+    with `price_data[sym] is None` it's removed for the rest of the session
+    (re-added only if the next daily refresh ranks it back in — the caller
+    clears `dead_counts` then). `exempt` (watchlist + held positions) is
+    never pruned: their fetch failures are signal, not noise.
+
+    Mutates `dead_counts` in place. Returns (pruned_top_movers, dropped).
+    """
+    kept:    list[str] = []
+    dropped: list[str] = []
+    for sym in top_movers:
+        if sym in exempt:
+            kept.append(sym)
+            continue
+        if price_data.get(sym) is None:
+            dead_counts[sym] = dead_counts.get(sym, 0) + 1
+            if dead_counts[sym] >= _MOVER_DEAD_AFTER:
+                dropped.append(sym)
+                continue
+        else:
+            dead_counts.pop(sym, None)
+        kept.append(sym)
+    return kept, dropped
 
 
 def _load_persisted_movers(today_iso: str) -> list[str]:
@@ -880,6 +917,7 @@ def run() -> None:
     else:
         _universe = None
     top_movers: list[str] = []
+    _dead_movers: dict[str, int] = {}   # top-mover -> consecutive no-price-data cycles
 
     # Restore today's top-movers across a restart so the bot doesn't drop back to
     # watchlist-only until the next daily refresh (it restarts often — VPS deploys,
@@ -1290,6 +1328,7 @@ def run() -> None:
                     top_movers  = _fresh
                     all_symbols = list(dict.fromkeys(watchlist_symbols + top_movers))
                     _last_universe_refresh = now_et
+                    _dead_movers.clear()   # fresh ranking — give every symbol a clean slate
                     _persist_movers(now_et.date().isoformat(), top_movers)
                     logger.info("Universe refreshed: %d movers — %s",
                                 len(top_movers), ", ".join(top_movers))
@@ -1378,6 +1417,22 @@ def run() -> None:
             s for s in cycle_symbols
             if isinstance(price_data.get(s), dict) and not price_data[s].get("screened")
         ]
+
+        # Prune top-movers that keep returning no price data (dead tickers /
+        # Yahoo gaps) so they stop spamming a yfinance ERROR every cycle.
+        if top_movers:
+            _exempt = watchlist_set | set(held_symbols)
+            top_movers, _dropped = _prune_dead_movers(
+                top_movers, price_data, _dead_movers, _exempt,
+            )
+            if _dropped:
+                all_symbols = list(dict.fromkeys(watchlist_symbols + top_movers))
+                _persist_movers(now_et.date().isoformat(), top_movers)
+                logger.warning(
+                    "Universe: dropped %s from top-movers after %d cycles with no "
+                    "price data — will return only if the next daily refresh ranks it back in",
+                    ", ".join(_dropped), _MOVER_DEAD_AFTER,
+                )
 
         _mark_positions_to_market(executor, price_data)
 

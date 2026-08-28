@@ -18,7 +18,12 @@ import json
 import pytest
 
 import stock_bot.main as main_mod
-from stock_bot.main import _load_persisted_movers, _persist_movers
+from stock_bot.main import (
+    _MOVER_DEAD_AFTER,
+    _load_persisted_movers,
+    _persist_movers,
+    _prune_dead_movers,
+)
 
 
 @pytest.fixture
@@ -106,3 +111,68 @@ def test_run_restores_persisted_movers_at_startup():
 def test_successful_refresh_persists():
     src = inspect.getsource(main_mod.run)
     assert "_persist_movers(now_et.date().isoformat(), top_movers)" in src
+
+
+# ── dead-mover pruning (BLX.TO, 2026-08-28) ─────────────────────────────────
+
+def test_prune_keeps_a_mover_below_the_failure_threshold():
+    dead: dict[str, int] = {}
+    movers = ["NVDA", "BLX.TO"]
+    price_data = {"NVDA": {"price": 1.0}, "BLX.TO": None}
+    for _ in range(_MOVER_DEAD_AFTER - 1):
+        movers, dropped = _prune_dead_movers(movers, price_data, dead, set())
+        assert dropped == []
+    assert movers == ["NVDA", "BLX.TO"]
+    assert dead["BLX.TO"] == _MOVER_DEAD_AFTER - 1
+
+
+def test_prune_drops_a_mover_at_the_failure_threshold():
+    dead: dict[str, int] = {}
+    movers = ["NVDA", "BLX.TO"]
+    price_data = {"NVDA": {"price": 1.0}, "BLX.TO": None}
+    for _ in range(_MOVER_DEAD_AFTER - 1):
+        movers, dropped = _prune_dead_movers(movers, price_data, dead, set())
+    movers, dropped = _prune_dead_movers(movers, price_data, dead, set())
+    assert dropped == ["BLX.TO"]
+    assert movers == ["NVDA"]
+
+
+def test_prune_resets_the_counter_on_a_good_cycle():
+    dead = {"BLX.TO": _MOVER_DEAD_AFTER - 1}
+    movers, dropped = _prune_dead_movers(
+        ["BLX.TO"], {"BLX.TO": {"price": 37.2}}, dead, set()
+    )
+    assert dropped == []
+    assert "BLX.TO" not in dead
+    assert movers == ["BLX.TO"]
+
+
+def test_prune_never_drops_an_exempt_symbol():
+    dead: dict[str, int] = {}
+    movers = ["AC.TO"]
+    price_data = {"AC.TO": None}
+    for _ in range(_MOVER_DEAD_AFTER + 5):
+        movers, dropped = _prune_dead_movers(movers, price_data, dead, {"AC.TO"})
+        assert dropped == []
+    assert movers == ["AC.TO"]
+    assert "AC.TO" not in dead          # exempt symbols aren't even counted
+
+
+def test_prune_drops_multiple_dead_movers_in_one_call():
+    dead = {"BLX.TO": _MOVER_DEAD_AFTER - 1, "XYZ.TO": _MOVER_DEAD_AFTER - 1}
+    movers, dropped = _prune_dead_movers(
+        ["NVDA", "BLX.TO", "AMD", "XYZ.TO"],
+        {"NVDA": {"p": 1}, "BLX.TO": None, "AMD": {"p": 1}, "XYZ.TO": None},
+        dead, set(),
+    )
+    assert dropped == ["BLX.TO", "XYZ.TO"]
+    assert movers == ["NVDA", "AMD"]
+
+
+def test_run_calls_prune_and_persists_the_trimmed_list():
+    src = inspect.getsource(main_mod.run)
+    assert "_prune_dead_movers(" in src
+    idx = src.index("_prune_dead_movers(")
+    tail = src[idx:idx + 500]
+    assert "_persist_movers(" in tail          # a drop rewrites the on-disk list
+    assert "all_symbols = list(dict.fromkeys(" in tail

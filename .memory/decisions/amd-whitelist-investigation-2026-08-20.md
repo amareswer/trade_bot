@@ -1,6 +1,6 @@
 ---
 name: amd-whitelist-investigation-2026-08-20
-description: AMD failed LiveTradingGate Gate 1's walk-forward on 2026-08-20 (RULE_WHITELIST symbol). Investigated — verdict is small-sample noise from one thin recent window, not a genuine edge failure. AMD NOT removed from RULE_WHITELIST. Re-check when the 250d window holds more trades.
+description: AMD failed LiveTradingGate Gate 1's walk-forward on 2026-08-20, verdict was small-sample noise from one thin 250d window. RESOLVED 2026-08-28 — re-run gives 16/16 PASS, AMD passes (the failing window's 3rd trade aged out → excluded as low-sample). AMD stays in RULE_WHITELIST, Gate 1 now 16/16. Closed.
 metadata:
   type: project
 ---
@@ -76,3 +76,27 @@ then this is "keep watching, don't force it," the same standing posture this fil
 memory already applies to the crypto capital gate.
 
 No config or whitelist changes made as part of this investigation.
+
+---
+
+## Re-check 2026-08-28 — AMD now PASSES, exactly as predicted
+
+Re-ran `stock_backtest.py` over all 16 RULE_WHITELIST symbols. **16/16 PASS, AMD verdict PASS.**
+
+| Window | 2026-08-20 | 2026-08-28 |
+|---|---|---|
+| full | 16 tr, PF 1.55 | 16 tr, PF 1.55 (**identical** — zero new AMD trades in the interim) |
+| 750d | 8 tr, PF 2.48 | 8 tr, PF 2.48 (identical) |
+| 500d | 5 tr, PF 1.43 | 5 tr, PF 1.43 (identical) |
+| **250d** | **3 tr, PF 0.75 → FAIL** | **2 tr, PF 1.70, `low_sample=true` → EXCLUDED from verdict** |
+
+The single failing window's 3rd trade aged out past the 250-day boundary between runs. With
+only 2 trades it's now below `MIN_TRADES_FOR_VERDICT` and doesn't count toward the verdict at
+all — exactly the "small-sample window-boundary instability" this file's #3 point called out.
+Nothing about AMD's actual edge changed (the full 16-trade history is byte-identical). The
+re-check trigger ("5-10+ trades in the 250d window") was NOT met — the window got *smaller*,
+not larger — but the practical outcome (AMD off the failing list) is the same.
+
+**Verdict: closed. AMD stays in RULE_WHITELIST. Gate 1 is now 16/16.** No further monitoring
+needed unless a future run flips it back — in which case the same "is the 250d window a real
+sample now?" question applies before acting.
