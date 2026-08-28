@@ -1405,6 +1405,17 @@ decision (`_LIVENESS_MAX_STALE_S=1800` already tolerates a ~13-min cycle). **Cod
 end-to-end: forced the switch on a real engine, live call to deepseek-v4-pro returned
 `KO → BUY 68`. Tests: `tests/stock/test_ai_failover.py` +4 (9→13). Suite 745→749.
 
+**Reusable probe tool — `verify_nvidia_models.py` (repo root, added 2026-08-27).** Turns the
+one-off model hunt into a standing command — `NVIDIA_MODEL` has died/degraded 5 times and each
+needed manual hunting. Runs the REAL path (`build_prompt()` → `AIEngine._analyze_once()`
+nvidia branch → real `_parse()`) against live data for 6 symbols. Modes: no args = verify the
+currently-configured `NVIDIA_MODEL` still works (exit non-zero if not — run after a swap or
+when `_update_ai_health` alerts); `--models a,b,c` = check specific ids; `--catalog` = sweep
+all ~56 chat models in NVIDIA's `/v1/models` and rank the deployed ones. 6 symbols not 2-3
+on purpose: a reasoning model's parse failure is *intermittent* (nemotron parse-failed 4/6 but
+can pass a lucky 2/2). Not in pytest — standalone, network, same as the `verify_kraken_*.py`
+scripts.
+
 **Two failover/health hardening changes from that incident:**
 - Failover now **also triggers on sustained parse failures** (`_last_call_parse_failed`), not
   just API errors — a model that answers with unparseable garbage every call is as dead as
