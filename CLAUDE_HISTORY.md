@@ -2672,3 +2672,50 @@ either not trading or getting stopped out). **Mean reversion is now tested and r
 both bots.** Not promoted. Report: `logs/stock_mean_reversion_experiment_20260828.md`.
 Suite 799 → 819, strategy hash `b30f2f9e769c8d41` unchanged (no `bot/strategy/*` or
 `stock_bot/strategy/*` touched).
+
+---
+
+## Cross-sectional momentum experiment (2026-08-29) — closest yet, still FAILED
+
+**Context:** third strategy tested in the 2026-08-28/29 "are there other ways to trade"
+search (after mean-reversion and grid/DCA, both failed). This one is structurally different
+— a portfolio *rotation* method (rank a universe by trailing return, hold the top slice,
+rebalance monthly), not a single-symbol timing entry. The most-replicated equity anomaly
+(Jegadeesh-Titman 1993).
+
+**Method (research only):** `stock_momentum_experiment.py` + `tests/stock/
+test_stock_momentum_experiment.py` (14 tests). Pre-registered: 55-name fixed liquid
+large-cap universe (54 aligned; HON dropped for thin data), 6-1 momentum (126d return
+ending 21d ago), hold top 10 equal-weight, rebalance every 21d, optional SPY>200d-SMA
+regime gate (tested both ways), long only, whole shares, IBKR cost model (commission +
+15 bps/fill). Data: 1485 aligned trading days (2020-09 → 2026-08), validation = most-recent
+40% (594 days). Gate: validation Sharpe > SPY buy-and-hold AND > equal-weight-hold-all, with
+maxDD <= 1.1x SPY's.
+
+**Result — FAILED both ways, but this is the closest any strategy came:**
+
+| | Validation CAGR | Validation Sharpe | Validation maxDD |
+|---|---|---|---|
+| Momentum (no regime) | **+43.8%** | 1.42 | 25.8% |
+| Momentum (SPY>200d) | +32.0% | 1.20 | 18.9% |
+| SPY buy-and-hold | +21.3% | 1.28 | 18.7% |
+| Equal-weight-hold-all | +24.1% | **1.49** | 18.6% |
+
+- The **raw return premium is real and large** — validation CAGR nearly 2x SPY, and it held
+  in the full window (+27.4% vs SPY +13.5%). Not noise.
+- It **beats SPY on Sharpe** (1.42 vs 1.28) — the first strategy in this search to beat the
+  benchmark on risk-adjusted terms.
+- But it **loses to the trivial "own all 54 equal-weight and never trade" benchmark** on
+  Sharpe (1.42 vs 1.49). The rotation's extra volatility + ~4.8% turnover cost (29 rebalances
+  on $100k) exactly cancel its return edge on a risk-adjusted basis.
+- **Drawdowns are deeper** (26-33% for a concentrated 10-name book) — fails the 1.1x-SPY test
+  without the regime filter. WITH the filter drawdown drops to 19% (passes) but return falls
+  enough that Sharpe (1.20) drops below SPY. No free lunch.
+
+**Verdict — not promoted.** Momentum genuinely outperforms SPY but not clearly enough to
+beat a simple diversified hold. Across all three strategies tested, the consistent finding
+is that **beating a passive diversified basket net of costs is hard** — which is precisely
+the premise of the two-bucket policy (the wealth engine is a broad index hold, outside the
+bots). This concludes the strategy search: no candidate clears the bar; the highest-value
+improvements are elsewhere (uptime, cost measurement once trade volume exists).
+Report: `logs/stock_momentum_experiment_20260829.md`. Suite 819 → 833, hash unchanged.
