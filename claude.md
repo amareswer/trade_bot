@@ -485,7 +485,7 @@ when nothing's blocked and nothing changed. Also covers the SPY-regime-fetch-fai
 then-`PAPER_MAX_EXPOSURE_PCT=0.25` ceiling (one ~20% position — `T` — + `PAPER_RISK_PCT=0.20`
 per trade means a 2nd full-size BUY didn't fit), and their rule signal toggled BUY↔HOLD every
 other cycle — each toggle changed the set and re-alerted. (The cap was raised the same day,
-0.25 → 0.45 → 0.60 → 0.85, see "Risk-gate config (stock bot)" — 4 full positions now fit (PAPER_MAX_POSITIONS is the binding limit); the
+0.25 → 0.45 → 0.60 → 0.85, later → 1.0 on 2026-08-31; see "Risk-gate config (stock bot)" — the
 debounce below still stands for any symbol that flaps a gate.) Now `state['alerted']` tracks each
 blocked symbol with an `absent` counter: a symbol dropping out does NOT alert and is only
 forgotten after `_BLOCKED_BUY_ABSENT_CYCLES_TO_CLEAR=3` consecutive absent cycles, so a
@@ -1068,26 +1068,27 @@ Both executors implement the same tiers independently (accepted duplication — 
 as the sector-concentration gate). All tiers block new BUYs only; SELL/exits are never
 blocked by any breaker (mirrors the crypto RiskManager's hard rule above).
 ```
-PAPER_MAX_EXPOSURE_PCT=0.85        # SET in stock_bot/.env 2026-08-27 (config.py default is
-                                    # 0.25). Max fraction of account equity in open positions;
-                                    # a rule/AI BUY is blocked (MAX_EXPOSURE) if the projected
-                                    # post-trade exposure would exceed this. Raised 0.25 → 0.45
-                                    # → 0.60 → 0.85 same day: each earlier step was blocking an
-                                    # Nth full-size (PAPER_RISK_PCT=0.20) BUY while N held
-                                    # (0.25→1, 0.45→2 T+BNS, 0.60→3 +GM). 0.85 makes
-                                    # PAPER_MAX_POSITIONS=4 the binding limit instead — 4 at
-                                    # full size (4×20% + ~5% mark-to-market headroom). PAPER
-                                    # bot building a 30-trade track record for the live gate →
-                                    # idle cash generates no trades/learning; the per-position
-                                    # 5% stop + the 4 breaker tiers (3/5/15/20%) are the real
-                                    # risk controls, not this cap. Accepted downside: ~85% in
-                                    # 4 large caps → a broad down-day hits the whole book.
-                                    # LAST loosening — 4 full positions is the ceiling. Does
-                                    # NOT apply to the real-money crypto bot. Still BUY-only —
-                                    # never blocks a SELL/exit.
-PAPER_MAX_POSITIONS=4              # hard cap on concurrent open positions — now the binding
-                                    # limit (checked after the exposure gate, which at 0.85
-                                    # allows all 4 at full size)
+PAPER_MAX_EXPOSURE_PCT=1.0         # SET in stock_bot/.env. config.py default is 0.25. Max
+                                    # fraction of account equity in open positions; a rule/AI
+                                    # BUY is blocked (MAX_EXPOSURE) if projected post-trade
+                                    # exposure would exceed this. History: 0.25 → 0.45 → 0.60
+                                    # → 0.85 (2026-08-27), then → 1.0 (2026-08-31, user
+                                    # request "use all the amount" — the paper bot needs a
+                                    # 30-trade track record for the live gate and idle cash
+                                    # generates no trades/learning; a 20-min universe refresh
+                                    # was discussed and rejected — refresh cadence is not the
+                                    # constraint, the daily-timeframe entry signal is). At
+                                    # PAPER_RISK_PCT=0.20, ~5 full-size positions = 100%
+                                    # invested; the 6th slot fills only if a position sits
+                                    # below full size. Real risk controls remain: per-position
+                                    # 5% stop + the 4 breaker tiers (3/5/15/20%). Downside
+                                    # accepted, eyes open: ZERO cash buffer — a broad down-day
+                                    # hits ~100% of the book, no dry powder until a position
+                                    # closes. Does NOT apply to the real-money crypto bot.
+                                    # Still BUY-only — never blocks a SELL/exit.
+PAPER_MAX_POSITIONS=6              # hard cap on concurrent open positions (4 → 6, 2026-08-31).
+                                    # At exposure 1.0 / risk 0.20, ~5 fill fully; #6 is a
+                                    # spare slot for when one position is under full size.
 PAPER_DAILY_LOSS_PCT=0.03          # (default; not set in stock_bot/.env) halt new BUYs if
                                     # portfolio down >3% from the calendar-day open (UTC).
                                     # Unified with the crypto RiskManager 2026-08-28: the
@@ -1804,7 +1805,8 @@ index-constituent-list cache TTL in `StockUniverse`; only `UNIVERSE_REFRESH_HOUR
   user shared — punch list is now clear through P0. P1 investigated next: the long-term/DCA
   bucket item was confirmed by-design (two-bucket policy, not a gap); the cash-reserve item
   turned out already satisfied (`PAPER_MAX_EXPOSURE_PCT` default 0.25 = 75%+ cash floor,
-  already gating BUYs; raised to 0.85 / PAPER_MAX_POSITIONS=4 now binding, on 2026-08-27 — see "Risk-gate config
+  already gating BUYs; later raised 0.85 (2026-08-27) → 1.0 / PAPER_MAX_POSITIONS 4 → 6
+  (2026-08-31, "use all the amount") — see "Risk-gate config
   (stock bot)") — the one real precision gap found was `check_exposure()` checking
   current state only, not the pending trade, so a single large BUY could blow past the cap
   in one shot before the *next* BUY got caught. Fixed 2026-08-05: both executors'
