@@ -401,6 +401,14 @@ class IBKRExecutor(StockExecutorBase):
     # equity ~$995 CAD, all ten RULE_WHITELIST symbols USD-denominated) hit
     # this wall — every future USD BUY would have repeated the same rejection
     # cycle. Checked proactively so a doomed order never reaches IBKR.
+    #
+    # Checked against NET LIQUIDATION VALUE, not free cash (fixed 2026-08-31):
+    # IBKR's margin/currency minimum is an account-equity rule, not a cash rule.
+    # The original 2026-07-20 check used self.cash as a proxy, which was fine
+    # when cash ≈ equity (tiny account, ~no positions). Once the account held
+    # open positions, free cash fell well below net-liq and this guard started
+    # rejecting perfectly fundable USD BUYs every cycle (net-liq $4,997, cash
+    # $2,137 → AMZN/PLTR rejected + STUCK LOOP alert, 2026-08-31).
     _MIN_EQUITY_FOR_FX_TRADE_CAD = 2500.0
 
     @staticmethod
@@ -620,10 +628,12 @@ class IBKRExecutor(StockExecutorBase):
             )
 
         contract_currency = self.to_contract(sym).currency
-        if contract_currency != "CAD" and self.cash < self._MIN_EQUITY_FOR_FX_TRADE_CAD:
+        _fx_equity = self._net_liquidation()
+        if (contract_currency != "CAD"
+                and 0 < _fx_equity < self._MIN_EQUITY_FOR_FX_TRADE_CAD):
             return self._reject(
                 sym, OrderSide.BUY, shares, price,
-                f"Account equity ${self.cash:,.2f} CAD is below IBKR's "
+                f"Account equity ${_fx_equity:,.2f} CAD is below IBKR's "
                 f"${self._MIN_EQUITY_FOR_FX_TRADE_CAD:,.0f} CAD minimum required to buy "
                 f"a {contract_currency}-denominated security (IBKR Error 201 — "
                 "margin/currency-trade minimum)",
