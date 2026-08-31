@@ -827,6 +827,14 @@ _last_universe_refresh = None                                        # datetime 
 _last_universe_attempt = None                                        # datetime | None — throttles failed retries
 _UNIVERSE_REFRESH_HOUR = int(_os.getenv("UNIVERSE_REFRESH_HOUR", "16"))  # legacy — refresh is now first-LIVE-cycle-of-day, not a fixed hour
 _UNIVERSE_RETRY_COOLDOWN_S = 900   # min seconds between top-movers pre_filter attempts while it keeps failing
+# How often to re-rank the top-movers universe during market hours. Was once/day
+# (first LIVE cycle) until 2026-08-31 — a stock that broke out mid-morning was
+# invisible for BUY until the next day. Now re-ranked every N hours so a fresh
+# breakout is picked up within one interval. Only fires in LIVE mode (the block
+# lives below the PRE_MARKET/AFTER_HOURS `continue`s), so ~3-4 refreshes/session.
+_MOVERS_REFRESH_HOURS = float(_os.getenv("UNIVERSE_MOVERS_REFRESH_HOURS", "2"))
+# <= 0 disables the intraday re-rank → back to once-per-day (first LIVE cycle only).
+_MOVERS_REFRESH_INTERVAL_S = _MOVERS_REFRESH_HOURS * 3600 if _MOVERS_REFRESH_HOURS > 0 else float("inf")
 _MOVERS_STATE_FILE = _os.path.join(_os.path.dirname(__file__), "universe_movers.json")
 _MOVER_DEAD_AFTER = 3   # consecutive no-price-data cycles before a top-mover is pruned
 
@@ -895,11 +903,32 @@ def _load_persisted_movers(today_iso: str) -> list[str]:
     return []
 
 
+def _load_persisted_refresh_time(today_iso: str):
+    """The ET timestamp of today's persisted top-movers list, or None when the
+    file is missing/stale/unreadable or predates the `refreshed_at` field. Lets a
+    restart continue the intraday re-rank cadence instead of resetting the clock
+    (so an afternoon restart still gets its next scheduled refresh, not a fresh
+    full interval)."""
+    try:
+        with open(_MOVERS_STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("date") == today_iso and data.get("refreshed_at"):
+            return datetime.fromisoformat(str(data["refreshed_at"]))
+    except (OSError, ValueError, TypeError):
+        pass
+    return None
+
+
 def _persist_movers(today_iso: str, movers: list[str]) -> None:
-    """Best-effort — a write failure never blocks the scan loop."""
+    """Best-effort — a write failure never blocks the scan loop. Stamps
+    `refreshed_at` (ET now) so a restart can resume the intraday re-rank cadence."""
     try:
         from bot.atomic_json import atomic_write_json
-        atomic_write_json(_MOVERS_STATE_FILE, {"date": today_iso, "movers": list(movers)})
+        atomic_write_json(_MOVERS_STATE_FILE, {
+            "date": today_iso,
+            "movers": list(movers),
+            "refreshed_at": datetime.now(_pytz.timezone("US/Eastern")).isoformat(),
+        })
     except Exception as exc:                                   # noqa: BLE001
         logger.warning("Could not persist universe movers: %s", exc)
 
@@ -940,8 +969,11 @@ def run() -> None:
         _today_et = datetime.now(_pytz.timezone("US/Eastern")).date().isoformat()
         top_movers = _load_persisted_movers(_today_et)
         if top_movers:
-            _last_universe_refresh = datetime.now(_pytz.timezone("US/Eastern"))
-            logger.info("Universe: restored %d persisted movers for %s", len(top_movers), _today_et)
+            _last_universe_refresh = (_load_persisted_refresh_time(_today_et)
+                                      or datetime.now(_pytz.timezone("US/Eastern")))
+            logger.info("Universe: restored %d persisted movers for %s (last refresh %s ET)",
+                        len(top_movers), _today_et,
+                        _last_universe_refresh.strftime("%H:%M"))
 
     all_symbols = list(dict.fromkeys(watchlist_symbols + top_movers))
 
@@ -1036,7 +1068,9 @@ def run() -> None:
     print(f"  {'─' * 45}")
     print(f"  My Watchlist : {', '.join(watchlist_symbols)}")
     if cfg.universe_enabled:
-        print(f"  Universe     : S&P500 + TSX60 → top {cfg.universe_size} movers (refreshes on the first scan cycle each day)")
+        _mv_int = ("first cycle each day only" if _MOVERS_REFRESH_INTERVAL_S == float("inf")
+                   else f"first cycle each day, then every {_MOVERS_REFRESH_HOURS:g}h")
+        print(f"  Universe     : S&P500 + TSX60 → top {cfg.universe_size} movers (refresh: {_mv_int})")
         print(f"  Top Movers   : {', '.join(top_movers) if top_movers else '(restoring / first refresh pending)'}")
     print(f"  Screener  : {'enabled' if screener else 'disabled'}")
     print(f"  Interval  : {cfg.interval}   Lookback: {cfg.lookback_days}d   Loop: {cfg.loop_interval}s")
@@ -1316,21 +1350,27 @@ def run() -> None:
         print(f"  {'Symbol':<10}  {'Price':>10}  {'RSI':^7}  {'Trend':<10}  {'ADX':^13}  MACD")
         print(f"  {'─'*10}  {'─'*10}  {'─'*7}  {'─'*10}  {'─'*13}  {'─'*30}")
 
-        # Refresh the top-movers universe once per trading day, on the first
-        # LIVE scan cycle of the day.
+        # Refresh the top-movers universe on the first LIVE cycle of the day AND
+        # every _MOVERS_REFRESH_INTERVAL_S (default 2h) thereafter during market
+        # hours — so a stock that breaks out mid-session becomes a BUY candidate
+        # within one interval instead of only the next morning (2026-08-31).
         #
-        # This used to be gated on the ET clock hour matching
-        # _UNIVERSE_REFRESH_HOUR (16), which was UNREACHABLE: this block only
-        # runs in LIVE mode (market open), but by 16:00 ET the market is closed
-        # and the loop is already in AFTER_HOURS mode and has `continue`d.
-        # Result: the refresh never fired and the bot ran watchlist-only
-        # indefinitely (found 2026-08-27 — 179 "waiting" log lines, 0
-        # "refreshed", across 3 days). pre_filter ranks on 30-day daily bars /
-        # 5-day momentum / 20-day avg volume, so a partial current-day candle is
-        # immaterial and a mid-session refresh is fine.
+        # This block only runs in LIVE mode (it sits below the PRE_MARKET/
+        # AFTER_HOURS `continue`s), so the interval is naturally clamped to the
+        # ~6.5h session → ~3-4 refreshes/day. It used to be gated on the ET clock
+        # hour matching _UNIVERSE_REFRESH_HOUR (16), which was UNREACHABLE (market
+        # already closed → AFTER_HOURS → `continue`d before this code): the
+        # refresh never fired and the bot ran watchlist-only indefinitely (found
+        # 2026-08-27 — 179 "waiting" log lines, 0 "refreshed", across 3 days).
+        # pre_filter ranks on 30-day daily bars / 5-day momentum / 20-day avg
+        # volume, so a partial current-day candle is immaterial and a mid-session
+        # re-rank is fine.
         if cfg.universe_enabled and _universe is not None:
-            _needs_refresh = (_last_universe_refresh is None
-                              or _last_universe_refresh.date() != now_et.date())
+            _needs_refresh = (
+                _last_universe_refresh is None
+                or _last_universe_refresh.date() != now_et.date()
+                or (now_et - _last_universe_refresh).total_seconds() >= _MOVERS_REFRESH_INTERVAL_S
+            )
             _retry_ok = (_last_universe_attempt is None
                          or (now_et - _last_universe_attempt).total_seconds() >= _UNIVERSE_RETRY_COOLDOWN_S)
             if _needs_refresh and _retry_ok:
@@ -1444,7 +1484,7 @@ def run() -> None:
                 _persist_movers(now_et.date().isoformat(), top_movers)
                 logger.warning(
                     "Universe: dropped %s from top-movers after %d cycles with no "
-                    "price data — will return only if the next daily refresh ranks it back in",
+                    "price data — will return only if a later universe refresh ranks it back in",
                     ", ".join(_dropped), _MOVER_DEAD_AFTER,
                 )
 

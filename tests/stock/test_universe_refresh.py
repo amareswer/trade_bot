@@ -21,6 +21,7 @@ import stock_bot.main as main_mod
 from stock_bot.main import (
     _MOVER_DEAD_AFTER,
     _load_persisted_movers,
+    _load_persisted_refresh_time,
     _persist_movers,
     _prune_dead_movers,
 )
@@ -70,6 +71,53 @@ def test_load_preserves_order(movers_file):
 def test_persist_never_raises_on_bad_path(monkeypatch):
     monkeypatch.setattr(main_mod, "_MOVERS_STATE_FILE", "/nonexistent-dir/x/y.json")
     _persist_movers("2026-08-27", ["NVDA"])   # must not raise
+
+
+# ── intraday re-rank cadence (2026-08-31) ───────────────────────────────────
+
+def test_persist_stamps_refresh_time_that_load_reads_back(movers_file):
+    _persist_movers("2026-08-27", ["NVDA"])
+    ts = _load_persisted_refresh_time("2026-08-27")
+    assert ts is not None and ts.tzinfo is not None   # tz-aware ET
+
+
+def test_refresh_time_none_for_a_different_date(movers_file):
+    _persist_movers("2026-08-27", ["NVDA"])
+    assert _load_persisted_refresh_time("2026-08-28") is None
+
+
+def test_refresh_time_none_when_field_absent(movers_file):
+    # a file written before the refreshed_at field existed
+    movers_file.write_text(json.dumps({"date": "2026-08-27", "movers": ["NVDA"]}),
+                           encoding="utf-8")
+    assert _load_persisted_refresh_time("2026-08-27") is None
+    assert _load_persisted_movers("2026-08-27") == ["NVDA"]   # list still restores
+
+
+def test_refresh_time_none_on_corrupt_json(movers_file):
+    movers_file.write_text("{bad", encoding="utf-8")
+    assert _load_persisted_refresh_time("2026-08-27") is None
+
+
+def test_run_re_ranks_movers_on_an_interval_not_just_once_per_day():
+    src = inspect.getsource(main_mod.run)
+    assert "_MOVERS_REFRESH_INTERVAL_S" in src, (
+        "The refresh must also fire every _MOVERS_REFRESH_INTERVAL_S so a mid-day "
+        "breakout becomes a BUY candidate the same session, not only next morning."
+    )
+    # first-cycle-of-day trigger must still be present too
+    assert "_last_universe_refresh.date() != now_et.date()" in src
+
+
+def test_movers_interval_default_is_two_hours():
+    # no UNIVERSE_MOVERS_REFRESH_HOURS in the test env → the 2h default
+    assert main_mod._MOVERS_REFRESH_INTERVAL_S == 2 * 3600
+
+
+def test_movers_interval_zero_or_negative_disables_intraday_rerank():
+    # the module-level guard: <= 0 hours ⇒ inf (once-per-day only), never "every cycle"
+    src = inspect.getsource(main_mod)
+    assert 'if _MOVERS_REFRESH_HOURS > 0 else float("inf")' in src
 
 
 # ── the bugfix — source-inspection guards on run() ───────────────────────────
