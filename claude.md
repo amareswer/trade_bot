@@ -1133,16 +1133,21 @@ stock bot is already yfinance-rate-limit-sensitive (see dashboard log noise re: 
 MACRO_BLACKOUT_DAYS=1               # added 2026-08-05. Symmetric window (days before AND
                                      # after) around an event date. 0 or negative disables
                                      # the feature entirely.
-MACRO_EVENT_DATES=                  # added 2026-08-05. Empty by default. Comma-separated
-                                     # ISO dates for FOMC/CPI/GDP — user-maintained, this
-                                     # module does NOT fabricate them (they don't follow a
-                                     # clean weekday rule the way jobs reports do). Add real
-                                     # ones as published:
+MACRO_EVENT_DATES=<11 dates>        # added 2026-08-05, EMPTY until 2026-08-30. Comma-
+                                     # separated ISO dates for FOMC/CPI/GDP — user-maintained,
+                                     # this module does NOT fabricate them (they don't follow a
+                                     # clean weekday rule the way jobs reports do).
                                      #   FOMC: federalreserve.gov/monetarypolicy/fomccalendars.htm
                                      #   CPI:  bls.gov/schedule/news_release/cpi.htm
                                      #   GDP:  bea.gov/news/schedule
                                      # A two-day FOMC meeting needs both days listed.
 ```
+**Populated 2026-08-30** (was empty since the feature shipped 2026-08-05, so only the
+auto-computed monthly jobs-report blackout was ever active — FOMC/CPI/GDP did nothing).
+Now set for the rest of 2026, verified against the official calendars above:
+`2026-09-11,2026-09-15,2026-09-16,2026-10-14,2026-10-27,2026-10-28,2026-10-29,2026-11-10,2026-12-08,2026-12-09,2026-12-10`
+— CPI Sep 11 / Oct 14 / Nov 10 / Dec 10; FOMC Sep 15-16 / Oct 27-28 / Dec 8-9; GDP advance
+Q3 Oct 29. **Refresh in Jan 2027** with the next year's dates.
 `stock_bot/risk/macro_calendar.py`. Two date sources: (1) `jobs_report_dates()` — the U.S.
 Non-Farm Payrolls report is always the first Friday of the month, computed algorithmically
 (same style as `_us_holidays()`/`_ca_holidays()` in `stock_bot/main.py` — no external data,
