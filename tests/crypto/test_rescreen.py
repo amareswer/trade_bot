@@ -74,9 +74,11 @@ def test_usd_leg_runs_with_correct_env_override(tmp_path, monkeypatch):
     monkeypatch.setattr(rescreen, "_run_gate", _fake_run_gate)
     rescreen.run()
 
-    assert ("screen_universe.py", None) in calls              # CAD leg — unchanged
+    assert ("screen_universe.py", None) in calls              # CAD auto-discovery — unchanged
+    # CAD whitelist re-validation — explicit-symbol run, liquidity gate off
+    assert ("screen_universe.py", {"SCREEN_SYMBOLS": "BTC/CAD", "SCREEN_MIN_VOL_CAD": "0"}) in calls
     assert ("screen_universe.py", {"SCREEN_QUOTE": "USD"}) in calls  # USD leg — new
-    assert len(calls) == 2  # CAD + USD only, stocks skipped
+    assert len(calls) == 3  # CAD discovery + CAD re-validation + USD; stocks skipped
 
 
 def test_usd_leg_results_land_in_report_correctly(tmp_path, monkeypatch):
@@ -100,15 +102,20 @@ def test_usd_leg_results_land_in_report_correctly(tmp_path, monkeypatch):
     assert "whitelist now: (none)" in usd_section  # nothing USD-whitelisted today
 
 
-def test_cad_leg_unaffected_by_usd_addition_regression(tmp_path, monkeypatch):
-    """The CAD leg's own behavior (whitelist comparison, no extra_env,
-    section content) must be identical to before the USD leg existed."""
+def test_cad_decay_comes_from_revalidation_not_discovery(tmp_path, monkeypatch):
+    """Regression for the 2026-09-01 false positive: screen_universe.py's
+    auto-discovery EXCLUDES whitelisted bases (BTC/SOL/...), so the CAD
+    discovery PASS list never contains a live symbol. Edge decay must be
+    derived from the separate explicit-symbol re-validation run, not from
+    `whitelist - discovery_passes` (which flagged BTC/CAD every month)."""
     _make_run_env(tmp_path, monkeypatch, whitelist="BTC/CAD")
 
     def _fake_run_gate(script, extra_env=None):
+        if extra_env and "SCREEN_SYMBOLS" in extra_env:
+            return 0, "PASS (1): BTC/CAD\n"    # re-validation: BTC/CAD still has edge
         if extra_env is None:
-            return 0, "PASS (1): BTC/CAD\n"   # CAD leg: whitelist matches evidence
-        return 0, "PASS (0): \n"
+            return 0, "PASS (0): \n"           # discovery: no new alt qualified
+        return 0, "PASS (0): \n"               # USD leg
 
     monkeypatch.setattr(rescreen, "_run_gate", _fake_run_gate)
     rescreen.run()
@@ -117,8 +124,46 @@ def test_cad_leg_unaffected_by_usd_addition_regression(tmp_path, monkeypatch):
     cad_section = report.split("## crypto (screen_universe.py)")[1].split("## crypto-usd")[0]
     assert "whitelist now: BTC/CAD" in cad_section
     assert "✓ no changes — whitelist matches the evidence" in cad_section
-    assert "🔻" not in cad_section
+    assert "🔻" not in cad_section  # NOT flagged as decayed — the old bug
     assert "🆕" not in cad_section
+
+
+def test_cad_decay_flagged_when_revalidation_fails_the_symbol(tmp_path, monkeypatch):
+    """The other direction: when the explicit re-validation run genuinely
+    fails a whitelisted symbol, it IS reported as edge decay."""
+    _make_run_env(tmp_path, monkeypatch, whitelist="BTC/CAD")
+
+    def _fake_run_gate(script, extra_env=None):
+        if extra_env and "SCREEN_SYMBOLS" in extra_env:
+            return 0, "PASS (0): \n"           # re-validation: BTC/CAD failed
+        return 0, "PASS (0): \n"
+
+    monkeypatch.setattr(rescreen, "_run_gate", _fake_run_gate)
+    rescreen.run()
+
+    report = (tmp_path / "logs" / f"rescreen_{_today()}.md").read_text()
+    cad_section = report.split("## crypto (screen_universe.py)")[1].split("## crypto-usd")[0]
+    assert "🔻 EDGE DECAY — whitelisted but failed re-validation: BTC/CAD" in cad_section
+
+
+def test_cad_revalidation_run_failure_noted_not_treated_as_decay(tmp_path, monkeypatch):
+    """A non-zero rc on the re-validation subprocess is surfaced as its own
+    warning — it must NOT be silently read as 'every whitelisted symbol
+    decayed'."""
+    _make_run_env(tmp_path, monkeypatch, whitelist="BTC/CAD")
+
+    def _fake_run_gate(script, extra_env=None):
+        if extra_env and "SCREEN_SYMBOLS" in extra_env:
+            return 1, "boom"
+        return 0, "PASS (0): \n"
+
+    monkeypatch.setattr(rescreen, "_run_gate", _fake_run_gate)
+    rescreen.run()
+
+    report = (tmp_path / "logs" / f"rescreen_{_today()}.md").read_text()
+    cad_section = report.split("## crypto (screen_universe.py)")[1].split("## crypto-usd")[0]
+    assert "🔻" not in cad_section
+    assert "re-validation FAILED to run (rc=1)" in cad_section
 
 
 def test_rescreen_skip_usd_env_var(tmp_path, monkeypatch):
@@ -132,7 +177,11 @@ def test_rescreen_skip_usd_env_var(tmp_path, monkeypatch):
 
     monkeypatch.setattr(rescreen, "_run_gate", _fake_run_gate)
     rescreen.run()
-    assert calls == [("screen_universe.py", None)]   # only CAD ran, USD and stocks both skipped
+    # only the CAD leg ran (USD + stocks skipped): auto-discovery + whitelist re-validation
+    assert calls == [
+        ("screen_universe.py", None),
+        ("screen_universe.py", {"SCREEN_SYMBOLS": "BTC/CAD", "SCREEN_MIN_VOL_CAD": "0"}),
+    ]
 
 
 def test_usd_leg_failure_reported_like_cad_failure(tmp_path, monkeypatch):
