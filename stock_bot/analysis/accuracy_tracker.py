@@ -8,13 +8,17 @@ LiveTradingGate — four-gate check-list surfaced on the dashboard and in the
 weekly email as a live-trading readiness indicator. Call print_gate_status()
 to see current state.
 
-DISPLAY-ONLY as of 2026-08-20 — deliberately not wired into IBKRExecutor or
-IBKR_ALLOW_LIVE. Whether/how to make a PASS status actually block or gate a
-live-trading switch (most likely mirroring IBKRExecutor's existing
-allow_live "refuse to start" pattern in stock_bot/execution/ibkr.py) is an
-open, deferred decision — see CLAUDE.md and .memory/decisions/ for the
-2026-08-20 gate-repair session that fixed what these gates measure without
-yet deciding whether they enforce anything.
+ENFORCED as of 2026-08-20 (second pass, same day). Gates 1-3 are a hard
+precondition on going live: IBKRExecutor.__init__ (stock_bot/execution/
+ibkr.py) calls LiveTradingGate().evaluate() when allow_live=True on a live
+port (7496/4001) and raises ValueError — refusing to start — unless all
+three report PASS, before any TWS connection is attempted. Gate 4
+(infrastructure importability) is deliberately excluded from enforcement —
+a code-hygiene smoke check, not a trading-readiness signal. Paper-mode
+callers (the default, IBKR_ALLOW_LIVE=false) never evaluate the gate.
+(This docstring said "DISPLAY-ONLY / deferred decision" until 2026-09-01 —
+stale since the enforcement pass landed the same afternoon it was written;
+see CLAUDE.md "LiveTradingGate — stock bot readiness check".)
 
 Gate definitions corrected 2026-08-20 (see the same session's investigation
 first, then this fix pass):
@@ -325,8 +329,9 @@ def _fmt_pf(pf: float) -> str:
 
 class LiveTradingGate:
     """
-    Four-gate live trading readiness check. DISPLAY-ONLY — see module
-    docstring for the deferred enforcement decision.
+    Four-gate live trading readiness check. Also surfaced on the dashboard
+    and weekly email, but Gates 1-3 are ENFORCED: IBKRExecutor refuses to
+    start a live session unless all three PASS (see module docstring).
 
     Gate 1 — Backtest walk-forward (logs/stock_backtest_latest.json):
               Every symbol in the CURRENT RULE_WHITELIST must have
