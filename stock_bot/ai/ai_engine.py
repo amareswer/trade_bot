@@ -305,6 +305,18 @@ class AIEngine:
             return
 
         self._ready = True
+        # Snapshot the primary provider's routing config so a failover can be
+        # REVERTED later (see _revert_to_primary). A transient primary outage
+        # that trips the one-shot failover used to strand the engine on the
+        # fallback for the rest of the session even after the primary recovered
+        # — 2026-09-01: mistral 503'd for ~1h, failover went to a dead nvidia
+        # model, AI stayed dark for hours after mistral was back.
+        self._primary_route = {
+            k: getattr(self, k)
+            for k in ("_provider", "_model", "_base_url",
+                      "_headers", "_api_key", "_openai_cls")
+            if hasattr(self, k)
+        }
         logger.info("Stock AIEngine ready | provider=%s model=%s", self._provider, self._model)
 
     @property
@@ -390,6 +402,29 @@ class AIEngine:
         self._consecutive_failures = 0
         return True
 
+    def _revert_to_primary(self) -> bool:
+        """Undo an active failover — restore the primary provider's routing from
+        the __init__ snapshot. Called when the FALLBACK itself racks up
+        _FALLBACK_AFTER consecutive failures: at that point the primary's
+        earlier (often transient) outage may well have cleared, and staying on a
+        dead fallback helps nobody. Resets _fallback_active so a later failover
+        can fire again — worst case (both providers down) the engine ping-pongs,
+        which is harmless for an advisory-only signal. Returns True iff reverted.
+        """
+        if not self._fallback_active or not getattr(self, "_primary_route", None):
+            return False
+        for k, v in self._primary_route.items():
+            setattr(self, k, v)
+        logger.error(
+            "AI FAILBACK: fallback %s failed %d consecutive calls — reverting to "
+            "primary %s (%s); its earlier outage may have cleared",
+            self._fallback_provider, self._consecutive_failures,
+            self._primary_provider, self._model,
+        )
+        self._fallback_active      = False
+        self._consecutive_failures = 0
+        return True
+
     def analyze(
         self,
         symbol:          str,
@@ -419,13 +454,17 @@ class AIEngine:
             return verdict
 
         self._consecutive_failures += 1
-        if (self._consecutive_failures >= _FALLBACK_AFTER
-                and not self._fallback_active
-                and self._switch_to_fallback()):
-            # Retry this same symbol once on the new provider.
-            return self._analyze_once(
-                symbol, candle, indicators, research, stop_loss_pct, take_profit_pct,
-            )
+        if self._consecutive_failures >= _FALLBACK_AFTER:
+            # Not yet failed over → switch to the fallback.
+            # Already failed over and the fallback is failing too → revert to
+            # the primary (its outage may have cleared). Either way, retry this
+            # same symbol once on the newly-selected provider.
+            switched = (self._switch_to_fallback() if not self._fallback_active
+                        else self._revert_to_primary())
+            if switched:
+                return self._analyze_once(
+                    symbol, candle, indicators, research, stop_loss_pct, take_profit_pct,
+                )
         return verdict
 
     def _analyze_once(

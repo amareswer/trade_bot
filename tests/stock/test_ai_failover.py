@@ -240,6 +240,71 @@ def test_sustained_parse_failures_trigger_failover(monkeypatch):
     assert v.provider == "openrouter" and v.signal == "HOLD"
 
 
+# ── failback: a dead fallback reverts to the (recovered) primary ────────────
+# 2026-09-01: mistral 503'd for ~1h → one-shot failover to a dead nvidia model
+# → AI stayed dark for hours after mistral recovered, because the failover never
+# reverted. _revert_to_primary() fixes that.
+
+def _boom_post():
+    return SimpleNamespace(
+        raise_for_status=lambda: (_ for _ in ()).throw(RuntimeError("mistral 503")),
+    )
+
+
+def test_fallback_failure_reverts_to_recovered_primary(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER", "mistral")
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("AI_FALLBACK_PROVIDER", "nvidia_nim")
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
+    monkeypatch.setenv("NVIDIA_MODEL", "deepseek-ai/deepseek-v4-pro-0813")
+    e = AIEngine()
+
+    # mistral down for the first 5 posts, then recovered; nvidia fallback dead throughout
+    posts = [_boom_post()] * _FALLBACK_AFTER + [_OKPost()]
+    with patch("stock_bot.ai.ai_engine._requests.post", side_effect=posts), \
+         patch("openai.OpenAI", _BoomOpenAI):
+        for _ in range(_FALLBACK_AFTER):        # trip the failover to nvidia
+            _analyze(e)
+        assert e._fallback_active is True and e._provider == "nvidia_nim"
+        for _ in range(_FALLBACK_AFTER):        # nvidia fails too → revert to mistral + retry
+            v = _analyze(e)
+
+    assert e._fallback_active is False
+    assert e._provider == "mistral"
+    assert v.provider == "mistral" and v.signal == "BUY"
+
+
+def test_revert_lets_the_failover_fire_again(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER", "mistral")
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("AI_FALLBACK_PROVIDER", "nvidia_nim")
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
+    e = AIEngine()
+    e._openai_cls = _BoomOpenAI
+
+    with patch("stock_bot.ai.ai_engine._requests.post", return_value=_boom_post()), \
+         patch("openai.OpenAI", _BoomOpenAI):
+        for _ in range(_FALLBACK_AFTER):
+            _analyze(e)
+        assert e._fallback_active is True                    # → nvidia
+        for _ in range(_FALLBACK_AFTER):
+            _analyze(e)
+        assert e._fallback_active is False                   # reverted → mistral
+        for _ in range(_FALLBACK_AFTER):
+            _analyze(e)
+        assert e._fallback_active is True                    # failed over again
+
+
+def test_revert_is_noop_when_not_failed_over(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER", "mistral")
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("AI_FALLBACK_PROVIDER", "nvidia_nim")
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
+    e = AIEngine()
+    assert e._revert_to_primary() is False
+    assert e._provider == "mistral"
+
+
 def test_one_off_parse_failure_does_not_trigger_failover(monkeypatch):
     monkeypatch.setenv("AI_PROVIDER", "mistral")
     monkeypatch.setenv("MISTRAL_API_KEY", "test-key")

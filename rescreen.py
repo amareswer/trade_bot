@@ -6,8 +6,17 @@ Runs the existing validation gates as subprocesses and compares their
 PASS lists against the live whitelists:
 
   1. screen_universe.py   — Kraken CAD auto-discovery + 3-window walk-forward
-                            (crypto; includes BTC/CAD, so live-symbol edge
-                            decay is caught too)
+                            (crypto). Auto-discovery EXCLUDES already-decided
+                            bases (BTC/SOL/XRP/ETH/DOGE), so live-symbol edge
+                            decay is checked by a second explicit-symbol run
+                            of the same gate (SCREEN_SYMBOLS=<whitelist>,
+                            liquidity gate off). Before 2026-09-01 the decay
+                            check compared the discovery PASS list against the
+                            whitelist directly, which flagged every live CAD
+                            symbol as "decayed" every month — it was never
+                            re-tested at all. (The Telegram push for this was
+                            also dead until 2026-08-24, so the false flag only
+                            became visible on the 2026-09-01 run.)
   2. screen_universe.py   — same gate, Kraken USD auto-discovery
      (SCREEN_QUOTE=USD)    (added 2026-08-24 — closes a real automation gap:
                             CLAUDE.md had long claimed USD re-screening was
@@ -148,7 +157,14 @@ def _alert(lines: list[str]) -> None:
             cfg.alerts.telegram_bot_token, cfg.alerts.telegram_chat_id,
             cfg.alerts.telegram_enabled,
         )
-        alerter.error("📋 Monthly re-screen:\n" + "\n".join(lines))
+        # message(), not error() — this is a routine informational digest, not
+        # a fault. error() prepends "⚠️ BOT ERROR", which made every monthly
+        # run look like an incident. message() has no timestamp of its own, so
+        # stamp it here.
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        alerter.message(
+            "📋 Monthly re-screen:\n" + "\n".join(lines) + f"\n{stamp}"
+        )
         # _send_async uses a daemon thread — give it a moment before exit
         import time
         time.sleep(5)
@@ -167,18 +183,26 @@ def run() -> int:
     ]
     attention: list[str] = []
 
-    sections: list[tuple[str, str, set[str], dict[str, str] | None]] = []
+    # 5th field `revalidate`: when true, the gate's own auto-discovery can't
+    # re-test a whitelisted symbol, so edge decay must come from a separate
+    # explicit-symbol run (see the loop body). screen_universe.py's Kraken
+    # discovery excludes already-decided bases (BTC/SOL/XRP/ETH/DOGE via
+    # _ALWAYS_EXCLUDE_BASES), so without this every live CAD symbol was
+    # flagged "edge decay" every month. stock_backtest.py re-runs the full
+    # WATCHLIST (a superset of RULE_WHITELIST), so its auto-run tests every
+    # whitelisted symbol directly — no separate pass needed.
+    sections: list[tuple[str, str, set[str], dict[str, str] | None, bool]] = []
     if os.getenv("RESCREEN_SKIP_CRYPTO", "").lower() != "true":
-        sections.append(("crypto", "screen_universe.py", _crypto_whitelist(), None))
+        sections.append(("crypto", "screen_universe.py", _crypto_whitelist(), None, True))
     if os.getenv("RESCREEN_SKIP_USD", "").lower() != "true":
         sections.append((
             "crypto-usd", "screen_universe.py", _crypto_usd_whitelist(),
-            {"SCREEN_QUOTE": "USD"},
+            {"SCREEN_QUOTE": "USD"}, False,
         ))
     if os.getenv("RESCREEN_SKIP_STOCKS", "").lower() != "true":
-        sections.append(("stocks", "stock_backtest.py", _stock_whitelist(), None))
+        sections.append(("stocks", "stock_backtest.py", _stock_whitelist(), None, False))
 
-    for label, script, whitelist, extra_env in sections:
+    for label, script, whitelist, extra_env, revalidate in sections:
         print(f"\n── {label}: {script} ──", flush=True)
         rc, output = _run_gate(script, extra_env=extra_env)
         passes = set(_parse_pass_list(output))
@@ -192,15 +216,39 @@ def run() -> int:
         report_lines.append(f"- PASS: {', '.join(sorted(passes)) or '(none)'}")
         report_lines.append(f"- whitelist now: {', '.join(sorted(whitelist)) or '(none)'}")
 
-        decayed = sorted(whitelist - passes)
-        newly   = sorted(passes - whitelist)
+        # New qualifiers always come from the auto-discovery run above.
+        newly = sorted(passes - whitelist)
+
+        # Edge decay: for `revalidate` gates, run the gate again with an
+        # explicit SCREEN_SYMBOLS list (liquidity gate off — a live symbol's
+        # liquidity isn't the question) and derive decay from that alone.
+        revalidate_note: str | None = None
+        if revalidate and whitelist:
+            print(f"  re-validating whitelist: {', '.join(sorted(whitelist))}", flush=True)
+            rc2, output2 = _run_gate(script, extra_env={
+                **(extra_env or {}),
+                "SCREEN_SYMBOLS": ",".join(sorted(whitelist)),
+                "SCREEN_MIN_VOL_CAD": "0",
+            })
+            output = output + "\n\n─── whitelist re-validation ───\n" + output2
+            if rc2 == 0:
+                decayed = sorted(whitelist - set(_parse_pass_list(output2)))
+            else:
+                decayed = []
+                revalidate_note = f"whitelist re-validation FAILED to run (rc={rc2}) — decay not checked"
+        else:
+            decayed = sorted(whitelist - passes)
+
         if decayed:
             report_lines.append(f"- 🔻 EDGE DECAY — whitelisted but failed re-validation: {', '.join(decayed)}")
             attention.append(f"🔻 {label} edge decay: {', '.join(decayed)}")
         if newly:
             report_lines.append(f"- 🆕 NEW QUALIFIERS — passed but not whitelisted: {', '.join(newly)}")
             attention.append(f"🆕 {label} new qualifiers: {', '.join(newly)}")
-        if not decayed and not newly:
+        if revalidate_note:
+            report_lines.append(f"- ⚠ {revalidate_note}")
+            attention.append(f"⚠ {label} {revalidate_note}")
+        if not decayed and not newly and not revalidate_note:
             report_lines.append("- ✓ no changes — whitelist matches the evidence")
         report_lines.append("")
 
