@@ -5,6 +5,26 @@ metadata:
   type: project
 ---
 
+> **This file is stale below.** Real current state lives in repo `CLAUDE.md` +
+> `CLAUDE_HISTORY.md`. Latest sessions are logged there and in `.memory/decisions/`.
+
+## 2026-09-02 — Crypto BUY-gate audit + strategy selectivity check
+
+- **Fear&Greed / external-signal BUY gate REMOVED** (backtested net-negative, 0 live vetoes).
+  Redundant "regime gate" (main.py §2e) REMOVED (dead code). MTF daily-trend gate KEPT.
+  → `.memory/decisions/crypto-buy-overlays-2026-09-02.md`. Commits d3d3aed, a2b83ed.
+- **`display.py` BrokenPipeError hardening** + **stock-bot `.TO` (TSX) auto-buy guard**
+  (RULE_WHITELIST removal had silently dropped it; AC.TO hit IBKR live). Commit b8deaed.
+  → `known-gaps.md` #19, #20.
+- **Strategy selectivity audit: NO modification.** Fresh walk-forward both symbols PASS
+  strongly (BTC OOS PF 2.78, SOL 1.98); sweep shows every loosening degrades the edge.
+  → `.memory/decisions/strategy-selectivity-2026-09-02.md`.
+- Suite 846 → 864. Strategy hash `b30f2f9e769c8d41` unchanged. Both bots restarted clean.
+- Open (unchanged): more crypto symbols blocked on deposit + FX layer; stock bot toward
+  LiveTradingGate Gate 3 (~4/30 round-trips); IB Gateway headless deploy; VPS migration.
+
+---
+
 **Status as of 2026-08-05 (Trading-Spec Punch List P0–P2 Closed + Dashboard/Test-Pollution Fixes complete):**
 
 ## Session 2026-08-05 — Trading-Spec Gap Review, Punch List P0–P2, Dashboard/Shadow Bugs (COMPLETE ✅)

@@ -734,3 +734,39 @@ Not committed (user handles git).
 **Still open from the same review (not this fix):** ATR sizing dormant (AMD/KO fail ATR×2.0
 walk-forward), AMD fails LiveTradingGate Gate 1, no remote control / reachable dashboard for
 the stock bot, IB Gateway headless deploy (roadmap G), yfinance-from-datacenter-IP untested.
+
+---
+
+## 19. Stock bot could place `.TO` (TSX) orders after the RULE_WHITELIST removal — RESOLVED 2026-09-02
+
+**Symptom:** `⚠️ Order rejected: BUY AC.TO — IBKR order failed: order ended 'Inactive' with
+no fill` on Telegram. Stock bot tried to BUY 35 shares of AC.TO; IBKR blocked it (CIRO rule
+DMR 3200 — no automated orders on Canadian exchanges). No position opened, no money moved,
+but a false "Order rejected" ops alert every cycle AC.TO's rule signals BUY.
+
+**Root cause:** the TSX guard was *implicit* in `RULE_WHITELIST` — it had no `.TO` members,
+so `.TO` names were never rule-buyable. The 2026-08-23 whitelist removal
+([[stock-whitelist-gate-removed-2026-08-23]]) made `_rule_buy` fire for any scanned symbol
+and nothing replaced the guard. AC.TO is in the WATCHLIST and got picked into top-movers.
+
+**Fix:** `stock_bot/main.py` `run()` — explicit guard right after `_act_buy` is computed:
+`.TO` symbol → log `TSX_BLOCKED`, record in `_blocked_rule_buys` for the digest, set
+`_act_buy = False`. BUY-only (a manual `.TO` position stays exit-manageable). +4 source-guard
+tests (`tests/stock/test_tsx_rule_buy_block.py`). Committed b8deaed. Not a `strategy/` file.
+
+## 20. Cosmetic console print crashed the whole crypto bot on a broken stdout pipe — RESOLVED 2026-09-02
+
+**Symptom:** `CRITICAL FATAL CRASH — bot exiting: BrokenPipeError: [Errno 32] Broken pipe`
+at `bot/display.py:55` (`display.warmup()`'s `print`), via `_warmup_strategy` in
+`bot/main.py`. Fired a Telegram crash alert.
+
+**Root cause (this instance):** a `timeout`-killed `python -m bot.main` smoke run — `timeout`
+closed stdout mid-warmup, the dying process threw `BrokenPipeError` from `print()`. But the
+real gap: a purely decorative progress bar could take down a live-money bot. Would also bite
+on a terminal disconnect / journald hiccup during the ~5 min warmup on a VPS.
+
+**Fix:** `bot/display.py` shadows `print` with a wrapper that swallows
+`BrokenPipeError`/`OSError` — console output is cosmetic, the file log handler is
+independent. +4 tests (`tests/crypto/test_display_broken_pipe.py`). Committed b8deaed.
+**Lesson: don't run the live bot binary as a smoke test — `timeout`-killing it fires a real
+crash alert.**
