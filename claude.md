@@ -175,14 +175,14 @@ narrative behind any decision below, and `.memory/decisions/*.md` for the deepes
 
 ## Test Suite Manifest
 
-**Expected total: 856 tests** (`pytest --collect-only -q`). If the count disagrees: a file
+**Expected total: 864 tests** (`pytest --collect-only -q`). If the count disagrees: a file
 has an import error, was deleted, was added without a manifest bump, or was excluded from the
 runner — investigate before trusting a green suite. Suite runtime ~9–26s; minutes means a
 test is reading live `.env` config. The per-row table sum below lags the header total by ~22
 (pre-existing row-vs-total drift; `--collect-only` and this header agree). Full count-delta
 history: `CLAUDE_HISTORY.md` → "CLAUDE.md trim, 2026-09-01" → "count-delta history".
 
-Run: `python -m pytest --tb=short -q` — must show **856 passed**.
+Run: `python -m pytest --tb=short -q` — must show **864 passed**.
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -230,6 +230,8 @@ Run: `python -m pytest --tb=short -q` — must show **856 passed**.
 | `tests/shared/test_crash_hardening.py` | 9 | `atomic_write_json`, `send_now` sync + disabled, crash-alert helpers never raise |
 | `tests/crypto/test_engine_params.py` | 8 | `engine_kwargs_from_cfg` builder: keys accepted by `engine.run`, ATR keys from cfg, macd/Mode A/B params from cfg, generic parity, validation scripts use the builder (backtest / walkforward / validate_symbol / screen_universe) |
 | `tests/crypto/test_overlay_gates.py` | 10 | `engine.run` opt-in live-only BUY overlays (`mtf_daily_closes` / `fng_by_date`, added 2026-09-02 for `mtf_overlay_backtest.py`): None ≡ baseline, MTF BEARISH-daily veto, FNG>threshold veto, `_fng_asof` most-recent-prior / fail-open, MTF-before-FNG precedence, insufficient-daily-history skip |
+| `tests/crypto/test_display_broken_pipe.py` | 4 | `bot/display.py` print wrapper swallows `BrokenPipeError`/`OSError` (2026-09-02 regression: a broken-pipe from `display.warmup()` crashed the crypto bot mid-warmup); normal output still reaches stdout |
+| `tests/stock/test_tsx_rule_buy_block.py` | 4 | Source guard: `run()` blocks `.TO` symbols from automated BUYs (`TSX_BLOCKED`), clears `_act_buy` before the exec block, records the block for the digest, leaves the SELL path alone (CIRO DMR 3200; implicit guard lost when RULE_WHITELIST stopped gating BUYs 2026-08-23; AC.TO hit it live 2026-09-02) |
 | `tests/stock/test_alert_evaluator.py` | 4 | AlertEvaluator EARNINGS_SOON: held-vs-not-held priority, live-executor-only held-position source |
 | `tests/crypto/test_crypto_telegram.py` | 2 | `TelegramAlerter.fill()` reason line included/omitted; dup-alert throttle |
 | `tests/shared/test_liveness.py` | 7 | LivenessTracker: touch/is_alive/staleness boundary, simulated hang |
@@ -786,6 +788,12 @@ new/modified strategy (its own fresh walk-forward + hash stamp) or materially mo
 CIRO rule DMR 3200 A.1.(b)(i) prohibits IBKR Canada clients from placing orders on Canadian
 exchanges via ANY automated system. Regulatory, not a settings fix. Never re-add a `.TO`
 symbol to `RULE_WHITELIST` — TSX names may only be watch-listed (advisory) or traded manually in TWS.
+**Explicit code guard since 2026-09-02** (`stock_bot/main.py` `run()`): a `.TO` symbol that
+produces a rule/AI BUY has `_act_buy` cleared and logs `TSX_BLOCKED` — it never reaches an
+IBKR order. This was implicit in `RULE_WHITELIST` (no `.TO` members) until the whitelist
+stopped gating BUYs on 2026-08-23; AC.TO then reached IBKR live on 2026-09-02 and bounced off
+the broker's 'Inactive' rejection with a false "Order rejected" ops alert. `.TO` names stay
+watch-list / top-mover scannable for advisory + AI-training purposes.
 
 ### No automated IPO trading
 The bots never trade IPOs or recent listings via any special path. New listings earn entry

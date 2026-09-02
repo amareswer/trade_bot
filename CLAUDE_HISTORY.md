@@ -3254,3 +3254,39 @@ the bot barely trades. Read-only pipeline trace + `logs/live_signals.csv` (243 r
 the bot's inactivity is the core strategy correctly sitting out a trendless BTC 4h regime.
 Trading more is a solved question (3 candidate 2nd strategies all FAILED, Aug 2026) — the
 real lever is more validated symbols, blocked on a deposit + an unbuilt FX layer.
+
+---
+
+## Telegram-alert triage — 2026-09-02 (two real fixes)
+
+User reported three Telegram messages after the FNG-gate restart.
+
+**1. Crypto bot `BrokenPipeError` FATAL CRASH (09:39 UTC) — was a self-inflicted test artifact,
+but exposed a real gap.** The crash came from a `timeout`-killed `python -m bot.main` smoke run
+(mine, during the FNG session) — `timeout` closed stdout mid-warmup, the dying process threw
+`BrokenPipeError` from `display.warmup()`'s `print()`, and it propagated out of `run()` as a
+`CRITICAL FATAL CRASH` + Telegram alert. The user's actual bot (PID 76056, restarted 09:44)
+was healthy throughout. **Fix regardless:** `bot/display.py` now shadows `print` with a wrapper
+that swallows `BrokenPipeError`/`OSError` — console output is cosmetic, the file log handler is
+independent, and a broken pipe (terminal disconnect, journald hiccup on a VPS, killed parent)
+must never crash a live-money bot. +4 tests (`tests/crypto/test_display_broken_pipe.py`).
+**Lesson: do not run the live bot binary as a smoke test — `timeout`-killing it fires a real
+crash alert.**
+
+**2. Stock bot tried to BUY AC.TO → IBKR 'Inactive' rejection → false "Order rejected" ops
+alert. REAL BUG, FIXED.** Root cause: the RULE_WHITELIST removal (2026-08-23) also removed the
+*implicit* TSX guard — the whitelist had no `.TO` members, so `.TO` names were never
+rule-buyable. Nothing replaced it. AC.TO is in the WATCHLIST **and** got picked into top-movers
+(2026-09-01), its rule fired BUY on 2026-09-02 09:46, and `_act_buy` carried it all the way to
+`executor.buy()` → IBKR ended the order 'Inactive' (CIRO DMR 3200) → `IBKR BUY REJECTED
+AC.TO × 35` → ops alert. No position opened, no money moved, but a false alarm every cycle the
+rule says BUY. **Fix** (`stock_bot/main.py` `run()`, not `strategy/`): explicit guard right
+after `_act_buy` is computed — `.TO` symbol → log `TSX_BLOCKED`, record it in
+`_blocked_rule_buys` for the digest, set `_act_buy = False`. BUY-only (a manual `.TO` position
+stays exit-manageable). +4 source-guard tests (`tests/stock/test_tsx_rule_buy_block.py`).
+
+**3. `🟢 BUY CVX (IBKR paper) 3 sh @ $211.18` — normal.** CVX in RULE_WHITELIST, rule BUY
+(RSI 72 / ADX 28), AI HOLD 50 advisory-ignored. Expected.
+
+Suite 856 → 864. Strategy hash unchanged (`b30f2f9e769c8d41` — no `strategy/` files touched).
+**Both bots need a restart** to pick up the fixes (crypto: display wrapper; stock: TSX guard).

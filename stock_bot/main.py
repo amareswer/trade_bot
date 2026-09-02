@@ -1738,6 +1738,22 @@ def run() -> None:
                     and verdict.confidence >= cfg.paper_min_confidence
                 )
                 _act_buy  = _rule_buy if cfg.rule_trading_enabled else _ai_buy
+
+                # TSX regulatory block (CIRO rule DMR 3200 A.1.(b)(i)): IBKR
+                # Canada clients may not place orders on Canadian exchanges via
+                # any automated system. `.TO` names are watch-list / top-mover
+                # scannable (advisory + AI training data) but never auto-buyable
+                # — IBKR ends the order 'Inactive' and the bot fires a false
+                # "Order rejected" ops alert (seen live 2026-09-02 on AC.TO).
+                # This guard was implicit in RULE_WHITELIST (no `.TO` members)
+                # until the whitelist stopped gating BUYs on 2026-08-23; it is
+                # now explicit. Trade TSX names manually in TWS.
+                if _act_buy and symbol.upper().endswith(".TO"):
+                    logger.info("TSX_BLOCKED: %s — .TO names are advisory-only (CIRO)", symbol)
+                    if _rule_buy:
+                        _blocked_rule_buys[symbol] = "TSX_BLOCKED"
+                    _act_buy = False
+
                 _ai_exit  = (
                     verdict is not None and verdict.confidence > 0
                     and _exit_dec is not None and _exit_dec.should_exit

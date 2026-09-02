@@ -4,6 +4,21 @@ Console display — ANSI colors, no external dependencies.
 from __future__ import annotations
 from datetime import datetime, timezone
 
+_builtin_print = print
+
+
+def print(*args, **kwargs) -> None:  # noqa: A001 — deliberate module-scoped shadow
+    """Console output is purely cosmetic — a broken stdout pipe (terminal
+    disconnect, `timeout`-killed parent, journald hiccup on a VPS) must never
+    crash a live trading bot. The file log handler is independent of this.
+    Regression: 2026-09-02 a `BrokenPipeError` from display.warmup()'s print
+    took the whole crypto bot down mid-warmup with a FATAL CRASH alert.
+    """
+    try:
+        _builtin_print(*args, **kwargs)
+    except (BrokenPipeError, OSError):
+        pass
+
 # ANSI codes
 _R  = "\033[0m"
 _B  = "\033[1m"
