@@ -2391,52 +2391,20 @@ def run():
                         _ext_status.get("funding_rate"),
                     )
 
-            # ── 2e. Regime gate ───────────────────────────────────────
-            # Independent check: ADX ≥ threshold AND EMA spread ≥ MIN_EMA_SPREAD_PCT.
-            # Runs after strategy evaluation so it can override BUY → HOLD when the
-            # broader regime is degraded even if this specific candle passed strategy filters.
-            if is_indicator and live_exchange is not None:
-                _rg_adx_ok    = _adx_live is not None and _adx_live >= cfg.strategy.adx_threshold
-                _rg_spread_ok = _spread >= cfg.strategy.min_ema_spread_pct * 100
-                _rg_ok        = _rg_adx_ok and _rg_spread_ok
-
-                if not _rg_ok:
-                    _rg_parts = []
-                    if not _rg_adx_ok:
-                        _rg_parts.append(
-                            f"ADX {_adx_live:.1f} < {cfg.strategy.adx_threshold:.0f}"
-                            if _adx_live is not None else "ADX n/a"
-                        )
-                    if not _rg_spread_ok:
-                        _rg_parts.append(
-                            f"EMA spread {_spread:.3f}% < {cfg.strategy.min_ema_spread_pct * 100:.1f}%"
-                        )
-                    _rg_status_msg = "  ".join(_rg_parts)
-
-                    if raw_signal == Signal.BUY:
-                        raw_signal = Signal.HOLD
-                        if not _buy_block_gate:
-                            _buy_block_gate = "regime"
-                        print(
-                            f"  [{sym}] REGIME GATE: BUY overridden → HOLD"
-                            f"  ({_rg_status_msg})",
-                            flush=True,
-                        )
-                        logger.warning(
-                            "REGIME GATE [%s]: BUY overridden → HOLD  %s", sym, _rg_status_msg
-                        )
-                    else:
-                        print(
-                            f"  [{sym}] REGIME GATE: degraded  ({_rg_status_msg})"
-                            f"  — BUY would be blocked",
-                            flush=True,
-                        )
-                        logger.info(
-                            "REGIME GATE [%s]: degraded  %s  — no BUY to override",
-                            sym, _rg_status_msg,
-                        )
-                else:
-                    logger.info("REGIME GATE [%s]: OK  ADX=%.1f  spread=%.3f%%", sym, _adx_live, _spread)
+            # ── 2e. (removed 2026-09-02) independent "regime gate" ─────
+            # This re-checked ADX ≥ adx_threshold AND EMA spread ≥
+            # min_ema_spread_pct using the SAME strategy.last_adx and the SAME
+            # closes deque the strategy itself gates on
+            # (IndicatorStrategy._trend_signal enforces ADX at ~line 341 and
+            # EMA spread via `ema_strong` at ~line 367/395). A strategy BUY has
+            # therefore already cleared both — this block could never flip one
+            # to HOLD. Its only live effect was a log line plus sharing the
+            # "regime" blocked-gate label with the strategy's own 200-EMA macro
+            # filter, an ambiguity that cost real time in the 2026-08-18
+            # missed-BUY investigation. Removed as dead code; the strategy's
+            # ADX/spread rejections still surface via the section-2b candle
+            # diagnostic and `last_buy_block_gate`. Do not re-add without a
+            # check that actually differs from the strategy's own.
 
             # ── 2f. Correlation gate ──────────────────────────────────
             # Block BUY when this symbol's 30-day returns are highly correlated

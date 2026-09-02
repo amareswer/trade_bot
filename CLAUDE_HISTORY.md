@@ -2719,3 +2719,532 @@ the premise of the two-bucket policy (the wealth engine is a broad index hold, o
 bots). This concludes the strategy search: no candidate clears the bar; the highest-value
 improvements are elsewhere (uptime, cost measurement once trade volume exists).
 Report: `logs/stock_momentum_experiment_20260829.md`. Suite 819 → 833, hash unchanged.
+
+---
+
+## CLAUDE.md trim, 2026-09-01 — incident narratives moved here
+
+`CLAUDE.md` had grown to 222k chars (limit 150k), same problem that triggered this file's
+2026-07-25 split. The dated incident write-ups and the test-count-delta history below were
+moved out of `CLAUDE.md`'s "Current Live Configuration" / "Test Suite Manifest" / "Current
+operational status" sections; `CLAUDE.md` keeps only the current config values + one-line
+pointers. Nothing here changes behavior — it's the "why" backstop.
+
+### Test Suite Manifest — count-delta history (was the big run-on narrative)
+
+Expected total is now **846**. The per-row table sum in `CLAUDE.md` lags the header total by
+~22 (pre-existing drift, individual rows not kept perfectly in sync; `--collect-only` and the
+header agree). If `pytest --collect-only -q` disagrees with 846: a file has an import error,
+was deleted, was added without a manifest bump, or was excluded from the runner. Suite
+runtime ~9–26s; minutes means a test is reading live `.env`.
+
+Chronological deltas (file · +N · reason):
+- 527 baseline (2026-08-19, one above the 526 previously claimed — not investigated)
+- 629→639→647 (2026-08-24) CapitalPool per-symbol slot caps + `config._slot_caps_by_base()` config-layer coverage gap found by a same-session self-audit
+- 647→658 (2026-08-24) `tests/crypto/test_rescreen.py` new — rescreen.py USD leg + `_alert()` nested-config bugfix (first-ever coverage for that script)
+- 658→666 (2026-08-25) `tests/stock/test_ai_health.py` new — `_update_ai_health()`
+- 666→674 (2026-08-26) `tests/crypto/test_dashboard_renderer.py` new — multi-symbol dashboard combine (first-ever coverage for `bot/dashboard/renderer.py`)
+- 674→676 (2026-08-26) `tests/stock/test_rules_log_visibility.py` new — RULES-decision log visibility
+- 676→678→680 (2026-08-27) maker→taker silent-fallback alert (+2, test_live_executor 63→65); MTF-gate fail-open alert (+2, new test_mtf_gate_alert.py)
+- 680→687 (2026-08-27) `tests/crypto/test_blocked_buy_alert.py` new — blocked-BUY Telegram alert (Track 4 observability)
+- 687→694 (2026-08-27) `tests/stock/test_blocked_rule_buys_alert.py` new — stock-bot blocked-rule-BUY digest
+- 694→697→698 (2026-08-27) IBKRExecutor TWS-query resilience (+3, 56→59); `ibkr_trades.csv` write resilience (+1, 59→60)
+- 698→706 (2026-08-27) `tests/stock/test_ai_failover.py` new — Mistral provider + auto-failover
+- 706→709 (2026-08-27) native-stop pre-cancel-on-SELL fix (+3, test_live_executor 65→68) — SOL/CAD deadlock incident
+- 709→712 (2026-08-27) blocked-rule-BUY digest debounce (+3, 7→10) — BNS/GM MAX_EXPOSURE flap
+- 712→719 (2026-08-27) native-stop post-mortem observability: TelegramAlerter dup-alert throttle (+4, test_crypto_telegram) + SL/TP-exit-failure alert (+3, new test_exit_fail_alert.py)
+- 719→729 (2026-08-27) `tests/crypto/test_health_digest.py` new — daily both-bots health digest
+- 729→731 (2026-08-27) AI provider swap fallout: failover on sustained parse failures + health check needs majority success; `fetch_earnings` ETF short-circuit
+- 731→733 (2026-08-27) IBKR Error 10349 slow-resubmit fill fix (+2, test_ibkr_executor 60→62) — BNS incident
+- 733→745 (2026-08-27) `tests/stock/test_universe_refresh.py` new — top-movers universe refresh fix (never fired: 179 "waiting" / 0 "refreshed")
+- 745→749 (2026-08-27) `nvidia_nim` as auto-failover target (+4, test_ai_failover 9→13) — `_switch_to_fallback()` OpenAI-SDK-client reconfig + fallback==primary guard
+- 749→760 (2026-08-27) `tests/shared/test_stuck_loop.py` new — generic StuckLoopDetector, wired into crypto execute() + health digest
+- 760→763 (2026-08-27) stock-bot StuckLoopDetector analog (+3, test_sl_tp_watcher_audit_log 9→12) — scan-loop buy/sell + SL/TP watcher, which also gained a previously-silent rejected-exit `else` branch
+- 763→770 (2026-08-28) stock-bot daily-loss breaker calendar-day fix (+7, test_stock_breaker 14→18 + test_ibkr_executor 62→65) — was anchored to `_session_start_value` (re-based every restart); now `day_open_equity`/`day_start_iso` persisted + UTC-date-rolled, sticky bool removed
+- 770→790 (2026-08-28) `mean_reversion_experiment.py` + tests new (+20) — Bollinger/RSI crypto strategy, FAILED (BTC PF 0.30, SOL PF 0.36)
+- 790→799 (2026-08-28) `_prune_dead_movers` (+9, test_universe_refresh 12→21) — BLX.TO thin-data yfinance spam
+- 799→819 (2026-08-28) `stock_mean_reversion_experiment.py` + tests new (+20) — stock analog w/ short leg, FAILED (long-only 0/16, long+short 1/16=chance)
+- 819→833 (2026-08-29) `stock_momentum_experiment.py` + tests new (+14) — cross-sectional momentum, closest yet but FAILED (loses to equal-weight-hold-all on Sharpe)
+- 833→840 (2026-08-31) intraday top-movers re-rank (+7, test_universe_refresh 21→28)
+- 840→841 (2026-08-31) IBKR FX/margin guard net-liq fix (+1, test_ibkr_executor 65→66)
+- 841→844 (2026-09-01) revertible AI failover (+3, test_ai_failover 13→16)
+- 844→846 (2026-09-01) rescreen.py monthly-digest fixes (+2, test_rescreen 11→13)
+
+Directory layout: 54 test files were moved from repo root into `tests/{crypto,stock,shared}/`
+on 2026-08-18, bucketed by actual import (grep'd `from bot...`/`from stock_bot...`).
+`conftest.py` stayed at repo root (ancestor conftest applies to all nested tests). Only
+`test_engine_params.py` needed a code fix (repo-root path `.parent` → `.parent.parent.parent`).
+Verified: same 526 collected/passed before and after.
+
+### Post-only param bug (live 2026-06-22 → fixed 2026-08-26)
+
+`_place_limit_order()` (`bot/execution/live_executor.py`) sent `{"timeInForce": "PO"}` for a
+post-only limit. ccxt's Kraken adapter passes `timeInForce` nearly verbatim into Kraken's
+`timeinforce` field, which only accepts GTC/IOC/GTD — `"PO"` was rejected with
+`EGeneral:Invalid arguments:timeinforce` every time, silently falling back to a market order.
+Invisible for 2+ months because it degrades gracefully. Found via SOL/CAD's first live fill
+(2026-08-26). Practical effect: every BUY entry and every non-urgent strategy SELL since
+2026-06-22 paid taker (~0.80%) not maker (~0.25–0.40%) fees. Fixed: `{"postOnly": True}`
+(ccxt's real unified param → Kraken `oflags=post`). Verified via `verify_kraken_postonly_param.py`
+(pure request-dict builder) and a real authenticated `validate=true` round-trip
+(`verify_kraken_postonly_live_validate.py`, `id: None`, Kraken echoed a well-formed order).
+The non-chase "simple" limit path already used `{"postOnly": True}` correctly. 1 test
+assertion had been locking in the bug — corrected. Execution-layer only, no walk-forward.
+
+Monitoring addendum (2026-08-27): `_place_limit_order()` has 4 post-only→market fallback
+paths (orderbook-fetch fail, spread-too-tight, exchange rejection, chase timeout). Each now
+sets `self._maker_fallback_reason`; `execute()` fires a **MAKER FALLBACK** `alerter.error()`
+after the fill if set. Post-fill only, can't block. Also same sweep: MTF (1D BEARISH) veto
+silently failed-open when the daily-candle fetch failed with no cached closes — the `except`
+now fires an **MTF GATE BYPASSED** alert in the no-cache branch only (new test_mtf_gate_alert.py).
+
+### Blocked-BUY alert (crypto, 2026-08-27) & blocked rule-BUY digest (stock, 2026-08-27)
+
+Crypto: closes the 2026-08-18 incident gap (bot sat flat through a $90k→$108k BTC rally
+while a genuine BUY was correctly MTF-vetoed, only discoverable from `live_signals.csv`).
+`bot.main._evaluate_blocked_buy_alert(ss, sym, raw_signal_was_buy, block_gate, alerter)` —
+edge-triggered `alerter.error()` "BUY signal blocked [sym]" when the raw strategy signal is
+BUY but an external gate (state_machine/capital_pool/risk_manager/correlation/candle_watchdog/
+mtf_trend/external_signal/regime) holds it. One alert per fresh (symbol, gate); re-alerts on
+gate change; `ss['last_buy_block_alert']` clears when the raw signal stops being BUY.
+Strategy-internal HOLDs never reach it. Called from `run()` section-7b after the CSV write.
+Not persisted.
+
+Stock: `_evaluate_blocked_rule_buys_alert(current, state, notifier)` — end-of-cycle debounced
+digest (universe ~40 symbols), one `notifier.ops_alert` listing every symbol whose rule BUY a
+gate held (MACRO_BLACKOUT, EARNINGS_BLACKOUT, REGIME_SKIP, VIX_CRISIS, MAX_EXPOSURE,
+MAX_POSITIONS, CORRELATION, SIZE_SKIP). Edge-triggered on the `{symbol: gate}` mapping.
+Debounced (`_BLOCKED_BUY_ABSENT_CYCLES_TO_CLEAR=3`) — a symbol flapping BUY↔HOLD near the
+MAX_EXPOSURE ceiling (BNS/GM 2026-08-27) alerts once, not per toggle. `_blocked_rule_buys`
+collected at 8 BUY-gate sites in the scan loop.
+
+### IBKR executor TWS-query resilience + csv write buffer (stock, 2026-08-27)
+
+`IBKRExecutor._account_value()` / `positions_snapshot()` returned a fabricated `0.0` / `{}`
+on any transient TWS failure (`logger.warning` only). Live consequence: `cash==0.0` → every
+BUY rejected "insufficient cash"; `positions_snapshot()=={}` → SL/TP watcher blind to a real
+position, breakers compute wrong equity. Fix: both cache last-good (`_acct_values_cache` /
+`_positions_cache` + `*_cache_valid`) and serve it on failure; `_note_sync(ok)` flips
+`executor.sync_healthy` on the edge; `stock_bot/main.py` polls once/cycle → edge-triggered
+`ops_alert`. Only a first-call failure (no cache yet) still returns `0.0`/`{}`.
+Also: `_record_trade()` CSV append was `logger.warning`-and-drop on `OSError` — a real fill
+would be missing from the frozen 9-col CSV the gate/accuracy pipeline reads. Now
+`_write_trade_row()` buffers to `_unwritten_csv_rows` and retries on the next fill;
+`executor.csv_write_healthy` False while buffer non-empty, edge-alerted. Order-timeout path
+left as-is (raises RuntimeError → `ops_alert("Order rejected")`, cancel-race grace window
+already records a beating fill). `_log_settlement_csv()` left warning-only (tax file, not
+gate schema).
+
+### LIVE INCIDENT 2026-08-31 — FX/margin-minimum guard rejected fundable USD BUYs
+
+`_MIN_EQUITY_FOR_FX_TRADE_CAD` guard (`stock_bot/execution/ibkr.py`, from the 2026-07-20 CM
+incident) pre-empts a USD BUY below IBKR's ~$2,500 CAD margin/currency minimum (Error 201).
+It checked `self.cash` (free cash) as an equity proxy — fine in 2026-07-20 (account ~$995, no
+positions, cash≈net-liq). By 2026-08-31 the account held 3 positions: net-liq $4,997, free
+cash $2,137. AMZN + PLTR BUYs (~$750–920 each, well within cash) were rejected every cycle
+(~10 "Order rejected" alerts, then `StuckLoopDetector` fired `STUCK LOOP 'buy:PLTR'/'buy:AMZN'`).
+Nothing unsafe (a rejection places no order) but pure noise on BUYs IBKR would accept — the
+margin/currency minimum is a net-liquidation rule, never free cash. Fix: guard reads
+`self._net_liquidation()`; `0 < _fx_equity < 2500` so a TWS-query failure returning `0.0`
+skips the guard rather than false-rejecting. CAD contracts still exempt. Regression test:
+net-liq clears $2,500 but cash doesn't → BUY fills.
+
+### LIVE INCIDENT 2026-08-27 — IBKR Error 10349 slow resubmit dropped a real fill
+
+First BUY after `PAPER_MAX_EXPOSURE_PCT` 0.25→0.45: BNS rule BUY, 7 shares. IBKR rejected
+with `Error 10349: "Order TIF was set to DAY based on order preset"`, flipped to `Cancelled`
+with zero fill, then silently resubmitted — filled ~8.3s later at $92.96, past the old
+hardcoded 5s grace window. Executor gave up, raised `RuntimeError`, fired a false
+`ops_alert("Order rejected: BUY BNS")`, never recorded the fill (while IBKR held 7 BNS).
+Position/cash stayed correct (read live) but `ibkr_trades.csv` was missing the BUY row.
+Manually reconciled. Fix (`_place_market_async`): the wait loop no longer treats a transient
+unfilled `Cancelled`/`ApiCancelled` as terminal — first flicker starts a `_CANCEL_RESUBMIT_GRACE_S`
+(20s, independent of `_fill_timeout_s`) window and keeps polling for the resubmit's fill; a
+genuine dead `Cancelled` with no resubmit gives up after that window. Old 5s grace `elif`
+removed. Prevention (same session): `_place_market_async` now builds `MarketOrder(action,
+qty, tif="DAY")` instead of `tif=""` — empty TIF makes TWS apply a preset default (the 10349
+trigger). Same class as the two RY incidents (2026-07-31, 2026-08-19).
+
+### Native exchange-side stop-loss — full detail (crypto, ON since 2026-08-15)
+
+`NATIVE_STOP_LOSS_ENABLED=true` (config.py default still false). Added 2026-08-07 from a gap
+review against external crypto-bot best-practice research: the software SL/TP path only works
+while the bot is alive and polling. Flipped on 2026-08-15 while the user was traveling,
+without the planned prior live-validation window (position was flat at flip time).
+
+`sync_protective_stop()` rests a real Kraken stop order (`create_order(...,
+params={"stopLossPrice": X})`, executes as market on trigger) after every BUY fill, at
+whatever SL price `bot/main.py` computed (ATR if available, else flat `STOP_LOSS_PCT`).
+Usually static — no mid-trade repricing by default. Cancelled the moment the bot closes the
+position itself. Order id/price persist in `logs/live_state_BTC_CAD.json`, reconciled on
+every restart: still-open saved order kept as-is (level never touches down); saved-but-gone
+order cleared (filled while bot was down = working as intended); held position with no
+resting stop gets a same-startup fallback at flat `STOP_LOSS_PCT` off cost_basis. Placement/
+cancel failures alert but never raise. `PARTIAL_TP_PCT` unset → the quantity-tracking half is
+defensive/future-proofing.
+
+Native trailing-stop (2026-08-19): the static backstop never followed the software trailing
+stop as it rose (`ss['native_stop_price']` set once at BUY-fill). Only matters when
+`ss['atr_sl'] == 0` — with ATR SL available (always, live) the software trailing logic is
+dormant and a flat native stop mirrors it. When trailing IS the active software level,
+`sync_protective_stop()` accepts `trailing_pct` and places a Kraken `trailing-stop` order
+(`params={"trailingPercent": "X.XXXX"}`) — Kraken tracks the peak server-side. `TRAILING_STOP_PCT=0`
+today so this path is dormant. `trailingPercent` verified against real ccxt source
+(`verify_kraken_trailing_stop_param.py`) and a real authenticated Kraken `validate=true`
+round-trip (`verify_kraken_trailing_stop_live_validate.py`, 2026-08-19, `id: None`, Kraken
+echoed `'sell 0.00080 XBTCAD @ trailing stop -2.0000%'`). Note: `validate=True` Python bool
+serializes as `validate=True` on the wire (ccxt `urlencode_nested()` has no bool→string
+norm) — the script passes the string `'true'`.
+
+Restart-seeding gap closed 2026-08-20: `LiveExecutor`'s own native-stop bookkeeping was
+reconciled against Kraken on restart (`_verify_resting_stop_on_startup`) but `bot/main.py`'s
+separate `symbol_state` copy (`ss['native_stop_price']`/`ss['native_stop_is_trailing']`) was
+never re-seeded, defaulting to None/False. Risk: `_resync_native_stop(ss)` (fired by a
+partial TP / partial fill on an urgent exit) trusts `ss`'s stale copy → would call
+`sync_protective_stop(None)`, unconditionally cancel the resting stop and place nothing.
+Fixed: `_seed_native_stop_state(executor)` mirrors the executor's reconciled state into `ss`
+in the restart-recovery block. Same pass: `_verify_resting_stop_on_startup()` now also counts
+stop-type orders resting on the symbol (from the already-fetched `fetch_open_orders()`); >1 →
+loud Telegram alert, no auto-resolve.
+
+Both remaining gaps closed 2026-08-20 (same-day follow-up): (a) quantity mismatch —
+`_verify_resting_stop_on_startup()` never checked resting-order volume vs the position's real
+size. Now: always alert on any mismatch; auto cancel+replace (same price/trailing-pct, sized
+up) only when under-sized; leave over-sized alone. Replacement level read from the resting
+order's raw fields, never recomputed. (b) untracked-but-real order — the no-tracked-id branch
+returned before `fetch_open_orders()`, so the ambiguity scan was unreachable when
+`native_stop_order_id` was None → `bot/main.py` would place a second stop alongside a real
+untracked one. Now: always fetch and scan even with no tracked id; exactly one found → adopt
+verbatim; ≥2 → ambiguity alert, adopt nothing.
+
+**LIVE INCIDENT 2026-08-27 — native stop deadlocked every SELL.** SOL/CAD's first position
+rode to +10.8% and hit `TAKE_PROFIT_PCT`. The urgent market SELL was rejected by Kraken with
+`EOrder:Insufficient funds` every ~32s for 8+ min. Root cause: the resting native stop order
+reserves 100% of the base asset on Kraken (`SOL free=0.0 used=0.080808`), so no SELL can
+execute while it rests — and `bot/main.py`'s SL/TP block only cancelled the native stop
+*after* a successful fill, which could never happen. Pure deadlock; same latent bug in the
+strategy-SELL and partial-TP paths. First time the native-stop feature was exercised against
+a real software TP. Resolved live by manually cancelling the stop via ccxt; next tick sold
+cleanly (SOL/CAD closed +$1.27 / +10.9%, first completed round-trip). Fix:
+`LiveExecutor.execute()` now cancels any resting native stop *before* placing a SELL (all
+three exit paths, at the executor layer) — full close leaves it gone, partial fill has
+`_resync_native_stop` re-place it smaller, a rejected SELL triggers
+`_rearm_native_stop_after_failed_sell()` (static stop back at prior level; a trailing stop
+can't be recovered → loud "NAKED POSITION" alert). `bot/main.py`'s post-fill
+`sync_protective_stop(None)` is now a belt-and-suspenders no-op.
+
+**Post-mortem observability (2026-08-27, "how would we know on a VPS?").** The deadlock
+rejected ~200 SL/TP exits over 8 min with ZERO Telegram alert. Two gaps fixed: (a)
+`bot/main.py`'s SL/TP block only handled `status == FILLED`, no `else` — a rejected/None
+urgent exit fell through silently. Now an `else` increments `ss['exit_fail_count']` and fires
+an edge-escalated `alerter.error()` (1st, 3rd, 10th, then every 20th), reset on a successful
+exit. (b) `TelegramAlerter.error()`/`.message()` had no throttle — an identical body re-sent
+within `_DUP_ALERT_THROTTLE_S=600` is now suppressed. Turns a stuck loop from 200 pages into ~1.
+
+### Generic stuck-loop detector (crypto + stock, 2026-08-27)
+
+`bot/alerts/stuck_loop.StuckLoopDetector` — error-string-agnostic "same operation keeps
+failing" watchdog. `record(key, ok, detail)` per attempt; `threshold`(5) consecutive
+failures → one `alerter.error()`, re-alert every `re_alert_every`(20); any success resets;
+keys idle `ttl_s`(1h) pruned. Thread-safe, alerter-fault-tolerant. Crypto: wired into
+`bot/main.py` after the primary strategy-driven `execute()` (`execute:{sym}:{signal}`); the
+SL/TP path keeps its own `exit_fail_count` to avoid double-alerting; `failing_keys()` feeds
+the health digest. Stock: `stock_bot/main.py` scan-loop `buy:{sym}`/`sell:{sym}` +
+`_check_open_positions_sl_tp` (`sl_tp_exit:{sym}`) — that watcher also gained a
+previously-missing `else` branch that `logger.error`s a rejected SL/TP exit (was fully
+silent, the stock analog of the crypto deadlock gap).
+
+### Daily health digest (crypto, 2026-08-27)
+
+`bot/main.py._maybe_send_health_digest()` — once/day at `HEALTH_DIGEST_TIME` (local, default
+`08:00`; `off`/`0`/`false` disables), scheduled via `_audit_due()`, tracked under
+`"health_digest"` in `logs/audit_state.json` (date recorded before composing). One
+`alerter.message()` covering both bots: `_status_crypto_text`, open Kraken orders (one
+best-effort authed call), `_status_stock_text` (cross-bot file read), 24h ERROR-line counts
+from both logs. `✅ all systems normal` / `⚠️ NEEDS ATTENTION` header driven by: manual halt,
+tripped kill-switch, any `exit_fail_count > 0`, stale candle feed, ≥20 errors/24h, or any
+`stuck_detector.failing_keys()`.
+
+### Two-way Telegram control — full detail (crypto, built + enabled 2026-08-20)
+
+`TELEGRAM_CONTROL_ENABLED=true` (config.py default false). New module
+`bot/alerts/telegram_control.py` (`TelegramCommandPoller`) long-polls `getUpdates` in its own
+daemon thread, started from `bot/main.py` when the flag is true. Commands: `/status_crypto`,
+`/pause_crypto`, `/resume_crypto`, `/status_stock` (read-only), `/help_crypto`. Auth: every
+inbound `chat.id` compared against `TELEGRAM_CHAT_ID`; mismatch silently ignored (no reply —
+replying confirms a live bot exists at the token). `/pause_crypto`/`/resume_crypto` only
+`open()`/`os.remove()` `logs/HALT` — the same flag `_check_halt_flag()` polls every tick, no
+parallel halt path. `/status_crypto` is structurally read-only (no `LiveExecutor` import
+anywhere in the command bodies or the poller module). Live smoke test 2026-08-20 passed
+(`/help_crypto`/`/status_crypto` cross-checked against `logs/live_state_BTC_CAD.json`).
+
+**Shared-token constraint (read before adding a second poller):** `TELEGRAM_BOT_TOKEN`/
+`TELEGRAM_CHAT_ID` are shared with the stock bot's outbound-only `TelegramAlerter`.
+Telegram's `getUpdates` `offset` is a server-side, per-token acknowledgment — two independent
+processes tracking local offsets against one token WILL corrupt each other (whichever
+advances further silently erases the other's unprocessed updates). **Exactly one process may
+run a `TelegramCommandPoller` against this token** — today the crypto bot only. Stock-bot
+two-way control, if ever added, must route through this poller or use a second dedicated
+token. Documented in the module docstring too.
+
+Hot-loop bug fixed 2026-08-23: `poll_once()` caught the `getUpdates` exception, logged, and
+returned with no pause — a fast-failing 502 (unlike a real long-poll that blocks 25s) let the
+outer `while True` retry instantly, flooding the log during a transient Telegram-side outage.
+Fixed: `poll_once()` sleeps `error_backoff_s` (default 5.0s) after a failed call; a
+successful call never sleeps.
+
+### Stock bot indicator/regime audit (2026-08-20)
+
+`regime()` in `stock_bot/indicators/indicators.py` is live (`stock_bot/main.py:1038`, every
+scan cycle on fresh SPY closes) and directly gates real BUYs via `_regime_ok` (shared with
+VIX crisis mode). The same module's `rsi()`/`trend()`/`adx()`/`macd()` are also called live
+but only feed the console/log indicator line (display only). The actual rule trade trigger is
+`IndicatorStrategy` in `bot/strategy/indicator_strategy.py` (imported by
+`stock_bot/strategy/rules.py`).
+
+Audited read-only, no bugs found: all 8 functions (`sma`, `ema`, `rsi`, `macd`, `adx`, `atr`,
+`trend`, `regime`) are pure, stateless, full-recompute-per-call — no persisted rolling
+history, so the crypto self-referential-ATR-baseline bug class is structurally impossible
+here. No lookahead (`compute_indicators()` slices `[:i+1]` inclusive; SPY regime path uses
+the same growing slice). Wilder-smoothing boundary cases in `adx()`/`atr()` partition cleanly.
+`stock_bot/backtest.py` (the standalone module with its own indicator pipeline) is confirmed
+DEAD TOOLING — zero importers, standalone CLI only. The load-bearing walk-forward gate is
+root-level `stock_backtest.py` → `stock_bot/backtest/engine.py` (the package, not the
+module), which imports `bot/strategy/indicator_strategy.py` directly.
+Full findings: `.memory/decisions/stock-offline-audit-2026-08-20.md`.
+
+### LiveTradingGate repair + enforcement (stock, 2026-08-20)
+
+`stock_bot/analysis/accuracy_tracker.py`. A 2026-08-20 investigation found two of four gates
+structurally broken. Full trail: `.memory/decisions/livetradinggate-gate-repair-2026-08-20.md`.
+- **Gate 1** (backtest walk-forward) was validating a stale (2026-06-29) config via dead
+  `stock_bot/backtest.py --walkforward`. Now reads `logs/stock_backtest_latest.json` (fixed
+  path `stock_backtest.py` overwrites each run), checks every current `RULE_WHITELIST` symbol
+  has `verdict: PASS`, trusting the script's own verdict. First run 2026-08-20: 15/16 (AMD
+  FAIL). **Re-run 2026-08-28: 16/16 — AMD now PASSES** (its failing 250d window's 3rd trade
+  aged out past the boundary → 2 trades → below `MIN_TRADES_FOR_VERDICT` → window excluded;
+  pure small-sample instability, exactly as the 2026-08-20 investigation predicted —
+  `.memory/decisions/amd-whitelist-investigation-2026-08-20.md`).
+- **Gate 2** (was reading the retired `fast_trades.csv`) repurposed: reads the active position
+  book, asks whether AI confidence is predictive — ≥10 completed MED/HIGH-confidence (80+)
+  round-trips with ≥55% win rate. Different signal from Gate 3.
+- **Gate 3** threshold raised 5 → **≥30 round-trips, PF≥1.2, win≥30%, all three**. Label
+  corrected "Swing paper (daily)" → "Position book (live)".
+- **Enforcement (2026-08-20, hard block):** `IBKRExecutor.__init__()` — on a live port with
+  `allow_live=True`, calls `LiveTradingGate().evaluate()` and raises `ValueError` naming every
+  non-PASS gate if Gates 1-3 aren't all PASS. Before any TWS connection. Gate 4
+  (infrastructure importability) deliberately excluded. Paper-mode callers never reach it.
+
+### Fingerprint hash change — self-referential ATR regime baseline (2026-08-20)
+
+Hash `b30f2f9e769c8d41`. `IndicatorStrategy.evaluate()` appended the current candle's ATR to
+`self._atr_history` *before* `_classify_regime()` compared it against that history's mean —
+the VOLATILE check judged a spike against a baseline the spike was already folded into
+(self-inclusion bias, ~1/20th of the spike's pull). Not a lookahead bug. Fixed by moving the
+`append` to strictly after `_classify_regime()` returns. Trade count 32→31 (one marginal
+setup now correctly reads VOLATILE and sits flat), aggregate PF 1.72→2.19. Walk-forward
+(Binance BTC/USDT): PASS (training 1.20 → validation 2.99). Re-stamped. Trade-count history
+across sessions (58→39→35→32→31) is elsewhere in this file.
+
+### AI provider health monitoring + auto-failover saga (stock)
+
+**Health monitoring (2026-08-25).** `nvidia_nim` had degraded 3× on this project, each only
+caught by manual API testing. `stock_bot/main.py._update_ai_health()` — evaluated once per
+scan cycle that attempted ≥1 AI call; at `_AI_HEALTH_THRESHOLD=3` consecutive fully-failed
+cycles fires an edge-triggered `notifier.ops_alert()`, one success flips it back + a recovery
+alert. **Deliberately NOT wired into either heartbeat's `healthy_fn`** — AI is advisory-only
+(`RULE_TRADING_ENABLED=true`), a degraded provider must not misreport "the bot is down". A
+source-inspection test locks this in. Prediction confirmed 2026-08-27: `meta/llama-3.1-8b-instruct`
+hit EOL 2026-08-26 and this monitor caught it automatically — the first of the four incidents
+caught without manual testing.
+
+**Auto-failover (2026-08-27).** `stock_bot/ai/ai_engine.py`. After `_FALLBACK_AFTER=5`
+consecutive API failures the engine switches to `AI_FALLBACK_PROVIDER` and retries. New
+provider `mistral` (OpenAI-compatible `https://api.mistral.ai/v1/chat/completions`,
+`MISTRAL_API_KEY` in root `.env`, `MISTRAL_MODEL` default `mistral-small-latest`, 2s
+rate-limit spacing). Chosen over OpenRouter (free tier caps at 50 req/day). The 2026-08-26
+nvidia swap to `nvidia/nemotron-3-nano-30b-a3b` was a reasoning model — rambled CoT, 65 parse
+failures / 22 successes in one scan pass, 9–20s/call — so `AI_PROVIDER=mistral` was promoted
+to **primary** same day (~1.2s, clean JSON, verified end-to-end). nvidia_nim branch params
+fixed anyway (`temperature` → `_TEMPERATURE` 0.3, `max_tokens` 1024 → 4096).
+
+**Fallback re-established (2026-08-27, after a live Mistral 503 blip).** Probed all 84 models
+on NVIDIA's `/v1/models` catalog against the real `build_prompt()`+`_parse()` path
+(`verify_nvidia_models.py`, kept as a standing tool — `NVIDIA_MODEL` has died/degraded 5×).
+Only 3 of 84 are actually deployed on the account. Picked `deepseek-ai/deepseek-v4-pro-0813`
+(6/6 clean, ~12s). Set `NVIDIA_MODEL=deepseek-ai/deepseek-v4-pro-0813`,
+`AI_FALLBACK_PROVIDER=nvidia_nim`. `_switch_to_fallback()` gained an `nvidia_nim` branch
+(reconfigures the OpenAI-SDK client) + a `fallback == primary` no-op guard. Failover now also
+triggers on sustained parse failures (`_last_call_parse_failed`), not just API errors.
+`_update_ai_health` now needs the *majority* of attempted calls to succeed
+(`_ai_ok_n * 2 >= _ai_attempted_n`), not just "any success". Also removed the dead
+`_fallback_openrouter()`/`_fallback_to_openrouter()`; `earnings.py` short-circuits a
+`_NO_EARNINGS_SYMBOLS` set (GLD + ETFs, were 404ing every cycle).
+
+**LIVE INCIDENT 2026-09-01 — one-shot failover stranded on a dead fallback.** Mistral
+returned `503` for ~1h. After 5 failures the engine failed over to nvidia deepseek-v4-pro —
+but that model had itself gone dead (100% `APITimeoutError`, ~26s > 20s client timeout). The
+failover was one-way/one-shot (`_fallback_active` never reset), so the engine stayed on the
+dead model for hours after Mistral recovered. AI is advisory-only → zero trading impact. Two
+fixes: (a) **recoverable failover** — `__init__` snapshots `_primary_route`;
+`_revert_to_primary()` restores it; `analyze()`'s trigger is now `_switch_to_fallback()` if
+not yet failed over, **else `_revert_to_primary()`** — a fallback that racks up its own 5
+failures reverts to the (likely-recovered) primary; `_fallback_active` resets on revert so
+failover can fire again. (b) **`NVIDIA_MODEL` swapped** — re-probed 2026-09-01:
+`deepseek-v4-pro` dead, `meta/llama-3.3-70b` 410-Gone, `openai/gpt-oss-20b` times out,
+**`openai/gpt-oss-120b` GOOD** (6/6, avg 12.1s). Set `NVIDIA_MODEL=openai/gpt-oss-120b`.
+Mistral stays primary. **User must restart the stock bot** for this to take effect.
+
+### Crypto dashboard multi-symbol combine (2026-08-26)
+
+`dashboard.html` was hardcoded to render only `_active_symbol` (first `UNIVERSE_WHITELIST`
+entry, BTC/CAD) — SOL/CAD had zero visibility after its 2026-08-25 promotion despite holding
+a real position. Root cause deeper than the render call: `tick_log` / sticky indicator
+display values were shared module-level state written only for the active symbol; the
+`executor`/`state_machine`/`position_manager` aliases were bound to `_active_symbol` at
+startup. Fix (single combined page, chosen over per-symbol pages): `bot/dashboard/renderer.py`
+rewritten around `write_multi(path, exchange, strategy, tick, symbols: list[dict], ...)` —
+one shared page shell wrapping one full content block per symbol. `bot/main.py`: `tick_log`
+entries carry a `"sym"` tag; sticky display values moved into `symbol_state[sym]['dash_*']`;
+`_render_dashboard(sym, ...)` updates that symbol's entry in `_dash_snapshots` and re-renders
+the full page. `if sym == _active_symbol:` gates removed from the tick-log/dashboard path
+(three sites), left on the console print calls. Smoke-tested: shared `<html>`/`<style>`,
+correct ordering, position-protection panel renders only inside the holding symbol's block.
+`unified_dashboard.py` unchanged. New `tests/crypto/test_dashboard_renderer.py` (first-ever
+coverage for the module).
+
+### Stock bot RULES-decision log visibility (2026-08-26)
+
+The per-symbol `📐 RULES: BUY/SELL/HOLD` + RSI/ADX/trend/regime line was `print()`-only,
+never in `logs/stock_bot.log` — found when asked "why isn't the stock bot buying other
+stocks" with no log evidence to check. Now also `logger.info("RULES [%s]: ...", symbol,
+...)` with the symbol name embedded explicitly. The adjacent SCREEN_SKIP path was already
+fine (`screener.py`'s `_reason` already embeds the symbol + was `logger.warning()`'d).
+
+### Stock bot scan universe widened + top-movers refresh fix
+
+**Widened (2026-08-27):** `UNIVERSE_SIZE` 15 → 30, user request. Scan breadth only — rule
+signal criteria + the in-distribution ATR%/liquidity screener unchanged, `interval=1d`
+untouched. Prompted by a "make as much as we can in 2 days" conversation; that framing was
+declined (would mean forcing unvalidated trades / day-trading), widening the scan was the one
+legitimate lever.
+
+**Top-movers refresh NEVER FIRED — fixed 2026-08-27.** The `UNIVERSE_SIZE=30` top-movers scan
+had never run once: 179 `Universe: waiting for 16:00 ET refresh` lines / 0 `Universe
+refreshed` across Aug 25–27. The refresh was gated on `now_et.hour == _UNIVERSE_REFRESH_HOUR`
+(16), but that block sits inside `run()`'s LIVE-mode branch — by 16:00 ET the market is
+closed → `AFTER_HOURS` → the loop `continue`s ~90 lines earlier. So `top_movers` stayed `[]`
+forever. Fix (`stock_bot/main.py`, no strategy files): refresh on the **first LIVE scan cycle
+of each day** (no clock-hour gate); persisted across restarts via
+`stock_bot/universe_movers.json` (`{date, movers}`, gitignored, `atomic_write_json`);
+`_load_persisted_movers()` reloads at startup if the date matches; a failed `pre_filter`
+lands in a temp `_fresh` and only replaces `top_movers` on success; retries throttled to
+`_UNIVERSE_RETRY_COOLDOWN_S`(900s). `_UNIVERSE_REFRESH_HOUR` env key is now legacy.
+
+**Dead-mover prune (2026-08-28).** BLX.TO got ranked into top-movers but Yahoo serves ~7
+daily rows for it → `fetch_candles` returns None / an under-length dict, yfinance logs `ERROR
+$BLX.TO: possibly delisted` every cycle. `_prune_dead_movers(top_movers, price_data,
+dead_counts, exempt, min_candles=26)` — a mover unusable (`price_data[sym] is None` OR a real
+dict with `< _MOVER_MIN_CANDLES`=26 candles) for `_MOVER_DEAD_AFTER`=3 consecutive cycles is
+dropped for the session, list re-persisted. `{"screened": True}` dicts left alone. Watchlist +
+held positions exempt. `_dead_movers` clears on the daily refresh (per-refresh after
+2026-08-31).
+
+**Intraday re-rank (2026-08-31).** The list was fixed at the first LIVE cycle (~09:48 ET) and
+never re-ranked until the next morning — a stock breaking out mid-day was invisible for BUY
+(SELL was always covered: held + WATCHLIST force-scanned every cycle). `_needs_refresh` now
+also fires when `_MOVERS_REFRESH_INTERVAL_S` (`UNIVERSE_MOVERS_REFRESH_HOURS` env, default
+2h, `<=0` disables → once/day) has elapsed. LIVE-mode only → ~3-4 refreshes/session.
+`_persist_movers()` stamps a tz-aware ET `refreshed_at`; `_load_persisted_refresh_time()`
+restores it so an afternoon restart resumes the cadence. Also fixed a stale annotation:
+`UNIVERSE_REFRESH_HOURS` (plural, =4) is the raw index-constituent-list cache TTL in
+`StockUniverse` — NOT legacy; only `UNIVERSE_REFRESH_HOUR` (singular, =16) is the dead
+clock-hour key.
+
+### Current operational status — 2026-08-15 Kraken auth incident (full)
+
+While the user was traveling (host still running, still online — public Kraken calls
+succeeded throughout), every *authenticated* Kraken call started failing with
+`EGeneral:Permission denied` from 2026-08-11, continuous by the morning of 2026-08-15.
+Public-vs-private-only failing = API-key IP restriction or a revoked/reset key, not a network
+outage. Position was flat throughout. Never resolved from the code side; last `Permission
+denied` at 2026-08-15 10:22 UTC, none since (auth recovered on its own, outside this repo).
+What was fixed: this was invisible to every monitoring layer — the drift-check failure only
+`logger.warning`'d, and the heartbeat `healthy_fn` only checks the main loop is ticking. New
+shared `_auth_health` flag: (1) edge-triggered `alerter.error()` on entering/leaving the
+failure state, (2) feeds the heartbeat `healthy_fn`. Extracted into `_update_auth_health()`
+(2026-08-18) with 5 direct unit tests.
+
+### Other older incidents referenced by pointers
+
+- **yfinance outage 2026-08-05/06:** stock scan `yf.download()` failed the entire NYSE
+  session (174 consecutive "0/28" cycles), "possibly delisted" for real large caps =
+  Yahoo-side block. Bot detection worked (Telegram OPS ALERT every cycle). Follow-on fixes:
+  `unified_dashboard.py` BTC/CAD "STALE" badge now cross-checks `logs/trade_bot.log`
+  freshness (a week-quiet healthy bot showed the same red alarm as a hung one) → amber "NO
+  FILLS · Nd — bot alive"; `_check_open_positions_sl_tp` got an always-visible INFO "SL/TP
+  check: N/M positions priced" line + its first behavioral test coverage.
+- **Shadow Match fabricated 0.8% (2026-08-05):** dashboard regex fell through an "N/A"
+  match-rate row to `BACKTEST_FEE_PCT: 0.80%`. Root cause: `shadow_signal.py`'s Kraken OHLCV
+  fetch had no retry — one hiccup wasted the day's audit. Both fixed (`fetch_with_retry` +
+  bounded regex). Real number was 100.0% PASS all along.
+- **Test-pollution incident (2026-08-05):** the settlement-CSV feature broke test isolation —
+  4 fixtures predated `_SETTLEMENT_CSV`, so suite runs appended fake rows to the REAL
+  `*_settlement.csv` files. Fixed the 4 fixtures + added `conftest.py`'s autouse
+  `_block_real_stock_bot_file_writes` (same shape as `_block_real_telegram_sends`).
+
+---
+
+## Crypto BUY-overlay audit — 2026-09-02 ("are the rules we added worth it?")
+
+**Trigger:** user asked whether the accumulated crypto-bot rules earn their keep and why
+the bot barely trades. Read-only pipeline trace + `logs/live_signals.csv` (243 rows,
+2026-07-02 → 2026-09-01).
+
+**What the live evidence showed:**
+- Over ~203 live 4h candles BTC/CAD's *strategy* emitted BUY exactly **once** (2026-08-18,
+  vetoed by the MTF gate — see `.memory/decisions/2026-08-18-missed-buy-signal.md`). SOL/CAD:
+  3 BUYs, 1 filled (+$1.27 round-trip), 2 correctly blocked by the state machine
+  (already in position).
+- **Every safety/risk gate — correlation, candle watchdog, RiskManager's 7 tiers, native
+  stop, slippage guard — has blocked ZERO live trades.** They are unused insurance, not the
+  reason the bot sits flat.
+- The bot sits flat because BTC 4h has been in a low-ADX coil: ADX 9–12 vs 18 required,
+  EMA spread 0.03–0.15% vs 0.4% required. No trend to trade. This is variance + regime,
+  strategy faithful (hash `b30f2f9e769c8d41` matches `logs/validated_strategy_hash`).
+
+**Changes made:**
+1. **Deleted the independent "regime gate"** (old `bot/main.py` section 2e). It re-checked
+   ADX ≥ `adx_threshold` AND EMA spread ≥ `min_ema_spread_pct` from the *same*
+   `strategy.last_adx` / same closes deque `IndicatorStrategy._trend_signal` already gates
+   on (ADX at ~line 341, spread via `ema_strong` at ~line 367/395) — so it could never flip
+   a strategy BUY, pure dead code. Its `"regime"` blocked-gate label also collided with the
+   strategy's own 200-EMA filter, an ambiguity that cost real time in the 2026-08-18
+   investigation. Strategy hash unchanged (not a `bot/strategy/` file). Pinned-window
+   fingerprint verified identical (30 trades / PF 1.94 / `b30f2f9e769c8d41`).
+2. **Added opt-in overlay params to `bot/backtest/engine.py`** (`mtf_daily_closes`,
+   `fng_by_date`, `mtf_fast/slow_period`, `fng_bear_max`) — default `None` → inert, byte-
+   identical to before (proven via pinned fingerprint). Lets a research script replay the
+   live-only MTF and Fear&Greed vetoes on history (the engine never modelled them, so the
+   validated PF was measured *without* them). `+10` tests (`tests/crypto/test_overlay_gates.py`),
+   suite 846 → 856.
+3. **`mtf_overlay_backtest.py`** (repo root, research tooling, wired into nothing) — runs
+   BTC/USDT + SOL/USDT 4 ways (baseline / +MTF / +FNG / +both). Report:
+   `logs/mtf_overlay_backtest_20260902.md`.
+
+**Overlay findings (2 windows):**
+- **MTF 1D-BEARISH veto:** regime-dependent. 2022–24 bear: BTC PF 1.47 → 1.50 (helps a
+  little, better DD). 2024–26 bull/chop: BTC PF 2.10 → 1.48, SOL 1.78 → 1.68 (hurts). Wash
+  over a cycle. **Kept** — genuine bear protection, only 1 live veto ever; removal would need
+  a design change (slower daily lookback / veto-only-when-deteriorating) with its own
+  walk-forward.
+- **Fear&Greed > 75 veto:** net-negative or wash in every window (2022–24 BTC PF 1.47 →
+  1.21; 2024–26 BTC +0.08 / SOL −0.19). 0 live vetoes ever. Costs an alternative.me API
+  dependency + a fail-open bypass-alert path. **Recommended for removal — awaiting user
+  sign-off** (not yet done: touching a live risk gate).
+- **200-EMA macro regime filter:** untouched — it IS in the validated fingerprint.
+
+**Bottom line for the user:** the safety rules are near-zero-cost and have blocked nothing;
+the bot's inactivity is the core strategy correctly sitting out a trendless BTC 4h regime.
+Trading more is a solved question (3 candidate 2nd strategies all FAILED, Aug 2026) — the
+real lever is more validated symbols, blocked on a deposit + an unbuilt FX layer.

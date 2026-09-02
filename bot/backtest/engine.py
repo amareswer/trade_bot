@@ -23,7 +23,7 @@ from bot.data.historical_feed import Candle
 from bot.strategy.threshold_strategy import ThresholdStrategy, Signal
 from bot.strategy.indicator_strategy import IndicatorStrategy, IndicatorConfig
 from bot.execution.executor import PaperExecutor, OrderStatus, OrderSide
-from bot.indicators.indicators import ema as _ema
+from bot.indicators.indicators import ema as _ema, trend as _trend
 from bot.risk.risk_manager import RiskManager, RiskConfig
 from bot.state.trade_state import TradingStateMachine
 from bot.portfolio.position_manager import PositionManager
@@ -126,6 +126,25 @@ def run(
     # Default off — the canonical fingerprint runs use plain notional sizing.
     atr_risk_sizing:          bool  = False,
     atr_sizing_baseline_sl_pct: float = 0.015,
+    # ── Live-only BUY overlays (default OFF — NOT part of the validated
+    #    fingerprint; every canonical hash run has these unset). When supplied
+    #    a BUY signal is additionally vetoed exactly as bot/main.py does live,
+    #    letting a research script measure whether the overlay earns its keep:
+    #      mtf_daily_closes — list of (completed-day date, daily close). Before
+    #        a BUY, the 9/21-EMA trend() of the daily closes strictly PRIOR to
+    #        the current candle's date is computed; "BEARISH" vetoes the BUY
+    #        (mirrors bot/main.py section 2c, which slices the forming daily
+    #        candle off with [:-1] and passes ~29 closes to trend()).
+    #      fng_by_date — {date: Fear&Greed value 0-100}. The value on the
+    #        candle's date (or the most recent prior date) > fng_bear_max
+    #        vetoes the BUY (mirrors ExternalSignalGate.approve_buy()).
+    #    None for either = that overlay is inert and results are bit-identical
+    #    to a run without the argument.
+    mtf_daily_closes: list | None = None,
+    mtf_fast_period:  int = 9,
+    mtf_slow_period:  int = 21,
+    fng_by_date:      dict | None = None,
+    fng_bear_max:     float = 75.0,
 ) -> BacktestResult:
     """Run a full backtest and return the result."""
 
@@ -183,6 +202,21 @@ def run(
     _partial_tp_done: bool = False
     _entry_atr:      float = 0.0   # ATR at the time of BUY — used for ATR-based SL
     entry_snapshots: list[dict] = []
+    _overlay_rej:    dict[str, int] = {}   # live-only BUY overlays: veto counts
+
+    _overlays_on = mtf_daily_closes is not None or fng_by_date is not None
+    _mtf_sorted  = (
+        sorted(mtf_daily_closes, key=lambda dc: dc[0]) if mtf_daily_closes is not None else None
+    )
+
+    def _fng_asof(d) -> "int | None":
+        """Fear&Greed value for date d, else the most recent prior date's value."""
+        if not fng_by_date:
+            return None
+        if d in fng_by_date:
+            return fng_by_date[d]
+        _prior = [dd for dd in fng_by_date if dd <= d]
+        return fng_by_date[max(_prior)] if _prior else None
 
     # ── Main loop ─────────────────────────────────────────────────────
     for i, candle in enumerate(candles):
@@ -196,6 +230,26 @@ def run(
             warmup_ticks += 1
             equity_curve.append(executor.portfolio.total_value(price))
             continue
+
+        # ── Live-only BUY overlays (MTF daily trend / Fear&Greed) ────
+        # Same veto bot/main.py applies live, replayed on history. Only
+        # touches BUY; a forced SL/TP exit below is unaffected.
+        if _overlays_on and is_indicator and raw_signal == Signal.BUY:
+            _cdate = candle.timestamp.date()
+            _veto = ""
+            if _mtf_sorted is not None:
+                _prior = [cl for (d, cl) in _mtf_sorted if d < _cdate]
+                if len(_prior) >= mtf_slow_period and _trend(
+                    _prior[-30:], mtf_fast_period, mtf_slow_period
+                ) == "BEARISH":
+                    _veto = "mtf_trend"
+            if not _veto and fng_by_date is not None:
+                _f = _fng_asof(_cdate)
+                if _f is not None and _f > fng_bear_max:
+                    _veto = "external_signal"
+            if _veto:
+                raw_signal = Signal.HOLD
+                _overlay_rej[_veto] = _overlay_rej.get(_veto, 0) + 1
 
         # ── Trailing peak update ──────────────────────────────────────
         if executor.position > 0 and entry_price > 0 and trail_stop_pct > 0:
@@ -372,6 +426,9 @@ def run(
     rej_stats: dict[str, int] = {}
     if is_indicator and hasattr(strategy, "stats"):
         rej_stats = dict(strategy.stats)
+    if _overlays_on:
+        rej_stats["overlay_mtf_rejected"] = _overlay_rej.get("mtf_trend", 0)
+        rej_stats["overlay_fng_rejected"] = _overlay_rej.get("external_signal", 0)
 
     return BacktestResult(
         symbol          = symbol,
