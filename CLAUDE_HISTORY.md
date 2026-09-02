@@ -3290,3 +3290,41 @@ stays exit-manageable). +4 source-guard tests (`tests/stock/test_tsx_rule_buy_bl
 
 Suite 856 → 864. Strategy hash unchanged (`b30f2f9e769c8d41` — no `strategy/` files touched).
 **Both bots need a restart** to pick up the fixes (crypto: display wrapper; stock: TSX guard).
+
+---
+
+## Strategy selectivity audit — 2026-09-02 ("is the strategy too picky, should we modify it")
+
+User (not a strategy person) asked for a fresh check on whether the trend-following
+strategy's "only buy uptrends" design needs modification, prompted by all 3 crypto symbols
+sitting in a mild pullback (negative EMA spread) with the bot flat.
+
+**Fresh walk-forward (today, both live symbols), active config unchanged:**
+
+| | Train PF | OOS PF (2025-02-22→present) | Verdict |
+|---|---|---|---|
+| BTC/USDT | 1.20 | **2.78** | ✓ holds — "genuine edge" |
+| SOL/USDT | 1.49 | **1.98** | ✓ holds — "genuine edge" |
+
+Signal fidelity 100% (shadow reports). Hash `b30f2f9e769c8d41` unchanged.
+
+**Selectivity sweep** (`strategy_selectivity_sweep.py`, new research tool, wired into nothing;
+`logs/strategy_selectivity_sweep_20260902.md`). Swept `adx_threshold` and
+`min_ema_spread_pct` + structural variants on the OOS window. Every loosening that materially
+raises trade count degrades the edge:
+
+- **EMA spread ↓ to 0.2%:** BTC 19→28 trades but PF 2.78→1.60, return +0.5%→−1.8%, DD 2.4×
+  deeper. SOL 26→31 trades, PF 1.98→1.26. The added trades are net losers.
+- **Drop the 200-EMA macro filter:** BTC +8 trades, PF 2.78→1.82, return negative. SOL +17
+  trades, PF 1.98→**1.15**. The filter is load-bearing.
+- **ADX ↓ to 12–15:** +2 trades each symbol, PF slightly *down* (BTC 2.78→2.56). No benefit.
+- **Tightening** the spread to 0.8% *improves* everything (BTC PF 3.51, half the drawdown) —
+  consistent with the WF attribution (winning entries averaged 0.89% spread vs 0.71% for
+  losers). The strategy is, if anything, slightly *under*-selective, not over.
+
+**Verdict: NO modification.** The strategy is validated, holding strongly out-of-sample,
+executing faithfully, and every knob that would make it trade more turns the small profit
+into a loss with deeper drawdowns. Its inactivity in a pullback is the edge, not a defect.
+This reinforces the 2026-08-28/29 strategy-search conclusion (3 alt strategies all failed to
+beat a passive hold). The real lever for more activity remains more validated symbols
+(deposit + FX-layer blocked), not loosening this one.
