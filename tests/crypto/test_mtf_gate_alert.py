@@ -18,10 +18,10 @@ import bot.main as bot_main
 
 def _mtf_gate_block() -> str:
     """The MTF-gate section of run()'s source, from its banner comment to the
-    start of the next gate (2d — external signal gate)."""
+    start of the next gate section (2d)."""
     src = inspect.getsource(bot_main.run)
     start = src.index("2c. MTF gate")
-    end = src.index("2d. External signal gate", start)
+    end = src.index("2d.", start)
     return src[start:end]
 
 

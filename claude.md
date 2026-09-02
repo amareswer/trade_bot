@@ -395,10 +395,13 @@ were reviewed after "why won't the bot trade":
   (BTC PF 1.47→1.50), hurts in the 2024–26 bull/chop (BTC PF 2.10→1.48). Roughly a wash
   over a cycle; kept because it's genuine bear protection and has blocked only 1 live signal
   ever. Report: `logs/mtf_overlay_backtest_20260902.md`.
-- **Recommended for removal (not yet done — needs user sign-off):** the **Fear&Greed > 75
-  veto** (section 2d + `ExternalSignalGate`). Net-negative or wash in every window tested,
-  0 live vetoes to date, costs a third-party API dependency (alternative.me) + a fail-open
-  bypass-alert path.
+- **Removed (2026-09-02, user-approved):** the **Fear&Greed > 75 / BTC-funding veto**
+  (old `bot/main.py` section 2d, `bot/signals/external_signals.py`, `config.ExternalSignalsConfig`,
+  `cfg.signals`, `EXT_FNG_*` / `EXT_FUNDING_*` env keys — all deleted). Net-negative or wash
+  in every backtest window, 0 live vetoes ever, and it cost a third-party API dependency
+  (alternative.me) + a fail-open bypass-alert path. Funding was already dead (Kraken spot).
+  `bot/backtest/engine.py`'s opt-in `fng_by_date` param stays — it replays the old gate for
+  research only.
 - **Untouched:** the 200-EMA macro regime filter inside the strategy — it IS in the
   validated fingerprint.
 
@@ -484,8 +487,9 @@ Fetch failure fails open. Full BUY block market-wide, not a sizing dial.
 - **Crypto (2026-08-27):** `bot.main._evaluate_blocked_buy_alert(ss, sym, raw_signal_was_buy,
   block_gate, alerter)` — edge-triggered `alerter.error()` "BUY signal blocked [sym]" when
   the raw strategy signal is BUY but an external gate (state_machine/capital_pool/risk_manager/
-  correlation/candle_watchdog/mtf_trend/external_signal/regime) holds it. One per fresh
+  correlation/candle_watchdog/mtf_trend/regime) holds it. One per fresh
   (symbol, gate). Not persisted. Called from `run()` section-7b after the CSV write.
+  (`external_signal` label retired 2026-09-02 with the Fear&Greed gate.)
 - **Stock (2026-08-27):** `stock_bot.main._evaluate_blocked_rule_buys_alert` — end-of-cycle
   debounced `ops_alert` digest listing every symbol whose rule BUY a gate held (MACRO/
   EARNINGS_BLACKOUT, REGIME_SKIP, VIX_CRISIS, MAX_EXPOSURE/MAX_POSITIONS, CORRELATION,

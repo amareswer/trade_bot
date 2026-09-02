@@ -137,7 +137,8 @@ def run(
     #        candle off with [:-1] and passes ~29 closes to trend()).
     #      fng_by_date — {date: Fear&Greed value 0-100}. The value on the
     #        candle's date (or the most recent prior date) > fng_bear_max
-    #        vetoes the BUY (mirrors ExternalSignalGate.approve_buy()).
+    #        vetoes the BUY. This replays the old live Fear&Greed gate
+    #        (removed from bot/main.py 2026-09-02) for research comparison.
     #    None for either = that overlay is inert and results are bit-identical
     #    to a run without the argument.
     mtf_daily_closes: list | None = None,

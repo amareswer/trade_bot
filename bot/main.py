@@ -77,7 +77,6 @@ from bot.indicators.indicators import ema as _ema_fn, trend as _trend_fn, atr as
 from bot.ai.ai_engine import AIEngine, merge_signals
 from bot import display
 from bot.dashboard import renderer as _dashboard
-from bot.signals.external_signals import ExternalSignalGate, ExternalSignalsConfig as _ExtSigsCfg
 from bot.alerts.telegram import TelegramAlerter
 from bot.alerts.stuck_loop import StuckLoopDetector
 from bot.data.trade_log import TradeLog
@@ -744,8 +743,7 @@ _BUY_BLOCK_REASONS = {
     "correlation":     "too correlated (>0.70) with an already-open position",
     "candle_watchdog": "the candle feed is stale — BUYs paused until it recovers",
     "mtf_trend":       "the daily (1D) trend is BEARISH",
-    "external_signal": "the external-signal gate rejected the entry",
-    "regime":          "the market regime is not favourable for a new entry",
+    "regime":          "the market regime is not favourable for a new entry (strategy 200-EMA / volatile)",
 }
 
 
@@ -1369,19 +1367,13 @@ def run():
         timeout_s      = cfg.ai.timeout_s,
     ) if cfg.ai.enabled else None
 
-    # ── External signal gate (live mode only) ─────────────────────────────────
-    ext_gate: "ExternalSignalGate | None" = None
-    if cfg.exchange.feed_mode == "live" and (cfg.signals.fng_enabled or cfg.signals.funding_enabled):
-        ext_gate = ExternalSignalGate(_ExtSigsCfg(
-            fng_enabled           = cfg.signals.fng_enabled,
-            fng_bear_max          = cfg.signals.fng_bear_max,
-            fng_bull_min          = cfg.signals.fng_bull_min,
-            fng_cache_seconds     = cfg.signals.fng_cache_seconds,
-            funding_enabled       = cfg.signals.funding_enabled,
-            funding_symbol        = cfg.signals.funding_symbol,
-            funding_max           = cfg.signals.funding_max,
-            funding_cache_seconds = cfg.signals.funding_cache_seconds,
-        ))
+    # ── External signal (Fear&Greed / funding) gate — REMOVED 2026-09-02 ──────
+    # `mtf_overlay_backtest.py` showed the FNG>75 BUY veto was net-negative or a
+    # wash in every window tested (2022–24 BTC PF 1.47→1.21; 2024–26 BTC +0.08 /
+    # SOL −0.19) and it had never once fired on the live bot, while costing a
+    # third-party API dependency (alternative.me) plus a fail-open
+    # risk-gate-bypass alert path. Funding was already dead (Kraken is spot).
+    # Full trail: CLAUDE_HISTORY.md "Crypto BUY-overlay audit — 2026-09-02".
 
     # ── Persistent trade log + Telegram alerts ────────────────────────────────
     trade_log = TradeLog()
@@ -2303,14 +2295,14 @@ def run():
             # ── Blocked-gate tracking (initialise per-candle) ─────────
             # Records the first gate (in priority order) that blocked a BUY.
             # Priority: trend → RSI → ADX → EMA_spread → MACD → mtf_trend
-            #           → external_signal → regime → correlation
-            #           → candle_watchdog → state_machine → risk_manager
-            #           → capital_pool
-            # mtf_trend / external_signal / regime were previously a single
-            # shared "regime" label — split 2026-08-24 after the 2026-08-18
-            # missed-BUY investigation found it impossible to tell which of
-            # the three had actually fired from live_signals.csv alone. See
-            # .memory/decisions/2026-08-18-missed-buy-signal.md.
+            #           → correlation → candle_watchdog → state_machine
+            #           → risk_manager → capital_pool
+            # (external_signal and the independent regime gate were both
+            # removed 2026-09-02 — see sections 2d/2e below. mtf_trend was
+            # split from a shared "regime" label 2026-08-24 after the
+            # 2026-08-18 missed-BUY investigation. "regime" as a label now
+            # comes only from the strategy's own 200-EMA / VOLATILE path. See
+            # .memory/decisions/2026-08-18-missed-buy-signal.md.)
             _signal_raw_for_csv = raw_signal
             _buy_block_gate: str = ""
             if is_indicator and live_exchange is not None:
@@ -2373,23 +2365,10 @@ def run():
                     else:
                         logger.info("MTF gate [%s]: OK — daily trend %s", sym, _mtf_trend)
 
-            # ── 2d. External signal gate ──────────────────────────────
-            if raw_signal == Signal.BUY and ext_gate is not None:
-                _ext_approved, _ext_reason = ext_gate.approve_buy()
-                if not _ext_approved:
-                    raw_signal = Signal.HOLD
-                    if not _buy_block_gate:
-                        # 2026-08-24: was "regime" — see MTF gate comment above.
-                        _buy_block_gate = "external_signal"
-                    print(f"  [{sym}] EXT gate: {_ext_reason}", flush=True)
-                    logger.info("External signal gate blocked BUY [%s]: %s", sym, _ext_reason)
-                else:
-                    _ext_status = ext_gate.status()
-                    logger.info(
-                        "External signal gate [%s]: OK — FNG=%s (%s)  funding=%s",
-                        sym, _ext_status.get("fng_value"), _ext_status.get("fng_classification"),
-                        _ext_status.get("funding_rate"),
-                    )
+            # ── 2d. (removed 2026-09-02) external Fear&Greed / funding gate ──
+            # Backtested net-negative-to-wash on every window, 0 live vetoes
+            # ever, cost a third-party API + a bypass-alert path. See the
+            # removal note further up in run() and CLAUDE_HISTORY.md.
 
             # ── 2e. (removed 2026-09-02) independent "regime gate" ─────
             # This re-checked ADX ≥ adx_threshold AND EMA spread ≥

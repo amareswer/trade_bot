@@ -3239,9 +3239,15 @@ the bot barely trades. Read-only pipeline trace + `logs/live_signals.csv` (243 r
   a design change (slower daily lookback / veto-only-when-deteriorating) with its own
   walk-forward.
 - **Fear&Greed > 75 veto:** net-negative or wash in every window (2022–24 BTC PF 1.47 →
-  1.21; 2024–26 BTC +0.08 / SOL −0.19). 0 live vetoes ever. Costs an alternative.me API
-  dependency + a fail-open bypass-alert path. **Recommended for removal — awaiting user
-  sign-off** (not yet done: touching a live risk gate).
+  1.21; 2024–26 BTC +0.08 / SOL −0.19). 0 live vetoes ever. Cost an alternative.me API
+  dependency + a fail-open bypass-alert path. **REMOVED (user-approved same session):**
+  deleted `bot/signals/external_signals.py`, `config.ExternalSignalsConfig` + `cfg.signals`,
+  `bot/main.py` sections 2d + the `ext_gate` construction + import, `EXT_FNG_*`/`EXT_FUNDING_*`
+  from `.env`. `_BUY_BLOCK_REASONS` lost `"external_signal"`; priority-order comment updated;
+  `test_mtf_gate_alert.py` helper's section-boundary string loosened. Funding leg was already
+  dead (Kraken spot). `bot/backtest/engine.py`'s opt-in `fng_by_date` param kept (research
+  replay only). Suite still 856, fingerprint still 30 / 1.94 / `b30f2f9e769c8d41`, dry-run
+  boots clean.
 - **200-EMA macro regime filter:** untouched — it IS in the validated fingerprint.
 
 **Bottom line for the user:** the safety rules are near-zero-cost and have blocked nothing;

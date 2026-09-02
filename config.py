@@ -385,16 +385,9 @@ class BacktestConfig:
             raise ValueError("ATR_SL_MULT must be >= 0 (0 = disabled)")
 
 
-@dataclass
-class ExternalSignalsConfig:
-    fng_enabled:           bool  = True
-    fng_bear_max:          float = 75.0    # block BUY when FNG > this (extreme greed)
-    fng_bull_min:          float = 0.0     # require FNG >= this (0 = disabled)
-    fng_cache_seconds:     int   = 3600    # TTL for Fear & Greed cache
-    funding_enabled:       bool  = True
-    funding_symbol:        str   = "BTCUSDT"
-    funding_max:           float = 0.0005  # block BUY when funding > 0.05%
-    funding_cache_seconds: int   = 3600    # TTL for funding rate cache
+# ExternalSignalsConfig (Fear&Greed / BTC funding BUY gate) removed 2026-09-02 —
+# the FNG>75 veto backtested net-negative and never fired live; funding was dead
+# (Kraken spot). See CLAUDE_HISTORY.md "Crypto BUY-overlay audit — 2026-09-02".
 
 
 @dataclass
@@ -448,7 +441,6 @@ class AppConfig:
     ai:        AIConfig
     dashboard: DashboardConfig
     backtest:  BacktestConfig
-    signals:   ExternalSignalsConfig
     alerts:    AlertConfig
     universe:  UniverseConfig
     paper:     PaperConfig = field(default_factory=PaperConfig)
@@ -714,16 +706,6 @@ def _load() -> AppConfig:
             partial_tp_size  = _float("PARTIAL_TP_SIZE",      0.5),
             atr_sl_mult      = _float("ATR_SL_MULT",           0.0),
             atr_sizing_enabled = _bool("ATR_SIZING_ENABLED",  False),
-        ),
-        signals=ExternalSignalsConfig(
-            fng_enabled            = _bool ("EXT_FNG_ENABLED",       True),
-            fng_bear_max           = _float("EXT_FNG_BEAR_MAX",      75.0),
-            fng_bull_min           = _float("EXT_FNG_BULL_MIN",      0.0),
-            fng_cache_seconds      = _int  ("EXT_FNG_CACHE_S",       3600),
-            funding_enabled        = _bool ("EXT_FUNDING_ENABLED",   True),
-            funding_symbol         = _str  ("EXT_FUNDING_SYMBOL",    "BTCUSDT"),
-            funding_max            = _float("EXT_FUNDING_MAX",       0.0005),
-            funding_cache_seconds  = _int  ("EXT_FUNDING_CACHE_S",   3600),
         ),
         alerts=AlertConfig(
             telegram_enabled          = _bool("TELEGRAM_ENABLED",          False),
