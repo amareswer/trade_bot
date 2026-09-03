@@ -25,7 +25,8 @@ metadata:
 - `fee-structure.md` — maker/taker assumptions, round-trip cost model
 - `strategy-search-2026-08-28.md` — 3 alt strategies (mean-reversion / grid-DCA / momentum) ALL FAILED to beat a passive hold; search concluded
 - `mean-reversion-experiment-2026-08-28.md` — mean-reversion detail (FAILED both bots)
-- `strategy-selectivity-2026-09-02.md` — trend strategy is NOT too selective; every loosening degrades the OOS edge. NO modification
+- `strategy-selectivity-2026-09-02.md` — trend strategy ENTRY is NOT too selective; every loosening degrades the OOS edge. NO modification
+- `per-symbol-exit-2026-09-03.md` — BTC take-profit 10%→20% (per-symbol exit config, `TAKE_PROFIT_PCT_<BASE>`); SOL keeps 10%. Hash unchanged
 - `crypto-buy-overlays-2026-09-02.md` — Fear&Greed gate + redundant regime gate REMOVED; MTF daily-trend gate KEPT
 - `2026-08-18-missed-buy-signal.md` — a real BTC BUY vetoed by the MTF gate (not a bug); the gate-logging fix that followed
 - `stock-whitelist-gate-removed-2026-08-23.md` — RULE_WHITELIST no longer gates stock-bot BUYs (user request)

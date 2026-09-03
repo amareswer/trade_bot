@@ -1639,7 +1639,9 @@ def run():
             return
         if ss['native_stop_is_trailing']:
             ss['executor'].sync_protective_stop(
-                None, trailing_pct=cfg.backtest.trail_stop_pct,
+                None,
+                trailing_pct=cfg.backtest.exit_params_for(
+                    ss['executor'].symbol)["trail_stop_pct"],
             )
         else:
             ss['executor'].sync_protective_stop(ss.get('native_stop_price'))
@@ -1703,7 +1705,7 @@ def run():
             "tick_log":           [t for t in tick_log if t.get("sym") == sym],
             "candle_log":         [c for c in candle_log if c.get("sym") == sym],
             "stop_loss_pct":      cfg.backtest.stop_loss_pct,
-            "take_profit_pct":    cfg.backtest.take_profit_pct,
+            "take_profit_pct":    cfg.backtest.exit_params_for(sym)["take_profit_pct"],
             "fees_paid":          getattr(_exc, "fees_paid", 0.0),
             "rsi_filter_enabled": cfg.strategy.rsi_filter_enabled,
             "volume_k":           cfg.strategy.volume_k,
@@ -1855,6 +1857,15 @@ def run():
         # ── Per-symbol processing ─────────────────────────────────────
         for sym, ss in symbol_state.items():
 
+            # Per-symbol exit params (2026-09-03): BTC sustains trends and its
+            # flat 10% take-profit was cutting winners short (exit-logic
+            # research) → BTC runs a wider TP; SOL is choppy → keeps the 10% TP.
+            # exit_params_for() merges any TAKE_PROFIT_PCT_<BASE> /
+            # TRAILING_STOP_PCT_<BASE> override over the shared defaults, and
+            # engine_kwargs_from_cfg() resolves the identical dict for the
+            # backtest, so validated and live behaviour stay in lockstep.
+            _ep = cfg.backtest.exit_params_for(sym)
+
             # ── 1. Fetch live price ───────────────────────────────────
             if live_exchange is not None:
                 try:
@@ -1953,8 +1964,8 @@ def run():
             if is_indicator and live_exchange is not None:
                 if ss['pm'].has_position and ss['pm'].avg_entry > 0:
                     _ic_entry       = ss['pm'].avg_entry
-                    _trail_stop_pct = cfg.backtest.trail_stop_pct
-                    _trail_act_pct  = cfg.backtest.trail_stop_activation_pct
+                    _trail_stop_pct = _ep["trail_stop_pct"]
+                    _trail_act_pct  = _ep["trail_stop_activation_pct"]
                     if _trail_stop_pct > 0:
                         if ss['trail_peak'] == 0.0:
                             if _trail_act_pct == 0.0 or price >= _ic_entry * (1 + _trail_act_pct):
@@ -2071,8 +2082,8 @@ def run():
                         or (_fixed_sl_level > 0 and price <= _fixed_sl_level)
                     )
                     _ic_tp = (
-                        cfg.backtest.take_profit_pct > 0
-                        and price >= _ic_entry * (1 + cfg.backtest.take_profit_pct)
+                        _ep["take_profit_pct"] > 0
+                        and price >= _ic_entry * (1 + _ep["take_profit_pct"])
                     )
                     if _ic_sl or _ic_tp:
                         if _ic_sl:
@@ -2086,7 +2097,7 @@ def run():
                         else:
                             logger.warning(
                                 "TAKE PROFIT [%s]: price=%.2f entry=%.2f tp=%.1f%%",
-                                sym, price, _ic_entry, cfg.backtest.take_profit_pct * 100,
+                                sym, price, _ic_entry, _ep["take_profit_pct"] * 100,
                             )
                             print(f"           ✅ TAKE PROFIT [{sym}]  price={price:,.2f}  entry={_ic_entry:,.2f}", flush=True)
                         _ic_qty      = ss['pm'].quantity
@@ -2703,7 +2714,7 @@ def run():
                             # Seeding unconditionally here bypassed that gate.
                             ss['trail_peak'] = (
                                 order.price
-                                if cfg.backtest.trail_stop_activation_pct <= 0
+                                if cfg.backtest.exit_params_for(sym)["trail_stop_activation_pct"] <= 0
                                 else 0.0
                             )
                             ss['partial_done'] = False

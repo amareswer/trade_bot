@@ -59,8 +59,12 @@ AFTER_DATE  = os.environ.get("BACKTEST_START") or None  # keep candles FROM this
 
 def main():
     parser = argparse.ArgumentParser(description="Run crypto backtest")
-    parser.add_argument("--stop_loss",    type=float, default=cfg.backtest.stop_loss_pct)
-    parser.add_argument("--take_profit",  type=float, default=cfg.backtest.take_profit_pct)
+    # Default None → keep engine_kwargs_from_cfg()'s per-symbol exit value
+    # (TAKE_PROFIT_PCT_<BASE> etc.). Only a value explicitly passed on the CLI
+    # overrides it. Was `default=cfg.backtest.*` which always clobbered the
+    # per-symbol resolution with the shared value (found 2026-09-03).
+    parser.add_argument("--stop_loss",    type=float, default=None)
+    parser.add_argument("--take_profit",  type=float, default=None)
     parser.add_argument("--fee",          type=float, default=cfg.backtest.fee_pct)
     parser.add_argument("--limit",        type=int,   default=cfg.backtest.limit)
     parser.add_argument("--max_drawdown", type=float, default=0.25)
@@ -110,9 +114,11 @@ def main():
     run_kwargs.update(
         fee_pct          = args.fee,
         max_drawdown_pct = args.max_drawdown,
-        stop_loss_pct    = args.stop_loss,
-        take_profit_pct  = args.take_profit,
     )
+    if args.stop_loss is not None:
+        run_kwargs["stop_loss_pct"] = args.stop_loss
+    if args.take_profit is not None:
+        run_kwargs["take_profit_pct"] = args.take_profit
     result = engine.run(candles=candles, **run_kwargs)
 
     m = metrics_mod.compute(result)

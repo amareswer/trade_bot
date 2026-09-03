@@ -175,14 +175,14 @@ narrative behind any decision below, and `.memory/decisions/*.md` for the deepes
 
 ## Test Suite Manifest
 
-**Expected total: 864 tests** (`pytest --collect-only -q`). If the count disagrees: a file
+**Expected total: 875 tests** (`pytest --collect-only -q`). If the count disagrees: a file
 has an import error, was deleted, was added without a manifest bump, or was excluded from the
 runner — investigate before trusting a green suite. Suite runtime ~9–26s; minutes means a
 test is reading live `.env` config. The per-row table sum below lags the header total by ~22
 (pre-existing row-vs-total drift; `--collect-only` and this header agree). Full count-delta
 history: `CLAUDE_HISTORY.md` → "CLAUDE.md trim, 2026-09-01" → "count-delta history".
 
-Run: `python -m pytest --tb=short -q` — must show **864 passed**.
+Run: `python -m pytest --tb=short -q` — must show **875 passed**.
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -232,6 +232,7 @@ Run: `python -m pytest --tb=short -q` — must show **864 passed**.
 | `tests/crypto/test_overlay_gates.py` | 10 | `engine.run` opt-in live-only BUY overlays (`mtf_daily_closes` / `fng_by_date`, added 2026-09-02 for `mtf_overlay_backtest.py`): None ≡ baseline, MTF BEARISH-daily veto, FNG>threshold veto, `_fng_asof` most-recent-prior / fail-open, MTF-before-FNG precedence, insufficient-daily-history skip |
 | `tests/crypto/test_display_broken_pipe.py` | 4 | `bot/display.py` print wrapper swallows `BrokenPipeError`/`OSError` (2026-09-02 regression: a broken-pipe from `display.warmup()` crashed the crypto bot mid-warmup); normal output still reaches stdout |
 | `tests/stock/test_tsx_rule_buy_block.py` | 4 | Source guard: `run()` blocks `.TO` symbols from automated BUYs (`TSX_BLOCKED`), clears `_act_buy` before the exec block, records the block for the digest, leaves the SELL path alone (CIRO DMR 3200; implicit guard lost when RULE_WHITELIST stopped gating BUYs 2026-08-23; AC.TO hit it live 2026-09-02) |
+| `tests/crypto/test_exit_overrides.py` | 11 | Per-symbol EXIT overrides (`TAKE_PROFIT_PCT_<BASE>` / `TRAILING_STOP_PCT_<BASE>` / `TRAILING_STOP_ACTIVATION_PCT_<BASE>`, added 2026-09-03): `_exit_overrides_by_base()` scanner (bare keys ignored, non-numeric rejected), `BacktestConfig.exit_params_for()` fallback/merge/base-not-quote/missing-symbol, out-of-range validation, `engine_kwargs_from_cfg(cfg, symbol=...)` resolves for the right base, `bot/main.py` exit block reads the per-symbol dict |
 | `tests/stock/test_alert_evaluator.py` | 4 | AlertEvaluator EARNINGS_SOON: held-vs-not-held priority, live-executor-only held-position source |
 | `tests/crypto/test_crypto_telegram.py` | 2 | `TelegramAlerter.fill()` reason line included/omitted; dup-alert throttle |
 | `tests/shared/test_liveness.py` | 7 | LivenessTracker: touch/is_alive/staleness boundary, simulated hang |
@@ -275,7 +276,9 @@ RSI_FILTER_ENABLED=true
 MIN_EMA_SPREAD_PCT=0.004
 VOLUME_K=0
 STOP_LOSS_PCT=0.015          # fallback only — ATR_SL_MULT takes priority when set
-TAKE_PROFIT_PCT=0.10
+TAKE_PROFIT_PCT=0.10         # SOL/CAD + default
+TAKE_PROFIT_PCT_BTC=0.20     # BTC/CAD only — 10% was capping trend winners (exit-logic
+                             #  research 2026-09-03; per-symbol via _exit_overrides_by_base())
 ATR_SL_MULT=2.0              # adopted live 2026-07-17, walk-forward validated
 ATR_SIZING_ENABLED=true      # adopted live 2026-07-17, caps qty at fixed-SL-baseline dollar risk
 BACKTEST_LIMIT=5000
@@ -291,7 +294,8 @@ SYMBOL=BTC/CAD
 CANDLE_MINUTES=240            # 4h — the only validated live timeframe (1h FAILED walk-forward)
 RISK_PER_TRADE_PCT=0.10       # capital-allocation dial, NOT % risked — real dollar risk ~0.15% of cash
 STOP_LOSS_PCT=0.015           # fallback only — ATR_SL_MULT=2.0 takes priority when ATR is available
-TAKE_PROFIT_PCT=0.10
+TAKE_PROFIT_PCT=0.10          # SOL/CAD + default
+TAKE_PROFIT_PCT_BTC=0.20      # BTC/CAD only (per-symbol exit — see "Per-symbol exit config" below)
 ORDER_TYPE=limit / LIMIT_ORDER_ENABLED=true   # BUY entries limit-chase for maker rate (post-only);
                               # ALL SL/TP exits forced to market via urgent=True
 UNIVERSE_WHITELIST=BTC/CAD,SOL/CAD
@@ -331,6 +335,25 @@ POSITION_SIZE. `peak_value`, `week_open_value`, `kill_switch_tripped` persist in
 `logs/risk_state.json`. Config validation enforces
 `RISK_DRAWDOWN_WARNING < RISK_MAX_DRAWDOWN < RISK_KILL_SWITCH` strictly increasing.
 Four-tier breaker upgrade added 2026-08-07 (mirrors the stock bot's 2026-08-05 upgrade).
+
+### Per-symbol exit config (crypto — added 2026-09-03)
+`config._exit_overrides_by_base()` scans `.env` for `TAKE_PROFIT_PCT_<BASE>` /
+`TRAILING_STOP_PCT_<BASE>` / `TRAILING_STOP_ACTIVATION_PCT_<BASE>` (same `_<BASE>` pattern as
+`MAX_SLOT_CASH_CAD_<BASE>`). `BacktestConfig.exit_params_for(symbol)` merges any override for
+that base over the shared `TAKE_PROFIT_PCT` / `TRAILING_STOP_PCT` / `TRAILING_STOP_ACTIVATION_PCT`.
+**Both `bot/main.py` (live, `_ep` per loop iteration) and `engine_kwargs_from_cfg(cfg, symbol=)`
+(validation) route through it**, so a symbol's live exits always match its walk-forward.
+- **Live:** `TAKE_PROFIT_PCT_BTC=0.20` (BTC sustains trends — a flat 10% capped its winners;
+  exit-logic research 2026-09-03: TP20 beats TP10 in **both** walk-forward windows, BTC/USDT
+  TRAIN PF 1.20→1.37, VAL 2.78→3.41, and 5 of 6 rolling windows tested). **SOL keeps the 10% TP**
+  — every wider-TP / trailing-stop variant made SOL worse (choppier price action).
+- `backtest.py`'s `--stop_loss` / `--take_profit` now default to `None` (only an explicit CLI
+  value overrides the per-symbol resolution — the old `default=cfg.backtest.*` always clobbered it).
+- `validate_symbol.py` / `screen_universe.py` pass `symbol=` so a screened candidate's exit
+  params resolve for ITS base, not the configured symbol's.
+- No strategy-hash impact (exit params are `cfg.backtest`, not the hashed strategy files).
+- Research: `strategy_exit_sweep.py` + `logs/strategy_exit_sweep_20260902.md`,
+  `CLAUDE_HISTORY.md` "Crypto exit-logic research — 2026-09-02".
 
 ### Native exchange-side stop-loss (crypto — ON since 2026-08-15)
 `NATIVE_STOP_LOSS_ENABLED=true` (config.py default false). `sync_protective_stop()` rests a
@@ -589,27 +612,31 @@ the load-bearing gate is root `stock_backtest.py` → `stock_bot/backtest/engine
 
 ### How to verify the config is active
 Run: `EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py`
-Expected (rolling, drifts as the window advances): **~32 trades, PF ~2.1, ~37% win
-rate**, hash `b30f2f9e769c8d41` (was 31 / 2.19 / 38.7% on 2026-08-20; 32 / 2.10 / 37.5%
-on 2026-09-02 — pure new-candle drift, hash identical). If `RSI_FILTER_ENABLED=false`
-accidentally: trade count jumps, PF drops below 1.2. **Use the pinned-window check below
-for a deterministic pass/fail.**
+Expected (rolling, drifts as the window advances): **~29 trades, PF ~2.4–2.5, ~38% win
+rate**, hash `b30f2f9e769c8d41`. Was 32 / 2.10 with the old flat 10% TP; **2026-09-03 BTC
+moved to `TAKE_PROFIT_PCT_BTC=0.20`** (per-symbol exit — SOL keeps 10%), lifting rolling PF
+to ~2.46. If `RSI_FILTER_ENABLED=false` accidentally: trade count jumps, PF drops below 1.2.
+**Use the pinned-window check below for a deterministic pass/fail.**
 
 Reproducible pinned-window check (deterministic — data range fixed):
 ```
 EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-06-20 python backtest.py
 ```
-Expected: **30 trades, PF 1.94, 40.0% win rate** (5010 candles), hash `b30f2f9e769c8d41`.
-Use the rolling run for the canonical fingerprint, this pinned run for "did my
-environment/data change break something".
+Expected: **27 trades, PF 1.87, 40.7% win rate** (5010 candles), hash `b30f2f9e769c8d41`.
+(Was 30 / 1.94 with the flat 10% TP — the pinned window ends 2026-06 and predates the recent
+strong-trend period where TP20 pays off, so it dips slightly here while the walk-forward
+split improves; PF 1.87 still clears the ≥1.72 floor.) Use the rolling run for the canonical
+fingerprint, this pinned run for "did my environment/data change break something".
 
 ### Canonical strategy fingerprint (BTC/USDT)
-- **Strategy hash:** `b30f2f9e769c8d41`
+- **Strategy hash:** `b30f2f9e769c8d41` (UNCHANGED by the 2026-09-03 per-symbol TP change —
+  exit params live in `cfg.backtest` / `engine.run`, not the hashed strategy files).
 - **Hashed files (behavior-defining only):** `bot/strategy/indicator_strategy.py`,
   `bot/strategy/threshold_strategy.py`, `bot/indicators/indicators.py`
-- **Current result:** rolling ~32 trades, PF ~2.1 (pinned window: 30 / 1.94). Trade-count
-  evolution across sessions (58→39→35→32→31) and the 2026-08-20
-  self-referential-ATR-regime-baseline fix that produced the current hash are in
+- **Current result (BTC, `TAKE_PROFIT_PCT_BTC=0.20`):** rolling ~29 trades, PF ~2.46
+  (pinned window: 27 / 1.87). Walk-forward: TRAIN PF 1.37 / VALIDATION PF 3.41 (both up from
+  the flat-10%-TP 1.20 / 2.78). SOL/USDT unchanged (10% TP): rolling 43 / 1.78, WF 1.49 /
+  1.98. Trade-count evolution and the 2026-08-20 ATR-regime-baseline fix are in
   `CLAUDE_HISTORY.md`.
 - Stamp after each passing walk-forward: `python stamp_strategy.py` → `logs/validated_strategy_hash`
 - If the bot or backtest prints `STRATEGY CODE DIFFERS`, re-run walk-forward before trusting any PF numbers.
@@ -644,7 +671,7 @@ environment/data change break something".
 ### Approved for live trading
 | Symbol | Status | Basis |
 |--------|--------|-------|
-| BTC/CAD | ACTIVE | Walk-forward re-confirmed on current code: all windows PF > 1.0. Original validated pair. |
+| BTC/CAD | ACTIVE | Walk-forward re-confirmed 2026-09-03 on current code with `TAKE_PROFIT_PCT_BTC=0.20` (per-symbol exit): TRAIN PF 1.37 / VALIDATION PF 3.41, all windows PF > 1.0. Original validated pair. |
 | SOL/CAD | ACTIVE (2026-08-25) | Fresh 3-window walk-forward PASS on current strategy (TRAIN PF 1.32 / VALIDATION PF 1.46, ATR×2.0 stop + dollar-risk-capped sizing — `logs/atr_oos_SOL_2.0_sized_20260825.md`); capital verified live ($553.39 CAD, `check_kraken_balance.py`); FX precondition N/A (direct CAD-quoted market). `.env`: `MAX_SLOT_CASH_CAD_SOL=376`, `MAX_CONCURRENT_POSITIONS=2`, `STARTING_CASH=553.39`. Trail: `.memory/decisions/multi-symbol-validation.md`. |
 
 ### Watchlist (not yet tradeable)

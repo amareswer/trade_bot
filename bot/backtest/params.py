@@ -50,14 +50,21 @@ Deliberate exclusions — do not add without a validation decision:
 """
 
 
-def engine_kwargs_from_cfg(cfg) -> dict:
+def engine_kwargs_from_cfg(cfg, symbol: str | None = None) -> dict:
     """Build the full engine.run() kwarg dict from the loaded AppConfig.
 
     Returns everything except `candles`. Callers may .update() individual
     keys for CLI overrides before passing to engine.run().
+
+    `symbol` overrides `cfg.exchange.symbol` — pass it when building kwargs for
+    a symbol other than the configured one (validate_symbol.py, screen_universe.py)
+    so the per-symbol EXIT params (TAKE_PROFIT_PCT_<BASE> etc.) resolve for the
+    RIGHT base, not the configured symbol's. Omit it for backtest.py /
+    walkforward.py, which validate the configured symbol.
     """
+    _sym = symbol or cfg.exchange.symbol
     return dict(
-        symbol               = cfg.exchange.symbol,
+        symbol               = _sym,
         timeframe            = cfg.backtest.timeframe,
         strategy_mode        = cfg.strategy.mode,
         starting_cash        = cfg.portfolio.starting_cash,
@@ -92,9 +99,12 @@ def engine_kwargs_from_cfg(cfg) -> dict:
         max_drawdown_pct     = 0.25,
         max_trades_per_day   = cfg.risk.max_trades_per_day,
         stop_loss_pct        = cfg.backtest.stop_loss_pct,
-        take_profit_pct      = cfg.backtest.take_profit_pct,
-        trail_stop_pct            = cfg.backtest.trail_stop_pct,
-        trail_stop_activation_pct = cfg.backtest.trail_stop_activation_pct,
+        # Exit params are per-symbol (2026-09-03): BTC rides trends → trailing
+        # stop; SOL is choppy → hard TP. exit_params_for() merges any
+        # TAKE_PROFIT_PCT_<BASE> / TRAILING_STOP_PCT_<BASE> override over the
+        # shared defaults. Keyed off cfg.exchange.symbol — the one symbol this
+        # builder is producing kwargs for.
+        **cfg.backtest.exit_params_for(_sym),
         partial_tp_pct       = cfg.backtest.partial_tp_pct,
         partial_tp_size      = cfg.backtest.partial_tp_size,
         regime_ema_period       = cfg.strategy.regime_ema_period,

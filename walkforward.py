@@ -42,9 +42,13 @@ def _config_summary() -> str:
     b, s = cfg.backtest, cfg.strategy
     sl = (f"ATRx{b.atr_sl_mult}" if b.atr_sl_mult > 0
           else f"{b.stop_loss_pct*100:.1f}%")
+    _ep = b.exit_params_for(cfg.exchange.symbol)   # per-symbol TP / trailing stop
+    tp = (f"trail{_ep['trail_stop_pct']*100:.0f}%" if _ep["trail_stop_pct"] > 0
+          else f"{_ep['take_profit_pct']*100:.0f}%" if _ep["take_profit_pct"] > 0
+          else "none")
     return (f"ADX≥{s.adx_threshold:g}  EMA≥{s.min_ema_spread_pct*100:.1f}%  "
             f"RSI={'on' if s.rsi_filter_enabled else 'off'}  "
-            f"VolK={s.volume_k:g}  SL={sl}  TP={b.take_profit_pct*100:.0f}%  "
+            f"VolK={s.volume_k:g}  SL={sl}  TP={tp}  "
             f"ATRsizing={'on' if b.atr_sizing_enabled else 'off'}")
 
 

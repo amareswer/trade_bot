@@ -98,6 +98,43 @@ def _slot_caps_by_base() -> dict[str, float]:
     return out
 
 
+def _exit_overrides_by_base() -> dict[str, dict[str, float]]:
+    """Scan the environment for per-base-asset EXIT param overrides, keyed by
+    base asset (uppercased — the part before '/'). Lets one symbol run a
+    different exit config from the rest — added 2026-09-03 after the crypto
+    exit-logic research found BTC's flat 10% take-profit was cutting winners
+    short (BTC rides trends → trailing stop; SOL is choppy → keep the hard TP).
+
+    Recognised keys (each maps to a BacktestConfig field):
+      TAKE_PROFIT_PCT_<BASE>              -> take_profit_pct
+      TRAILING_STOP_PCT_<BASE>           -> trail_stop_pct
+      TRAILING_STOP_ACTIVATION_PCT_<BASE> -> trail_stop_activation_pct
+
+    Returns {} when none are set — an .env that only defines the shared keys is
+    completely unaffected (BacktestConfig.exit_params_for() then returns the
+    shared values for every symbol, exactly as before).
+    """
+    specs = {
+        "TRAILING_STOP_ACTIVATION_PCT_": "trail_stop_activation_pct",
+        "TAKE_PROFIT_PCT_":              "take_profit_pct",
+        "TRAILING_STOP_PCT_":            "trail_stop_pct",
+    }
+    out: dict[str, dict[str, float]] = {}
+    for key, raw in os.environ.items():
+        for prefix, field_name in specs.items():
+            if not key.startswith(prefix):
+                continue
+            base = key[len(prefix):].strip().upper()
+            if not base:
+                break
+            try:
+                out.setdefault(base, {})[field_name] = float(raw.strip())
+            except ValueError:
+                raise ValueError(f"Config error: {key} must be a number, got '{raw}'")
+            break
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Config groups
 # ---------------------------------------------------------------------------
@@ -356,8 +393,26 @@ class BacktestConfig:
     partial_tp_size:     float = 0.5     # fraction of position to sell at partial TP
     atr_sl_mult:         float = 0.0     # ATR SL multiplier; 0 = disabled (uses fixed stop_loss_pct)
     atr_sizing_enabled:  bool  = False   # same ATR_SIZING_ENABLED key as StrategyConfig (drift-incident rule: one key, two readers)
+    # Per-base EXIT overrides ({"BTC": {"trail_stop_pct": 0.08, "take_profit_pct": 0.0}}).
+    # Falls back to the shared take_profit_pct / trail_stop_pct / trail_stop_activation_pct
+    # for any base not listed. Read via exit_params_for(symbol). Added 2026-09-03.
+    exit_overrides_by_base: dict = field(default_factory=dict)
 
     _VALID_TIMEFRAMES = {"1m","5m","15m","30m","1h","2h","4h","6h","12h","1d","1w"}
+
+    def exit_params_for(self, symbol: str) -> dict:
+        """Effective exit params for `symbol` — the per-base override (if any)
+        merged over the shared BacktestConfig defaults. Returns a dict with
+        keys take_profit_pct / trail_stop_pct / trail_stop_activation_pct.
+        Both bot/main.py (live) and engine_kwargs_from_cfg() (validation) route
+        through this, so backtest and live stay in lockstep per symbol."""
+        base = (symbol or "").split("/")[0].strip().upper()
+        ov = self.exit_overrides_by_base.get(base, {})
+        return {
+            "take_profit_pct":           ov.get("take_profit_pct",           self.take_profit_pct),
+            "trail_stop_pct":            ov.get("trail_stop_pct",            self.trail_stop_pct),
+            "trail_stop_activation_pct": ov.get("trail_stop_activation_pct", self.trail_stop_activation_pct),
+        }
 
     def __post_init__(self):
         if self.timeframe not in self._VALID_TIMEFRAMES:
@@ -377,6 +432,14 @@ class BacktestConfig:
             raise ValueError("TRAILING_STOP_PCT must be between 0% and 50% (0 = disabled)")
         if not 0 <= self.trail_stop_activation_pct <= 1.0:
             raise ValueError("TRAILING_STOP_ACTIVATION_PCT must be between 0% and 100%")
+        for _base, _ov in self.exit_overrides_by_base.items():
+            _p = self.exit_params_for(_base + "/X")
+            if not 0 <= _p["take_profit_pct"] <= 1.0:
+                raise ValueError(f"TAKE_PROFIT_PCT_{_base} must be between 0% and 100%")
+            if not 0 <= _p["trail_stop_pct"] <= 0.50:
+                raise ValueError(f"TRAILING_STOP_PCT_{_base} must be between 0% and 50%")
+            if not 0 <= _p["trail_stop_activation_pct"] <= 1.0:
+                raise ValueError(f"TRAILING_STOP_ACTIVATION_PCT_{_base} must be between 0% and 100%")
         if not 0 <= self.partial_tp_pct <= 1.0:
             raise ValueError("PARTIAL_TP_PCT must be between 0% and 100% (0 = disabled)")
         if not 0 < self.partial_tp_size <= 1.0:
@@ -702,6 +765,7 @@ def _load() -> AppConfig:
             take_profit_pct  = _float("TAKE_PROFIT_PCT",      0.10),
             trail_stop_pct              = _float("TRAILING_STOP_PCT",            0.0),
             trail_stop_activation_pct   = _float("TRAILING_STOP_ACTIVATION_PCT", 0.03),
+            exit_overrides_by_base      = _exit_overrides_by_base(),
             partial_tp_pct   = _float("PARTIAL_TP_PCT",       0.0),
             partial_tp_size  = _float("PARTIAL_TP_SIZE",      0.5),
             atr_sl_mult      = _float("ATR_SL_MULT",           0.0),
@@ -756,10 +820,19 @@ def _load() -> AppConfig:
     )
 
     # ── Drift guard: warn on unrecognised strategy-critical env keys ──────
+    # Per-base overrides (KNOWN_KEY_<BASE>, e.g. TAKE_PROFIT_PCT_BTC) are
+    # recognised — they're picked up by _exit_overrides_by_base() /
+    # _slot_caps_by_base(), not the flat loader.
+    _PER_BASE_OVERRIDE_KEYS = (
+        "TAKE_PROFIT_PCT", "TRAILING_STOP_PCT", "TRAILING_STOP_ACTIVATION_PCT",
+        "MAX_SLOT_CASH_CAD",
+    )
     _unrecognised = [
         k for k in os.environ
         if any(k.startswith(p) for p in _STRATEGY_CRITICAL_PREFIXES)
         and k not in _KNOWN_STRATEGY_ENV_KEYS
+        and not any(k.startswith(_pb + "_") and len(k) > len(_pb) + 1
+                    for _pb in _PER_BASE_OVERRIDE_KEYS)
     ]
     if _unrecognised:
         logger.warning(

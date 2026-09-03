@@ -34,6 +34,7 @@ def make_fake_cfg(**overrides):
             partial_tp_size=0.5,
             atr_sl_mult=2.0,
             atr_sizing_enabled=True,
+            exit_overrides_by_base={},
         ),
         strategy=SimpleNamespace(
             mode="indicator",
@@ -75,6 +76,11 @@ def make_fake_cfg(**overrides):
     for dotted, value in overrides.items():
         section, attr = dotted.split(".")
         setattr(getattr(cfg, section), attr, value)
+    # Bind the real per-symbol exit-param resolver onto the fake backtest ns —
+    # it only reads exit_overrides_by_base / take_profit_pct / trail_stop_pct /
+    # trail_stop_activation_pct, all present above.
+    from config import BacktestConfig
+    cfg.backtest.exit_params_for = BacktestConfig.exit_params_for.__get__(cfg.backtest)
     return cfg
 
 

@@ -3328,3 +3328,98 @@ into a loss with deeper drawdowns. Its inactivity in a pullback is the edge, not
 This reinforces the 2026-08-28/29 strategy-search conclusion (3 alt strategies all failed to
 beat a passive hold). The real lever for more activity remains more validated symbols
 (deposit + FX-layer blocked), not loosening this one.
+
+---
+
+## Crypto exit-logic research — 2026-09-02 ("do we need changes to crypto logic")
+
+After the entry-selectivity audit (same day) found the entry side well-calibrated, swept the
+EXIT side — `strategy_exit_sweep.py` (new research tool, wired into nothing;
+`logs/strategy_exit_sweep_20260902.md`). Sweep: TP level (6–20% + off), trailing stop
+(3/5/8%), partial TP, ATR-stop multiplier — OOS window + a 4-window robustness re-check.
+
+**Verified no lookahead:** live drops the forming candle everywhere (`_warmup_strategy`
+`raw[:-1]`, `_fetch_completed_candle` limit=2, MTF `_raw_1d[:-1]`).
+
+**One real finding — BTC's hard 10% take-profit is cutting winners short:**
+
+| BTC/USDT window | live (ATR2.0 + 10% TP) | trail 8% (act 3%), no hard TP |
+|---|---|---|
+| TRAIN 2024-02→2025-02 | PF 1.20 | **1.43** |
+| VAL 2025-02→now | PF 2.78 | **3.73** |
+| full 5000c | PF 2.10 | **2.63** |
+| recent 3000c | PF 2.67 | **3.21** |
+
+Beats the 10% TP in **all 4 windows** (PF and return higher every time, drawdown
+comparable). Matches the WF attribution — BTC winners ride ~11 days; an 8% trail-from-peak
+captures 15–30% moves the 10% cap chops at 10%. "TP 15%" and "TP off" also beat live but
+the trail is strongest/most consistent.
+
+**SOL is the opposite — the 10% TP is already optimal.** Every SOL variant was worse
+(trail-8%-no-TP → PF 1.98→1.79; TP 15% → 1.10). SOL's moves are shorter/choppier — bank the
+10%.
+
+**ATR stop ×2.0 confirmed right** (×1.5 too tight → 25% win rate; ×2.5–3.0 slightly worse).
+**Partial TP** (50% @ 4–5%, rest to 10%): ~neutral PF but 1.5–2× the trades, much higher win
+rate (37→60%), lower drawdown — a "smoother ride / faster gate progress" option, not a
+returns win.
+
+**Proposal (not yet implemented — user said "we will work on it"):** per-symbol exit config
+— BTC gets an 8% trailing stop (activate +3%) replacing the hard 10% TP; SOL keeps the 10%
+TP. Needs: (1) a `TRAILING_STOP_PCT_<BASE>` / `TAKE_PROFIT_PCT_<BASE>` override mechanism
+(mirror the existing `MAX_SLOT_CASH_CAD_<BASE>` pattern), (2) full walk-forward
+re-validation of both symbols, (3) CLAUDE.md validated-config update. Does NOT change the
+strategy hash (exit params live in cfg.backtest / engine, not the hashed strategy files) but
+DOES change what was validated. Everything else (entry filters, BUY gates, ATR mult, SOL's
+TP) stays.
+
+**Also flagged (config, not logic — user's call):** BTC's `MAX_SLOT_CASH_CAD=77` is ~14× the
+Kraken minimum so it trades fine, but positions are tiny; the documented rule is $100/symbol
+and ~$177 is unallocated in the pool. Entry fill drift (SOL Aug-26 filled 5.2% off signal)
+was during the post-only bug window — need more fills to know if the limit-chase design
+causes systematic drift.
+
+---
+
+## Per-symbol take-profit — IMPLEMENTED 2026-09-03 (BTC → 20%, SOL stays 10%)
+
+Followed the 2026-09-02 exit-logic research (above). User: "proceed."
+
+**Mechanism** (`config._exit_overrides_by_base()` + `BacktestConfig.exit_params_for(symbol)`):
+scans `.env` for `TAKE_PROFIT_PCT_<BASE>` / `TRAILING_STOP_PCT_<BASE>` /
+`TRAILING_STOP_ACTIVATION_PCT_<BASE>` (same `_<BASE>` pattern as `MAX_SLOT_CASH_CAD_<BASE>`),
+merges any override over the shared keys. Wired into **both** `bot/main.py` (live — `_ep` per
+per-symbol loop iteration, used by `_ic_tp` / trail computation / dashboard / native-stop
+resync / trail-peak seeding) **and** `engine_kwargs_from_cfg(cfg, symbol=)` (validation), so a
+symbol's live exits always match its walk-forward.
+
+**Config decided:** `TAKE_PROFIT_PCT_BTC=0.20`. Chosen over TP15 / TP-off / 8%-trailing:
+- TP20 beats the flat TP10 in **both** walk-forward windows — BTC/USDT TRAIN PF 1.20→1.37,
+  VALIDATION 2.78→3.41 — and in 5 of 6 rolling windows (tied in the 6th). The TRAIN
+  improvement (older data) is the robustness signal: TP20 isn't just fitting recent trends.
+- TP15 was worse than TP10 in the TRAIN window (1.15 vs 1.20). 8%-trailing was strongest
+  (VAL 3.73) but needs a live SL-priority rework (see below) — deferred.
+- Pinned window (2024-03→2026-06) dips 1.94→1.87 — that window ends right before the recent
+  strong-trend period TP20 is designed for; a sampling artifact, still clears the ≥1.72 floor.
+
+**SOL unchanged** (`TAKE_PROFIT_PCT=0.10` global): every wider-TP / trailing variant made SOL
+worse. SOL walk-forward re-confirmed identical (1.49 / 1.98).
+
+**Also fixed** (found during wiring):
+- `backtest.py` `--stop_loss` / `--take_profit` defaulted to `cfg.backtest.*` and *always*
+  applied via `run_kwargs.update()` → silently clobbered the per-symbol resolution with the
+  shared value. Now `default=None`, only an explicit CLI value overrides.
+- `validate_symbol.py` / `screen_universe.py` built kwargs from the configured symbol then
+  `.update(symbol=<candidate>)` without re-resolving exit params → a screened candidate would
+  inherit BTC's TP. Now pass `engine_kwargs_from_cfg(cfg, symbol=<candidate>)`.
+
+**Deferred — live SL-priority divergence from the backtest** (found, not fixed): the engine
+applies stops as trail(if armed) → ATR → fixed, one only. `bot/main.py`'s `_ic_sl` ORs the
+ATR level with the 1.5% fixed SL, so the tighter one can fire — a pre-existing live/backtest
+mismatch. It doesn't affect the TP20 change (TP is a separate check) but the 8%-trailing
+option needs it fixed first. Its own careful change.
+
+**Strategy hash `b30f2f9e769c8d41` UNCHANGED** (config + main.py exit wiring + validation
+scripts only — no `bot/strategy/` files). New canonical BTC fingerprint: pinned 27 / PF 1.87,
+rolling ~29 / PF ~2.46. Tests +11 (`tests/crypto/test_exit_overrides.py`), suite 864→875.
+**Crypto bot needs a restart** to pick up `TAKE_PROFIT_PCT_BTC=0.20`.

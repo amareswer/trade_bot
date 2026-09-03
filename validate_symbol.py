@@ -166,8 +166,8 @@ def run_backtest_window(candles, window_size: int, symbol: str, timeframe: str) 
     # Full live config (MACD, ATR SL, Mode A/B entry params, everything) —
     # only the per-candidate symbol/timeframe and the pinned strategy_mode
     # are overridden. See module docstring / 2026-07-30 note above.
-    kwargs = engine_kwargs_from_cfg(cfg)
-    kwargs.update(symbol=symbol, timeframe=timeframe, strategy_mode="indicator")
+    kwargs = engine_kwargs_from_cfg(cfg, symbol=symbol)   # resolves exit params for THIS candidate's base
+    kwargs.update(timeframe=timeframe, strategy_mode="indicator")
     result = engine.run(candles=sliced, **kwargs)
 
     m = metrics_mod.compute(result)

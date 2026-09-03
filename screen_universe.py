@@ -204,9 +204,8 @@ def _run_window(candles: list, n: int) -> dict:
     # walkforward.py, and validate_symbol.py was already fixed for on
     # 2026-07-30. Fixed 2026-08-27 after a same-session cross-check showed
     # this script and validate_symbol.py disagreeing on LINK/USD's verdict.
-    kwargs = engine_kwargs_from_cfg(cfg)
+    kwargs = engine_kwargs_from_cfg(cfg, symbol="SCREEN")   # base "SCREEN" has no override → global exit params
     kwargs.update(
-        symbol           = "SCREEN",
         timeframe        = SCREEN_TIMEFRAME,
         fee_pct          = SCREEN_FEE,
         max_drawdown_pct = 0.25,
