@@ -531,6 +531,14 @@ class AIEngine:
                     # any future nvidia model used as a fallback.)
                     max_tokens  = 4096,
                     stream      = False,
+                    # 2026-09-03: nemotron-3.5-lightning (the only NVIDIA model
+                    # still deployed on this account) defaults thinking ON — the
+                    # real scan prompt then burns 30s+ of reasoning tokens and
+                    # blows past _TIMEOUT_S=20 on every call. Disabling thinking
+                    # drops it to ~1.7s and the model emits the JSON verdict
+                    # directly. NVIDIA NIM ignores this key for models that don't
+                    # support it, so it is safe for any future swap.
+                    extra_body  = {"chat_template_kwargs": {"enable_thinking": False}},
                 )
                 # 2026-07-23: completion.choices can come back None/empty (content
                 # filter, empty generation, provider-side hiccup) — subscripting it
