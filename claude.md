@@ -453,9 +453,15 @@ SELL/exits are never blocked.
 PAPER_MAX_EXPOSURE_PCT=1.0         # SET in stock_bot/.env (config.py default 0.25). History 0.25→0.45
                                     # →0.60→0.85 (2026-08-27) →1.0 (2026-08-31, "use all the amount"
                                     # — paper track-record bot, idle cash generates no trades). At
-                                    # PAPER_RISK_PCT=0.20, ~5 full positions = 100% invested. ZERO cash
-                                    # buffer accepted, eyes open. Does NOT apply to the real-money crypto bot.
-PAPER_MAX_POSITIONS=6              # 4→6 (2026-08-31)
+                                    # PAPER_RISK_PCT=0.12 (2026-09-07), ~8 full positions = 100% invested.
+                                    # ZERO cash buffer accepted, eyes open. Does NOT apply to the real-money crypto bot.
+PAPER_RISK_PCT=0.12               # SET in stock_bot/.env (config.py default 0.10). 0.20→0.12 (2026-09-07)
+                                    # — the exposure ceiling × 0.20 saturated the book at ~5 fat positions and
+                                    # blocked weekly rule BUYs on MAX_EXPOSURE; smaller positions → ~8 fit →
+                                    # ~60% more concurrent trades toward the 30-round-trip live gate. Tail risk
+                                    # ~unchanged (8×0.12×5% ≈ 5×0.20×5%). Benefit ramps in ~4wk as fat
+                                    # positions recycle. See project_config_tune_2026-08-30 (auto-memory).
+PAPER_MAX_POSITIONS=10             # 4→6 (2026-08-31) →10 (2026-09-07, so it doesn't re-bind at ~8 positions)
 PAPER_DAILY_LOSS_PCT=0.03          # config.py default. Down >3% from calendar-day open (UTC). Baseline
                                     # (day_open_equity/day_start_iso) persisted + UTC-rolled (unified with
                                     # crypto RiskManager 2026-08-28). Non-sticky, recomputed each call.
@@ -586,9 +592,9 @@ The per-symbol `📐 RULES: BUY/SELL/HOLD` + RSI/ADX/trend/regime line is now
 `print()`-only, no log evidence for "why isn't the bot buying X").
 
 ### Stock bot scan universe + top-movers refresh
-`UNIVERSE_SIZE=30` top-movers scanned per cycle on top of the ~28 `WATCHLIST` symbols (raised
-15→30, 2026-08-27, scan breadth only — the rule criteria + in-distribution screener are
-unchanged, `interval=1d` untouched). Refreshed on the **first LIVE scan cycle of each day**
+`UNIVERSE_SIZE=45` top-movers scanned per cycle on top of the ~28 `WATCHLIST` symbols (raised
+15→30 on 2026-08-27, 30→45 on 2026-09-07, scan breadth only — the rule criteria + in-distribution
+screener are unchanged, `interval=1d` untouched). Refreshed on the **first LIVE scan cycle of each day**
 (2026-08-27 fix — the old `hour==16` gate was unreachable), re-ranked every
 `UNIVERSE_MOVERS_REFRESH_HOURS` (default 2h) during market hours (2026-08-31), persisted to
 `stock_bot/universe_movers.json` (`{date, movers, refreshed_at}`, gitignored) across
@@ -712,8 +718,8 @@ net. Full detail: `CLAUDE_HISTORY.md`, `.memory/decisions/stock-whitelist-gate-r
 1. In-distribution ATR%/liquidity filter (`stock_bot/data/screener.py`) — rejects a
    non-watchlist symbol with ATR% > 3× the reference range (~30.8%) or avg $ volume < $50M/day.
    Rejections visible on the dashboard. Held + watchlist symbols exempt.
-2. Position sizing — flat notional (`PAPER_RISK_PCT=0.20`). ATR-inverse sizing gated behind
-   `PAPER_ATR_SIZING_ENABLED` (still `false` — AMD/KO fail its walk-forward).
+2. Position sizing — flat notional (`PAPER_RISK_PCT=0.12`, was 0.20 until 2026-09-07). ATR-inverse
+   sizing gated behind `PAPER_ATR_SIZING_ENABLED` (still `false` — AMD/KO fail its walk-forward).
 3. Risk-gate tiers (see "Risk-gate config (stock bot)").
 4. Sector-concentration + correlation gates — generic (live yfinance sector lookups, Pearson
    over fetched candles), no hardcoded mapping.
