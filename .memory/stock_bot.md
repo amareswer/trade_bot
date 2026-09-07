@@ -540,3 +540,29 @@ Fixed to mirror the executors' weekly tier + crypto `RiskManager`:
 
 Tests +7 (`test_stock_breaker.py` 14→18, `test_ibkr_executor.py` 62→65). Suite 763→770.
 Strategy hash unchanged (execution-layer only). Full detail: [[known-gaps]] #18.
+
+## Weekly progress monitor + throughput tune (2026-09-07)
+
+**Throughput tune (`stock_bot/.env`):** `PAPER_RISK_PCT` 0.20→0.12, `PAPER_MAX_POSITIONS`
+6→10, `UNIVERSE_SIZE` 30→45. The exposure ceiling (`PAPER_MAX_EXPOSURE_PCT=1.0`) × 0.20 was
+saturating the book at ~5 fat positions so weekly rule BUYs bounced off MAX_EXPOSURE.
+Smaller positions → ~8 fit → ~60% more concurrent trades toward Gate 3. Ramps in ~4 wk as
+the fat positions recycle. Tail risk ~unchanged.
+
+**`stock_bot/analysis/weekly_monitor.py` — report-only weekly check (BUILT + scheduled).**
+Reads live logs/state, no network. Verdict: NEEDS_ATTENTION / EDGE_FAILING / EDGE_WEAK /
+THROUGHPUT_STALLED / EARLY / ON_TRACK. Tracks Gate 3 progress (round-trips/30, net-of-
+commission PF via `paper_report._expectancy_stats`, win, pace), fat-position recycling,
+drawdown/kill-switch, 7-day log scan (faults vs noise, blocked rule-BUYs by gate). Writes
+`logs/weekly_monitor_<date>.md` + `logs/weekly_monitor_state.json` (WoW baseline). `--send`
+→ Telegram via `AlertNotifier.ops_alert`. **Never trades / edits config / commits.**
+Scheduled: `make install-monitor` → launchd `com.tradebot.weeklymonitor`, Mon 17:30 local.
+Logic is in-repo; only the schedule is machine-local (`make install-monitor` after a machine
+move). `deploy/WEEKLY_MONITOR.md`. First-run verdict: EARLY (7/30 round-trips).
+
+**Shared CSV parser fix (same commit 67d01ed):** `paper_report._row_to_trade` is now the
+single row parser for both `paper_report` and `accuracy_tracker` (LiveTradingGate). Recovers
+rows with an unquoted comma in `reason` and coerces numeric fields independently. See
+[[known-gaps]] #21 — a hand-backfilled RY row had been mis-valued as a −$842 loss.
+
+Suite 875→900 (+25). Strategy hash unchanged. Committed 53c107c (doc-sync) + 67d01ed.

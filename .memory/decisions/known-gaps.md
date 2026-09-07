@@ -770,3 +770,33 @@ on a terminal disconnect / journald hiccup during the ~5 min warmup on a VPS.
 independent. +4 tests (`tests/crypto/test_display_broken_pipe.py`). Committed b8deaed.
 **Lesson: don't run the live bot binary as a smoke test — `timeout`-killing it fires a real
 crash alert.**
+
+## 21. Unquoted comma in a hand-backfilled `ibkr_trades.csv` row poisoned the go-live gate — RESOLVED 2026-09-07
+
+**Symptom:** `paper_report` showed the position book at net PF 0.04, expectancy −$124/trade
+over 7 round-trips — wildly worse than the −$31.61 realized P&L. One "round-trip" (RY) valued
+at −$842.20 / −100%.
+
+**Root cause:** the RY SELL row (2026-08-19, hand-backfilled during the flicker-bug incident
+— gap #? / the `Cancelled→Submitted` reconciliation) had a bare comma inside its free-text
+`reason` field: `"... flicker bug, ibkr.py fix ..."`. `csv.reader` over-split the row to 10
+columns. `reason` is the only free-text field and `confidence` is always last, but both
+readers (`paper_report._read_trades`, `accuracy_tracker.ConfidenceBandTracker.load_trades`)
+mapped strictly by index, so `confidence` picked up ` ibkr.py fix 2026-08-19)`. The shared
+`try: float(shares); float(price); int(confidence) except: shares=price=0` then zeroed the
+**valid** price/shares because the confidence parse raised. RY's real +$6.32 became −$842.20,
+feeding both `paper_report` and `LiveTradingGate.check_gate3` (harmless only because gate 3
+is PENDING at n<30 — at n≥30 it would have dragged the live-go-live PF straight through the
+floor).
+
+**Fix:** (1) quoted that one row in `ibkr_trades.csv` (matches what `csv.writer` would emit;
+the executor's own `_record_trade` uses `csv.writer` and quotes correctly — only manual
+backfills are exposed). (2) `paper_report._row_to_trade` is now the **shared** row parser
+(`accuracy_tracker` imports it): when `len(row) > 9` it rejoins the over-split middle as
+`reason`, and it coerces `shares`/`price`/`total_value`/`confidence` **independently** so one
+bad field never zeroes another. +8 tests (`tests/stock/test_trade_csv_parsing.py`). Committed
+67d01ed. Not a `strategy/` file — hash unchanged. Post-fix book: 7 round-trips, net PF 0.62,
+57% win, −$3.11/trade.
+
+**Found by:** building the weekly progress monitor (`stock_bot/analysis/weekly_monitor.py`,
+same commit) — it surfaced the impossible expectancy number on its first run.

@@ -36,4 +36,4 @@ metadata:
 - `stock-bot-stability.md`, `stock-offline-audit-2026-08-20.md` — stock-bot hardening passes
 - `telegram-control.md` — two-way Telegram command poller design + shared-token constraint
 - `expert-practices-benchmark.md` — DSR/CSCV deferral rationale
-- `known-gaps.md` — chronological bug log (20 entries; #19 TSX .TO orders, #20 display BrokenPipeError — both 2026-09-02)
+- `known-gaps.md` — chronological bug log (21 entries; #19 TSX .TO orders, #20 display BrokenPipeError — 2026-09-02; #21 unquoted-comma CSV row poisoned the go-live gate — 2026-09-07)

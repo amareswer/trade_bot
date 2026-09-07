@@ -8,6 +8,42 @@ metadata:
 > **This file is stale below.** Real current state lives in repo `CLAUDE.md` +
 > `CLAUDE_HISTORY.md`. Latest sessions are logged there and in `.memory/decisions/`.
 
+## 2026-09-07 — Stock-bot throughput tune + weekly monitor + a CSV-parser bug
+
+Goal reaffirmed: get the STOCK bot to real IBKR money. Blocker = LiveTradingGate Gate 3
+(30 completed round-trips / net PF ≥ 1.2 / win ≥ 30%), currently ~7/30, ~1 round-trip/week
+→ ~6 months. Calendar time, not code.
+
+- **Throughput tune (`stock_bot/.env`, commit 53c107c is the CLAUDE.md doc-sync; `.env` is
+  gitignored):** `PAPER_RISK_PCT` 0.20 → **0.12**, `PAPER_MAX_POSITIONS` 6 → **10**,
+  `UNIVERSE_SIZE` 30 → **45**. Root cause: `PAPER_MAX_EXPOSURE_PCT=1.0` × 0.20 saturated the
+  book at ~5 fat positions → weekly rule BUYs bounced off MAX_EXPOSURE. Smaller positions →
+  ~8 fit → ~60% more concurrent trades. Tail risk ~unchanged. Benefit ramps in ~4 wk as the
+  5 fat positions recycle. Stock bot restarted 09:09 (PID 35206), clean.
+- **Weekly progress monitor — BUILT + INSTALLED (commit 67d01ed).**
+  `stock_bot/analysis/weekly_monitor.py`, report-only (never trades / edits config /
+  commits). Verdict tiers NEEDS_ATTENTION / EDGE_FAILING / EDGE_WEAK / THROUGHPUT_STALLED /
+  EARLY / ON_TRACK. Tracks Gate 3 progress, net-of-commission PF, pace, fat-position
+  recycling, drawdown/kill-switch, 7-day log scan (faults vs noise, blocked rule-BUYs by
+  gate). `logs/weekly_monitor_<date>.md` + `logs/weekly_monitor_state.json` (WoW baseline).
+  Scheduled via `make install-monitor` → launchd `com.tradebot.weeklymonitor`, **Mon 17:30
+  local, auto `--send` to Telegram**. Logic is in-repo; only the schedule is machine-local
+  (portable — one `make` cmd after a machine move). `deploy/WEEKLY_MONITOR.md`.
+  Current verdict: **EARLY** (7/30, net PF 0.62, 57% win — too small to judge the edge).
+- **BUG FOUND + FIXED (latent since 2026-08-19):** a hand-backfilled RY SELL row in
+  `ibkr_trades.csv` had an unquoted comma in `reason` → csv.reader over-split it → the old
+  per-reader try/except zeroed `price`/`shares` when the shifted `confidence` failed to
+  parse → RY's real +$6.32 round-trip surfaced as a phantom **−$842.20 / −100%** loss in
+  `paper_report` AND `LiveTradingGate.check_gate3` (masked only by gate 3 being PENDING at
+  n<30 — would have poisoned the live-go-live PF at n≥30). Fix: quoted the CSV row +
+  `paper_report._row_to_trade` is now the SHARED parser (accuracy_tracker imports it),
+  rejoins over-split `reason`, coerces each numeric field independently. Post-fix book:
+  7 round-trips, net PF 0.62, −$3.11/trade.
+- Suite **875 → 900** (+25). Strategy hash unchanged (no `bot/strategy/` touch).
+- Open (unchanged): go-live decisions (capital amount / keep-AI-or-pure-rules / ACB timing /
+  US-only); IB Gateway headless deploy (~4h, `deploy/IBKR_GATEWAY_SETUP.md`); VPS migration
+  (user deferred). Crypto side untouched this session.
+
 ## 2026-09-02 — Crypto BUY-gate audit + strategy selectivity check
 
 - **Fear&Greed / external-signal BUY gate REMOVED** (backtested net-negative, 0 live vetoes).
