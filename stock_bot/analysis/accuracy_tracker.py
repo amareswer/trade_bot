@@ -53,6 +53,8 @@ import json
 import os
 from datetime import datetime
 
+from stock_bot.analysis.paper_report import _row_to_trade
+
 # ─────────────────────────────── paths ────────────────────────────────────────
 
 _STOCK_BOT_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -100,8 +102,11 @@ class ConfidenceBandTracker:
 
     def load_trades(self, csv_path: str | None = None) -> list[dict]:
         """
-        Read paper_trades.csv. Returns list of trade dicts.
-        Handles missing confidence column (older trades without it get confidence=0).
+        Read paper_trades.csv / ibkr_trades.csv. Returns list of trade dicts.
+        Handles missing confidence column (older trades without it get confidence=0)
+        and hand-backfilled rows with an unquoted comma in `reason` — see
+        paper_report._row_to_trade (shared so both readers agree; before
+        2026-09-07 a bad row here silently mis-valued a round-trip).
         """
         path = csv_path or _TRADES_CSV
         trades: list[dict] = []
@@ -109,33 +114,10 @@ class ConfidenceBandTracker:
             return trades
 
         with open(path, "r", encoding="utf-8", newline="") as f:
-            reader = csv.reader(f)
-            for row in reader:
-                if not row:
-                    continue
-                # Skip header row if present
-                if row[0].strip().lower() == "timestamp":
-                    continue
-                # Skip rows that don't look like timestamps
-                try:
-                    datetime.strptime(row[0].strip()[:19], "%Y-%m-%d %H:%M:%S")
-                except (ValueError, IndexError):
-                    continue
-
-                row_dict: dict = {}
-                for i, col in enumerate(_COLS):
-                    row_dict[col] = row[i].strip() if i < len(row) else ""
-
-                try:
-                    row_dict["shares"]     = float(row_dict["shares"])     if row_dict["shares"]     else 0.0
-                    row_dict["price"]      = float(row_dict["price"])      if row_dict["price"]      else 0.0
-                    row_dict["confidence"] = int(float(row_dict["confidence"])) if row_dict["confidence"] else 0
-                except (ValueError, TypeError):
-                    row_dict["shares"]     = 0.0
-                    row_dict["price"]      = 0.0
-                    row_dict["confidence"] = 0
-
-                trades.append(row_dict)
+            for raw in csv.reader(f):
+                t = _row_to_trade(raw)
+                if t is not None:
+                    trades.append(t)
 
         return trades
 

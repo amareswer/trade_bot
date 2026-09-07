@@ -25,35 +25,65 @@ _COLS = [
 ]
 
 
+def _row_to_trade(raw: list[str]) -> dict | None:
+    """One raw CSV row → a trade dict, or None if it isn't a data row.
+
+    Tolerant of the one way these CSVs get corrupted: a hand-backfilled row
+    with an UNQUOTED comma inside the free-text `reason` field, which
+    csv.reader over-splits into >9 columns (the normal executor path uses
+    csv.writer and quotes correctly). `reason` is the only free-text field and
+    `confidence` is always last, so columns 0-6 stay aligned and the split
+    middle is rejoined.
+
+    Each numeric field is also coerced independently — a bad `confidence`
+    must never zero a valid `price`/`shares`. The old shared try/except did
+    exactly that, turning RY's real +$6 round-trip into a phantom -$842 loss
+    that poisoned paper_report and LiveTradingGate Gate 3 (found 2026-09-07).
+    """
+    if not raw:
+        return None
+    if raw[0].strip().lower() == "timestamp":
+        return None
+    try:
+        datetime.strptime(raw[0].strip()[:19], "%Y-%m-%d %H:%M:%S")
+    except (ValueError, IndexError):
+        return None
+
+    row = list(raw)
+    n = len(_COLS)
+    if len(row) > n:
+        # over-split `reason`: cols 0..n-3 fixed, confidence last, reason = rest
+        row = row[: n - 2] + [",".join(row[n - 2 : -1]), row[-1]]
+
+    d: dict = {}
+    for i, col in enumerate(_COLS):
+        d[col] = row[i].strip() if i < len(row) else ""
+
+    def _num(key: str) -> float:
+        try:
+            return float(d[key]) if d[key] else 0.0
+        except (ValueError, TypeError):
+            return 0.0
+
+    d["shares"]      = _num("shares")
+    d["price"]       = _num("price")
+    d["total_value"] = _num("total_value")
+    try:
+        d["confidence"] = int(float(d["confidence"])) if d["confidence"] else 0
+    except (ValueError, TypeError):
+        d["confidence"] = 0
+    return d
+
+
 def _read_trades(csv_path: str) -> list[dict]:
     trades: list[dict] = []
     if not os.path.exists(csv_path):
         return trades
     with open(csv_path, "r", encoding="utf-8", newline="") as f:
-        reader = csv.reader(f)
-        for row in reader:
-            if not row:
-                continue
-            if row[0].strip().lower() == "timestamp":
-                continue
-            try:
-                datetime.strptime(row[0].strip()[:19], "%Y-%m-%d %H:%M:%S")
-            except (ValueError, IndexError):
-                continue
-            d: dict = {}
-            for i, col in enumerate(_COLS):
-                d[col] = row[i].strip() if i < len(row) else ""
-            try:
-                d["shares"]     = float(d["shares"])     if d["shares"]     else 0.0
-                d["price"]      = float(d["price"])      if d["price"]      else 0.0
-                d["total_value"] = float(d["total_value"]) if d["total_value"] else 0.0
-                d["confidence"] = int(float(d["confidence"])) if d["confidence"] else 0
-            except (ValueError, TypeError):
-                d["shares"]     = 0.0
-                d["price"]      = 0.0
-                d["total_value"] = 0.0
-                d["confidence"] = 0
-            trades.append(d)
+        for raw in csv.reader(f):
+            t = _row_to_trade(raw)
+            if t is not None:
+                trades.append(t)
     return trades
 
 

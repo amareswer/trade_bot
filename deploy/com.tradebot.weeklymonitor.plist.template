@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd job for the weekly stock-bot progress monitor.
+
+  This is a TEMPLATE. `make install-monitor` substitutes __REPO__ with the
+  absolute repo path and installs the result to
+  ~/Library/LaunchAgents/com.tradebot.weeklymonitor.plist.
+
+  Schedule: Monday 17:30 local time (after the US market close). launchd runs
+  a missed job at next wake if the Mac was asleep at the scheduled time.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tradebot.weeklymonitor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__REPO__/scripts/weekly_monitor.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>17</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <key>StandardOutPath</key>
+    <string>__REPO__/logs/weekly_monitor_launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO__/logs/weekly_monitor_launchd.err</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

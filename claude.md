@@ -175,14 +175,14 @@ narrative behind any decision below, and `.memory/decisions/*.md` for the deepes
 
 ## Test Suite Manifest
 
-**Expected total: 875 tests** (`pytest --collect-only -q`). If the count disagrees: a file
+**Expected total: 900 tests** (`pytest --collect-only -q`). If the count disagrees: a file
 has an import error, was deleted, was added without a manifest bump, or was excluded from the
 runner — investigate before trusting a green suite. Suite runtime ~9–26s; minutes means a
 test is reading live `.env` config. The per-row table sum below lags the header total by ~22
 (pre-existing row-vs-total drift; `--collect-only` and this header agree). Full count-delta
 history: `CLAUDE_HISTORY.md` → "CLAUDE.md trim, 2026-09-01" → "count-delta history".
 
-Run: `python -m pytest --tb=short -q` — must show **875 passed**.
+Run: `python -m pytest --tb=short -q` — must show **900 passed**.
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -211,7 +211,7 @@ Run: `python -m pytest --tb=short -q` — must show **875 passed**.
 | `tests/crypto/test_universe.py` | 4 | Universe screener: scoring, momentum filter, fallback |
 | `tests/crypto/test_main_strategy.py` | 2 | Strategy builder: full config wiring |
 | `tests/stock/test_fast_validator_exits.py` | 6 | FastValidator exits: MAX_HOLD live-price fallback, corruption guard, SL regression |
-| `tests/stock/test_paper_report.py` | 10 | Expectancy math: IBKR commission model, net-of-cost flip, merged paper+IBKR book, IBKR account section, live-cash-snapshot precedence |
+| `tests/stock/test_paper_report.py` | 10 | Expectancy math: IBKR commission model, net-of-cost flip, merged paper+IBKR book, IBKR account section, live-cash-snapshot precedence (row parsing is now `_row_to_trade`, tested separately) |
 | `tests/stock/test_exit_policy.py` | 11 | Stock asymmetric exit bars: single-verdict exit, 2-strike SELL streak, streak resets, AC.TO incident regression |
 | `tests/stock/test_stock_backtest_engine.py` | 14 | Stock backtest engine: next-open fills, intra-candle SL/TP, gap handling, slippage/commission math, walk-forward gating, optional ATR(14)×mult stop mode |
 | `tests/stock/test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last, determinism, validated-parameter pin |
@@ -261,6 +261,8 @@ Run: `python -m pytest --tb=short -q` — must show **875 passed**.
 | `tests/crypto/test_mtf_gate_alert.py` | 2 | Source guards: MTF (1D BEARISH) veto fires **MTF GATE BYPASSED** alert only in the no-cached-closes branch |
 | `tests/crypto/test_blocked_buy_alert.py` | 7 | `_evaluate_blocked_buy_alert`: edge-triggered on (symbol, gate), no re-alert while blocked, re-alert on gate change, clears when raw signal stops being BUY, source guard |
 | `tests/stock/test_blocked_rule_buys_alert.py` | 10 | `_evaluate_blocked_rule_buys_alert`: end-of-cycle debounced digest, edge-triggered on the `{symbol: gate}` mapping, `_BLOCKED_BUY_ABSENT_CYCLES_TO_CLEAR=3` debounce, all-clear message, source guard |
+| `tests/stock/test_trade_csv_parsing.py` | 8 | `paper_report._row_to_trade` (shared by `accuracy_tracker.load_trades`): clean row, header/junk reject, **unquoted-comma-in-`reason` recovery** (>9 cols → rejoin), bad `confidence` never zeroes `price`/`shares` (2026-09-07 RY phantom -$842 regression), missing-confidence default, end-to-end RY round-trip = +$6.32 |
+| `tests/stock/test_weekly_monitor.py` | 17 | `stock_bot/analysis/weekly_monitor.py` (report-only): verdict tiers (EARLY/EDGE_FAILING/EDGE_WEAK/THROUGHPUT_STALLED/NEEDS_ATTENTION/ON_TRACK), EARLY suppresses stalled, throughput needs a prior run, severity ordering, log-scan fault-vs-noise bucketing + time window, render sections, `run()` writes report + baseline, `--quiet` suppresses ON_TRACK, `main()` exit code on fault |
 
 ---
 
@@ -526,6 +528,31 @@ Fetch failure fails open. Full BUY block market-wide, not a sizing dial.
   EARNINGS_BLACKOUT, REGIME_SKIP, VIX_CRISIS, MAX_EXPOSURE/MAX_POSITIONS, CORRELATION,
   SIZE_SKIP). Edge-triggered on the `{symbol: gate}` mapping;
   `_BLOCKED_BUY_ABSENT_CYCLES_TO_CLEAR=3` debounce so a symbol flapping near a gate alerts once.
+
+### Weekly stock-bot progress monitor (BUILT 2026-09-07)
+`stock_bot/analysis/weekly_monitor.py` — report-only. Once a week, reads the live
+logs/state (no network, no TWS) and returns one verdict: `NEEDS_ATTENTION` /
+`EDGE_FAILING` / `EDGE_WEAK` / `THROUGHPUT_STALLED` / `EARLY` / `ON_TRACK`. Tracks
+Gate 3 progress (round-trips vs 30, net-of-commission PF, win rate, pace), whether the
+2026-09-07 sizing change is recycling the fat positions, drawdown/kill-switch, and a
+7-day log scan (faults vs noise, blocked rule-BUYs by gate). Writes
+`logs/weekly_monitor_<date>.md` + `logs/weekly_monitor_state.json` (week-over-week
+baseline); `--send` relays a summary via the stock `AlertNotifier.ops_alert` (Telegram).
+**It never trades, edits config, or commits** — strategy/whitelist/capital stay
+human-gated. Schedule: `make install-monitor` (launchd, Mon 17:30 local) — logic is in
+the repo, only the schedule is machine-local (one command to re-install after a machine
+move). Full doc: `deploy/WEEKLY_MONITOR.md`.
+
+**CSV parser fix, same change:** `paper_report._row_to_trade` is now the shared
+trade-CSV row parser (used by `accuracy_tracker.load_trades` too). A hand-backfilled
+RY SELL row in `ibkr_trades.csv` had an unquoted comma inside `reason`, over-splitting
+it to 10 columns; the old per-reader try/except then zeroed `price`/`shares` when the
+shifted `confidence` failed to parse — turning RY's real +$6.32 round-trip into a
+phantom −$842.20 / −100% loss feeding `paper_report` and `LiveTradingGate.check_gate3`
+(masked only because gate 3 is still PENDING at n<30). Fixed: the row is quoted in the
+CSV, and `_row_to_trade` rejoins over-split `reason` + coerces each numeric field
+independently. Post-fix book: 7 round-trips, net PF 0.62, −$3.11/trade (was showing
+0.04 / −$124).
 
 ### Settlement date + FX-rate tax record-keeping (stock bot)
 `paper_trades.csv` / `ibkr_trades.csv` are UNCHANGED (9-column schema frozen). New data goes
