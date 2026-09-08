@@ -175,14 +175,14 @@ narrative behind any decision below, and `.memory/decisions/*.md` for the deepes
 
 ## Test Suite Manifest
 
-**Expected total: 900 tests** (`pytest --collect-only -q`). If the count disagrees: a file
+**Expected total: 906 tests** (`pytest --collect-only -q`). If the count disagrees: a file
 has an import error, was deleted, was added without a manifest bump, or was excluded from the
 runner — investigate before trusting a green suite. Suite runtime ~9–26s; minutes means a
 test is reading live `.env` config. The per-row table sum below lags the header total by ~22
 (pre-existing row-vs-total drift; `--collect-only` and this header agree). Full count-delta
 history: `CLAUDE_HISTORY.md` → "CLAUDE.md trim, 2026-09-01" → "count-delta history".
 
-Run: `python -m pytest --tb=short -q` — must show **900 passed**.
+Run: `python -m pytest --tb=short -q` — must show **906 passed**.
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -260,6 +260,7 @@ Run: `python -m pytest --tb=short -q` — must show **900 passed**.
 | `tests/stock/test_universe_refresh.py` | 28 | Top-movers universe refresh: `_load/_persist_movers` round-trip, source guards (first-LIVE-cycle-of-day trigger, transient-failure protection), `_prune_dead_movers` (None or <26 candles for 3 cycles), intraday re-rank cadence (`_MOVERS_REFRESH_INTERVAL_S`, `refreshed_at` persistence) |
 | `tests/crypto/test_mtf_gate_alert.py` | 2 | Source guards: MTF (1D BEARISH) veto fires **MTF GATE BYPASSED** alert only in the no-cached-closes branch |
 | `tests/crypto/test_blocked_buy_alert.py` | 7 | `_evaluate_blocked_buy_alert`: edge-triggered on (symbol, gate), no re-alert while blocked, re-alert on gate change, clears when raw signal stops being BUY, source guard |
+| `tests/crypto/test_buy_signal_alert.py` | 6 | `_evaluate_buy_signal_alert`: edge-triggered Telegram heads-up the moment the raw strategy signal turns BUY (before gates/execution), no re-alert while BUY, resets + re-alerts on a fresh BUY episode, missing-price clause, wired into `run()` ahead of the blocked-BUY alert |
 | `tests/stock/test_blocked_rule_buys_alert.py` | 10 | `_evaluate_blocked_rule_buys_alert`: end-of-cycle debounced digest, edge-triggered on the `{symbol: gate}` mapping, `_BLOCKED_BUY_ABSENT_CYCLES_TO_CLEAR=3` debounce, all-clear message, source guard |
 | `tests/stock/test_trade_csv_parsing.py` | 8 | `paper_report._row_to_trade` (shared by `accuracy_tracker.load_trades`): clean row, header/junk reject, **unquoted-comma-in-`reason` recovery** (>9 cols → rejoin), bad `confidence` never zeroes `price`/`shares` (2026-09-07 RY phantom -$842 regression), missing-confidence default, end-to-end RY round-trip = +$6.32 |
 | `tests/stock/test_weekly_monitor.py` | 17 | `stock_bot/analysis/weekly_monitor.py` (report-only): verdict tiers (EARLY/EDGE_FAILING/EDGE_WEAK/THROUGHPUT_STALLED/NEEDS_ATTENTION/ON_TRACK), EARLY suppresses stalled, throughput needs a prior run, severity ordering, log-scan fault-vs-noise bucketing + time window, render sections, `run()` writes report + baseline, `--quiet` suppresses ON_TRACK, `main()` exit code on fault |
@@ -523,6 +524,12 @@ Fetch failure fails open. Full BUY block market-wide, not a sizing dial.
   correlation/candle_watchdog/mtf_trend/regime) holds it. One per fresh
   (symbol, gate). Not persisted. Called from `run()` section-7b after the CSV write.
   (`external_signal` label retired 2026-09-02 with the Fear&Greed gate.)
+- **Crypto BUY-signal heads-up (2026-09-07):** `bot.main._evaluate_buy_signal_alert(ss, sym,
+  raw_signal_was_buy, price, alerter)` — edge-triggered `alerter.message()` "🔔 BUY signal [sym]"
+  fired at raw-strategy-signal time, *before* gates/execution, so a BUY is announced even during
+  a limit-chase or an "already holding" filter. One per fresh BUY episode (resets when the raw
+  signal stops being BUY). Called from `run()` section-2b (ahead of the blocked-BUY alert); the
+  fill alert / blocked-BUY alert then report the outcome.
 - **Stock (2026-08-27):** `stock_bot.main._evaluate_blocked_rule_buys_alert` — end-of-cycle
   debounced `ops_alert` digest listing every symbol whose rule BUY a gate held (MACRO/
   EARNINGS_BLACKOUT, REGIME_SKIP, VIX_CRISIS, MAX_EXPOSURE/MAX_POSITIONS, CORRELATION,

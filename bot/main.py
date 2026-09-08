@@ -747,6 +747,32 @@ _BUY_BLOCK_REASONS = {
 }
 
 
+def _evaluate_buy_signal_alert(
+    ss: dict, sym: str, raw_signal_was_buy: bool, price: float, alerter,
+) -> None:
+    """Edge-triggered Telegram heads-up the moment the strategy signals BUY.
+
+    Fires ONE alerter.message() when the raw strategy signal first turns BUY
+    for this symbol — before any gate or execution. The existing fill alert
+    (BUY executed) or blocked-BUY alert (a gate held it) then reports the
+    outcome. Resets ss['last_buy_signal_alerted'] as soon as the raw signal is
+    no longer BUY, so the next fresh BUY episode re-alerts. Not persisted —
+    resets on restart like the other per-process edge flags.
+    """
+    if not raw_signal_was_buy:
+        ss['last_buy_signal_alerted'] = False
+        return
+    if ss.get('last_buy_signal_alerted'):
+        return
+    ss['last_buy_signal_alerted'] = True
+    alerter.message(
+        f"🔔 BUY signal [{sym}] — the strategy wants to enter"
+        + (f" near ${price:,.2f}" if price else "")
+        + ". Checking risk gates / placing the order; a fill or blocked-BUY "
+        "alert follows with the outcome."
+    )
+
+
 def _evaluate_blocked_buy_alert(
     ss: dict, sym: str, raw_signal_was_buy: bool, block_gate: str, alerter,
 ) -> None:
@@ -1472,6 +1498,7 @@ def run():
                 # the raw signal is no longer BUY. Not persisted — resets on
                 # restart (same as the other per-process flags above).
                 'last_buy_block_alert': "",
+                'last_buy_signal_alerted': False,  # edge-trigger for the raw-BUY-signal heads-up alert
                 'exit_fail_count': 0,   # consecutive failed urgent SL/TP exits (edge-alert)
             }
             logger.info("Symbol ready: %s", sym)
@@ -1517,6 +1544,7 @@ def run():
             'dash_filter':      "",
             'dash_block':       "",
             'last_buy_block_alert': "",   # edge-trigger for the blocked-BUY alert
+            'last_buy_signal_alerted': False,  # edge-trigger for the raw-BUY-signal heads-up alert
             'exit_fail_count': 0,         # consecutive failed urgent SL/TP exits (edge-alert)
         }
 
@@ -2301,6 +2329,16 @@ def run():
                     f"  EMA_spread={_spread:.3f}%"
                     f"  signal={_sig_str}",
                     flush=True
+                )
+
+                # Heads-up Telegram alert the moment the raw strategy signal
+                # turns BUY — before gates / execution. Edge-triggered per
+                # symbol; the fill or blocked-BUY alert reports the outcome.
+                _evaluate_buy_signal_alert(
+                    ss, sym,
+                    raw_signal_was_buy=(raw_signal == Signal.BUY),
+                    price=price,
+                    alerter=alerter,
                 )
 
             # ── Blocked-gate tracking (initialise per-candle) ─────────
