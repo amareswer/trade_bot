@@ -777,3 +777,35 @@ and liquidity-clean**; the two remaining gates (capital + FX build) are BOTH con
 deposit decision. **When the user decides to fund a USD symbol, the FX build is the immediate
 next task** — nothing else about these two symbols needs work. No `.env`/`UNIVERSE_WHITELIST`
 change.
+
+---
+
+## Addendum 2026-09-09 — wide USD screen + deep WF: NO alt has a real edge; expansion closed
+
+Trigger: user frustrated crypto never fires (BTC/CAD 0 fills ~85d). Screened the whole
+tradeable universe on current strategy hash `b30f2f9e769c8d41`.
+
+- **CAD:** only 2 Kraken CAD pairs beyond BTC/SOL/ETH/XRP/DOGE, 0 clear liquidity. Dead end.
+- **XRP/CAD** re-validated 3rd time — still BLOCKED (5000c PF 0.99 / 3000c 0.60). Liquidity
+  now *passes* (spread 0.005%); pure edge failure. Stop re-checking without a new strategy.
+- **Individually checked & out:** USDC/USDT (stablecoins, untradeable), ZEC/USD (PF 1.05),
+  XLM/USD (0.94/0.92), BNB/USD (fails thin recent window), XMR (delisted from Binance+OKX,
+  4mo Kraken history only — cannot validate, delisting risk), DOGE/USD (passes 2 windows
+  PF 1.48/1.38 but near-zero net return — DOGE/USD *does* fix the old DOGE/CAD liquidity block).
+- **Top-50 USD screen → 7 screen-passes:** NEAR, PUMP, ENA, ARB, UNI, MINA, ONDO.
+- **Deep train/val WF on the 7:** ENA 1.31/1.35 (−0.22%), NEAR 0.98/1.64 (+0.07%), ARB
+  2.35/1.50 degrades (−0.20%), UNI 1.19/1.35 (−0.47%), MINA 1.17/1.28 (−0.76%); PUMP + ONDO
+  have no training period (history too short). **Every one: PF>1 but flat-to-negative
+  net-of-fee OOS return.** vs BTC/USDT VAL PF 3.41 / SOL 1.98 — a different tier.
+
+**Decision: crypto expansion CLOSED.** The strategy's edge is BTC + SOL, full stop (4th
+investigation, same result — CAD screen, prior USD screens, Aug strategy search, this).
+**USD re-base NOT worth doing** absent new coins: CAD markets are liquid enough at these
+sizes (BTC/CAD spread 0.000%, SOL/CAD 0.007% — tighter than SOL/USD), and BTC/SOL never
+needed a USD move to validate (always on /USDT proxy). The re-base would only add USD/CAD FX
+exposure to a CAD-base account.
+
+**SYN/USD + PUMP/USD "validation-complete candidate" framing above and in CLAUDE.md's USD
+Expansion section is now SUPERSEDED** — PUMP fails the deep WF (history), and the bar going
+forward is PF ~1.4 **with positive OOS net return**, not the screen's PF≥1.2. Don't re-propose
+USD alts below that bar. Reports: `logs/screen_results_usd_20260910.md`.
