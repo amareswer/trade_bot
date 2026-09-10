@@ -54,3 +54,35 @@ stock mean-reversion run was that in action — a chance false positive, correct
 - Tests: `tests/crypto/test_mean_reversion_experiment.py` (20),
   `tests/stock/test_stock_mean_reversion_experiment.py` (20),
   `tests/stock/test_stock_momentum_experiment.py` (14) — all hermetic, no `*/strategy/*` touched.
+
+---
+
+## Addendum 2026-09-10 — 4th candidate: Donchian breakout (crypto). FAILED. Search still concluded.
+
+User asked to try one more after an exhaustive crypto-universe screen came up empty.
+`breakout_experiment.py` (new hermetic research script, pre-registered params, strategy hash
+untouched): Donchian(20-bar entry / 10-bar trailing exit) + EMA(200) macro filter +
+ADX(14)≥20, 2×ATR hard stop, **no fixed take-profit** (let the trailing stop decide) —
+long-only, 0.8%/side fee, BTC/SOL primary + ETH/NEAR/ENA secondary.
+
+**Result — the worst BTC/SOL result of any strategy tested:**
+- BTC/USDT: 5000c PF 0.70, 3000c 0.43; OOS split TRAIN PF 1.22 (+6.6%) → **VALIDATION PF
+  0.52 (−34%)** — textbook curve-fit collapse. Win rate 17–23% (failed breakouts stopped out).
+- SOL/USDT: 5000c PF 0.61, 3000c 0.61; **VALIDATION PF 0.52 (−53%)**.
+- ETH 0.76 / NEAR 0.77–0.87 — all fail.
+- ENA: OOS PF 1.41 (+60%) — the multiple-testing false positive (27% win rate, one young
+  hyper-volatile coin riding a historical mega-trend; not repeatable edge).
+
+Breakout whipsaws hardest in exactly the ranging regime BTC has been stuck in — the low
+prior was right. **Strategy search: now 5 shapes tested (live pullback + mean-reversion +
+grid/DCA + cross-sectional momentum + breakout), 4 failed. Concluded, firmly.**
+
+Same session also closed the surrounding questions: moving Kraken CAD→USD changes nothing
+(fees are volume/holdings-based, not currency); no cheaper platform is available to a
+Canadian retail account (NDAX spreads 0.4–0.5% on majors negate its low headline fee;
+Binance/KuCoin/OKX are not legal in Canada; Coinbase/Gemini ≥ Kraken). The only real lever
+left is the account growing to ~$10k → Kraken's holdings tier auto-cuts the taker fee
+0.80%→0.38%. Full trail: `.memory/decisions/multi-symbol-validation.md` (2026-09-09
+addendum) + auto-memory `project_crypto_usd_expansion_closed_2026-09-09`. Report:
+`logs/breakout_experiment_20260910.md`. New file: `breakout_experiment.py` (no tests yet —
+negative result; add the hermetic-test suite if it's ever kept as standing tooling).
