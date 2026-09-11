@@ -45,6 +45,19 @@ first, then this fix pass):
            corrected from "Swing paper (daily)" (stale — this reads the
            active Mode A/B position book, not the retired swing book).
   Gate 4 — unchanged (infrastructure importability smoke check).
+
+Gate 2 — SKIPPED when AI is disabled (2026-09-10): AI_ENABLED=false
+(stock_bot/.env, set 2026-09-09 after mistral hit sustained 429s and the
+nvidia failover started timing out) means MED/HIGH-confidence AI trades can
+never accumulate again — Gate 2 would sit PENDING forever, permanently
+code-blocking IBKR go-live on a gate the user had already accepted dropping
+for a pure-rules bot (CLAUDE.md "Standing Policies" / go-live plan memory).
+check_gate2() now reports status SKIPPED (not PENDING) when cfg.ai_enabled is
+False, and SKIPPED counts as resolved everywhere a gate's PASS/remaining
+status is computed (get_gate_status(), print_gate_status(), and the
+IBKRExecutor enforcement check). Re-enabling AI (a proven-reliable or paid
+provider) makes Gate 2 live again automatically — no code change needed to
+revert.
 """
 from __future__ import annotations
 
@@ -302,7 +315,13 @@ _STATUS_DISPLAY = {
     "FAIL":    "FAIL    ✗",
     "PENDING": "PENDING  ",
     "NOT_RUN": "NOT_RUN  ",
+    "SKIPPED": "SKIPPED ~",
 }
+
+# Statuses that do not block go-live / do not count toward "gates remaining".
+# PASS = the gate was checked and cleared. SKIPPED = the gate is not
+# applicable right now (AI disabled) — not a readiness signal either way.
+_RESOLVED_STATUSES = ("PASS", "SKIPPED")
 
 
 def _fmt_pf(pf: float) -> str:
@@ -418,7 +437,26 @@ class LiveTradingGate:
         since 2026-07-22). Mirrors ConfidenceBandTracker.recommendation()'s
         own MED/HIGH-band threshold (structured here instead of parsing its
         return string, so this gate stays testable independent of that
-        method's exact wording)."""
+        method's exact wording).
+
+        Returns SKIPPED (not PENDING) when AI_ENABLED=false — a pure-rules
+        bot can never accumulate AI-confidence trades, so PENDING would mean
+        "forever blocked" rather than "needs more data". See module
+        docstring, "Gate 2 — SKIPPED when AI is disabled"."""
+        try:
+            from stock_bot.config import load as _load_stock_config
+            ai_enabled = _load_stock_config().ai_enabled
+        except Exception:
+            ai_enabled = True  # fail toward the stricter (enforced) behavior
+
+        if not ai_enabled:
+            return {
+                "status": "SKIPPED",
+                "detail": "AI_ENABLED=false — pure-rules bot, AI confidence-band edge not applicable",
+                "trades": 0,
+                "win_pct": 0.0,
+            }
+
         tracker = ConfidenceBandTracker()
         trades  = tracker.load_trades() + tracker.load_trades(_IBKR_CSV)
         trades.sort(key=lambda t: t.get("timestamp", ""))
@@ -545,7 +583,7 @@ class LiveTradingGate:
     def get_gate_status(self) -> dict:
         """Return structured gate data for dashboard rendering."""
         gates     = self.evaluate()
-        remaining = sum(1 for g in gates if g["status"] != "PASS")
+        remaining = sum(1 for g in gates if g["status"] not in _RESOLVED_STATUSES)
         return {
             "gates":      gates,
             "remaining":  remaining,
@@ -601,7 +639,7 @@ def print_gate_status() -> None:
 
     print(f"  {thin}")
 
-    remaining = sum(1 for r in results if r["status"] != "PASS")
+    remaining = sum(1 for r in results if r["status"] not in _RESOLVED_STATUSES)
     if remaining == 0:
         verdict = "LIVE TRADING: READY"
     else:

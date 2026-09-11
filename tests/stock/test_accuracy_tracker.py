@@ -39,6 +39,10 @@ def _isolate_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(at_mod, "_IBKR_CSV", str(tmp_path / "ibkr_trades.csv"))
     monkeypatch.setattr(at_mod, "_LATEST_BACKTEST_JSON", str(tmp_path / "stock_backtest_latest.json"))
     monkeypatch.setenv("RULE_WHITELIST", _WHITELIST)
+    # Gate 2 reads cfg.ai_enabled (2026-09-10) — pin it True so these tests
+    # exercise the real trade-counting logic regardless of the actual
+    # stock_bot/.env AI_ENABLED value. Dedicated SKIPPED tests override this.
+    monkeypatch.setenv("AI_ENABLED", "true")
     yield
 
 
@@ -198,6 +202,42 @@ def test_gate2_reads_active_book_not_retired_fast_book():
     this file at all — confirms Gate 2 was actually repurposed, not just
     relabeled."""
     assert not hasattr(at_mod, "_FAST_TRADES_CSV")
+
+
+# ---------------------------------------------------------------------------
+# Gate 2 — SKIPPED when AI is disabled (2026-09-10)
+# ---------------------------------------------------------------------------
+
+def test_gate2_skipped_when_ai_disabled(monkeypatch):
+    """AI_ENABLED=false must report SKIPPED, not PENDING — a pure-rules bot
+    can never accumulate AI-confidence trades, so PENDING would mean
+    'permanently blocked' rather than 'needs more data'. Even plenty of
+    passing trade history must not override this."""
+    monkeypatch.setenv("AI_ENABLED", "false")
+    _write_round_trips(at_mod._TRADES_CSV, _trips(6, 4, confidence=85))   # would PASS if AI were on
+    result = LiveTradingGate().check_gate2()
+    assert result["status"] == "SKIPPED"
+    assert result["trades"] == 0
+
+
+def test_gate2_skipped_counts_as_resolved_in_gate_status(monkeypatch):
+    """get_gate_status()'s remaining/ready must treat SKIPPED like PASS —
+    otherwise a pure-rules bot could never reach LIVE TRADING: READY."""
+    monkeypatch.setenv("AI_ENABLED", "false")
+    _write_json(at_mod._LATEST_BACKTEST_JSON, [_sym_result(s, "PASS") for s in _WHITELIST.split(",")])
+    _write_round_trips(
+        at_mod._TRADES_CSV,
+        _trips(25, 5, confidence=85),   # 30 round-trips, PF/win comfortably clear Gate 3
+    )
+    status = LiveTradingGate().get_gate_status()
+    gate2  = next(g for g in status["gates"] if g["gate"] == 2)
+    assert gate2["status"] == "SKIPPED"
+    # Gate 4 depends on real imports (not mocked here) so only assert on the
+    # three enforced gates rather than the full-readiness flag.
+    assert status["remaining"] <= 1
+    for g in status["gates"]:
+        if g["gate"] in (1, 2, 3):
+            assert g["status"] in ("PASS", "SKIPPED")
 
 
 # ---------------------------------------------------------------------------

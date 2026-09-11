@@ -249,6 +249,20 @@ def test_live_port_allowed_even_when_gate4_fails(executors):
     assert ex is not None
 
 
+def test_live_port_allowed_when_gate2_skipped(executors):
+    """Gate 2 SKIPPED (AI_ENABLED=false — 2026-09-10) must clear like PASS,
+    not block like PENDING/FAIL: a pure-rules bot can never accumulate
+    AI-confidence trades, so treating SKIPPED as blocking would make go-live
+    permanently impossible."""
+    fake  = FakeIB(accounts=("U26459664",))
+    gates = _all_gates_pass()
+    gates[1] = _gate(2, "AI confidence-band edge", "SKIPPED", "AI_ENABLED=false — pure-rules bot")
+    with patch.object(ibkr_mod.LiveTradingGate, "evaluate", return_value=gates):
+        ex = make_executor(fake, port=7496, allow_live=True)
+    executors.append(ex)
+    assert ex is not None
+
+
 def test_live_port_blocked_when_gate2_fails():
     gates = _all_gates_pass()
     gates[1] = _gate(2, "AI confidence-band edge", "FAIL", "4 round-trips 40.0% win rate (need 55%)")

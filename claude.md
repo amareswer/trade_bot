@@ -175,7 +175,7 @@ narrative behind any decision below, and `.memory/decisions/*.md` for the deepes
 
 ## Test Suite Manifest
 
-**Expected total: 906 tests** (`pytest --collect-only -q`). If the count disagrees: a file
+**Expected total: 909 tests** (`pytest --collect-only -q`). If the count disagrees: a file
 has an import error, was deleted, was added without a manifest bump, or was excluded from the
 runner — investigate before trusting a green suite. Suite runtime ~9–26s; minutes means a
 test is reading live `.env` config. The per-row table sum below lags the header total by ~22
@@ -217,10 +217,10 @@ Run: `python -m pytest --tb=short -q` — must show **906 passed**.
 | `tests/stock/test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last, determinism, validated-parameter pin |
 | `tests/crypto/test_audit_scheduler.py` | 14 | REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, monthly 1st-anchored re-screen, missed-run catch-up |
 | `tests/crypto/test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
-| `tests/stock/test_ibkr_executor.py` | 66 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping, broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe, FX/margin-minimum guard (**checks NET-LIQ, not free cash** — 2026-08-31 fix), sector-concentration gate, weekly/drawdown-halt/kill-switch tiers, per-position ATR stop-pct override, projected-exposure check, LiveTradingGate enforcement, TWS-query resilience (last-good cache), `ibkr_trades.csv` write buffer/retry, Error 10349 slow-resubmit fill (20s grace + `tif="DAY"`), daily-loss calendar-day anchoring |
+| `tests/stock/test_ibkr_executor.py` | 67 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping, broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe, FX/margin-minimum guard (**checks NET-LIQ, not free cash** — 2026-08-31 fix), sector-concentration gate, weekly/drawdown-halt/kill-switch tiers, per-position ATR stop-pct override, projected-exposure check, LiveTradingGate enforcement (incl. Gate 2 SKIPPED-when-AI-disabled bypass, 2026-09-10), TWS-query resilience (last-good cache), `ibkr_trades.csv` write buffer/retry, Error 10349 slow-resubmit fill (20s grace + `tif="DAY"`), daily-loss calendar-day anchoring |
 | `tests/stock/test_fx_sizing.py` | 14 | USD/CAD sizing: `is_cad_symbol`, `get_usd_cad_rate`, mixed-currency `total_value`/`check_exposure`, sector-concentration gate, projected-exposure check |
 | `tests/stock/test_screener_in_distribution.py` | 5 | In-distribution ATR%/liquidity filter (`stock_bot/data/screener.py`, replacement safety net after RULE_WHITELIST stopped gating BUYs) |
-| `tests/stock/test_accuracy_tracker.py` | 18 | `LiveTradingGate` gates — Gate 1 (`stock_backtest_latest.json` vs `RULE_WHITELIST`), Gate 2 (AI confidence-band edge), Gate 3 (≥30 round-trips/PF≥1.2/win≥30%) |
+| `tests/stock/test_accuracy_tracker.py` | 20 | `LiveTradingGate` gates — Gate 1 (`stock_backtest_latest.json` vs `RULE_WHITELIST`), Gate 2 (AI confidence-band edge, incl. SKIPPED when `AI_ENABLED=false` — 2026-09-10), Gate 3 (≥30 round-trips/PF≥1.2/win≥30%) |
 | `tests/stock/test_checkpoint_tracker.py` | 14 | Post-whitelist review checkpoint tracker (`checkpoint_tracker.py`, dashboard visibility only): sample floors, win-rate/PF/AI-agreement gap triggers, AI-split sample-size guard |
 | `tests/shared/test_heartbeat.py` | 8 | Heartbeat pings: URL-off, success/failure never raise, healthy_fn gate |
 | `tests/stock/test_tws_monitor.py` | 6 | TwsConnectionMonitor state machine: blip tolerance, alert-once per outage, recovery notice |
@@ -580,15 +580,22 @@ path left as-is (already alerts + the cancel-race grace window records a beating
 ### LiveTradingGate — stock bot IBKR readiness check (repaired + code-enforced 2026-08-20)
 `stock_bot/analysis/accuracy_tracker.py`. `IBKRExecutor.__init__()` on a live port with
 `allow_live=True` calls `LiveTradingGate().evaluate()` and raises `ValueError` naming every
-non-PASS gate unless Gates 1-3 are all PASS (before any TWS connection). Paper-mode callers
-never reach it.
+gate that is neither PASS nor SKIPPED, unless Gates 1-3 all report PASS/SKIPPED (before any
+TWS connection). Paper-mode callers never reach it.
 - **Gate 1** — every current `RULE_WHITELIST` symbol has `verdict: PASS` in
   `logs/stock_backtest_latest.json`. **Status: 16/16 PASS** (re-run 2026-08-28 — AMD now
   passes, small-sample window-boundary effect, was 15/16 on 2026-08-20).
 - **Gate 2** — AI confidence-band edge: ≥10 completed MED/HIGH-confidence (80+) round-trips,
-  ≥55% win rate. **PENDING.**
+  ≥55% win rate. **Status: SKIPPED** (2026-09-10 fix — `check_gate2()` now returns SKIPPED,
+  not PENDING, whenever `AI_ENABLED=false`. AI was disabled 2026-09-09 (sustained provider
+  failures — see "AI provider" below), so a pure-rules bot can never accumulate MED/HIGH AI
+  trades again; leaving it PENDING would have permanently code-blocked go-live on a gate the
+  user had already accepted dropping. SKIPPED counts as resolved everywhere PASS does
+  (`get_gate_status()`, `print_gate_status()`, the `IBKRExecutor` enforcement check) —
+  re-enabling AI makes Gate 2 a live requirement again automatically, no code change needed.
 - **Gate 3** — position book: ≥30 completed round-trips, PF≥1.2, win≥30%, all three.
-  **PENDING (~5/30).**
+  **PENDING (7/30 as of 2026-09-10)** — the only gate actually standing between the stock bot
+  and IBKR real-money go-live now.
 - Gate 4 (infrastructure importability) deliberately excluded from enforcement.
 Full repair trail: `.memory/decisions/livetradinggate-gate-repair-2026-08-20.md`.
 
@@ -951,7 +958,7 @@ liquidity) — informational only. Full trail: `CLAUDE_HISTORY.md`.
 | F | VPS logrotate | Config ready (`deploy/logrotate_trade_bot.conf`, `/opt/trade_bot` path). Nothing left until a VPS exists — migration deferred. |
 | G | Stock-bot headless deploy (IB Gateway + IBC) | Scoped + written 2026-08-27 (`deploy/IBKR_GATEWAY_SETUP.md`, `deploy/stock_bot.service`). No bot code change needed (only `IBKR_PORT=7497→4002`). ~4h + a day's observation. Not started — deferred with the VPS migration; the crypto bot moves first. |
 | H | Ollama Cloud key revoke | Confirmed unused 2026-07-16; user parked indefinitely — don't re-raise unprompted. |
-| I | IBKR live go-live | Gate-blocked. `LiveTradingGate` Gates 1-3 code-enforced in `IBKRExecutor.__init__()`. Gate 1 16/16 PASS; Gates 2-3 PENDING (~5/30 live trades). |
+| I | IBKR live go-live | Gate-blocked. `LiveTradingGate` Gates 1-3 code-enforced in `IBKRExecutor.__init__()`. Gate 1 16/16 PASS; Gate 2 SKIPPED (AI disabled, 2026-09-10 fix — no longer a permanent blocker); Gate 3 PENDING (7/30 live trades) — the only remaining blocker. |
 | J | USD symbol re-screen | Automated monthly via `rescreen.py` (now genuinely covers the USD leg as of 2026-08-24). |
 | K | ATR SL for SYN/LINK/PUMP | SOL/CAD promoted 2026-08-25. SYN/PUMP/LINK validation-complete but blocked on new capital + an un-built FX-conversion layer (both need a deposit). None promoted. Detail: `.memory/decisions/multi-symbol-validation.md`. |
 | — | Crypto capital gate | BTC/CAD 0/15 fills (~3–6 wk/trade — don't force it). SOL/CAD 1/15 fills, 1 completed round-trip. |

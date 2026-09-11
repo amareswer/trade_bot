@@ -1385,6 +1385,7 @@ def _readiness_panel_html(gate_status: Optional[dict]) -> str:
         "FAIL":    _RED,
         "PENDING": _YELLOW,
         "NOT_RUN": _MUTED,
+        "SKIPPED": _MUTED,   # not applicable right now (e.g. Gate 2 with AI disabled) — resolved, not blocking
     }
 
     def _badge(status: str) -> str:

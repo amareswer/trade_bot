@@ -29,12 +29,20 @@ Safety guards
   is True on a live port, __init__ ALSO requires Gates 1-3 of
   stock_bot.analysis.accuracy_tracker.LiveTradingGate (backtest walk-forward
   vs the current strategy, AI confidence-band edge, live position-book
-  performance) to all report PASS, before ever attempting a TWS connection.
-  Gate 4 (infrastructure importability) is deliberately excluded — it's a
-  code-hygiene smoke check, not a trading-readiness signal, and shouldn't
-  block someone who's otherwise cleared to go live over an unrelated import
-  issue. This check only runs when allow_live=True is already being passed;
-  paper-mode callers (the default) never reach it.
+  performance) to all report PASS (or SKIPPED — see next point), before
+  ever attempting a TWS connection. Gate 4 (infrastructure importability)
+  is deliberately excluded — it's a code-hygiene smoke check, not a
+  trading-readiness signal, and shouldn't block someone who's otherwise
+  cleared to go live over an unrelated import issue. This check only runs
+  when allow_live=True is already being passed; paper-mode callers (the
+  default) never reach it.
+- Gate 2 (AI confidence-band edge) reports SKIPPED, not a blocking status,
+  when AI_ENABLED=false (2026-09-09: AI disabled after sustained provider
+  failures, pure-rules go-live accepted). A pure-rules bot can never
+  accumulate the AI-confidence trades Gate 2 needs, so PENDING would mean
+  "permanently blocked" rather than "needs more data" — SKIPPED is treated
+  the same as PASS by the check below. Re-enabling AI makes Gate 2 a real
+  requirement again automatically.
 - Market orders wait for a fill deadline; on timeout the order is
   cancelled and THEN re-checked for a fill that raced the cancel — the
   fill is recorded, never lost (2026-07-15 crypto limit-chase lesson).
@@ -121,6 +129,11 @@ _CANCEL_RESUBMIT_GRACE_S = 20.0
 # class docstring's "Safety guards" section for why.
 _ENFORCED_GATE_NUMBERS = (1, 2, 3)
 
+# Statuses that satisfy an enforced gate. PASS = checked and cleared.
+# SKIPPED = not applicable right now (Gate 2 when AI_ENABLED=false) — see
+# module docstring "Safety guards".
+_GATE_RESOLVED_STATUSES = ("PASS", "SKIPPED")
+
 # A manual IBKR paper-account reset (or any other external deposit/withdrawal)
 # changes NetLiquidation outside of anything this executor traded — at cost
 # basis, a BUY just moves cash into inventory at no gain/loss, so absent an
@@ -166,7 +179,8 @@ class IBKRExecutor(StockExecutorBase):
             gates = LiveTradingGate().evaluate()
             not_passing = [
                 g for g in gates
-                if g["gate"] in _ENFORCED_GATE_NUMBERS and g["status"] != "PASS"
+                if g["gate"] in _ENFORCED_GATE_NUMBERS
+                and g["status"] not in _GATE_RESOLVED_STATUSES
             ]
             if not_passing:
                 summary = "; ".join(
