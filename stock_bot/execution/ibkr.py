@@ -763,9 +763,24 @@ class IBKRExecutor(StockExecutorBase):
         """First matching account value (base currency preferred).
 
         On a TWS query failure, serves the last-good rows rather than a
-        fabricated 0.0 (which would reject every BUY as 'insufficient cash')."""
+        fabricated 0.0 (which would reject every BUY as 'insufficient cash').
+
+        accountValues()/positions() are local reads of ib_async's own cache,
+        not network round-trips — they never raise just because the socket
+        is down. ib_async clears that local cache on disconnect, so a stale
+        connection silently returns an empty (but 'successful') list rather
+        than throwing, which used to sail past the try/except below, get
+        treated as a fresh good reading, and overwrite the real last-good
+        cache with the empty one (2026-09-11 live incident: TWS bounced,
+        reconnect hadn't happened yet, and the running bot reported
+        cash=$0.00 / 0 positions for ~26 minutes despite this cache existing
+        specifically to prevent that). Checking isConnected() first routes a
+        stale connection through the same cache-preserving path as a raised
+        exception."""
         try:
             async def _vals():
+                if not self._ib.isConnected():
+                    raise ConnectionError("IBKR client reports disconnected")
                 return list(self._ib.accountValues())
             rows = self._call(_vals(), timeout=10)
             self._acct_values_cache = rows
@@ -846,9 +861,16 @@ class IBKRExecutor(StockExecutorBase):
     def positions_snapshot(self) -> dict[str, tuple[float, float]]:
         """On a TWS query failure, serves the last-good position book rather
         than {} — an empty book would make the SL/TP watcher blind to a real
-        position whose stop just triggered."""
+        position whose stop just triggered.
+
+        See _account_value()'s docstring: positions() is a local ib_async
+        cache read that never raises on its own, so a stale/disconnected
+        client must be caught explicitly via isConnected() rather than
+        relying on an exception that will never come."""
         try:
             async def _pos():
+                if not self._ib.isConnected():
+                    raise ConnectionError("IBKR client reports disconnected")
                 return list(self._ib.positions())
             rows = self._call(_pos(), timeout=10)
             self._note_sync(True, "positions")

@@ -693,6 +693,48 @@ def test_cash_serves_last_good_cache_on_account_values_failure(executors):
     assert ex.sync_healthy is False
 
 
+def test_positions_snapshot_preserves_cache_when_disconnected_without_error(executors):
+    """2026-09-11 live incident: accountValues()/positions() are local reads
+    of ib_async's own cache, not network calls — a stale/disconnected client
+    doesn't raise, it just returns an empty list (ib_async clears its local
+    cache on disconnect). That must be treated exactly like a raised
+    exception (preserve the cache), not as a fresh good reading that
+    overwrites it — the live bot reported cash=$0.00 / 0 positions for ~26
+    minutes despite this cache existing specifically to prevent that."""
+    fake = FakeIB(positions=[_cm_position(4, 168.35)])
+    ex = make_executor(fake)
+    executors.append(ex)
+    assert ex.positions_snapshot() == {"CM.TO": (4.0, 168.35)}   # primes the cache
+
+    fake._connected = False    # socket is down, but positions() itself won't raise
+    fake._positions = []       # ib_async cleared its local cache on disconnect
+
+    snap = ex.positions_snapshot()
+    assert snap == {"CM.TO": (4.0, 168.35)}, "must fall back to the last-good book"
+    assert ex.sync_healthy is False
+
+    fake._connected = True
+    fake._positions = [_cm_position(4, 168.35)]
+    ex.positions_snapshot()
+    assert ex.sync_healthy is True   # recovers
+
+
+def test_cash_preserves_cache_when_disconnected_without_error(executors):
+    """Same 2026-09-11 incident, the account-values side."""
+    fake = FakeIB(cash=4004.51, net_liq=5003.02)
+    ex = make_executor(fake)
+    executors.append(ex)
+    assert ex.cash == pytest.approx(4004.51)   # primes the cache
+
+    fake._connected = False    # socket is down, but accountValues() itself won't raise
+
+    assert ex.cash == pytest.approx(4004.51), "stale cash beats a fabricated 0.0"
+    assert ex.sync_healthy is False
+
+    fake._connected = True
+    assert ex.cash == pytest.approx(4004.51)   # recovers, still correct
+
+
 def test_no_cache_yet_still_falls_back_to_zero_and_empty(executors):
     fake = FakeIB()
     def _boom():
