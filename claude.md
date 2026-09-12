@@ -175,7 +175,7 @@ narrative behind any decision below, and `.memory/decisions/*.md` for the deepes
 
 ## Test Suite Manifest
 
-**Expected total: 911 tests** (`pytest --collect-only -q`). If the count disagrees: a file
+**Expected total: 914 tests** (`pytest --collect-only -q`). If the count disagrees: a file
 has an import error, was deleted, was added without a manifest bump, or was excluded from the
 runner — investigate before trusting a green suite. Suite runtime ~9–26s; minutes means a
 test is reading live `.env` config. The per-row table sum below lags the header total by ~22
@@ -187,7 +187,7 @@ Run: `python -m pytest --tb=short -q` — must show **906 passed**.
 | File | Tests | What it covers |
 |------|-------|----------------|
 | `tests/shared/test_indicators.py` | 30 | RSI, EMA, ADX, MACD, ATR; regime-classification self-referential-ATR-baseline regression |
-| `tests/crypto/test_live_executor.py` | 65 | LiveExecutor: dry-run, market/limit orders, urgent-exit bypass, fee deduction, state save/load, min-size guard, restart recovery, native static + trailing stop-loss backstop (placement/cancel/resync/failure-alert/restart reconciliation/quantity reconciliation/untracked-order adoption/multi-stop ambiguity), `native_stop_price` property, slippage guard, maker→taker silent-fallback alert, native-stop pre-cancel-on-SELL (2026-08-27 deadlock incident) |
+| `tests/crypto/test_live_executor.py` | 68 | LiveExecutor: dry-run, market/limit orders, urgent-exit bypass, fee deduction, state save/load, min-size guard, restart recovery, native static + trailing stop-loss backstop (placement/cancel/resync/failure-alert/restart reconciliation/quantity reconciliation/untracked-order adoption/multi-stop ambiguity), `native_stop_price` property, slippage guard, maker→taker silent-fallback alert, native-stop pre-cancel-on-SELL (2026-08-27 deadlock incident), **duplicate-order guards (2026-09-11)**: submission-exception reconciliation adopts an untracked resting order instead of market-ordering on top of it, cancel-timeout retry blocked unless the post-cancel status is confirmed terminal |
 | `tests/crypto/test_capital_pool.py` | 37 | CapitalPool: slot allocation, slot cap, per-symbol slot caps (`slot_caps`, `slot_cash_for()`), release, edge cases; `config._slot_caps_by_base()` env scanner; `PortfolioConfig.max_slot_cash_cad_by_base` validation |
 | `tests/crypto/test_correlation.py` | 17 | Pearson correlation, pct_returns, fetch_correlation |
 | `tests/stock/test_stock_correlation.py` | 5 | `stock_bot/risk/correlation.py`: `fetch_correlation_from_closes` — no-network wrapper reusing the crypto pearson/pct_returns |
@@ -357,6 +357,30 @@ that base over the shared `TAKE_PROFIT_PCT` / `TRAILING_STOP_PCT` / `TRAILING_ST
 - No strategy-hash impact (exit params are `cfg.backtest`, not the hashed strategy files).
 - Research: `strategy_exit_sweep.py` + `logs/strategy_exit_sweep_20260902.md`,
   `CLAUDE_HISTORY.md` "Crypto exit-logic research — 2026-09-02".
+
+### Limit-chase duplicate-order guards (crypto — fixed 2026-09-11)
+Code review found two real gaps in `_place_limit_order()` (`bot/execution/live_executor.py`)
+where an ambiguous exchange response could lead to a duplicate live order:
+1. **Submission exception → blind market fallback.** An exception raised by `create_order()`
+   means the *response* was lost (network timeout, connection drop) — it does NOT mean Kraken
+   never received the *request*. The old code fell straight to a market order regardless,
+   risking a double fill if the original limit order had actually gone through. Fixed:
+   `_find_untracked_entry_order()` checks `fetch_open_orders()` for a matching resting order
+   first (same "adopt, don't duplicate" pattern as `_adopt_untracked_stop()`) — if found, it's
+   adopted and polled like a normal placement; only a genuinely empty result falls back to
+   market, same as before.
+2. **Cancel-timeout retry with no terminal-status check.** After a chase timeout, the old code
+   cancelled the order, then only checked whether it had *filled* before allowing a retry — it
+   never checked whether the cancel actually reached a terminal state. An order still reading
+   back `status="open"` (cancel silently ignored, or eventual consistency) let the loop place a
+   **second** live order on top of the still-resting first one. Verified via a regression test
+   run against the pre-fix code: this **placed 5 separate live orders** in one chase (one per
+   retry attempt, `max_retries=3` → 4 total attempts + retries). Fixed: `_CANCELLED_TERMINAL_
+   STATUSES` (`canceled`/`cancelled`/`closed`/`expired`/`rejected`) gates the retry — anything
+   else aborts the chase without re-placing, identical to the existing "unverifiable state"
+   branch.
++3 tests (each verified to fail against the pre-fix code, reproducing a real duplicate-order
+scenario), suite 911→914. Execution-layer only — no `bot/strategy/` change, fingerprint unaffected.
 
 ### Native exchange-side stop-loss (crypto — ON since 2026-08-15)
 `NATIVE_STOP_LOSS_ENABLED=true` (config.py default false). `sync_protective_stop()` rests a

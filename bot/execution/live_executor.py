@@ -51,6 +51,14 @@ _MIN_SIZE_SAFETY_MARGIN = float(os.getenv("MIN_SIZE_SAFETY_MARGIN", "1.5"))
 # everything else that could be resting on the symbol.
 _NATIVE_STOP_ORDERTYPES = frozenset({"stop-loss", "trailing-stop"})
 
+# ccxt unified statuses that mean an order is genuinely done and NOT resting —
+# safe to treat a zero-fill order in one of these states as truly gone.
+# Anything else (open/pending/None/an unrecognized string) must NOT be
+# treated as safe to retry over: cancel_order() can "succeed" while the
+# order still reads back live (eventual consistency), or fail outright, and
+# a zero-fill order in either case may still be resting on the exchange.
+_CANCELLED_TERMINAL_STATUSES = frozenset({"canceled", "cancelled", "closed", "expired", "rejected"})
+
 
 def _raw_ordertype(order: dict) -> str:
     """Raw Kraken descr.ordertype string from a ccxt-parsed order dict
@@ -1064,6 +1072,45 @@ class LiveExecutor:
 
     # ── Limit order chasing ───────────────────────────────────────────
 
+    def _find_untracked_entry_order(self, side: str) -> dict | None:
+        """After an exception during limit-order submission, check whether
+        the exchange actually accepted the order despite the lost/failed
+        response — a network error on the response does not mean the
+        request never reached Kraken (2026-09 finding: the old code assumed
+        it did and placed a market order straight on top, risking a
+        duplicate). Mirrors the existing untracked-native-stop adoption
+        pattern (_adopt_untracked_stop): fetch_open_orders and look for
+        exactly one non-stop order on this side/symbol we don't already
+        know about. Ambiguous (more than one candidate) or a failed lookup
+        both return None — conservative by design, since guessing wrong
+        here is how you get a duplicate order instead of preventing one."""
+        try:
+            open_orders = fetch_with_retry(
+                lambda: self._exchange.fetch_open_orders(self.symbol),
+                attempts=2, delay_s=1.0,
+                label=f"post-error order reconciliation [{self.symbol}]",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not verify order state after a submission error (%s) "
+                "— proceeding as if it failed", exc,
+            )
+            return None
+
+        candidates = [
+            o for o in open_orders
+            if not _is_native_stop_order(o) and str(o.get("side", "")).lower() == side
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            logger.error(
+                "Multiple untracked %s orders found on %s after a submission "
+                "error — cannot tell which is ours, not auto-adopting any",
+                side, self.symbol,
+            )
+        return None
+
     def _place_limit_order(self, side: str, quantity: float, price: float) -> dict:
         """
         Post-only limit order with automatic repricing.
@@ -1151,12 +1198,29 @@ class LiveExecutor:
                     return self._exchange.create_order(self.symbol, "market", side, quantity)
                 continue
             except Exception as exc:
+                # The exception means the RESPONSE to create_order failed
+                # (network timeout, connection drop, etc.) — it does NOT
+                # mean the REQUEST never reached Kraken. Placing a market
+                # order here unconditionally risks a duplicate against an
+                # order that actually went through. Verify first.
                 logger.warning(
-                    "_place_limit_order: %s (%s) — falling back to market order",
+                    "_place_limit_order: %s (%s) — checking whether the "
+                    "exchange accepted it before falling back to market",
                     type(exc).__name__, exc,
                 )
-                self._maker_fallback_reason = f"exchange rejected limit order ({type(exc).__name__})"
-                return self._exchange.create_order(self.symbol, "market", side, quantity)
+                adopted = self._find_untracked_entry_order(side)
+                if adopted is None:
+                    self._maker_fallback_reason = f"exchange rejected limit order ({type(exc).__name__})"
+                    return self._exchange.create_order(self.symbol, "market", side, quantity)
+                logger.warning(
+                    "LIMIT %s order %s found resting despite the submission "
+                    "error — adopting it instead of placing a market order "
+                    "on top (would have double-ordered)",
+                    side.upper(), adopted.get("id"),
+                )
+                raw = adopted
+                order_id = str(raw.get("id", ""))
+                # falls through into the same poll loop as a normal placement
 
             # Quick return if exchange already shows the order as closed
             if raw.get("status") == "closed":
@@ -1196,6 +1260,23 @@ class LiveExecutor:
                     logger.warning(
                         "LIMIT %s %s filled %.6f during cancel race — recording it, no re-place",
                         side.upper(), order_id, float(post_cancel.get("filled") or 0.0),
+                    )
+                    return post_cancel
+                post_status = str(post_cancel.get("status") or "").lower()
+                if post_status not in _CANCELLED_TERMINAL_STATUSES:
+                    # cancel_order() either failed outright (cancel_ok=False)
+                    # or "succeeded" but the order still reads back as
+                    # live/open — eventual consistency, a race, or a
+                    # silently ignored cancel. Either way the first order
+                    # may still be resting on the exchange; looping back to
+                    # place a second one here is exactly how you end up with
+                    # two live orders on the same side. Abort without
+                    # re-placing, same as the unverifiable-state branch below.
+                    logger.error(
+                        "LIMIT %s %s: cancel did not reach a confirmed "
+                        "terminal state (status=%r, cancel_ok=%s) — aborting "
+                        "chase without re-placing.",
+                        side.upper(), order_id, post_cancel.get("status"), cancel_ok,
                     )
                     return post_cancel
             except Exception as post_exc:

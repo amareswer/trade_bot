@@ -810,6 +810,102 @@ def test_maker_fallback_no_alert_on_clean_limit_fill(mock_cfg, mock_sleep, tmp_p
 
 @patch("time.sleep")
 @patch("bot.execution.live_executor.cfg")
+def test_submission_exception_adopts_untracked_order_instead_of_market(mock_cfg, mock_sleep, tmp_path):
+    """create_order raises after Kraken may have already accepted the
+    request (e.g. the response itself was lost to a network error) — the
+    exchange might still have the order resting. The chase must check
+    fetch_open_orders before assuming failure and adopt a matching resting
+    order instead of placing a market order on top of it (duplicate-order
+    finding)."""
+    _limit_cfg(mock_cfg, enabled=True, timeout_s=30)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+    mock_ex.fetch_order_book.return_value   = _ob()
+    mock_ex.price_to_precision.return_value = "90009.0"
+    mock_ex.create_order.side_effect = ccxt.NetworkError("response lost")
+
+    resting = {
+        "id": "limit-ghost-1", "status": "open", "side": "buy",
+        "filled": 0.0, "amount": 0.001, "average": None, "fee": {},
+    }
+    mock_ex.fetch_open_orders.return_value = [resting]
+    mock_ex.fetch_order.return_value = {
+        **resting, "status": "closed", "filled": 0.001, "average": 90009.0,
+        "fee": {"cost": 0.36, "currency": "CAD"},
+    }
+
+    order = ex.execute(Signal.BUY, 90000.0, 0.001)
+
+    assert order is not None
+    assert order.status == OrderStatus.FILLED
+    assert order.quantity == pytest.approx(0.001)
+    # Only the one (failed-response) limit attempt — no market order placed
+    assert mock_ex.create_order.call_count == 1
+    mock_ex.fetch_open_orders.assert_called()
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_submission_exception_no_untracked_order_falls_back_to_market(mock_cfg, mock_sleep, tmp_path):
+    """create_order raises and fetch_open_orders confirms nothing landed —
+    the market-order fallback must still happen (no regression from before,
+    for the case where the order genuinely never reached the exchange)."""
+    _limit_cfg(mock_cfg, enabled=True, timeout_s=30)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+    mock_ex.fetch_order_book.return_value   = _ob()
+    mock_ex.price_to_precision.return_value = "90009.0"
+    mock_ex.fetch_open_orders.return_value  = []   # nothing resting — genuinely failed
+
+    market_raw = {
+        "id": "mkt-999", "status": "closed", "filled": 0.001,
+        "average": 90000.0, "fee": {"cost": 0.72, "currency": "CAD"},
+    }
+    mock_ex.create_order.side_effect = [ccxt.NetworkError("response lost"), market_raw]
+
+    order = ex.execute(Signal.BUY, 90000.0, 0.001)
+
+    assert order is not None
+    assert order.status == OrderStatus.FILLED
+    assert mock_ex.create_order.call_count == 2
+    last_call = mock_ex.create_order.call_args_list[-1]
+    assert last_call[0][1] == "market"
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_cancel_but_order_still_open_does_not_retry(mock_cfg, mock_sleep, caplog, tmp_path):
+    """Timeout → cancel_order() reports 'success', but the post-cancel check
+    shows the order still status='open' with filled=0 (eventual consistency
+    or a silently ignored cancel). The chase must NOT place a second order
+    on top of a possibly-still-resting first one."""
+    import logging
+    _limit_cfg(mock_cfg, enabled=True, timeout_s=0, max_retries=3)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+    mock_ex.fetch_order_book.return_value   = _ob()
+    mock_ex.price_to_precision.return_value = "90009.0"
+
+    open_raw = {"id": "limit-01", "status": "open", "filled": 0.0, "average": None, "fee": {}}
+    mock_ex.create_order.return_value = open_raw
+    mock_ex.cancel_order.return_value = {}   # reports success
+    # Post-cancel verification still reads the order as open — never confirmed cancelled
+    mock_ex.fetch_order.return_value = {
+        "id": "limit-01", "status": "open", "filled": 0.0, "average": None, "fee": {},
+    }
+
+    with caplog.at_level(logging.ERROR, logger="bot.execution.live_executor"):
+        ex.execute(Signal.BUY, 90000.0, 0.001)
+
+    # Exactly one limit attempt and one cancel — must not loop back and
+    # place a second order while the first may still be resting.
+    assert mock_ex.create_order.call_count == 1
+    assert mock_ex.cancel_order.call_count == 1
+    assert "aborting chase without re-placing" in caplog.text
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
 def test_limit_order_disabled_uses_market(mock_cfg, mock_sleep, tmp_path):
     """LIMIT_ORDER_ENABLED=false → existing market path used, create_order called with type='market'."""
     _limit_cfg(mock_cfg, enabled=False)
