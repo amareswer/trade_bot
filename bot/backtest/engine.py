@@ -253,6 +253,20 @@ def run(
                 _overlay_rej[_veto] = _overlay_rej.get(_veto, 0) + 1
 
         # ── Trailing peak update ──────────────────────────────────────
+        # 2026-09-15 fix: _trail_peak_for_sl_check snapshots the peak as it
+        # stood BEFORE this candle's own high can move it — a resting
+        # trailing-stop order can only exist at a level that was already
+        # known before this candle opened. The update below still uses this
+        # candle's high (as before), but only takes effect for the NEXT
+        # candle's check. Previously the SL/TP section further down used the
+        # peak AFTER this same candle's update, letting a candle activate (or
+        # raise) the trail using its own high and then, in that same
+        # candle, trigger a stop from its own low — a timing impossibility
+        # (a trailing stop that was never resting at the candle's open) that
+        # reproduced exactly as reported: entry $100, next candle opens $100
+        # and reaches $120 (activating the trail), old code sold at the
+        # earlier $100 open — a fill that predates the trail's own existence.
+        _trail_peak_for_sl_check = _trail_peak
         if executor.position > 0 and entry_price > 0 and trail_stop_pct > 0:
             if _trail_peak == 0.0:
                 # Activate once candle.high crosses the activation threshold
@@ -317,8 +331,15 @@ def run(
             # `sl_level >= candle.low`, so max() always resolved to
             # sl_level regardless of how far through the candle actually
             # traded), silently understating losses on any real gap-through.
-            if trail_stop_pct > 0 and _trail_peak > 0:
-                _trail_sl = _trail_peak * (1 - trail_stop_pct)
+            # Uses _trail_peak_for_sl_check (the peak as of BEFORE this
+            # candle's own high could move it), not _trail_peak — see the
+            # "Trailing peak update" comment above. A candle that activates
+            # or raises the trail using its own high cannot also be stopped
+            # out by that same candle's low; that check happens on the NEXT
+            # candle, once the raised level has genuinely had a chance to be
+            # a resting order.
+            if trail_stop_pct > 0 and _trail_peak_for_sl_check > 0:
+                _trail_sl = _trail_peak_for_sl_check * (1 - trail_stop_pct)
                 if candle.low <= _trail_sl:
                     raw_signal  = Signal.SELL
                     exit_reason = "trail_stop"

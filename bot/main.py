@@ -2273,6 +2273,19 @@ def run():
                     live_exchange, ss['last_ts_ms'], _LIVE_TF, symbol=sym
                 )
                 if candle is None:
+                    # 2026-09-15 fix: risk.evaluate() — and with it the
+                    # peak/kill-switch update — is never reached on a tick
+                    # with no new candle (this `continue` skips straight past
+                    # it). On a 4h timeframe that's most ticks, so a severe
+                    # drawdown-and-recovery entirely between two candle
+                    # closes could still escape the kill switch even after
+                    # the 2026-09-14 fix made the trip check run on every
+                    # evaluate() call — evaluate() just wasn't being called.
+                    # mark_valuation() uses the live tick price already
+                    # fetched into ss['last_price'] above, independent of any
+                    # signal or candle, so peak/kill-switch state now tracks
+                    # every tick's real valuation, not just candle-close ticks.
+                    risk.mark_valuation(_account_value())
                     if sym == _active_symbol:
                         countdown = _candle_countdown(_LIVE_TF)
                         display.next_candle(price, tick, countdown)

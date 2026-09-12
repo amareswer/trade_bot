@@ -72,3 +72,48 @@ def test_gap_through_stop_loss_fills_at_the_open_not_the_stale_level():
         f"stale $98 stop level the candle never actually traded at — got {sl_fill.price}"
     )
     assert sl_fill.price < 98.0, "the old bug filled exactly at the theoretical $98 level"
+
+
+def test_trailing_stop_cannot_fire_on_the_same_candle_that_activates_it():
+    """2026-09-15 finding: a trailing stop activated (or raised) by THIS
+    candle's own high was then checked against THIS SAME candle's low and,
+    if breached, filled at THIS candle's open — a timing impossibility (the
+    stop couldn't have been resting at the open; it didn't exist until the
+    high, sometime later in the same candle, activated it). Reproduced
+    exactly as reported: entry $100, next candle opens $100 and reaches $120
+    (activating a 10% trail at $108), old code sold at the earlier $100 open
+    even though the trail had no chance to exist at that price yet.
+
+    Fixed behavior: candle 1 (activates the trail using its own high) must
+    NOT exit, regardless of how low candle 1's own low goes. The trail only
+    protects starting the FOLLOWING candle, once it has genuinely had a
+    chance to be a resting order — candle 2 here, gap-aware fill at its open."""
+    candles = [
+        _candle(0, 100.0, 101.0, 99.0, 100.0),   # closes at 100 -> BUY
+        _candle(1, 100.0, 120.0, 95.0, 110.0),   # activates a 10% trail at $120 -> $108,
+                                                  # but its own low ($95) must NOT trigger an exit here
+        _candle(2, 105.0, 106.0, 90.0, 95.0),    # NOW the $108 trail (from candle 1's peak) is
+                                                  # genuinely resting — low $90 breaches it
+    ]
+    result = run(
+        candles, symbol="TEST/USD", timeframe="4h", strategy_mode="threshold",
+        buy_threshold=105.0, sell_threshold=999.0,
+        stop_loss_pct=0.0, take_profit_pct=0.0,
+        trail_stop_pct=0.10, trail_stop_activation_pct=0.0,
+    )
+    assert len(result.fills) == 2, (
+        f"expected exactly BUY + one trail-stop SELL, got {[(f.side, f.reason, f.price) for f in result.fills]}"
+    )
+    buy, sell = result.fills
+    assert buy.side == "BUY"
+    assert sell.side == "SELL"
+    assert sell.reason == "trail_stop"
+    assert sell.candle_index == 2, (
+        "the trail-stop exit must happen on candle 2 (the first candle where "
+        "the $108 level, set by candle 1's peak, was genuinely already "
+        "resting at the open) — not candle 1, which is what activated it"
+    )
+    assert sell.price == 105.0, (
+        f"candle 2's open ($105) is below the $108 trail level -> gap-aware "
+        f"fill at the open, not the stale $108 level — got {sell.price}"
+    )

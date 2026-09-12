@@ -114,6 +114,25 @@ def test_kill_switch_trips_from_a_hold_only_drawdown_not_just_at_buy_time():
     assert result.block_reason == BlockReason.KILL_SWITCH
 
 
+def test_mark_valuation_trips_kill_switch_without_ever_calling_evaluate():
+    """2026-09-15 finding: even after the 2026-09-14 fix made evaluate()'s
+    kill-switch check run on every signal, evaluate() itself is only called
+    by the live loop when a new candle has closed — on a 4h timeframe, most
+    ticks skip it entirely via an early `continue`, so a drawdown-and-recovery
+    entirely between two candle closes still never got judged. mark_valuation()
+    is the standalone entry point the live loop now calls every tick (fed the
+    live ticker price, no signal/candle needed) — this proves it alone is
+    sufficient to trip the sticky switch, with zero calls to evaluate()."""
+    ex, risk = _make(cash=1_000, kill_switch_pct=0.15)
+    risk.mark_valuation(1_000.0)   # seeds peak, mirrors what a HOLD tick used to do
+    risk.mark_valuation(800.0)     # 20% down, between two candle closes — no evaluate() call at all
+    assert risk.kill_switch_tripped
+    risk.mark_valuation(1_000.0)   # recovers before the next candle
+    result = risk.evaluate(Signal.BUY, 100, ex.portfolio, 0.001)
+    assert not result
+    assert result.block_reason == BlockReason.KILL_SWITCH
+
+
 def test_kill_switch_persists_across_restart():
     ex = PaperExecutor("BTC/USDT", quantity=1.0, starting_cash=10_000)
     with tempfile.TemporaryDirectory() as tmp:

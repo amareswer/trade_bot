@@ -174,24 +174,7 @@ class RiskManager:
         """
         slot_value    = portfolio.total_value(price)
         current_value = account_value if account_value is not None else slot_value
-        self._maybe_reset_day(current_value, candle_date)
-        self._maybe_reset_week(current_value, candle_date)
-        self._update_peak(current_value)
-
-        # Kill-switch TRIP evaluation runs on every tick, regardless of signal
-        # (2026-09-14 fix). Its BLOCKING effect stays BUY-only (Check 2 below,
-        # unchanged) — but the "has this account ever crossed the threshold"
-        # test used to live entirely inside `if signal == Signal.BUY`, which
-        # short-circuited before ever calling it for HOLD or SELL. A drawdown
-        # that happened while the strategy sat in HOLD (no active signal) or
-        # was only issuing SELLs could blow through kill_switch_pct and
-        # recover before the next BUY signal ever arrived — reproduced:
-        # equity $1000→$800 during HOLD, recovered, then a BUY was approved
-        # with the sticky switch never having tripped at all. Evaluating here
-        # unconditionally means the trip is judged against the true trough,
-        # not whatever the account happened to be worth the next time a BUY
-        # was considered.
-        self._is_kill_switch_tripped(current_value)
+        self.mark_valuation(current_value, candle_date)
 
         if signal == Signal.HOLD:
             return APPROVED
@@ -357,6 +340,32 @@ class RiskManager:
             "drawdown_pct":   dd,
             "warning":        dd >= self.config.drawdown_warning_pct,
         }
+
+    def mark_valuation(self, current_value: float, candle_date: Optional[date] = None) -> None:
+        """Update day/week counters, the all-time peak, and the kill-switch
+        trip state from a fresh account valuation — independent of any
+        trading signal or call to evaluate().
+
+        2026-09-15 fix: the 2026-09-14 kill-switch fix made the trip check
+        run on every evaluate() call regardless of signal — but evaluate()
+        itself is only called when the live loop has a fresh candle to
+        assess. On a 4h candle timeframe, `bot/main.py`'s per-symbol loop
+        fetches a live tick price every cycle but SKIPS calling risk.evaluate()
+        entirely on any tick where no new candle has closed yet (`continue`
+        before ever reaching it) — so a drawdown-and-recovery that happens
+        entirely between two candle closes still never got judged against
+        the kill-switch threshold, even after the previous fix. This method
+        lets the live loop feed a fresh valuation on EVERY tick (using the
+        live ticker price, no signal or trade needed) so the peak and
+        kill-switch state track the true intra-period path, not just
+        whatever the value happened to be the moment a candle closed.
+        evaluate() calls this same logic internally — this exists for ticks
+        that never reach evaluate() at all.
+        """
+        self._maybe_reset_day(current_value, candle_date)
+        self._maybe_reset_week(current_value, candle_date)
+        self._update_peak(current_value)
+        self._is_kill_switch_tripped(current_value)
 
     # ------------------------------------------------------------------
     # Internal

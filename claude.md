@@ -175,7 +175,7 @@ narrative behind any decision below, and `.memory/decisions/*.md` for the deepes
 
 ## Test Suite Manifest
 
-**Expected total: 960 tests** (`pytest --collect-only -q`). If the count disagrees: a file
+**Expected total: 964 tests** (`pytest --collect-only -q`). If the count disagrees: a file
 has an import error, was deleted, was added without a manifest bump, or was excluded from the
 runner — investigate before trusting a green suite. Suite runtime ~9–26s; minutes means a
 test is reading live `.env` config. The per-row table sum below lags the header total by ~22
@@ -197,7 +197,8 @@ Run: `python -m pytest --tb=short -q` — must show **906 passed**.
 | `tests/stock/test_stock_vix_crisis.py` | 6 | `vix_crisis.py`: `is_vix_crisis` — at/above/below threshold, None fails open, zero/negative disables |
 | `tests/stock/test_stock_vix_crisis_gate.py` | 2 | Source guard: `run()` fetches `^VIX`, computes crisis mode, gates BUYs via the shared `_regime_ok` flag |
 | `tests/stock/test_stock_settlement_csv.py` | 11 | Settlement/FX tax record-keeping: `_next_business_day` T+1, frozen CSV header unchanged, settlement CSV written on BUY/SELL with correct join key, CAD → fx_rate=1.0 |
-| `tests/crypto/test_risk_manager.py` | 34 | RiskManager: halt gate, daily loss, position size, SL/TP bypass, state persistence, per-symbol caps, aggregate breakers, kill-switch/drawdown-halt/weekly-loss/drawdown-warning tiers, **kill-switch trip evaluation on every tick regardless of signal (2026-09-14)** — a HOLD-only (or SELL-only) drawdown through the threshold now trips the sticky flag even if it fully recovers before the next BUY |
+| `tests/crypto/test_risk_manager.py` | 35 | RiskManager: halt gate, daily loss, position size, SL/TP bypass, state persistence, per-symbol caps, aggregate breakers, kill-switch/drawdown-halt/weekly-loss/drawdown-warning tiers, **kill-switch trip evaluation on every tick regardless of signal (2026-09-14)** — a HOLD-only (or SELL-only) drawdown through the threshold now trips the sticky flag even if it fully recovers before the next BUY, **`mark_valuation()` standalone entry point (2026-09-15)** — proves the kill switch trips from a fresh valuation alone, with zero calls to `evaluate()` |
+| `tests/crypto/test_no_new_candle_valuation.py` | 2 | Source guard (2026-09-15): `run()`'s "no new candle" branch — most ticks on a 4h timeframe — must call `risk.mark_valuation(_account_value())` before its `continue`, or a drawdown-and-recovery entirely between two candle closes still never reaches the kill switch even after it checks on every `evaluate()` call, because `evaluate()` itself was never being called on that path |
 | `tests/crypto/test_fill_recording.py` | 8 | qty=0 fill — filled priority, amount fallback, guard, TradeLog guard |
 | `tests/crypto/test_external_holdings.py` | 6 | External-holdings guard in `_sync_position` (adopt=false/true) |
 | `tests/crypto/test_executor.py` | 6 | PaperExecutor: BUY/SELL, insufficient cash, history |
@@ -210,7 +211,7 @@ Run: `python -m pytest --tb=short -q` — must show **906 passed**.
 | `tests/crypto/test_orphaned_positions.py` | 5 | Startup orphan check: open position outside this run's symbol list alerts |
 | `tests/crypto/test_universe.py` | 4 | Universe screener: scoring, momentum filter, fallback |
 | `tests/crypto/test_main_strategy.py` | 2 | Strategy builder: full config wiring, incl. **`atr_volatile_multiplier` (2026-09-14)** — live `build_strategy()` was omitting it entirely, silently trading `IndicatorConfig`'s hardcoded 1.5 default regardless of `ATR_VOLATILE_MULTIPLIER` in `.env`, while the backtest config builder already passed it correctly |
-| `tests/crypto/test_backtest_engine_execution_model.py` | 2 | `bot/backtest/engine.run()` direct execution-model tests (2026-09-14) — the first unit tests of `run()` itself, not just its config-builder wiring or `metrics.compute()`: **threshold-mode BUY crash** (the fill-snapshot block accessed `strategy.last_atr`/`._closes`/`.config.*_ema_period`, all indicator-only attributes, unconditionally — `ThresholdStrategy` has none of them) and **gap-through stop-loss fills** (a candle whose open already gapped past the stop level filled at the stale theoretical level instead of the realistic open price — mirrors the already-tested `min(open, sl_price)` pattern in `stock_bot/backtest/engine.py`) |
+| `tests/crypto/test_backtest_engine_execution_model.py` | 3 | `bot/backtest/engine.run()` direct execution-model tests (2026-09-14/15) — the first unit tests of `run()` itself, not just its config-builder wiring or `metrics.compute()`: **threshold-mode BUY crash** (the fill-snapshot block accessed `strategy.last_atr`/`._closes`/`.config.*_ema_period`, all indicator-only attributes, unconditionally — `ThresholdStrategy` has none of them), **gap-through stop-loss fills** (a candle whose open already gapped past the stop level filled at the stale theoretical level instead of the realistic open price — mirrors the already-tested `min(open, sl_price)` pattern in `stock_bot/backtest/engine.py`), and **trailing-stop same-candle activate-then-trigger (2026-09-15)** — a candle that activates or raises the trail using its own high could not also be stopped out by that same candle's low (the trail wasn't resting yet at the candle's open); the check now uses the peak as of before the candle's own update, deferring the exit to the next candle |
 | `tests/stock/test_fast_validator_exits.py` | 6 | FastValidator exits: MAX_HOLD live-price fallback, corruption guard, SL regression |
 | `tests/stock/test_paper_report.py` | 10 | Expectancy math: IBKR commission model, net-of-cost flip, merged paper+IBKR book, IBKR account section, live-cash-snapshot precedence (row parsing is now `_row_to_trade`, tested separately) |
 | `tests/stock/test_exit_policy.py` | 11 | Stock asymmetric exit bars: single-verdict exit, 2-strike SELL streak, streak resets, AC.TO incident regression |
@@ -869,6 +870,68 @@ tests — the first ever for `run()` itself — 1 `build_strategy()` config-wiri
 confirmed to fail against the pre-fix code), suite 957→960. **Crypto bot restarted 2026-09-14**
 (new PID, 13:21 — picks up the kill-switch and volatility-multiplier fixes); the backtest-engine fixes only affect
 validation tooling, not live trading directly.
+
+### Seventh-pass review: the kill switch STILL had a gap, plus a trailing-stop timing bug (2026-09-15)
+A seventh pass — checking the sixth round's own kill-switch fix — found it was necessary but
+not sufficient, plus one more backtest-engine execution-model bug in the same file the sixth
+pass had just touched. Both confirmed and fixed; the live-affecting one required understanding
+exactly how `bot/main.py`'s tick loop is gated, not just the risk-manager code in isolation.
+
+- **The kill switch could still miss a drawdown-and-recovery entirely between candle closes
+  (High, live-risk-relevant, and the more serious of the two).** The 2026-09-14 fix made
+  `RiskManager.evaluate()`'s trip check run on every call regardless of signal — but
+  `evaluate()` itself is only reached by the live loop on a tick where a NEW 4h candle has
+  closed. `bot/main.py`'s per-symbol loop fetches a live ticker price every cycle (much more
+  often than every 4h) but `continue`s straight past `risk.evaluate()` entirely whenever no new
+  candle exists yet — which is most ticks, by construction, on a 4h timeframe. So a severe
+  drawdown that happened and fully recovered between two candle closes still escaped the kill
+  switch even after the sixth-pass fix, because the code path that fix lived in was simply
+  never being executed on that tick. Fixed by separating the concerns properly rather than
+  patching around the same choke point again: `RiskManager` gained a new public
+  `mark_valuation(current_value, candle_date=None)` method — the exact day/week/peak/
+  kill-switch-trip logic `evaluate()` already ran internally, now callable on its own, needing
+  no signal, trade quantity, or candle. `evaluate()` was refactored to call it internally
+  (behavior unchanged there). `bot/main.py`'s "no new candle" branch now calls
+  `risk.mark_valuation(_account_value())` — using the live tick price already fetched into
+  `ss['last_price']` moments earlier in the same loop iteration, and the same whole-account
+  valuation `evaluate()` itself is fed elsewhere — before its `continue`. Checked
+  `logs/risk_state.json` again after this fix: still `kill_switch_tripped: false`, no evidence
+  this was ever silently missed in the account's actual history. `run()` is a ~1700-line
+  tick loop needing a full live-exchange/strategy stack to exercise behaviorally, so the
+  `bot/main.py` wiring itself is covered by a source-inspection guard (same idiom as the
+  existing MTF/VIX/macro/auth-health guards) rather than a behavioral test; `mark_valuation()`
+  itself has a direct, fully behavioral unit test proving it alone (zero calls to `evaluate()`)
+  trips the sticky switch. **Crypto bot needs another restart** for this fix.
+- **A trailing stop could fire on the exact candle that activated it, at a price from before
+  it existed (Medium — trailing is disabled for BTC/CAD and SOL/CAD today, so this affects
+  optional/future backtests, not the current live configuration).** The "Trailing peak update"
+  section updates `_trail_peak` using the CURRENT candle's own high, and the SL/TP check
+  further down used that freshly-updated peak against that SAME candle's low — so a candle
+  whose high newly activated (or raised) the trail, and whose low also happened to dip below
+  the resulting stop level, exited using a level that had no chance to exist as a resting order
+  before that candle's low was reached, and — compounding it — filled at that candle's OPEN
+  (the sixth-pass gap-fill logic), a price from before the trail existed at all. Reproduced
+  exactly as reported: entry $100, next candle opens $100 and reaches $120 (activating a 10%
+  trail at $108), old code sold at the $100 open on that SAME candle. Fixed by snapshotting the
+  peak as it stood BEFORE the candle's own update (`_trail_peak_for_sl_check`) and checking
+  THIS candle's low against THAT snapshot, not the freshly-updated peak — a candle that
+  activates or raises the trail no longer checks itself for an exit; the check (and, if
+  breached, a correctly gap-aware fill at the following candle's open) happens starting the
+  NEXT candle, once the level has genuinely had a chance to be resting. **Re-ran the pinned and
+  rolling BTC/USDT backtests plus rolling SOL/USDT (2026-09-15) to check whether this fix, or
+  the sixth-pass gap-fill fix, moved any of the documented numbers now that both are in the
+  engine together — they don't**: BTC pinned 27 trades/net PF 0.82, BTC rolling 29/1.17, SOL
+  rolling 43/1.05, all identical to what's already documented above, strategy hash unchanged
+  (`5c6540eccbd2f45f` — neither fix touches a hashed file). No gap-through or same-candle
+  trail-activation event occurred in any of these windows under the current live SL
+  configuration (ATR×2.0, trailing stops off) — confirmed empirically, not just argued as
+  theoretically unlikely. Walk-forward wasn't re-run separately: its sub-windows are strict
+  slices of these same full runs' trade sequences, which are now confirmed byte-identical, so
+  its numbers are unchanged by the same logic.
+
++4 tests (1 `mark_valuation()` standalone kill-switch trip, 2 source-guard tests for the
+`bot/main.py` wiring, 1 same-candle trailing-stop-activation reproduction — all four confirmed
+to fail against the pre-fix code), suite 960→964.
 
 ### Generic stuck-loop detector (crypto + stock — BUILT 2026-08-27)
 `bot/alerts/stuck_loop.StuckLoopDetector` — error-string-agnostic "same operation keeps
