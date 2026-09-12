@@ -107,3 +107,35 @@ def test_profit_factor_matches_independent_recomputation_from_real_saved_csv():
         "this pinned window's net-of-fees PF is a documented net loss (~0.82) "
         "— if this ever passes 1.0, the saved CSV or the fix has changed"
     )
+
+
+def test_partial_exit_fee_is_allocated_proportionally_not_dumped_on_first_sell():
+    """2026-09-13 finding: closing a position via TWO partial SELLs (engine.py's
+    opt-in partial_tp_pct — dormant in live config today, partial_tp_pct=0) used
+    to charge 100% of the entry fee to whichever SELL closed first and 0% to the
+    rest. Reproduces the reviewer's exact scenario: two SELLs that are BOTH real
+    economic losses once fees are fairly split, but the old code classified them
+    as one loss + one win (total P&L identical either way — only win/loss
+    classification, win_rate, and profit_factor were distorted).
+
+    BUY 10 units, $2.00 total entry fee. Two 5-unit partial SELLs:
+      SELL 1: gross pnl -$0.50, fee $0.20
+      SELL 2: gross pnl +$0.30, fee $0.20
+    Old (100% fee on first SELL): -0.50-2.00-0.20=-2.70 (loss), +0.30-0-0.20=+0.10 (WIN)
+    Fixed (fee split 50/50 by quantity): -0.50-1.00-0.20=-1.70 (loss), +0.30-1.00-0.20=-0.90 (loss)
+    """
+    fills = [
+        FillRecord(0, "t0", "BUY",  100.0, 10.0, 1000.0, None, fee=2.00, reason="strategy"),
+        FillRecord(1, "t1", "SELL", 99.9,  5.0,  499.5, pnl=-0.50, fee=0.20, reason="partial_tp"),
+        FillRecord(2, "t2", "SELL", 100.06, 5.0, 500.3, pnl=0.30,  fee=0.20, reason="strategy"),
+    ]
+    m = compute(_result(fills, total_fees=2.40))
+
+    assert m.total_trades == 2
+    assert m.winning_trades == 0, "both partial exits are real economic losses once the entry fee is split fairly"
+    assert m.losing_trades == 2
+    assert m.worst_trade == pytest.approx(-1.70)
+    assert m.best_trade == pytest.approx(-0.90)
+    # Total realized P&L is unchanged by how the fee is split between the two
+    # SELLs — only the per-trade classification changes.
+    assert sum([m.worst_trade, m.best_trade]) == pytest.approx(-0.50 + 0.30 - 2.00 - 0.20 - 0.20)

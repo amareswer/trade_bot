@@ -80,22 +80,39 @@ def compute(result: BacktestResult) -> BacktestMetrics:
     )
 
     # ── Trade stats (only SELL fills carry realized P&L) ─────────────
-    # NET pnl per closed trade = the SELL's gross pnl, minus the fee(s) of
-    # the BUY(s) that opened the position it closes, minus the SELL's own
-    # fee. Pairing by accumulating BUY fees since the last close (reset on
-    # each SELL) matches this engine's actual behavior — one entry per
-    # position, no pyramiding — confirmed by independently reproducing the
-    # reviewer's exact PF figures on the real saved CSVs this way.
+    # NET pnl per closed trade = the SELL's gross pnl, minus its proportional
+    # share of the entry fee(s) that opened the position it's closing, minus
+    # the SELL's own fee. The entry fee is allocated by QUANTITY, not dumped
+    # entirely onto whichever SELL happens to close the position first — with
+    # a single full-position exit (partial_tp_pct=0, the only mode live today)
+    # that's the same number either way, but a partial exit (partial TP,
+    # engine.py's opt-in partial_tp_pct) previously charged 100% of the entry
+    # fee to the FIRST partial SELL and 0% to the rest. Reviewer-reproduced:
+    # two economically-losing partial exits were classified as one loss + one
+    # win (total P&L unchanged, but win_rate/profit_factor distorted) —
+    # confirmed dormant against the currently-live full-exit config, but a
+    # real bug for anyone turning partial_tp_pct on.
     closed_pnls: list[float] = []   # NET — drives every statistic below
     gross_pnls:  list[float] = []   # pre-fee — comparison only
-    _pending_buy_fees = 0.0
+    _pending_buy_fee = 0.0
+    _pending_buy_qty = 0.0
     for f in fills:
         if f.side == "BUY":
-            _pending_buy_fees += f.fee
+            _pending_buy_fee += f.fee
+            _pending_buy_qty += f.quantity
         elif f.side == "SELL" and f.pnl is not None:
             gross_pnls.append(f.pnl)
-            closed_pnls.append(f.pnl - _pending_buy_fees - f.fee)
-            _pending_buy_fees = 0.0
+            if _pending_buy_qty > 0:
+                frac = min(f.quantity / _pending_buy_qty, 1.0)
+                allocated_fee = _pending_buy_fee * frac
+            else:
+                allocated_fee = 0.0
+            closed_pnls.append(f.pnl - allocated_fee - f.fee)
+            _pending_buy_fee -= allocated_fee
+            _pending_buy_qty -= f.quantity
+            if _pending_buy_qty <= 1e-9:   # fully closed — clear any float dust
+                _pending_buy_fee = 0.0
+                _pending_buy_qty = 0.0
 
     total_trades  = len(closed_pnls)
     wins          = [p for p in closed_pnls if p > 0]

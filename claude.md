@@ -175,7 +175,7 @@ narrative behind any decision below, and `.memory/decisions/*.md` for the deepes
 
 ## Test Suite Manifest
 
-**Expected total: 953 tests** (`pytest --collect-only -q`). If the count disagrees: a file
+**Expected total: 957 tests** (`pytest --collect-only -q`). If the count disagrees: a file
 has an import error, was deleted, was added without a manifest bump, or was excluded from the
 runner — investigate before trusting a green suite. Suite runtime ~9–26s; minutes means a
 test is reading live `.env` config. The per-row table sum below lags the header total by ~22
@@ -223,9 +223,9 @@ Run: `python -m pytest --tb=short -q` — must show **906 passed**.
 | `tests/stock/test_paper_executor_fill_price.py` | 2 | `StockPaperExecutor.buy()`/`sell()` regression (2026-09-12): `order.price`/`quantity`/`total_value` now reflect the actual slippage-adjusted fill, not the pre-slippage requested price — IBKRExecutor already did this correctly, paper.py did not |
 | `tests/stock/test_fx_sizing.py` | 15 | USD/CAD sizing: `is_cad_symbol`, `get_usd_cad_rate`, mixed-currency `total_value`/`check_exposure`, sector-concentration gate, projected-exposure check, **lazy fast_info failure inside get_usd_cad_rate now falls back gracefully instead of raising** (2026-09-12 fix — same class of bug already fixed in `intraday_price.py`, missed here at the time) |
 | `tests/shared/test_indicator_strategy_macd_history.py` | 1 | `IndicatorStrategy` MACD-history regression (2026-09-12): an ADX-rejected candle must still update `_last_macd_hist` — reproduces the exact reviewer scenario (histogram 1→5→3, middle candle ADX-rejected) that used to read a real momentum *fall* as "rising" and fire a false pullback BUY |
-| `tests/shared/test_backtest_metrics_fees.py` | 2 | `bot/backtest/metrics.compute()` fee-accounting regression (2026-09-12): a $1 gain eaten by $1.608 in fees must count as a net LOSS, not a win — includes a from-scratch recomputation cross-check against the real saved 2026-09-12 BTC/USDT pinned-window CSV confirming net PF ≈0.82 (a documented loss on that window) |
+| `tests/shared/test_backtest_metrics_fees.py` | 3 | `bot/backtest/metrics.compute()` fee-accounting regression (2026-09-12): a $1 gain eaten by $1.608 in fees must count as a net LOSS, not a win — includes a from-scratch recomputation cross-check against the real saved 2026-09-12 BTC/USDT pinned-window CSV confirming net PF ≈0.82 (a documented loss on that window); **partial-exit fee allocation (2026-09-13)**: a position closed via two partial SELLs must split the entry fee proportionally by quantity, not dump 100% onto whichever SELL closes first (dormant against today's live full-exit-only config, real bug if `partial_tp_pct` is ever enabled) |
 | `tests/stock/test_screener_in_distribution.py` | 5 | In-distribution ATR%/liquidity filter (`stock_bot/data/screener.py`, replacement safety net after RULE_WHITELIST stopped gating BUYs) |
-| `tests/stock/test_accuracy_tracker.py` | 20 | `LiveTradingGate` gates — Gate 1 (`stock_backtest_latest.json` vs `RULE_WHITELIST`), Gate 2 (AI confidence-band edge, incl. SKIPPED when `AI_ENABLED=false` — 2026-09-10), Gate 3 (≥30 round-trips/PF≥1.2/win≥30%) |
+| `tests/stock/test_accuracy_tracker.py` | 23 | `LiveTradingGate` gates — Gate 1 (`stock_backtest_latest.json` vs `RULE_WHITELIST`, **plus a `strategy_hash` staleness check added 2026-09-13** — a report computed on an old `bot/strategy/` version now hard-FAILs Gate 1 outright, not just a human noticing an old `run_at` date; a report with no hash field at all, pre-dating this fix, falls back to the original symbol-verdict check), Gate 2 (AI confidence-band edge, incl. SKIPPED when `AI_ENABLED=false` — 2026-09-10), Gate 3 (≥30 round-trips/PF≥1.2/win≥30%) |
 | `tests/stock/test_checkpoint_tracker.py` | 14 | Post-whitelist review checkpoint tracker (`checkpoint_tracker.py`, dashboard visibility only): sample floors, win-rate/PF/AI-agreement gap triggers, AI-split sample-size guard |
 | `tests/shared/test_heartbeat.py` | 8 | Heartbeat pings: URL-off, success/failure never raise, healthy_fn gate |
 | `tests/stock/test_tws_monitor.py` | 6 | TwsConnectionMonitor state machine: blip tolerance, alert-once per outage, recovery notice |
@@ -725,6 +725,65 @@ Two further items from the same review, one addressed, one intentionally not:
 +3 tests (2 fee-accounting, 1 partial-fill-still-active reproduction — all three confirmed to
 fail against the pre-fix code), suite 950→953.
 
+### Fifth-pass review: partial-exit fee split, Gate 1 staleness closed for real, halt scope clarified (2026-09-13)
+A fifth review pass, checking the fourth round's fixes, found one more real (if currently
+dormant) bug and one real observability gap, plus one place where I had described existing,
+correct, by-design behavior inaccurately to the user. No new strategy or execution-layer bugs
+this round — the multi-round native-stop/execution churn from earlier passes has settled.
+
+- **Partial-exit fee allocation was still wrong for a case round 4 didn't test (Medium,
+  confirmed dormant).** The round-4 fee-accounting fix (`bot/backtest/metrics.py`) correctly
+  computes NET P&L for a single-BUY/single-SELL full-position close, but for a position closed
+  via TWO partial SELLs (`engine.py`'s opt-in `partial_tp_pct`), it dumped 100% of the entry
+  fee onto whichever SELL closed first and 0% onto the rest. Reproduced exactly as described:
+  two SELLs that are BOTH real economic losses once the entry fee is fairly split were
+  classified as one loss + one win (total realized P&L identical either way — only per-trade
+  win/loss classification, `win_rate`, and `profit_factor` were distorted). **Confirmed dormant
+  against every currently-live and currently-validated number** — `PARTIAL_TP_PCT` is unset
+  live and every walk-forward/backtest run to date used single-fill full-position exits, so
+  nothing already documented in this file changes. Fixed: the entry fee is now allocated
+  proportionally by quantity across however many SELLs close a position, carried forward as a
+  running remainder rather than reset to zero after the first SELL. A real bug for whoever
+  enables partial take-profit in the future, not before.
+- **Gate 1 had no way to detect its own staleness in code — only a human noticing an old
+  `run_at` date caught it (High observability gap, now closed).** The 2026-09-12 fourth-pass
+  review flagged that Gate 1 was validating a report computed before that day's MACD-history
+  strategy fix — I fixed it by manually re-running `stock_backtest.py`, but nothing in the code
+  would have caught a FUTURE staleness the same way; the crypto side has had exactly this
+  mechanism (`stamp_strategy.py` / `compute_strategy_hash()`) since early in the project, and
+  the stock side's Gate 1 simply never adopted it. Fixed: `stock_backtest.py` now writes
+  `compute_strategy_hash()`'s result into `stock_backtest_latest.json` (the SAME hash function
+  and hashed-file list the crypto bot stamps — both bots share `bot/strategy/
+  indicator_strategy.py`), and `check_gate1()` compares it against the current code's hash on
+  every check, hard-FAILing with a named "re-run stock_backtest.py" message on any mismatch —
+  not just leaving the existing symbol-verdict table to quietly validate the wrong code
+  forever. A report with no `strategy_hash` field at all (every report written before this fix,
+  including the one already on disk) falls back to the pre-existing symbol-verdict check rather
+  than being treated as an automatic failure. Re-ran `stock_backtest.py` immediately after this
+  fix so the on-disk report now actually carries the field.
+- **Halt scope: my own description to the user was wrong, the code was not (Low, corrected in
+  place, no fix needed).** `logs/HALT` was engaged 2026-09-12 with the stated rationale "pause
+  new BUYs... SELL/exit safety mechanisms fully active." That's true only for SL/TP exits
+  (`RiskManager.evaluate()` is never in that code path, gated only by
+  `RISK_HALT_BLOCKS_STOPS=false`) — an ordinary strategy-driven SELL signal DOES still route
+  through `risk.evaluate()` and IS blocked by `config.halt`, the one breaker in that file that
+  isn't BUY-only (every other tier — kill switch, drawdown, weekly/daily loss, position size —
+  explicitly checks `if signal == Signal.BUY`, confirmed by reading each one). This is
+  confirmed as intentional, pre-existing, documented full-stop kill-switch behavior (the
+  `_pause_crypto_flag()` docstring already says "BUY and strategy SELL will be blocked; SL/TP
+  exits still fire") — not a bug introduced or found this session, just a place where my own
+  summary conflated "SL/TP" with "the SELL path" in general. **User's explicit call
+  (2026-09-13): keep it as the broad full-stop it already is** rather than build a narrower
+  BUY-only pause — no open position exists to be affected either way today. CLAUDE.md's
+  "Current operational status" section corrected in place.
+- **Re-confirmed, not re-litigated:** T remaining in `RULE_WHITELIST` despite its Gate 1 FAIL,
+  and the deeper "whitelist no longer bounds the executable universe" gap, are unchanged from
+  the fourth-pass writeup above — both are real, both are already documented as deliberate,
+  undecided-by-design open items, not overlooked.
+
++4 tests (1 partial-exit fee-split reproduction, 3 Gate-1 staleness — all four confirmed to
+fail against the pre-fix code), suite 953→957.
+
 ### Generic stuck-loop detector (crypto + stock — BUILT 2026-08-27)
 `bot/alerts/stuck_loop.StuckLoopDetector` — error-string-agnostic "same operation keeps
 failing" watchdog. `record(key, ok, detail)`; `threshold`(5) consecutive failures → one
@@ -1147,10 +1206,18 @@ this is the documented, expected result, not a regression.**
   the strategy has NOT been shown to have a demonstrated edge net of costs, and continuing to
   trade it live is a decision to make deliberately, not a default. **User decision 2026-09-12:
   new BUYs paused** — `logs/HALT` engaged via the existing manual kill-switch (same mechanism
-  `/pause_crypto` uses). SL/TP exits and the SELL path are unaffected
-  (`RISK_HALT_BLOCKS_STOPS=false`); no open position is at risk either way (BTC/CAD has never
-  filled, SOL/CAD is flat). Lift with `rm logs/HALT` or `/resume_crypto` once the net-of-fees
-  edge question is resolved one way or the other. BTC/CAD ($77 slot) capital
+  `/pause_crypto` uses). **Correction (2026-09-13):** this was first described here as "SELL/
+  exit safety mechanisms fully active" — true only for SL/TP exits (`RiskManager.evaluate()`
+  isn't in that code path at all, gated only by `RISK_HALT_BLOCKS_STOPS=false`); an ordinary
+  strategy-driven SELL signal DOES still route through `risk.evaluate()` and IS blocked by
+  `config.halt`, same as BUY (`bot/risk/risk_manager.py` Check 1 — the one breaker in that
+  file that isn't BUY-only, unlike every other tier). Confirmed as intentional, documented
+  full-stop kill-switch behavior, not a bug — user's explicit call (2026-09-13) is to keep it
+  that way rather than build a narrower BUY-only pause. No open position is at risk either way
+  (BTC/CAD has never filled, SOL/CAD is flat); if one opens while halted, SL/TP alone protects
+  it (which is the existing safety net, not a gap this halt creates). Lift with `rm logs/HALT`
+  or `/resume_crypto` once the net-of-fees edge question is resolved one way or the other.
+  BTC/CAD ($77 slot) capital
   gate 0/15 fills (strategy trades ~every 3–6 weeks; 65+ days elapsed with zero progress
   toward fill #1 as of 2026-08-24). SOL/CAD ($376 slot) 1/15 fills (BUY 0.080808 @ $134.02 on
   2026-08-26 — the fill that surfaced the post-only bug; TP-closed +$1.27/+10.9% on

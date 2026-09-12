@@ -376,6 +376,33 @@ class LiveTradingGate:
         except (json.JSONDecodeError, OSError) as exc:
             return {"status": "FAIL", "detail": f"stock_backtest_latest.json unreadable ({exc})"}
 
+        # Staleness guard (2026-09-13): a report computed on an old strategy
+        # version must not silently keep passing Gate 1 forever just because
+        # nobody happened to re-run stock_backtest.py after a bot/strategy/
+        # change. This mirrors the crypto side's stamp_strategy.py discipline
+        # instead of relying on a human noticing the run_at date is old.
+        # Reports written before this field existed have no "strategy_hash"
+        # key at all — treated as unverifiable rather than a hard FAIL, so an
+        # old-format report doesn't spuriously break an otherwise-passing gate.
+        report_hash = data.get("strategy_hash")
+        if report_hash:
+            try:
+                from bot.strategy.fingerprint import compute_strategy_hash
+                current_hash = compute_strategy_hash()
+            except Exception as exc:
+                return {"status": "FAIL", "detail": f"could not compute current strategy hash: {exc}"}
+            if report_hash != current_hash:
+                return {
+                    "status": "FAIL",
+                    "detail": (
+                        f"stock_backtest_latest.json was computed on strategy hash "
+                        f"{report_hash}, current code is {current_hash} — re-run "
+                        f".venv/bin/python stock_backtest.py before trusting Gate 1"
+                    ),
+                    "passing_count": 0,
+                    "total_count":   0,
+                }
+
         try:
             from stock_bot.config import load as _load_stock_config
             whitelist = sorted({

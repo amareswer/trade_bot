@@ -46,9 +46,13 @@ def _isolate_paths(tmp_path, monkeypatch):
     yield
 
 
-def _write_json(path: str, results: list[dict], run_at: str = "2026-08-20T12:00:00+00:00") -> None:
+def _write_json(path: str, results: list[dict], run_at: str = "2026-08-20T12:00:00+00:00",
+                 strategy_hash: str | None = None) -> None:
+    doc = {"run_at": run_at, "windows": [0, 750, 500, 250], "results": results}
+    if strategy_hash is not None:
+        doc["strategy_hash"] = strategy_hash
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({"run_at": run_at, "windows": [0, 750, 500, 250], "results": results}, f)
+        json.dump(doc, f)
 
 
 def _sym_result(symbol: str, verdict: str) -> dict:
@@ -154,6 +158,40 @@ def test_gate1_fail_when_whitelist_empty(monkeypatch):
     result = LiveTradingGate().check_gate1()
     assert result["status"] == "FAIL"
     assert "empty" in result["detail"]
+
+
+def test_gate1_no_hash_field_is_unverifiable_not_a_fail():
+    """A report written before the 2026-09-13 strategy_hash field existed has
+    no way to be checked for staleness — must fall back to the pre-existing
+    symbol-verdict check rather than treating the missing field as a failure."""
+    syms = _WHITELIST.split(",")
+    _write_json(at_mod._LATEST_BACKTEST_JSON, [_sym_result(s, "PASS") for s in syms])
+    result = LiveTradingGate().check_gate1()
+    assert result["status"] == "PASS"
+
+
+def test_gate1_current_hash_matches_evaluates_normally():
+    from bot.strategy.fingerprint import compute_strategy_hash
+    syms = _WHITELIST.split(",")
+    _write_json(at_mod._LATEST_BACKTEST_JSON, [_sym_result(s, "PASS") for s in syms],
+                strategy_hash=compute_strategy_hash())
+    result = LiveTradingGate().check_gate1()
+    assert result["status"] == "PASS"
+
+
+def test_gate1_fails_on_stale_strategy_hash_even_if_all_symbols_pass():
+    """2026-09-13 finding: Gate 1 had no way to detect that
+    stock_backtest_latest.json was computed on an old bot/strategy/ version —
+    only a human noticing the run_at date was stale caught this. A report
+    computed on stale strategy code must FAIL Gate 1 outright, regardless of
+    what its (now-irrelevant) symbol verdicts say."""
+    syms = _WHITELIST.split(",")
+    _write_json(at_mod._LATEST_BACKTEST_JSON, [_sym_result(s, "PASS") for s in syms],
+                strategy_hash="deadbeefdeadbeef")   # never a real hash
+    result = LiveTradingGate().check_gate1()
+    assert result["status"] == "FAIL"
+    assert "strategy hash" in result["detail"].lower() or "strategy_hash" in result["detail"].lower() \
+        or "deadbeefdeadbeef" in result["detail"]
 
 
 # ---------------------------------------------------------------------------

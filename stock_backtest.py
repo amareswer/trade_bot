@@ -45,6 +45,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from bot.atomic_json import atomic_write_json
+from bot.strategy.fingerprint import compute_strategy_hash
 from stock_bot.config import load as load_stock_config
 from stock_bot.data.price_feed import fetch_candles
 from stock_bot.backtest.engine import (
@@ -195,7 +196,11 @@ def run() -> int:
     # Machine-readable snapshot — fixed path, always overwritten. See module
     # docstring and _LATEST_JSON_PATH comment.
     atomic_write_json(_LATEST_JSON_PATH, {
-        "run_at":   datetime.now(timezone.utc).isoformat(),
+        "run_at":        datetime.now(timezone.utc).isoformat(),
+        "strategy_hash": compute_strategy_hash(),   # same fingerprint the crypto
+                                                     # bot stamps — lets Gate 1 detect
+                                                     # a report computed on stale
+                                                     # strategy code, not just a stale date.
         "windows":  WINDOWS,
         "gate_criteria": {
             "min_trades_full_window":  MIN_TRADES_FULL_WINDOW,
