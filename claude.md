@@ -1345,6 +1345,32 @@ this is the documented, expected result, not a regression.**
 - If the bot or backtest prints `STRATEGY CODE DIFFERS`, re-run walk-forward before trusting any PF numbers.
 - **Both bots need a restart** to run the fixed MACD-history strategy code.
 
+### Review deadline & keep/retire criteria (set 2026-09-12)
+Both strategies are on trial, not accepted indefinitely. One review date, explicit numeric
+bars, decided now so evaluation happens on a schedule instead of being deferred again each
+time a review pass finds another thing to fix.
+
+**Review date: 2027-03-12** (6 months out). This is a backstop — each bot below can also
+trigger review earlier, but neither can be pushed out past this date by "not enough trades yet."
+
+- **Stock bot (Gate 3):** review at 30 completed round-trips (the existing gate) OR
+  2027-03-12, whichever comes first. At review: PF≥1.2 net-of-commission AND win rate≥30% on
+  whatever trade count exists at that point — the existing Gate 3 bar, this only adds a date
+  backstop so a slow trade pace can't defer judgment forever.
+- **Crypto bot (BTC/CAD + SOL/CAD, HALTed since 2026-09-12):** resume BUYs only after a
+  walk-forward on data strictly AFTER 2026-09-12 — genuinely out-of-sample, not one of the
+  windows already reviewed across 7 passes — clears PF≥1.2 net on ALL windows for BOTH
+  BTC/USDT and SOL/USDT, evaluated against a simple buy-and-hold benchmark over the same
+  window (net return AND max drawdown, not PF alone). Check this at the 2027-03-12 review
+  date at the latest.
+- **If either bot fails its bar at review:** retire or redesign that strategy rather than
+  keep patching or waiting further. Don't relitigate this deadline itself without genuinely
+  new evidence (e.g., a materially different market regime) — a fixed deadline that gets
+  pushed back on request isn't a deadline.
+- **Feature/process work pauses:** no more proactive multi-pass code reviews on either bot
+  between now and the review date unless a specific bug is suspected — user's explicit call,
+  2026-09-12 (7 review passes already ran on this exact code this month).
+
 ### Current operational status
 - **Crypto bot:** live on Kraken, **but its profitability basis is now in question
   (2026-09-12)** — see "Canonical strategy fingerprint" above. The walk-forward/backtest

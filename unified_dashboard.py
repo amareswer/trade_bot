@@ -1075,7 +1075,7 @@ def _stock_card(state: dict | None) -> str:
             f'${total:,.2f} <span style="color:{ret_col};font-size:12px">{ret_s}{ret_pct:.1f}%</span>',
         )
         + _kv("Starting cash", f"${starting:,.2f}")
-        + _kv("Last updated", updated)
+        + _kv("Last trade activity", updated)
         + "</div>"
     )
 
