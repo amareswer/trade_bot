@@ -152,6 +152,25 @@ class FakeIB:
             asyncio.ensure_future(_slow_resubmit_then_fill())
         elif self.fill_mode == "flicker_cancel_no_resubmit":
             trade.orderStatus.status = "Cancelled"   # dead — never resubmits/fills
+        elif self.fill_mode == "partial_then_full":
+            # A real partial fill — order keeps working the remainder, no
+            # flicker/resubmit involved at all. Status stays live (not
+            # Filled/Cancelled) until the rest fills a moment later.
+            trade.orderStatus.status = "Submitted"
+            trade.orderStatus.filled = float(order.totalQuantity) / 2.0
+            trade.orderStatus.avgFillPrice = self.fill_price
+
+            async def _fill_remainder():
+                await asyncio.sleep(0.3)
+                self._fill(trade, order)   # completes to the full quantity
+
+            asyncio.ensure_future(_fill_remainder())
+        elif self.fill_mode == "partial_then_stalls":
+            # A real partial fill that never completes — order keeps
+            # reading back as live/working until something cancels it.
+            trade.orderStatus.status = "Submitted"
+            trade.orderStatus.filled = float(order.totalQuantity) / 2.0
+            trade.orderStatus.avgFillPrice = self.fill_price
         return trade
 
     def cancelOrder(self, order):
@@ -593,6 +612,40 @@ def test_flicker_cancel_then_slow_resubmit_fill_is_recorded(executors, monkeypat
     assert order.quantity == 7
     assert fake.cancelled == []       # never initiated a cancel ourselves
     assert elapsed > 0.3              # waited past _fill_timeout_s for the resubmit
+
+
+# ---------------------------------------------------------------------------
+# Partial fills (2026-09-12): the wait loop must not exit the instant ANY
+# fill appears while the order is still live/working the remainder — it
+# must track the order to genuine completion or a confirmed cancel.
+# ---------------------------------------------------------------------------
+
+def test_partial_fill_waits_for_remainder_not_first_partial(executors):
+    """A real partial fill (no flicker/resubmit involved) that keeps working
+    and completes a moment later must be recorded as the FULL final
+    quantity, not the first partial reading. Before the fix, the wait loop
+    returned the instant any fill appeared, silently abandoning the
+    still-working remainder — the later completion was never recorded."""
+    fake = FakeIB(fill_mode="partial_then_full", fill_price=60.0)
+    ex = make_executor(fake, fill_timeout_s=2.0)
+    executors.append(ex)
+    order = ex.buy("KO", 4, 60.0, reason="test")
+    assert order.status == OrderStatus.FILLED
+    assert order.quantity == 4, "must record the completed quantity, not the first partial (2)"
+
+
+def test_partial_fill_that_stalls_gets_cancelled_not_left_resting(executors):
+    """A partial fill whose remainder never completes must be actively
+    cancelled once the fill timeout is reached — 'track to completion or
+    confirmed cancellation', not silently accepted as done while the
+    remainder keeps resting unmanaged on the broker."""
+    fake = FakeIB(fill_mode="partial_then_stalls", fill_price=60.0)
+    ex = make_executor(fake, fill_timeout_s=0.3)
+    executors.append(ex)
+    order = ex.buy("KO", 4, 60.0, reason="test")
+    assert len(fake.cancelled) == 1, "the still-working remainder must be cancelled, not left resting"
+    assert order.status == OrderStatus.FILLED   # partial fill still gets recorded
+    assert order.quantity == 2                  # the confirmed partial, not the requested 4
 
 
 def test_flicker_cancel_no_resubmit_gives_up_after_grace(executors, monkeypatch):

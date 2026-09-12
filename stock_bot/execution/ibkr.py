@@ -493,39 +493,54 @@ class IBKRExecutor(StockExecutorBase):
         # the position is actually open and unrecorded (RY 2026-07-31/08-19,
         # BNS 2026-08-27). So an *unfilled* 'Cancelled'/'ApiCancelled' is not
         # treated as terminal: keep polling for the resubmit's fill for
-        # _CANCEL_RESUBMIT_GRACE_S past the first flicker sighting. Any fill, or
-        # any other done-state, ends the wait.
+        # _CANCEL_RESUBMIT_GRACE_S past the first flicker sighting. Only a
+        # genuine done-state (or the resubmit's own grace expiring) ends the
+        # wait — a PARTIAL fill must not, or the still-working remainder is
+        # abandoned unwatched (2026-09 finding: the old code broke out of
+        # this loop the instant ANY fill appeared, recorded that partial
+        # quantity as if it were the whole trade, and never cancelled or
+        # kept tracking the unfilled remainder — a later fill on the same
+        # order was then missing from accounting entirely).
         def _has_fill() -> bool:
             return bool(trade.fills) or float(trade.orderStatus.filled or 0.0) > 0
 
         deadline = self._loop.time() + self._fill_timeout_s
         resubmit_grace_until = None
         while True:
-            if _has_fill():
-                break
             if resubmit_grace_until is not None:
                 # A 10349 flicker was already seen — the silent resubmit governs
                 # now. Wait out _CANCEL_RESUBMIT_GRACE_S regardless of the
                 # resubmit's current status (Cancelled/PreSubmitted/Submitted)
                 # or the original fill deadline: the resubmit can land well
                 # after _fill_timeout_s (BNS ~8.3s), and a short fill timeout
-                # (tests, or a tight config) must not truncate it.
-                if self._loop.time() >= resubmit_grace_until:
-                    break   # resubmit never filled — genuinely dead
+                # (tests, or a tight config) must not truncate it. This
+                # branch keeps its original "any fill ends the wait"
+                # exit (unlike the general case below) — it's specifically
+                # watching for the known resubmit-then-fill pattern, not a
+                # normal working order, and its own leftover 'Cancelled'
+                # flicker status would otherwise satisfy isDone() on the
+                # very next poll before the resubmit ever resolves.
+                if _has_fill() or self._loop.time() >= resubmit_grace_until:
+                    break   # resubmit filled, or never filled — genuinely dead
             elif trade.isDone():
                 if trade.orderStatus.status not in ("Cancelled", "ApiCancelled"):
-                    break   # genuine terminal state, no fill
+                    break   # genuine terminal state — fully filled, or another terminal status
                 resubmit_grace_until = self._loop.time() + _CANCEL_RESUBMIT_GRACE_S
             elif self._loop.time() >= deadline:
-                break   # order still live but past the fill deadline
+                break   # order still live past the fill deadline — may hold a partial fill
             await asyncio.sleep(0.25)
 
-        if not _has_fill() and not trade.isDone():
-            # True timeout with the order still live: cancel, then wait for its
-            # actual fate — a fill can still race the cancel, never dropped.
+        if not trade.isDone():
+            # True timeout with the order still live — whether it's wholly
+            # unfilled or partially filled and still working the remainder,
+            # both must be cancelled and tracked to their actual fate rather
+            # than treated as done. A further fill can still race the
+            # cancel and must be captured, never dropped, same as the
+            # crypto bot's cancel-race handling.
             logger.warning(
-                "IBKR %s %s ×%d not done after %.0fs — cancelling",
-                action, symbol, qty, self._fill_timeout_s,
+                "IBKR %s %s ×%d not done after %.0fs (filled=%s so far) — "
+                "cancelling remainder",
+                action, symbol, qty, self._fill_timeout_s, trade.orderStatus.filled,
             )
             self._ib.cancelOrder(order)
             cancel_deadline = self._loop.time() + 15.0

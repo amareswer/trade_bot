@@ -175,7 +175,7 @@ narrative behind any decision below, and `.memory/decisions/*.md` for the deepes
 
 ## Test Suite Manifest
 
-**Expected total: 914 tests** (`pytest --collect-only -q`). If the count disagrees: a file
+**Expected total: 916 tests** (`pytest --collect-only -q`). If the count disagrees: a file
 has an import error, was deleted, was added without a manifest bump, or was excluded from the
 runner — investigate before trusting a green suite. Suite runtime ~9–26s; minutes means a
 test is reading live `.env` config. The per-row table sum below lags the header total by ~22
@@ -217,7 +217,7 @@ Run: `python -m pytest --tb=short -q` — must show **906 passed**.
 | `tests/stock/test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last, determinism, validated-parameter pin |
 | `tests/crypto/test_audit_scheduler.py` | 14 | REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, monthly 1st-anchored re-screen, missed-run catch-up |
 | `tests/crypto/test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
-| `tests/stock/test_ibkr_executor.py` | 69 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping, broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe, FX/margin-minimum guard (**checks NET-LIQ, not free cash** — 2026-08-31 fix), sector-concentration gate, weekly/drawdown-halt/kill-switch tiers, per-position ATR stop-pct override, projected-exposure check, LiveTradingGate enforcement (incl. Gate 2 SKIPPED-when-AI-disabled bypass, 2026-09-10), TWS-query resilience (last-good cache, incl. **disconnected-but-no-exception preserves cache** — 2026-09-11 fix), `ibkr_trades.csv` write buffer/retry, Error 10349 slow-resubmit fill (20s grace + `tif="DAY"`), daily-loss calendar-day anchoring |
+| `tests/stock/test_ibkr_executor.py` | 71 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping, broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe, FX/margin-minimum guard (**checks NET-LIQ, not free cash** — 2026-08-31 fix), sector-concentration gate, weekly/drawdown-halt/kill-switch tiers, per-position ATR stop-pct override, projected-exposure check, LiveTradingGate enforcement (incl. Gate 2 SKIPPED-when-AI-disabled bypass, 2026-09-10), TWS-query resilience (last-good cache, incl. **disconnected-but-no-exception preserves cache** — 2026-09-11 fix), `ibkr_trades.csv` write buffer/retry, Error 10349 slow-resubmit fill (20s grace + `tif="DAY"`), daily-loss calendar-day anchoring, **partial-fill tracking to completion or confirmed cancel** (2026-09-12 fix) |
 | `tests/stock/test_fx_sizing.py` | 14 | USD/CAD sizing: `is_cad_symbol`, `get_usd_cad_rate`, mixed-currency `total_value`/`check_exposure`, sector-concentration gate, projected-exposure check |
 | `tests/stock/test_screener_in_distribution.py` | 5 | In-distribution ATR%/liquidity filter (`stock_bot/data/screener.py`, replacement safety net after RULE_WHITELIST stopped gating BUYs) |
 | `tests/stock/test_accuracy_tracker.py` | 20 | `LiveTradingGate` gates — Gate 1 (`stock_backtest_latest.json` vs `RULE_WHITELIST`), Gate 2 (AI confidence-band edge, incl. SKIPPED when `AI_ENABLED=false` — 2026-09-10), Gate 3 (≥30 round-trips/PF≥1.2/win≥30%) |
@@ -614,6 +614,24 @@ Fixed: both methods now check `self._ib.isConnected()` inside the same async cal
 if not, routing a stale-but-non-raising connection through the identical cache-preserving
 path as a thrown exception. +2 tests (each verified to fail against the pre-fix code), suite
 909→911. Requires a stock bot restart to take effect — running process still has the old code.
+
+**Second gap found + fixed 2026-09-12 (code review):** `_place_market_async()`'s wait loop
+exited the instant ANY fill appeared — even a partial one — while the order kept working the
+unfilled remainder on the broker. `_execute()` logged "IBKR PARTIAL FILL" and returned that
+partial quantity as if the trade were complete: no cancellation of the remainder, no
+continued tracking, so a later fill on the same order was never recorded anywhere (a real
+accounting gap between `ibkr_trades.csv` and the broker's actual position). Fixed: the loop
+now only exits on a genuine terminal state (`trade.isDone()`) or the fill deadline, regardless
+of partial-fill amount; a timeout with the order still live — whole or partially filled —
+cancels the remainder and waits for its actual fate, same conservative philosophy as the
+crypto bot's cancel-race handling. The Error-10349 flicker/resubmit grace window (RY/BNS
+incidents) intentionally keeps its original "any fill resolves it" exit — it's narrowly
+watching for a known resubmit-then-fill pattern, not a normal working order, and reusing
+`isDone()` there would trip on the flicker's own leftover 'Cancelled' status before the
+resubmit ever resolved (caught by a regression during this fix — `test_flicker_cancel_
+then_fill_is_recorded` failed until the scoping was corrected). +2 tests (each verified to
+fail against the pre-fix code — old behavior recorded 2 of 4 shares and never called
+`cancelOrder` on the stalled remainder), suite 914→916. Requires a stock bot restart.
 
 ### LiveTradingGate — stock bot IBKR readiness check (repaired + code-enforced 2026-08-20)
 `stock_bot/analysis/accuracy_tracker.py`. `IBKRExecutor.__init__()` on a live port with
