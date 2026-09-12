@@ -652,11 +652,15 @@ def _check_open_positions_sl_tp(executor, cfg, notifier=None, stuck_detector=Non
             order = executor.sell(symbol, shares, live, reason=_kind)
             _filled = order.status == OrderStatus.FILLED
             if _filled:
+                # order.quantity/order.price are the actual fill — same
+                # 2026-09 finding as the main scan loop's BUY/SELL paths.
+                _fill_shares = order.quantity
+                _fill_price  = order.price
                 _label = "🛑 STOP LOSS" if _sl_hit else "✅ TAKE PROFIT"
-                print(f"  {_label} triggered: {symbol} @ ${live:.2f} ({pct_change:+.1%})")
+                print(f"  {_label} triggered: {symbol} @ ${_fill_price:.2f} ({pct_change:+.1%})")
                 if notifier:
-                    notifier.fill("SELL", symbol, shares, live, shares * live,
-                                  pnl=round((live - avg_cost) * shares, 2),
+                    notifier.fill("SELL", symbol, _fill_shares, _fill_price, order.total_value,
+                                  pnl=round((_fill_price - avg_cost) * _fill_shares, 2),
                                   reason="stop loss" if _sl_hit else "take profit")
             else:
                 # Previously silent — a rejected SL/TP exit here logged nothing
@@ -1979,14 +1983,23 @@ def run() -> None:
                                         candle_close=px, live_price=raw_live_price,
                                     )
                                     if order.status == OrderStatus.FILLED:
-                                        total = round(shares * execution_price, 2)
-                                        print(f"  📄 PAPER BUY:  {symbol}  {shares} shares")
-                                        print(f"                 @ ${execution_price:,.2f} = ${total:,.2f}")
+                                        # order.quantity/order.price are the ACTUAL fill
+                                        # (both executors now set these on FILLED, not the
+                                        # pre-order request) — a partial fill or slippage
+                                        # between the signal price and the real fill must
+                                        # not make the notification/CSV disagree with what
+                                        # the broker/paper book actually recorded
+                                        # (2026-09 finding).
+                                        fill_shares = order.quantity
+                                        fill_price  = order.price
+                                        total = order.total_value
+                                        print(f"  📄 PAPER BUY:  {symbol}  {fill_shares} shares")
+                                        print(f"                 @ ${fill_price:,.2f} = ${total:,.2f}")
                                         if _atr_stop_pct is not None:
                                             executor.set_position_stop_pct(symbol, _atr_stop_pct)
                                             print(f"                 ATR stop: {_atr_stop_pct:.1%} (vs flat {cfg.paper_stop_loss_pct:.1%})")
-                                        notifier.fill("BUY", symbol, shares,
-                                                      execution_price, total,
+                                        notifier.fill("BUY", symbol, fill_shares,
+                                                      fill_price, total,
                                                       reason=reason)
                                         print(f"                 Cash remaining: ${executor.cash:,.2f}")
                                     else:
@@ -2017,19 +2030,24 @@ def run() -> None:
                             order  = executor.sell(symbol, held, execution_price, reason=reason)
                             if order.status == OrderStatus.FILLED:
                                 exit_policy.clear(symbol)
-                                proceeds  = round(held * execution_price, 2)
-                                trade_pnl = round((execution_price - avg) * held, 2)
-                                notifier.fill("SELL", symbol, held, execution_price,
+                                # order.quantity/order.price are the ACTUAL fill, not the
+                                # pre-order signal price/requested shares — see the BUY
+                                # side's comment above (2026-09 finding).
+                                fill_shares = order.quantity
+                                fill_price  = order.price
+                                proceeds    = order.total_value
+                                trade_pnl   = round((fill_price - avg) * fill_shares, 2)
+                                notifier.fill("SELL", symbol, fill_shares, fill_price,
                                               proceeds, pnl=trade_pnl, reason=reason)
-                                pnl_pct   = round((execution_price - avg) / avg * 100, 1) if avg else 0.0
+                                pnl_pct   = round((fill_price - avg) / avg * 100, 1) if avg else 0.0
                                 logger.info(
                                     "EXIT (%s): %s %.4f sh @ %.2f — %s",
                                     "rule" if _rule_sell else "ai",
-                                    symbol, held, execution_price,
+                                    symbol, fill_shares, fill_price,
                                     reason if _rule_sell else (_exit_dec.reason if _exit_dec else reason),
                                 )
-                                print(f"  📄 PAPER SELL: {symbol}  {held:.4f} shares")
-                                print(f"                 @ ${execution_price:,.2f} = ${proceeds:,.2f}")
+                                print(f"  📄 PAPER SELL: {symbol}  {fill_shares:.4f} shares")
+                                print(f"                 @ ${fill_price:,.2f} = ${proceeds:,.2f}")
                                 print(f"                 Realized P&L: {trade_pnl:+.2f} ({pnl_pct:+.1f}%)")
                                 print(f"                 Cash remaining: ${executor.cash:,.2f}")
                             else:

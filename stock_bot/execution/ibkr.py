@@ -700,11 +700,20 @@ class IBKRExecutor(StockExecutorBase):
                     f"Sector limit: already {_MAX_PER_SECTOR} open positions in '{sector}'",
                 )
 
-        est_cost = shares * price
+        # self.cash is always base-currency (CAD) — price is in the
+        # security's OWN currency, so a USD stock's cost must be converted
+        # before comparing against CAD cash, or this understates the real
+        # CAD amount needed by the USD/CAD rate (~1.35-1.40x). _price_in_cad
+        # already exists and is used everywhere else this comparison
+        # matters (total_value()); this was the one spot still comparing
+        # mismatched currencies directly (2026-09 finding).
+        est_cost = shares * self._price_in_cad(sym, price)
         if est_cost > self.cash + 1e-9:
             return self._reject(
                 sym, OrderSide.BUY, shares, price,
-                f"Insufficient cash: have ${self.cash:,.2f}, need ${est_cost:,.2f}",
+                f"Insufficient cash: have ${self.cash:,.2f} CAD, need ${est_cost:,.2f} CAD"
+                + ("" if contract_currency == "CAD"
+                   else f" ({shares} × ${price:,.2f} {contract_currency})"),
             )
 
         order = self._new_order(sym, OrderSide.BUY, shares, price)

@@ -25,7 +25,12 @@ import stock_bot.main as main_mod
 def _executor(positions: dict[str, tuple[float, float]]) -> MagicMock:
     ex = MagicMock()
     ex.positions_snapshot.return_value = positions
-    ex.sell.return_value = SimpleNamespace(status=main_mod.OrderStatus.FILLED)
+    # quantity/price/total_value must be present — _check_open_positions_sl_tp
+    # reads the ACTUAL fill off the order object (2026-09 finding), not the
+    # request; individual tests override these when the values matter.
+    ex.sell.return_value = SimpleNamespace(
+        status=main_mod.OrderStatus.FILLED, quantity=4.0, price=200.0, total_value=800.0,
+    )
     ex.check_native_stop_fills.return_value = []   # realistic default — no broker-side fills
     del ex.get_position_stop_pct   # hasattr(executor, "get_position_stop_pct") is False
     return ex
@@ -96,7 +101,9 @@ def test_no_native_stop_sync_when_executor_does_not_support_it(monkeypatch):
         def positions_snapshot(self):
             return {"RY": (4.0, 200.0)}
         def sell(self, *a, **k):
-            return SimpleNamespace(status=main_mod.OrderStatus.FILLED)
+            return SimpleNamespace(
+                status=main_mod.OrderStatus.FILLED, quantity=4.0, price=100.0, total_value=400.0,
+            )
         def get_position_stop_pct(self, *a, **k):
             return 0.05
         # deliberately no sync_protective_stop / check_native_stop_fills
@@ -192,7 +199,8 @@ def test_filled_sl_tp_exit_resets_the_stuck_streak(monkeypatch):
     ex.sell.return_value = SimpleNamespace(
         status=main_mod.OrderStatus.REJECTED, reject_reason="x")
     main_mod._check_open_positions_sl_tp(ex, _cfg(stop_loss_pct=0.05), None, det)
-    ex.sell.return_value = SimpleNamespace(status=main_mod.OrderStatus.FILLED)
+    ex.sell.return_value = SimpleNamespace(
+        status=main_mod.OrderStatus.FILLED, quantity=4.0, price=200.0, total_value=800.0)
     main_mod._check_open_positions_sl_tp(ex, _cfg(stop_loss_pct=0.05), None, det)
     assert det.snapshot() == {}                          # success cleared it
 

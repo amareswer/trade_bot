@@ -927,6 +927,49 @@ def test_find_resting_native_stop_ambiguous_touches_nothing(executors):
     assert fake.cancelled == []
 
 
+# ---------------------------------------------------------------------------
+# Currency-aware cash check (2026-09 finding): buy() compared shares×price in
+# the security's OWN currency directly against base-currency (CAD) cash,
+# understating the real CAD cost for any USD-denominated stock.
+# ---------------------------------------------------------------------------
+
+def test_buy_rejects_usd_stock_when_cad_cash_is_short_after_fx(executors):
+    """10 shares @ $100 USD = $1000 USD, but self.cash is CAD. At a 1.35
+    USD/CAD rate that's $1350 CAD needed — more than the $1000 CAD cash on
+    hand. Before the fix, the check compared 1000 (USD-denominated) against
+    1000 (CAD cash) directly and let it through."""
+    fake = FakeIB(cash=1000.0, net_liq=10_000.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+    with patch.object(ibkr_mod, "get_usd_cad_rate", return_value=1.35):
+        order = ex.buy("KO", 10, 100.0, reason="test")
+    assert order.status == OrderStatus.REJECTED
+    assert "Insufficient cash" in order.reject_reason
+    assert fake.placed == [], "must reject before ever placing the order"
+
+
+def test_buy_allows_usd_stock_when_cad_cash_covers_fx_converted_cost(executors):
+    """Same trade, but with enough CAD cash to cover the FX-converted cost
+    ($1350 CAD needed, $2000 CAD on hand) — must go through normally."""
+    fake = FakeIB(cash=2000.0, net_liq=10_000.0, fill_price=100.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+    with patch.object(ibkr_mod, "get_usd_cad_rate", return_value=1.35):
+        order = ex.buy("KO", 10, 100.0, reason="test")
+    assert order.status == OrderStatus.FILLED
+
+
+def test_buy_cad_stock_cash_check_unaffected_by_fx_rate(executors):
+    """A CAD-denominated (.TO) symbol must never be converted — the fix
+    must not accidentally apply the FX rate to CAD-quoted stocks too."""
+    fake = FakeIB(cash=1000.0, net_liq=10_000.0, fill_price=100.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+    with patch.object(ibkr_mod, "get_usd_cad_rate", return_value=1.35):
+        order = ex.buy("CM.TO", 10, 100.0, reason="test")   # $1000 CAD == $1000 CAD cash
+    assert order.status == OrderStatus.FILLED
+
+
 def test_positions_snapshot_maps_back_to_yfinance_symbols(executors):
     fake = FakeIB(positions=[_cm_position()])
     ex = make_executor(fake)

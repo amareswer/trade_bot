@@ -491,6 +491,15 @@ class StockPaperExecutor(StockExecutorBase):
             )
             self._positions[sym] = (new_shares, round(new_cost, 6))
             self._cash          -= cost
+            # order.price was still the pre-slippage requested price at
+            # construction — total_value is computed once from price*quantity
+            # in StockOrder.__post_init__, so it must be recomputed here too,
+            # not just price (2026-09 finding: callers reading order.price/
+            # order.total_value after a FILLED order got the request, not
+            # the actual fill — mirrors IBKRExecutor's existing pattern).
+            order.quantity    = shares
+            order.price       = fill_px
+            order.total_value = round(abs(fill_px * shares), 2)
             order.status    = OrderStatus.FILLED
             order.filled_at = datetime.now(timezone.utc)
 
@@ -549,6 +558,13 @@ class StockPaperExecutor(StockExecutorBase):
                     self._position_stop_pct.pop(sym, None)
                 else:
                     self._positions[sym] = (new_shares, held_cost)
+                # Same fix as buy(): order.price/total_value must reflect
+                # the actual (slippage-adjusted) fill, not the pre-slippage
+                # requested price — a caller reading the order object after
+                # FILLED must see what really happened.
+                order.quantity    = shares
+                order.price       = fill_px
+                order.total_value = round(abs(fill_px * shares), 2)
                 order.status    = OrderStatus.FILLED
                 order.filled_at = datetime.now(timezone.utc)
 

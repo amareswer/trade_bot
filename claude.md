@@ -175,7 +175,7 @@ narrative behind any decision below, and `.memory/decisions/*.md` for the deepes
 
 ## Test Suite Manifest
 
-**Expected total: 935 tests** (`pytest --collect-only -q`). If the count disagrees: a file
+**Expected total: 940 tests** (`pytest --collect-only -q`). If the count disagrees: a file
 has an import error, was deleted, was added without a manifest bump, or was excluded from the
 runner — investigate before trusting a green suite. Suite runtime ~9–26s; minutes means a
 test is reading live `.env` config. The per-row table sum below lags the header total by ~22
@@ -217,9 +217,10 @@ Run: `python -m pytest --tb=short -q` — must show **906 passed**.
 | `tests/stock/test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last, determinism, validated-parameter pin |
 | `tests/crypto/test_audit_scheduler.py` | 14 | REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, monthly 1st-anchored re-screen, missed-run catch-up |
 | `tests/crypto/test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
-| `tests/stock/test_ibkr_executor.py` | 81 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping, broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe, FX/margin-minimum guard (**checks NET-LIQ, not free cash** — 2026-08-31 fix), sector-concentration gate, weekly/drawdown-halt/kill-switch tiers, per-position ATR stop-pct override, projected-exposure check, LiveTradingGate enforcement (incl. Gate 2 SKIPPED-when-AI-disabled bypass, 2026-09-10), TWS-query resilience (last-good cache, incl. **disconnected-but-no-exception preserves cache** — 2026-09-11 fix), `ibkr_trades.csv` write buffer/retry, Error 10349 slow-resubmit fill (20s grace + `tif="DAY"`), daily-loss calendar-day anchoring, **partial-fill tracking to completion or confirmed cancel** (2026-09-12 fix), **concurrent-sell serialization** (2026-09-12 fix, overlap-counter proof), **native broker-side protective stop** (2026-09-12: place/no-op/replace/adopt-on-restart, cancel-before-sell, broker-triggered-fill detection, multi-stop ambiguity) |
+| `tests/stock/test_ibkr_executor.py` | 84 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping, broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe, FX/margin-minimum guard (**checks NET-LIQ, not free cash** — 2026-08-31 fix), sector-concentration gate, weekly/drawdown-halt/kill-switch tiers, per-position ATR stop-pct override, projected-exposure check, LiveTradingGate enforcement (incl. Gate 2 SKIPPED-when-AI-disabled bypass, 2026-09-10), TWS-query resilience (last-good cache, incl. **disconnected-but-no-exception preserves cache** — 2026-09-11 fix), `ibkr_trades.csv` write buffer/retry, Error 10349 slow-resubmit fill (20s grace + `tif="DAY"`), daily-loss calendar-day anchoring, **partial-fill tracking to completion or confirmed cancel** (2026-09-12 fix), **concurrent-sell serialization** (2026-09-12 fix, overlap-counter proof), **native broker-side protective stop** (2026-09-12: place/no-op/replace/adopt-on-restart, cancel-before-sell, broker-triggered-fill detection, multi-stop ambiguity), **currency-aware cash check** (2026-09-12 fix: USD-stock affordability now converted to CAD before comparing against CAD cash) |
 | `tests/stock/test_concurrent_sell.py` | 1 | `StockPaperExecutor` concurrent-sell regression (2026-09-12): two threads racing a full-position sell — proves both the overlap invariant (per-symbol lock) and the actual business outcome (one FILLED, one REJECTED, never both filling the same shares) |
 | `tests/stock/test_intraday_price_guard.py` | 5 | `get_live_price()`'s previous-close corruption guard (2026-09-12): a genuine crash confirmed by today's own day_high/day_low is no longer discarded; a corrupted read outside that range still is; day-range lookup failure fails toward the conservative reject |
+| `tests/stock/test_paper_executor_fill_price.py` | 2 | `StockPaperExecutor.buy()`/`sell()` regression (2026-09-12): `order.price`/`quantity`/`total_value` now reflect the actual slippage-adjusted fill, not the pre-slippage requested price — IBKRExecutor already did this correctly, paper.py did not |
 | `tests/stock/test_fx_sizing.py` | 14 | USD/CAD sizing: `is_cad_symbol`, `get_usd_cad_rate`, mixed-currency `total_value`/`check_exposure`, sector-concentration gate, projected-exposure check |
 | `tests/stock/test_screener_in_distribution.py` | 5 | In-distribution ATR%/liquidity filter (`stock_bot/data/screener.py`, replacement safety net after RULE_WHITELIST stopped gating BUYs) |
 | `tests/stock/test_accuracy_tracker.py` | 20 | `LiveTradingGate` gates — Gate 1 (`stock_backtest_latest.json` vs `RULE_WHITELIST`), Gate 2 (AI confidence-band edge, incl. SKIPPED when `AI_ENABLED=false` — 2026-09-10), Gate 3 (≥30 round-trips/PF≥1.2/win≥30%) |
@@ -456,6 +457,37 @@ the day's actual range and is still rejected. Fails toward the old conservative 
 
 +17 tests total (9 `IBKRExecutor` native-stop unit tests, 3 `_check_open_positions_sl_tp`
 wiring tests, 5 price-guard tests), suite 918→935. Both require a stock bot restart.
+
+### Currency-aware cash check + accurate fill reporting (stock bot — fixed 2026-09-12)
+Two Medium findings from the same code review, same day.
+
+**Currency mismatch in the BUY affordability check:** `IBKRExecutor.buy()` compared
+`shares × price` (the security's OWN currency) directly against `self.cash` (always
+base-currency CAD) — for a USD stock this understated the real CAD cost needed by the
+USD/CAD rate (~1.35-1.40×), so a BUY could pass the cash check yet still be unaffordable in
+CAD terms. `_price_in_cad()` already existed and is used everywhere else this comparison
+matters (`total_value()`) — this was the one spot still comparing mismatched currencies
+directly. Fixed: `est_cost = shares * self._price_in_cad(sym, price)`. +3 tests (USD-short
+rejects, USD-sufficient-after-FX passes, CAD-quoted unaffected by the rate).
+
+**Fill notifications reported the request, not the fill:** `stock_bot/main.py`'s BUY/SELL
+notifier/print/log calls (all three call sites — the main scan loop's BUY, its SELL, and the
+SL/TP watcher's own SELL) used the pre-order signal price and requested share count, not
+`order.price`/`order.quantity` — so a partial fill or slippage between the signal price and
+the real fill made the Telegram alert, console output, and P&L math disagree with what
+actually happened. Root cause ran deeper than main.py: `StockPaperExecutor.buy()`/`sell()`
+set `order.status = FILLED` but never updated `order.price`/`order.quantity`/`order.total_value`
+away from the values passed into `_new_order()` at construction — `IBKRExecutor` already did
+this correctly (`order.quantity = filled_qty; order.price = fill_px`), `paper.py` did not, so
+patching only main.py would have "fixed" IBKR while leaving paper trading subtly wrong in a
+different way (its own slippage model — `_fill_price()`, `_slippage_bps` — was already being
+silently discarded from the returned order). Fixed at the source in both executors (mirroring
+IBKR's existing three-line pattern: quantity, price, and `total_value` recomputed together —
+the dataclass computes `total_value` once in `__post_init__`, so it goes stale too if only
+`price` is updated), then all three `main.py` call sites read `order.quantity`/`order.price`/
+`order.total_value` instead of the request. +2 tests proving the paper-executor fix directly
+(non-zero slippage bps, confirmed to fail against the pre-fix code: old code returned the
+exact pre-slippage request). Suite 935→940. Requires a stock bot restart.
 
 ### Generic stuck-loop detector (crypto + stock — BUILT 2026-08-27)
 `bot/alerts/stuck_loop.StuckLoopDetector` — error-string-agnostic "same operation keeps
