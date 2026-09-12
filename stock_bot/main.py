@@ -590,6 +590,28 @@ def _check_open_positions_sl_tp(executor, cfg, notifier=None, stuck_detector=Non
     """
     if executor is None:
         return
+
+    # Broker-side stop already fired on its own (independent of this bot
+    # noticing) — must be recorded before anything else this cycle touches
+    # positions/P&L, or the accounting gap the check exists to close just
+    # gets re-created a different way. IBKRExecutor only (paper trading has
+    # no broker to place a real stop with).
+    if hasattr(executor, "check_native_stop_fills"):
+        try:
+            for hit in executor.check_native_stop_fills():
+                print(
+                    f"  🛑 NATIVE STOP triggered: {hit['symbol']} @ "
+                    f"${hit['price']:.2f} (broker-side, independent of this bot)"
+                )
+                if notifier:
+                    notifier.fill(
+                        "SELL", hit["symbol"], hit["shares"], hit["price"],
+                        round(hit["shares"] * hit["price"], 2), pnl=hit["pnl"],
+                        reason="native stop (broker-triggered)",
+                    )
+        except Exception as exc:
+            logger.warning("check_native_stop_fills failed: %s", exc)
+
     _checked = 0
     _priced  = 0
     for symbol, (shares, avg_cost) in list(executor.positions_snapshot().items()):
@@ -610,6 +632,19 @@ def _check_open_positions_sl_tp(executor, cfg, notifier=None, stuck_detector=Non
             if hasattr(executor, "get_position_stop_pct")
             else cfg.paper_stop_loss_pct
         )
+
+        # Real broker-side protection (2026-09-12) — a resting stop the
+        # exchange triggers on its own even if this process dies, hangs, or
+        # loses its TWS connection between polls. Re-synced every cycle so
+        # a restart with an open-but-unprotected position gets covered
+        # within 30s without a separate reconciliation pass. No-ops when
+        # already correct (see sync_protective_stop's own docstring).
+        if hasattr(executor, "sync_protective_stop"):
+            try:
+                executor.sync_protective_stop(symbol, avg_cost * (1 - abs(_effective_stop_pct)))
+            except Exception as exc:
+                logger.warning("sync_protective_stop failed for %s: %s", symbol, exc)
+
         _sl_hit = pct_change <= -abs(_effective_stop_pct)
         _tp_hit = pct_change >= cfg.paper_take_profit_pct
         if _sl_hit or _tp_hit:

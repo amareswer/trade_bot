@@ -26,6 +26,7 @@ def _executor(positions: dict[str, tuple[float, float]]) -> MagicMock:
     ex = MagicMock()
     ex.positions_snapshot.return_value = positions
     ex.sell.return_value = SimpleNamespace(status=main_mod.OrderStatus.FILLED)
+    ex.check_native_stop_fills.return_value = []   # realistic default — no broker-side fills
     del ex.get_position_stop_pct   # hasattr(executor, "get_position_stop_pct") is False
     return ex
 
@@ -69,6 +70,61 @@ def test_no_log_when_no_open_positions(monkeypatch, caplog):
     with caplog.at_level("INFO", logger="stock_bot.main"):
         main_mod._check_open_positions_sl_tp(ex, _cfg())
     assert "SL/TP check" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Native broker-side protective stop wiring (2026-09-12)
+# ---------------------------------------------------------------------------
+
+def test_syncs_native_stop_at_the_correct_price_every_cycle(monkeypatch):
+    """IBKRExecutor-capable path: sync_protective_stop must be called every
+    cycle with the SAME stop price the SL/TP-hit decision itself uses, so a
+    restart with an open position gets broker-side coverage within one
+    cycle — and the level never silently drifts from what the in-process
+    check would trigger on."""
+    monkeypatch.setattr(main_mod, "get_live_price", lambda sym: 100.0)   # well above any stop
+    ex = _executor({"RY": (4.0, 200.0)})   # avg_cost=200, 5% stop -> 190.0
+    main_mod._check_open_positions_sl_tp(ex, _cfg(stop_loss_pct=0.05))
+    ex.sync_protective_stop.assert_called_once_with("RY", 190.0)
+
+
+def test_no_native_stop_sync_when_executor_does_not_support_it(monkeypatch):
+    """Paper trading has no broker to place a real stop with — must not
+    even attempt the call (a plain object without the method, not a
+    MagicMock that would silently accept any call)."""
+    class _PaperLikeExecutor:
+        def positions_snapshot(self):
+            return {"RY": (4.0, 200.0)}
+        def sell(self, *a, **k):
+            return SimpleNamespace(status=main_mod.OrderStatus.FILLED)
+        def get_position_stop_pct(self, *a, **k):
+            return 0.05
+        # deliberately no sync_protective_stop / check_native_stop_fills
+
+    monkeypatch.setattr(main_mod, "get_live_price", lambda sym: 100.0)
+    # Must not raise AttributeError despite lacking both native-stop methods.
+    main_mod._check_open_positions_sl_tp(_PaperLikeExecutor(), _cfg(stop_loss_pct=0.05))
+
+
+def test_native_stop_fill_is_alerted_and_precedes_the_price_based_check(monkeypatch):
+    """A broker-triggered stop fill must reach the notifier as a real SELL
+    fill. positions_snapshot() reflects the now-closed position (as it
+    would for real — the broker's own position update from the same fill),
+    so the price-based check right after correctly sees nothing left to
+    act on for RY: exactly one fill notification this cycle, not two."""
+    monkeypatch.setattr(main_mod, "get_live_price", lambda sym: 100.0)
+    ex = _executor({})   # RY already closed by the native stop
+    ex.check_native_stop_fills.return_value = [
+        {"symbol": "RY", "shares": 4.0, "price": 189.5, "pnl": -42.0},
+    ]
+    notifier = MagicMock()
+
+    main_mod._check_open_positions_sl_tp(ex, _cfg(stop_loss_pct=0.05), notifier=notifier)
+
+    notifier.fill.assert_called_once()
+    call_args = notifier.fill.call_args
+    assert call_args[0][:2] == ("SELL", "RY")
+    assert call_args[1]["pnl"] == -42.0
 
 
 def test_zero_share_positions_excluded_from_count(monkeypatch, caplog):

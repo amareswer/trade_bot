@@ -175,7 +175,7 @@ narrative behind any decision below, and `.memory/decisions/*.md` for the deepes
 
 ## Test Suite Manifest
 
-**Expected total: 918 tests** (`pytest --collect-only -q`). If the count disagrees: a file
+**Expected total: 935 tests** (`pytest --collect-only -q`). If the count disagrees: a file
 has an import error, was deleted, was added without a manifest bump, or was excluded from the
 runner — investigate before trusting a green suite. Suite runtime ~9–26s; minutes means a
 test is reading live `.env` config. The per-row table sum below lags the header total by ~22
@@ -217,8 +217,9 @@ Run: `python -m pytest --tb=short -q` — must show **906 passed**.
 | `tests/stock/test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last, determinism, validated-parameter pin |
 | `tests/crypto/test_audit_scheduler.py` | 14 | REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, monthly 1st-anchored re-screen, missed-run catch-up |
 | `tests/crypto/test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
-| `tests/stock/test_ibkr_executor.py` | 72 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping, broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe, FX/margin-minimum guard (**checks NET-LIQ, not free cash** — 2026-08-31 fix), sector-concentration gate, weekly/drawdown-halt/kill-switch tiers, per-position ATR stop-pct override, projected-exposure check, LiveTradingGate enforcement (incl. Gate 2 SKIPPED-when-AI-disabled bypass, 2026-09-10), TWS-query resilience (last-good cache, incl. **disconnected-but-no-exception preserves cache** — 2026-09-11 fix), `ibkr_trades.csv` write buffer/retry, Error 10349 slow-resubmit fill (20s grace + `tif="DAY"`), daily-loss calendar-day anchoring, **partial-fill tracking to completion or confirmed cancel** (2026-09-12 fix), **concurrent-sell serialization** (2026-09-12 fix, overlap-counter proof) |
+| `tests/stock/test_ibkr_executor.py` | 81 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping, broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe, FX/margin-minimum guard (**checks NET-LIQ, not free cash** — 2026-08-31 fix), sector-concentration gate, weekly/drawdown-halt/kill-switch tiers, per-position ATR stop-pct override, projected-exposure check, LiveTradingGate enforcement (incl. Gate 2 SKIPPED-when-AI-disabled bypass, 2026-09-10), TWS-query resilience (last-good cache, incl. **disconnected-but-no-exception preserves cache** — 2026-09-11 fix), `ibkr_trades.csv` write buffer/retry, Error 10349 slow-resubmit fill (20s grace + `tif="DAY"`), daily-loss calendar-day anchoring, **partial-fill tracking to completion or confirmed cancel** (2026-09-12 fix), **concurrent-sell serialization** (2026-09-12 fix, overlap-counter proof), **native broker-side protective stop** (2026-09-12: place/no-op/replace/adopt-on-restart, cancel-before-sell, broker-triggered-fill detection, multi-stop ambiguity) |
 | `tests/stock/test_concurrent_sell.py` | 1 | `StockPaperExecutor` concurrent-sell regression (2026-09-12): two threads racing a full-position sell — proves both the overlap invariant (per-symbol lock) and the actual business outcome (one FILLED, one REJECTED, never both filling the same shares) |
+| `tests/stock/test_intraday_price_guard.py` | 5 | `get_live_price()`'s previous-close corruption guard (2026-09-12): a genuine crash confirmed by today's own day_high/day_low is no longer discarded; a corrupted read outside that range still is; day-range lookup failure fails toward the conservative reject |
 | `tests/stock/test_fx_sizing.py` | 14 | USD/CAD sizing: `is_cad_symbol`, `get_usd_cad_rate`, mixed-currency `total_value`/`check_exposure`, sector-concentration gate, projected-exposure check |
 | `tests/stock/test_screener_in_distribution.py` | 5 | In-distribution ATR%/liquidity filter (`stock_bot/data/screener.py`, replacement safety net after RULE_WHITELIST stopped gating BUYs) |
 | `tests/stock/test_accuracy_tracker.py` | 20 | `LiveTradingGate` gates — Gate 1 (`stock_backtest_latest.json` vs `RULE_WHITELIST`), Gate 2 (AI confidence-band edge, incl. SKIPPED when `AI_ENABLED=false` — 2026-09-10), Gate 3 (≥30 round-trips/PF≥1.2/win≥30%) |
@@ -247,7 +248,7 @@ Run: `python -m pytest --tb=short -q` — must show **906 passed**.
 | `tests/crypto/test_shadow_signal_retry.py` | 3 | `shadow_signal.shadow_replay` Kraken fetch wrapped in `fetch_with_retry` |
 | `tests/shared/test_unified_dashboard.py` | 9 | `_read_gate_stats`/`_gate_tracker_section` shadow-match-rate parsing (bounded regex, N/A handling); `_crypto_card` STALE-vs-NO-FILLS badge |
 | `tests/stock/test_stock_position_mark_refresh.py` | 4 | REAL `_mark_positions_to_market()` — breaker trips from a price move alone, silent within limit, None-executor no-op, source guard |
-| `tests/stock/test_sl_tp_watcher_audit_log.py` | 12 | `_check_open_positions_sl_tp` behavior + "N/M positions priced" audit log + rejected-SL/TP-exit `else` branch (`logger.error` + `StuckLoopDetector`) |
+| `tests/stock/test_sl_tp_watcher_audit_log.py` | 15 | `_check_open_positions_sl_tp` behavior + "N/M positions priced" audit log + rejected-SL/TP-exit `else` branch (`logger.error` + `StuckLoopDetector`) + native-stop wiring (2026-09-12: `sync_protective_stop` called every cycle at the exact SL price, no-op when the executor lacks it, broker-triggered fills alerted and checked before the price-based decision) |
 | `tests/crypto/test_grid_stress_test.py` | 14 | `grid_stress_test.py` pure helpers (research tooling): crash-period parsing, buy-and-hold P&L, PASS/MARGINAL/FAILED classification |
 | `tests/crypto/test_grid_dca_experiment.py` | 12 | `grid_dca_experiment.py` standalone engines (research tooling): grid fills/reopens/floor-stop, capital split, fee math, DCA averaging + cycle restart |
 | `tests/stock/test_stock_momentum_experiment.py` | 14 | `stock_momentum_experiment.py` (research tooling — NOT the live pipeline): cross-sectional 6-1 momentum rotation. FAILED (see strategy-search note) |
@@ -400,6 +401,61 @@ three exit paths); a rejected SELL triggers `_rearm_native_stop_after_failed_sel
 level restored, or a "NAKED POSITION" alert for trailing). Full detail + all the
 restart-seeding / quantity-mismatch / untracked-order gap fixes: `CLAUDE_HISTORY.md`,
 `.memory/execution_layer.md`.
+
+### Native broker-side protective stop (stock bot — added 2026-09-12, IBKR only)
+Code review finding: the stock bot's only stop-loss protection was `_check_open_positions_
+sl_tp` (`stock_bot/main.py`) — an in-process thread polling yfinance every 30s. If the bot
+process died, hung, or lost its TWS connection, a real open position sat completely
+unprotected, unlike the crypto bot's native exchange-side stop (above, live since 2026-08-15).
+Fixed with the IBKR analog: `IBKRExecutor.sync_protective_stop(symbol, stop_price)` places a
+real resting `StopOrder` (`orderType="STP"`, GTC) via ib_async, confirmed against a real paper
+API session (2026-09-12) — the trigger price lives in `Order.auxPrice`, **not**
+`Order.stopPrice` (a different, unrelated order shape).
+
+**Scope (v1, deliberately narrower than the crypto version):** static stop only, no trailing —
+matches the stock SL/TP watcher, which has no trailing-stop concept either. `StockPaperExecutor`
+is untouched (paper trading has no broker to place a real stop with; its own in-process watcher
+IS its protection).
+- `sync_protective_stop()` is called every `_check_open_positions_sl_tp` cycle (not just at BUY
+  time) at the exact same stop price the in-process check itself would trigger on
+  (`avg_cost * (1 - effective_stop_pct)`), guarded by `hasattr(executor, "sync_protective_stop")`
+  so paper trading takes no code path here at all. A restart with an open, unprotected position
+  gets covered within one 30s cycle — no separate startup reconciliation pass needed.
+- **The exchange is always the source of truth, never in-memory tracking alone**: before placing
+  anything, it queries `openTrades()` live for an existing resting STP-SELL on that symbol and
+  adopts it if the price/quantity already match (no-op — avoids cancel/replace churn every
+  cycle), replaces it if the level changed, or places fresh if none exists. This is what makes
+  the "no separate reconciliation pass" claim above safe: a restart's first cycle naturally
+  adopts whatever was already resting rather than duplicating it.
+- **Cancel-before-sell** — the exact deadlock class the crypto bot hit 2026-08-27 (a resting
+  protective order racing the bot's own exit): `sell()` cancels any resting native stop for that
+  symbol *first*, inside the same `_position_lock` that also fixed the concurrent-sell finding,
+  before ever placing its own market sell.
+- **Broker-triggered fill detection** — `check_native_stop_fills()`, called once per SL/TP-watcher
+  cycle *before* the price-based check touches the same positions. Without this, a stop firing
+  independently of the bot noticing would self-correct the share count on the next
+  `positions_snapshot()` read (always live) but leave a real accounting gap: no CSV row, no
+  realized-P&L update, no fill notification — the same failure class as the 2026-09-12
+  partial-fill finding, just via a different order. Reason recorded as `NATIVE_STOP_HIT`.
+- **Ambiguity is never auto-resolved** — more than one resting STP-SELL found for a symbol logs
+  an error and touches neither, mirroring the crypto bot's multi-stop-ambiguity philosophy.
+- Not persisted to `ibkr_state.json` — a live `Trade` object isn't JSON-serializable, and a
+  fresh `IB()` connection after a restart gets new subscription state regardless; the live
+  `openTrades()` query above is the reconciliation mechanism, not a saved order id.
+
+**Companion fix, same finding — price-guard fail-open:** `get_live_price()`
+(`stock_bot/data/intraday_price.py`) rejected *any* price deviating >20% from previous close,
+including a genuine crash — since this backs the SL/TP watcher, a real sharp fall silently
+disabled stop-loss protection exactly when it mattered. Fixed: a deviant price is now checked
+against `fast_info`'s `day_high`/`day_low` (a separately-fetched price-history field, not the
+same live-quote value as `last_price` — genuine independent corroboration, not re-reading the
+same suspect number) with a 2% after-hours tolerance. A real crash's `last_price` falls inside
+the day's own low (that feed moved too) and is kept; a corrupted read usually lands nowhere near
+the day's actual range and is still rejected. Fails toward the old conservative reject if
+`day_high`/`day_low` are unavailable or the lookup itself fails.
+
++17 tests total (9 `IBKRExecutor` native-stop unit tests, 3 `_check_open_positions_sl_tp`
+wiring tests, 5 price-guard tests), suite 918→935. Both require a stock bot restart.
 
 ### Generic stuck-loop detector (crypto + stock — BUILT 2026-08-27)
 `bot/alerts/stuck_loop.StuckLoopDetector` — error-string-agnostic "same operation keeps

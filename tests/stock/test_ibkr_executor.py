@@ -46,9 +46,11 @@ class FakeOrderStatus:
 
 
 class FakeTrade:
-    def __init__(self):
+    def __init__(self, contract=None, order=None):
         self.orderStatus = FakeOrderStatus()
         self.fills = []
+        self.contract = contract
+        self.order = order
 
     def isDone(self):
         return self.orderStatus.status in ("Filled", "Cancelled", "ApiCancelled")
@@ -119,8 +121,15 @@ class FakeIB:
         return [contract]
 
     def placeOrder(self, contract, order):
-        trade = FakeTrade()
+        trade = FakeTrade(contract, order)
         self.placed.append((contract, order, trade))
+        # A resting protective stop (orderType STP) must never auto-fill
+        # just because fill_mode="instant" is the default for everything
+        # else placed in a test — it stays "Submitted" (resting) until a
+        # test explicitly triggers it via _fill()/cancelOrder(), exactly
+        # like a real stop order that hasn't been touched by price yet.
+        if str(getattr(order, "orderType", "")).upper() in ("STP", "STOP"):
+            return trade
         if self.fill_mode == "instant":
             self._fill(trade, order)
         elif self.fill_mode == "flicker_cancel_then_fill":
@@ -182,6 +191,9 @@ class FakeIB:
                     self._fill(trade, order)   # fill wins the race
                 else:
                     trade.orderStatus.status = "Cancelled"
+
+    def openTrades(self):
+        return [trade for _, _, trade in self.placed if not trade.isDone()]
 
     def _fill(self, trade, order):
         trade.orderStatus.status = "Filled"
@@ -745,6 +757,174 @@ def test_concurrent_sell_calls_are_serialized_per_symbol(executors):
     # hermetic fake doesn't shrink its static position list after a fill,
     # so the business outcome isn't asserted here; the overlap counter
     # above is the direct, unambiguous proof of the fix).
+
+
+# ---------------------------------------------------------------------------
+# Native broker-side protective stop (2026-09-12 finding: no broker-side
+# stop-loss existed for the stock bot — protection depended entirely on the
+# process staying up and an in-process yfinance poll)
+# ---------------------------------------------------------------------------
+
+def _ko_position(shares=10, avg_cost=60.0):
+    return SimpleNamespace(
+        contract=FakeContract("KO", "USD"),
+        position=float(shares),
+        avgCost=avg_cost,
+    )
+
+
+def test_sync_protective_stop_places_new_stop(executors):
+    fake = FakeIB(positions=[_ko_position(10, 60.0)])
+    ex = make_executor(fake)
+    executors.append(ex)
+
+    ex.sync_protective_stop("KO", 55.0)
+
+    resting = [t for _, o, t in ((c, o, t) for c, o, t in fake.placed) if not t.isDone()]
+    assert len(resting) == 1
+    order = resting[0].order
+    assert str(order.orderType).upper() == "STP"
+    assert order.action == "SELL"
+    assert order.totalQuantity == 10
+    assert order.auxPrice == 55.0
+
+
+def test_sync_protective_stop_noop_when_already_correct(executors):
+    """Calling sync repeatedly at the same price/quantity must not cancel
+    and re-place — that would be needless churn on every SL/TP-watcher
+    cycle (30s) for a stop level that hasn't changed."""
+    fake = FakeIB(positions=[_ko_position(10, 60.0)])
+    ex = make_executor(fake)
+    executors.append(ex)
+
+    ex.sync_protective_stop("KO", 55.0)
+    ex.sync_protective_stop("KO", 55.0)
+
+    assert len(fake.placed) == 1, "must not place a second stop order"
+    assert fake.cancelled == [], "must not cancel the still-correct resting stop"
+
+
+def test_sync_protective_stop_replaces_on_price_change(executors):
+    fake = FakeIB(positions=[_ko_position(10, 60.0)])
+    ex = make_executor(fake)
+    executors.append(ex)
+
+    ex.sync_protective_stop("KO", 55.0)
+    ex.sync_protective_stop("KO", 57.0)   # stop tightened
+
+    assert len(fake.placed) == 2, "must cancel the old stop and place a new one"
+    assert len(fake.cancelled) == 1
+    live = [t for _, _, t in fake.placed if not t.isDone()]
+    assert len(live) == 1
+    assert live[0].order.auxPrice == 57.0
+
+
+def test_sync_protective_stop_noop_when_no_position(executors):
+    fake = FakeIB(positions=[])
+    ex = make_executor(fake)
+    executors.append(ex)
+
+    ex.sync_protective_stop("KO", 55.0)
+
+    assert fake.placed == [], "nothing to protect — must not place a stop"
+
+
+def test_sync_protective_stop_adopts_resting_stop_from_before_a_restart(executors):
+    """A stop already resting on the exchange (placed by a previous process
+    lifetime, or the same session's tracking dict lost across a restart)
+    must be adopted, never duplicated — the exchange is always the source
+    of truth, not in-memory tracking."""
+    fake = FakeIB(positions=[_ko_position(10, 60.0)])
+    ex = make_executor(fake)
+    executors.append(ex)
+
+    # Simulate a stop that already exists on the exchange but that THIS
+    # executor instance has no memory of (e.g. placed before a restart).
+    from ib_async import StopOrder
+    pre_existing = StopOrder("SELL", 10, 55.0, tif="GTC")
+    fake.placeOrder(FakeContract("KO", "USD"), pre_existing)
+    assert ex._native_stops == {}   # confirm: genuinely untracked in memory
+
+    ex.sync_protective_stop("KO", 55.0)
+
+    assert len(fake.placed) == 1, "must adopt the existing resting stop, not place a second one"
+    assert fake.cancelled == []
+
+
+def test_sell_cancels_resting_native_stop_first(executors):
+    """The exact deadlock class the crypto bot hit 2026-08-27: a resting
+    protective order must never be left live while this executor places
+    its own sell for the same position."""
+    fake = FakeIB(positions=[_ko_position(10, 60.0)], fill_price=58.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+    ex.sync_protective_stop("KO", 55.0)
+    assert len(fake.cancelled) == 0
+
+    order = ex.sell("KO", 10, 58.0, reason="test")
+
+    assert order.status == OrderStatus.FILLED
+    assert len(fake.cancelled) == 1, "the resting native stop must be cancelled before our own sell"
+    assert "KO" not in ex._native_stops
+
+
+def test_check_native_stop_fills_detects_and_records_broker_triggered_exit(executors):
+    """The broker triggers the stop on its own (independent of this bot's
+    SL/TP watcher noticing) — must be detected, recorded (CSV row +
+    realized P&L), and reported, not silently left as an accounting gap
+    (the same failure class as the 2026-09-12 partial-fill finding, via a
+    different order)."""
+    fake = FakeIB(positions=[_ko_position(10, 60.0)])
+    ex = make_executor(fake)
+    executors.append(ex)
+    ex.sync_protective_stop("KO", 55.0)
+    trade = ex._native_stops["KO"]["trade"]
+
+    # Broker fills the resting stop on its own — nothing in this bot
+    # process initiated it.
+    fake._fill(trade, trade.order)
+    trade.orderStatus.avgFillPrice = 54.80
+
+    before_pnl = ex.realized_pnl()
+    results = ex.check_native_stop_fills()
+
+    assert len(results) == 1
+    assert results[0]["symbol"] == "KO"
+    assert results[0]["shares"] == 10.0
+    assert results[0]["price"] == 54.80
+    assert ex.realized_pnl() == pytest.approx(before_pnl + (54.80 - 60.0) * 10)
+    assert "KO" not in ex._native_stops   # cleared after recording
+    assert len(ex._trade_log) == 1
+    assert ex._trade_log[0].reason == "NATIVE_STOP_HIT"
+
+
+def test_check_native_stop_fills_ignores_still_resting_stops(executors):
+    fake = FakeIB(positions=[_ko_position(10, 60.0)])
+    ex = make_executor(fake)
+    executors.append(ex)
+    ex.sync_protective_stop("KO", 55.0)
+
+    results = ex.check_native_stop_fills()
+
+    assert results == []
+    assert "KO" in ex._native_stops   # still tracked, still resting
+
+
+def test_find_resting_native_stop_ambiguous_touches_nothing(executors):
+    """Two resting stops on the same symbol (shouldn't normally happen, but
+    if it does) must not be auto-resolved by guessing — same philosophy as
+    the crypto bot's multi-stop ambiguity handling."""
+    fake = FakeIB(positions=[_ko_position(10, 60.0)])
+    ex = make_executor(fake)
+    executors.append(ex)
+    from ib_async import StopOrder
+    fake.placeOrder(FakeContract("KO", "USD"), StopOrder("SELL", 10, 55.0, tif="GTC"))
+    fake.placeOrder(FakeContract("KO", "USD"), StopOrder("SELL", 10, 54.0, tif="GTC"))
+
+    found = ex._find_resting_native_stop("KO")
+
+    assert found is None
+    assert fake.cancelled == []
 
 
 def test_positions_snapshot_maps_back_to_yfinance_symbols(executors):
