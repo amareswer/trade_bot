@@ -618,15 +618,14 @@ def _check_open_positions_sl_tp(executor, cfg, notifier=None, stuck_detector=Non
         if shares <= 0:
             continue
         _checked += 1
-        live = get_live_price(symbol)
-        if live is None:
-            logger.debug("SL/TP check: skipping %s — no live price", symbol)
-            continue
-        _priced += 1
-        pct_change = (live - avg_cost) / avg_cost
+
         # Per-position ATR stop overrides the flat baseline when one was set
         # at entry (PAPER_ATR_SIZING_ENABLED) — must match what sizing used,
         # or the risk cap computed at entry time means nothing at exit time.
+        # Needs only avg_cost (from positions_snapshot(), the broker's own
+        # data) — NOT the live yfinance price, so it's computed and used to
+        # sync the broker-side stop before the live-price fetch below,
+        # never gated behind it.
         _effective_stop_pct = (
             executor.get_position_stop_pct(symbol, cfg.paper_stop_loss_pct)
             if hasattr(executor, "get_position_stop_pct")
@@ -639,12 +638,24 @@ def _check_open_positions_sl_tp(executor, cfg, notifier=None, stuck_detector=Non
         # a restart with an open-but-unprotected position gets covered
         # within 30s without a separate reconciliation pass. No-ops when
         # already correct (see sync_protective_stop's own docstring).
+        #
+        # Placed BEFORE the get_live_price() call below on purpose
+        # (2026-09-12 finding): a yfinance outage must not also disable
+        # broker-side protection — that's the one thing meant to survive
+        # exactly this kind of failure. Only avg_cost is needed here, and
+        # that comes from positions_snapshot(), not yfinance.
         if hasattr(executor, "sync_protective_stop"):
             try:
                 executor.sync_protective_stop(symbol, avg_cost * (1 - abs(_effective_stop_pct)))
             except Exception as exc:
                 logger.warning("sync_protective_stop failed for %s: %s", symbol, exc)
 
+        live = get_live_price(symbol)
+        if live is None:
+            logger.debug("SL/TP check: skipping %s — no live price", symbol)
+            continue
+        _priced += 1
+        pct_change = (live - avg_cost) / avg_cost
         _sl_hit = pct_change <= -abs(_effective_stop_pct)
         _tp_hit = pct_change >= cfg.paper_take_profit_pct
         if _sl_hit or _tp_hit:

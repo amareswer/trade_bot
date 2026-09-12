@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 
 import ccxt
@@ -74,6 +75,23 @@ def _is_native_stop_order(order: dict) -> bool:
     """True if a ccxt-parsed order dict (from fetch_open_orders etc.) is one
     of the two ordertypes this bot's own native-stop logic ever places."""
     return _raw_ordertype(order) in _NATIVE_STOP_ORDERTYPES
+
+
+def _match_by_client_order_id(orders: list[dict], client_order_id: str) -> dict | None:
+    """Find the order (open or closed) whose clientOrderId matches — ccxt's
+    kraken.py parses this from Kraken's own cl_ord_id field. Returns None
+    if not found; ambiguity (more than one match, which should be
+    impossible for a UUID we generated ourselves) logs and returns None
+    rather than guessing."""
+    matches = [o for o in orders if o.get("clientOrderId") == client_order_id]
+    if len(matches) > 1:
+        logger.error(
+            "Multiple orders matched clientOrderId %s — this should be "
+            "impossible for a freshly generated UUID, not auto-adopting any",
+            client_order_id,
+        )
+        return None
+    return matches[0] if matches else None
 
 
 def _resting_order_quantity(order: dict) -> float | None:
@@ -1072,23 +1090,34 @@ class LiveExecutor:
 
     # ── Limit order chasing ───────────────────────────────────────────
 
-    def _find_untracked_entry_order(self, side: str) -> dict | None:
+    def _find_untracked_entry_order(self, side: str, client_order_id: str | None = None) -> dict | None:
         """After an exception during limit-order submission, check whether
         the exchange actually accepted the order despite the lost/failed
         response — a network error on the response does not mean the
         request never reached Kraken (2026-09 finding: the old code assumed
         it did and placed a market order straight on top, risking a
-        duplicate). Mirrors the existing untracked-native-stop adoption
-        pattern (_adopt_untracked_stop): fetch_open_orders and look for
-        exactly one non-stop order on this side/symbol we don't already
-        know about. Ambiguous (more than one candidate) or a failed lookup
-        both return None — conservative by design, since guessing wrong
-        here is how you get a duplicate order instead of preventing one."""
+        duplicate).
+
+        A resting (still-open) order isn't the only way that exception can
+        resolve — the order may have already fully filled and closed by the
+        time we check, which fetch_open_orders() alone can never see
+        (reproduced independently: an empty open-orders list was read as
+        'nothing to adopt' even when the original order had, in fact,
+        already filled). client_order_id — a UUID generated fresh for this
+        specific placement attempt, sent as Kraken's cl_ord_id — resolves
+        this definitively: check both open and closed orders for a match,
+        rather than guessing from order shape alone.
+
+        Falls back to the coarser 'exactly one same-side non-stop order'
+        heuristic only if no client_order_id was supplied. Ambiguous (more
+        than one candidate either way) or a failed lookup both return None
+        — conservative by design, since guessing wrong here is how you get
+        a duplicate order instead of preventing one."""
         try:
             open_orders = fetch_with_retry(
                 lambda: self._exchange.fetch_open_orders(self.symbol),
                 attempts=2, delay_s=1.0,
-                label=f"post-error order reconciliation [{self.symbol}]",
+                label=f"post-error order reconciliation (open) [{self.symbol}]",
             )
         except Exception as exc:
             logger.warning(
@@ -1097,6 +1126,31 @@ class LiveExecutor:
             )
             return None
 
+        if client_order_id:
+            match = _match_by_client_order_id(open_orders, client_order_id)
+            if match is not None:
+                return match
+            try:
+                closed_orders = fetch_with_retry(
+                    lambda: self._exchange.fetch_closed_orders(self.symbol, limit=10),
+                    attempts=2, delay_s=1.0,
+                    label=f"post-error order reconciliation (closed) [{self.symbol}]",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not check closed orders after a submission error "
+                    "(%s) — the order may have already filled and closed; "
+                    "falling back to market risks a duplicate, but the "
+                    "alternative (never trading) is worse — proceeding "
+                    "with the market fallback as the existing conservative "
+                    "default", exc,
+                )
+                return None
+            return _match_by_client_order_id(closed_orders, client_order_id)
+
+        # No client_order_id available (shouldn't happen in normal use —
+        # every call site generates one) — fall back to the coarser
+        # same-side/non-stop heuristic against open orders only.
         candidates = [
             o for o in open_orders
             if not _is_native_stop_order(o) and str(o.get("side", "")).lower() == side
@@ -1166,6 +1220,14 @@ class LiveExecutor:
                 quantity, self.symbol, limit_price_f, tick_pct,
             )
 
+            # A unique id THIS specific attempt can be traced by regardless
+            # of whether create_order()'s response is ever seen — offline-
+            # verified against the real installed ccxt (order_request() maps
+            # clientOrderId -> Kraken's cl_ord_id, coexists with postOnly's
+            # oflags=post). See the exception handler below for why this
+            # exists: fetch_open_orders() alone can't tell "never reached
+            # Kraken" apart from "reached Kraken and already fully filled".
+            client_order_id = str(uuid.uuid4())
             try:
                 # postOnly (not timeInForce="PO") — found 2026-08-26 after
                 # SOL/CAD's first live BUY silently fell back to market.
@@ -1181,7 +1243,7 @@ class LiveExecutor:
                 # assertion itself; only the one public load_markets() call).
                 raw = self._exchange.create_order(
                     self.symbol, "limit", side, quantity, limit_price,
-                    {"postOnly": True},
+                    {"postOnly": True, "clientOrderId": client_order_id},
                 )
                 order_id = str(raw.get("id", ""))
             except ccxt.InvalidOrder:
@@ -1208,7 +1270,7 @@ class LiveExecutor:
                     "exchange accepted it before falling back to market",
                     type(exc).__name__, exc,
                 )
-                adopted = self._find_untracked_entry_order(side)
+                adopted = self._find_untracked_entry_order(side, client_order_id)
                 if adopted is None:
                     self._maker_fallback_reason = f"exchange rejected limit order ({type(exc).__name__})"
                     return self._exchange.create_order(self.symbol, "market", side, quantity)

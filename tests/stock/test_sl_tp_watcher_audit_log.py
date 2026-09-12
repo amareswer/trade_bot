@@ -93,6 +93,19 @@ def test_syncs_native_stop_at_the_correct_price_every_cycle(monkeypatch):
     ex.sync_protective_stop.assert_called_once_with("RY", 190.0)
 
 
+def test_native_stop_sync_happens_even_when_yfinance_is_down(monkeypatch):
+    """2026-09-12 finding: sync_protective_stop only needs avg_cost (from
+    positions_snapshot(), the broker's own data) — it must not be gated
+    behind get_live_price() returning a value. A yfinance outage must not
+    also disable the one protection meant to survive exactly that kind of
+    failure."""
+    monkeypatch.setattr(main_mod, "get_live_price", lambda sym: None)   # yfinance down
+    ex = _executor({"RY": (4.0, 200.0)})
+    main_mod._check_open_positions_sl_tp(ex, _cfg(stop_loss_pct=0.05))
+    ex.sync_protective_stop.assert_called_once_with("RY", 190.0)
+    ex.sell.assert_not_called()   # no price -> correctly no SL/TP decision either
+
+
 def test_no_native_stop_sync_when_executor_does_not_support_it(monkeypatch):
     """Paper trading has no broker to place a real stop with — must not
     even attempt the call (a plain object without the method, not a

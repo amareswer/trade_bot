@@ -106,10 +106,17 @@ class StockExecutorBase(ABC):
     # dict.setdefault are atomic under the GIL for this exact get-or-create
     # pattern) so unrelated symbols never serialize against each other.
 
-    def _position_lock(self, symbol: str) -> threading.Lock:
-        """Get-or-create the lock guarding this symbol's full sell sequence."""
+    def _position_lock(self, symbol: str) -> threading.RLock:
+        """Get-or-create the lock guarding this symbol's full sell sequence.
+
+        Reentrant (RLock, not Lock) — 2026-09-12: IBKRExecutor.sell() holds
+        this while cancelling a resting native stop, and sync_protective_stop()
+        (called independently by the SL/TP watcher, not just from sell())
+        also needs to hold it for the same reason. Both call into the same
+        underlying cancel helper; a plain Lock would deadlock the moment one
+        acquires it and then calls into the other on the same thread."""
         locks = self.__dict__.setdefault("_position_locks_by_symbol", {})
-        return locks.setdefault(symbol.upper(), threading.Lock())
+        return locks.setdefault(symbol.upper(), threading.RLock())
 
     # ── Portfolio state ───────────────────────────────────────────────────────
 

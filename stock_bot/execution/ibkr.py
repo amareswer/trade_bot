@@ -152,6 +152,13 @@ _NATIVE_STOP_ORDER_TYPES = frozenset({"STP", "STOP"})
 _NATIVE_STOP_ACTION = "SELL"
 _NATIVE_STOP_PRICE_TOLERANCE = 0.005   # dollars — below this, treat as "already correct"
 
+# Distinct from None: "the lookup could not confirm zero resting stops" —
+# either the query itself failed, or more than one was found. Neither means
+# "safe to place a new one" (2026-09-12 finding: conflating this with None
+# let a query failure or ambiguity be read as "nothing exists", placing a
+# duplicate on top of a stop that was, in fact, already there).
+_NATIVE_STOP_LOOKUP_AMBIGUOUS = object()
+
 
 def _default_ib_factory():
     from ib_async import IB
@@ -567,6 +574,29 @@ class IBKRExecutor(StockExecutorBase):
             while not trade.isDone() and self._loop.time() < cancel_deadline:
                 await asyncio.sleep(0.25)
 
+            if not trade.isDone():
+                # Known residual gap (2026-09-12 review): the cancel never
+                # confirmed within 15s. filled_qty below is whatever was
+                # true a moment ago, not a guarantee — the order may still
+                # be live at the broker, and a LATER fill on it (after this
+                # call has already returned) will not be captured here.
+                # positions_snapshot() will still reflect the broker's real
+                # position on its next read, so share counts self-correct,
+                # but this specific fill's CSV row / P&L attribution can be
+                # missed. Logged loudly (not just a warning) so it's a
+                # visible, investigable event rather than silent — full
+                # tracked-until-resolved reconciliation (mirroring
+                # check_native_stop_fills' pattern) is a real follow-up,
+                # not yet built.
+                logger.error(
+                    "IBKR %s %s ×%d: cancel did not confirm within 15s — "
+                    "order may still be live at the broker; a later fill "
+                    "on it will not be recorded by this call. Manual "
+                    "verification recommended (check TWS / IBKR "
+                    "positions for %s).",
+                    action, symbol, qty, symbol,
+                )
+
         status = trade.orderStatus.status
         filled_qty = float(trade.orderStatus.filled or 0.0)
         avg_px = float(trade.orderStatus.avgFillPrice or 0.0)
@@ -825,51 +855,90 @@ class IBKRExecutor(StockExecutorBase):
         (approximately) this price. Always confirms against a live
         openTrades() query first — never trusts in-memory tracking alone —
         so a restart adopts an already-resting order instead of duplicating
-        it. Placement/cancel failures are logged, never raised."""
+        it. Placement/cancel failures are logged, never raised.
+
+        Shares sell()'s per-symbol lock (2026-09-12 finding): without it,
+        this method (called every SL/TP-watcher cycle, independent of
+        sell()) could run concurrently with an executor-initiated sell on
+        the same symbol — placing/replacing a stop while sell() is
+        mid-cancel-and-execute for the very same position."""
         sym = symbol.upper()
-        try:
-            held = self.positions_snapshot().get(sym, (0.0, 0.0))[0]
-            if held <= 0:
-                self._cancel_native_stop(sym)   # nothing open left to protect
-                return
+        with self._position_lock(sym):
+            try:
+                held = self.positions_snapshot().get(sym, (0.0, 0.0))[0]
+                if held <= 0:
+                    self._cancel_native_stop(sym)   # nothing open left to protect
+                    return
 
-            existing = self._find_resting_native_stop(sym)
-            if existing is not None:
-                existing_price = self._native_stop_trigger_price(existing)
-                if (existing_price is not None
-                        and abs(existing_price - stop_price) < _NATIVE_STOP_PRICE_TOLERANCE
-                        and float(existing.order.totalQuantity) == int(held)):
-                    self._native_stops[sym] = {"order": existing.order, "trade": existing}
-                    return   # already correct — avoid needless cancel/replace churn
-                self._cancel_trade_and_wait(existing)
+                existing = self._find_resting_native_stop(sym)
+                if existing is _NATIVE_STOP_LOOKUP_AMBIGUOUS:
+                    # Query failed, or more than one resting stop already
+                    # exists — NOT the same as "confirmed none". Placing a
+                    # fresh stop here is exactly how two became three.
+                    # Skip this cycle; the next one tries again.
+                    logger.warning(
+                        "NATIVE STOP sync skipped for %s — resting-stop state "
+                        "unconfirmed this cycle, not placing a new one", sym,
+                    )
+                    return
+                if existing is not None:
+                    existing_price = self._native_stop_trigger_price(existing)
+                    if (existing_price is not None
+                            and abs(existing_price - stop_price) < _NATIVE_STOP_PRICE_TOLERANCE
+                            and float(existing.order.totalQuantity) == int(held)):
+                        _, avg_cost_now = self.positions_snapshot().get(sym, (0.0, 0.0))
+                        self._native_stops[sym] = {
+                            "order": existing.order, "trade": existing, "avg_cost": avg_cost_now,
+                        }
+                        return   # already correct — avoid needless cancel/replace churn
+                    if not self._cancel_trade_and_wait(existing):
+                        # Cancel didn't confirm within its own wait window —
+                        # the old stop may still be resting. Placing a
+                        # second one now would leave two live stops able to
+                        # both sell the same shares. Abort; retried next cycle.
+                        logger.error(
+                            "NATIVE STOP replace aborted for %s — old stop's "
+                            "cancellation did not confirm, not placing a "
+                            "second one on top of a possibly-still-live order", sym,
+                        )
+                        return
 
-            from ib_async import StopOrder
-            contract = self.to_contract(sym)
-            order = StopOrder(_NATIVE_STOP_ACTION, int(held), round(stop_price, 2), tif="GTC")
+                from ib_async import StopOrder
+                contract = self.to_contract(sym)
+                order = StopOrder(_NATIVE_STOP_ACTION, int(held), round(stop_price, 2), tif="GTC")
 
-            async def _place():
-                await self._ensure_connected_async()
-                qualified = await self._ib.qualifyContractsAsync(contract)
-                if not qualified:
-                    raise RuntimeError(f"IBKR could not qualify contract for {sym}")
-                return self._ib.placeOrder(qualified[0], order)
+                async def _place():
+                    await self._ensure_connected_async()
+                    qualified = await self._ib.qualifyContractsAsync(contract)
+                    if not qualified:
+                        raise RuntimeError(f"IBKR could not qualify contract for {sym}")
+                    return self._ib.placeOrder(qualified[0], order)
 
-            trade = self._call(_place(), timeout=self._connect_timeout_s + 15)
-            self._native_stops[sym] = {"order": order, "trade": trade}
-            logger.info(
-                "NATIVE STOP PLACED [%s]: %d shares @ $%.2f (GTC)",
-                sym, int(held), stop_price,
-            )
-        except Exception as exc:
-            logger.error("NATIVE STOP sync failed for %s @ $%.2f: %s", sym, stop_price, exc)
+                trade = self._call(_place(), timeout=self._connect_timeout_s + 15)
+                # Cache the cost basis NOW, while the position still exists —
+                # check_native_stop_fills() runs after the position is
+                # already closed (that's what "filled" means for an exit
+                # order), so positions_snapshot() would return (0.0, 0.0)
+                # for a symbol that just fully closed and the P&L would
+                # compute against a phantom zero cost basis (2026-09-12
+                # finding, reproduced: 10 shares @ $60 stopped at $54.80
+                # reported +$548 instead of -$52).
+                _, avg_cost_now = self.positions_snapshot().get(sym, (0.0, 0.0))
+                self._native_stops[sym] = {
+                    "order": order, "trade": trade, "avg_cost": avg_cost_now,
+                }
+                logger.info(
+                    "NATIVE STOP PLACED [%s]: %d shares @ $%.2f (GTC)",
+                    sym, int(held), stop_price,
+                )
+            except Exception as exc:
+                logger.error("NATIVE STOP sync failed for %s @ $%.2f: %s", sym, stop_price, exc)
 
-    def _find_resting_native_stop(self, symbol: str):
-        """Live query for a resting STP SELL order on `symbol` — the source
-        of truth is always the exchange, not in-memory tracking, so a
-        restart never places a duplicate stop on top of one already there.
-        Returns the ib_async Trade, or None (also on a query failure —
-        callers must treat that as 'unknown, proceed as if none exists',
-        same fail-open-to-a-fresh-placement behavior the crypto bot uses)."""
+    def _all_resting_native_stops(self, symbol: str) -> list | None:
+        """Live query for every resting STP SELL order on `symbol` — the
+        source of truth is always the exchange, not in-memory tracking.
+        Returns None on a query failure (unknown — distinct from an empty
+        list, which is a confirmed zero)."""
         try:
             async def _open():
                 return list(self._ib.openTrades())
@@ -895,13 +964,31 @@ class IBKRExecutor(StockExecutorBase):
                 matches.append(t)
             except Exception:
                 continue
+        return matches
 
+    def _find_resting_native_stop(self, symbol: str):
+        """Single-match view over _all_resting_native_stops(), for the
+        'am I safe to place a new stop' question (sync_protective_stop).
+
+        Returns exactly one of:
+          - the ib_async Trade — exactly one resting stop confirmed
+          - None — confirmed zero resting stops (safe to place a new one)
+          - _NATIVE_STOP_LOOKUP_AMBIGUOUS — the query itself failed, OR more
+            than one resting stop was found. Both are 'unknown/unsafe', NOT
+            'none' — a caller that treated this the same as None would place
+            a fresh stop on top of an order that might already be there
+            (2026-09-12 finding, reproduced: two existing stops became
+            three). Only sync_protective_stop's 'confirmed none' path may
+            ever place an order; every other caller must abort on this."""
+        matches = self._all_resting_native_stops(symbol)
+        if matches is None:
+            return _NATIVE_STOP_LOOKUP_AMBIGUOUS
         if len(matches) > 1:
             logger.error(
                 "Multiple resting native stops found for %s — not touching any "
                 "of them automatically, manual review needed", symbol,
             )
-            return None
+            return _NATIVE_STOP_LOOKUP_AMBIGUOUS
         return matches[0] if matches else None
 
     @staticmethod
@@ -916,19 +1003,21 @@ class IBKRExecutor(StockExecutorBase):
         except (TypeError, ValueError, AttributeError):
             return None
 
-    def _cancel_trade_and_wait(self, trade, timeout_s: float = 10.0) -> None:
+    def _cancel_trade_and_wait(self, trade, timeout_s: float = 10.0) -> bool:
         """Best-effort cancel of a resting Trade — never raises. Waits for
-        the cancel to actually land (trade.isDone()) so an immediately
-        following placeOrder() doesn't race a cancel still in flight;
-        gives up silently after timeout_s (the caller proceeds regardless —
-        matches the crypto native-stop's own 'never block on this' policy)."""
+        the cancel to actually land (trade.isDone()). Returns True only if
+        the cancellation is CONFIRMED — cancelOrder() itself raising, or the
+        order still not done after timeout_s, both return False. Callers
+        that then proceed as if the order were gone (e.g. placing a
+        replacement) on a False return risk two live orders able to both
+        sell the same shares (2026-09-12 finding)."""
         try:
             self._ib.cancelOrder(trade.order)
         except Exception as exc:
             logger.warning(
                 "Cancel failed for order %s: %s", getattr(trade.order, "orderId", "?"), exc,
             )
-            return
+            return False
         try:
             async def _wait():
                 deadline = self._loop.time() + timeout_s
@@ -937,19 +1026,38 @@ class IBKRExecutor(StockExecutorBase):
             self._call(_wait(), timeout=timeout_s + 5)
         except Exception:
             pass
+        return trade.isDone()
 
     def _cancel_native_stop(self, symbol: str) -> None:
-        """Cancel this symbol's tracked resting native stop, if any. Always
-        confirmed against a live query first (not just the in-memory
-        tracking dict) — the tracking dict can be stale after a restart,
-        and leaving a real resting stop live while we place our own sell is
-        exactly the deadlock class this exists to prevent."""
+        """Cancel every resting native stop found for this symbol (not just
+        the single-match case — 2026-09-12 finding: ahead of an executor-
+        initiated sell, an ambiguous multi-stop state must still be cleared
+        as fully as possible, not left alone the way sync_protective_stop's
+        placement decision must). Always confirmed against a live query
+        first (not just the in-memory tracking dict) — the tracking dict
+        can be stale after a restart, and leaving any real resting stop
+        live while we place our own sell is exactly the deadlock class this
+        exists to prevent. Reentrant-safe (shares _position_lock with
+        sell()/sync_protective_stop — RLock, so a caller that already holds
+        it does not deadlock here)."""
         sym = symbol.upper()
-        self._native_stops.pop(sym, None)
-        existing = self._find_resting_native_stop(sym)
-        if existing is not None:
-            self._cancel_trade_and_wait(existing)
-            logger.info("NATIVE STOP CANCELLED [%s] ahead of an executor-initiated sell", sym)
+        with self._position_lock(sym):
+            self._native_stops.pop(sym, None)
+            matches = self._all_resting_native_stops(sym)
+            if not matches:
+                return
+            for m in matches:
+                if self._cancel_trade_and_wait(m):
+                    logger.info(
+                        "NATIVE STOP CANCELLED [%s] ahead of an executor-initiated sell", sym,
+                    )
+                else:
+                    logger.error(
+                        "NATIVE STOP CANCEL UNCONFIRMED [%s] ahead of an executor-initiated "
+                        "sell — order may still be resting; proceeding with the sell anyway "
+                        "per this method's best-effort contract, but the position may be "
+                        "briefly exposed to both this sell and the old stop", sym,
+                    )
 
     def check_native_stop_fills(self) -> list[dict]:
         """Detect a native stop that filled on its own — broker-side,
@@ -968,30 +1076,39 @@ class IBKRExecutor(StockExecutorBase):
             trade = tracked.get("trade")
             if trade is None or not trade.isDone():
                 continue   # still resting or nothing to check — leave tracking alone
-            try:
-                filled_qty = float(trade.orderStatus.filled or 0.0)
-                if filled_qty <= 0:
-                    continue   # cancelled/rejected, not filled — cleared in the finally below
-                fill_px = float(trade.orderStatus.avgFillPrice or 0.0) or self._native_stop_trigger_price(trade) or 0.0
-                _, held_cost = self.positions_snapshot().get(sym, (0.0, 0.0))
-                pnl = round((fill_px - held_cost) * filled_qty, 2)
-                with self._state_lock:
-                    self._realized_pnl += pnl
-                self._position_stop_pct.pop(sym, None)
-                self._record_trade("SELL", sym, filled_qty, fill_px, "NATIVE_STOP_HIT")
-                logger.warning(
-                    "NATIVE STOP FILLED [%s]: %d shares @ $%.2f — broker triggered "
-                    "this independently of the bot's own SL/TP watcher",
-                    sym, int(filled_qty), fill_px,
-                )
-                filled.append({"symbol": sym, "shares": filled_qty, "price": fill_px, "pnl": pnl})
-            except Exception as exc:
-                logger.error("check_native_stop_fills failed for %s: %s", sym, exc)
-            finally:
-                # Reached only once trade.isDone() is confirmed — a genuine
-                # terminal state (filled, cancelled, or rejected), never the
-                # "still resting" case above, which continues before this.
-                self._native_stops.pop(sym, None)
+            # Per-symbol, reentrant — a concurrent sell()/sync_protective_stop()
+            # for the SAME symbol on another thread must not interleave with
+            # this fill's bookkeeping (2026-09-12 finding).
+            with self._position_lock(sym):
+                try:
+                    filled_qty = float(trade.orderStatus.filled or 0.0)
+                    if filled_qty <= 0:
+                        continue   # cancelled/rejected, not filled — cleared in the finally below
+                    fill_px = float(trade.orderStatus.avgFillPrice or 0.0) or self._native_stop_trigger_price(trade) or 0.0
+                    # Cost basis cached at placement time (see sync_protective_stop)
+                    # — by the time a SELL stop is isDone()/filled, the position
+                    # it closed is already gone from positions_snapshot(), so a
+                    # fresh lookup here would silently return 0.0 and invert the
+                    # sign of every native-stop P&L (2026-09-12 finding).
+                    held_cost = tracked.get("avg_cost", 0.0) or 0.0
+                    pnl = round((fill_px - held_cost) * filled_qty, 2)
+                    with self._state_lock:
+                        self._realized_pnl += pnl
+                    self._position_stop_pct.pop(sym, None)
+                    self._record_trade("SELL", sym, filled_qty, fill_px, "NATIVE_STOP_HIT")
+                    logger.warning(
+                        "NATIVE STOP FILLED [%s]: %d shares @ $%.2f — broker triggered "
+                        "this independently of the bot's own SL/TP watcher",
+                        sym, int(filled_qty), fill_px,
+                    )
+                    filled.append({"symbol": sym, "shares": filled_qty, "price": fill_px, "pnl": pnl})
+                except Exception as exc:
+                    logger.error("check_native_stop_fills failed for %s: %s", sym, exc)
+                finally:
+                    # Reached only once trade.isDone() is confirmed — a genuine
+                    # terminal state (filled, cancelled, or rejected), never the
+                    # "still resting" case above, which continues before this.
+                    self._native_stops.pop(sym, None)
         return filled
 
     # ── portfolio state (queried from IBKR) ──────────────────────────────────

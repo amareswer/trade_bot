@@ -819,6 +819,45 @@ def test_sync_protective_stop_replaces_on_price_change(executors):
     assert live[0].order.auxPrice == 57.0
 
 
+def test_sync_protective_stop_never_places_when_ambiguous(executors):
+    """Reviewer-reproduced bug: two resting stops already exist (shouldn't
+    normally happen, but the code must not make it worse). sync must NOT
+    read 'ambiguous' as 'nothing there' and place a third."""
+    fake = FakeIB(positions=[_ko_position(10, 60.0)])
+    ex = make_executor(fake)
+    executors.append(ex)
+    from ib_async import StopOrder
+    fake.placeOrder(FakeContract("KO", "USD"), StopOrder("SELL", 10, 55.0, tif="GTC"))
+    fake.placeOrder(FakeContract("KO", "USD"), StopOrder("SELL", 10, 54.0, tif="GTC"))
+    assert len(fake.placed) == 2
+
+    ex.sync_protective_stop("KO", 55.0)
+
+    assert len(fake.placed) == 2, "must not place a third stop on an ambiguous state"
+    assert fake.cancelled == []
+
+
+def test_sync_protective_stop_does_not_replace_when_cancel_unconfirmed(executors):
+    """Reviewer-reproduced bug: the old stop's cancellation doesn't confirm
+    (order stays 'open' after cancelOrder() is called) — must abort rather
+    than place a second stop on top of a possibly-still-live first one."""
+    fake = FakeIB(positions=[_ko_position(10, 60.0)])
+    ex = make_executor(fake)
+    executors.append(ex)
+    ex.sync_protective_stop("KO", 55.0)
+    assert len(fake.placed) == 1
+
+    # Make the cancel a no-op at the exchange (order stays live) —
+    # simulates a cancel that's accepted but never actually lands.
+    real_cancel = fake.cancelOrder
+    fake.cancelOrder = lambda order: fake.cancelled.append(order)   # no status change
+
+    ex.sync_protective_stop("KO", 57.0)   # tries to replace at a new price
+
+    assert len(fake.placed) == 1, "must not place a second stop while the first is unconfirmed-cancelled"
+    fake.cancelOrder = real_cancel
+
+
 def test_sync_protective_stop_noop_when_no_position(executors):
     fake = FakeIB(positions=[])
     ex = make_executor(fake)
@@ -868,6 +907,44 @@ def test_sell_cancels_resting_native_stop_first(executors):
     assert "KO" not in ex._native_stops
 
 
+def test_sell_and_sync_protective_stop_are_mutually_exclusive(executors):
+    """Reviewer finding: sync_protective_stop (called every SL/TP-watcher
+    cycle on its own thread) didn't share sell()'s per-symbol lock, so it
+    could run concurrently with an executor-initiated sell on the same
+    symbol. Proven the same deterministic way as the concurrent-sell fix:
+    an overlap counter around the shared critical section must never
+    exceed 1 across two real threads."""
+    fake = FakeIB(positions=[_ko_position(10, 60.0)], fill_price=58.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+
+    active = {"count": 0, "max": 0}
+    guard = threading.Lock()
+    real_snapshot = ex.positions_snapshot
+
+    def _slow_snapshot():
+        with guard:
+            active["count"] += 1
+            active["max"] = max(active["max"], active["count"])
+        time.sleep(0.15)
+        result = real_snapshot()
+        with guard:
+            active["count"] -= 1
+        return result
+
+    ex.positions_snapshot = _slow_snapshot
+
+    t1 = threading.Thread(target=lambda: ex.sell("KO", 10, 58.0, reason="test"))
+    t2 = threading.Thread(target=lambda: ex.sync_protective_stop("KO", 55.0))
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+
+    assert active["max"] == 1, (
+        "sell() and sync_protective_stop() entered their critical sections "
+        "concurrently — they must share the same per-symbol lock"
+    )
+
+
 def test_check_native_stop_fills_detects_and_records_broker_triggered_exit(executors):
     """The broker triggers the stop on its own (independent of this bot's
     SL/TP watcher noticing) — must be detected, recorded (CSV row +
@@ -881,9 +958,18 @@ def test_check_native_stop_fills_detects_and_records_broker_triggered_exit(execu
     trade = ex._native_stops["KO"]["trade"]
 
     # Broker fills the resting stop on its own — nothing in this bot
-    # process initiated it.
+    # process initiated it. Critically, the broker's position list also
+    # reflects the now-closed position (as it genuinely would) — a fresh
+    # positions_snapshot() lookup at this point returns nothing for KO.
+    # This is the exact condition the original bug hit: querying position
+    # AFTER the close returns cost_basis=0.0 and inverts the P&L sign
+    # (reproduced externally: +$548 instead of -$52). A hermetic fake with
+    # a still-static position list would hide this bug entirely — the fix
+    # must work because avg_cost was CACHED at stop-placement time, not
+    # because the fake happened to still show the old position.
     fake._fill(trade, trade.order)
     trade.orderStatus.avgFillPrice = 54.80
+    fake._positions = []
 
     before_pnl = ex.realized_pnl()
     results = ex.check_native_stop_fills()
@@ -892,6 +978,7 @@ def test_check_native_stop_fills_detects_and_records_broker_triggered_exit(execu
     assert results[0]["symbol"] == "KO"
     assert results[0]["shares"] == 10.0
     assert results[0]["price"] == 54.80
+    assert results[0]["pnl"] == pytest.approx((54.80 - 60.0) * 10)   # -52.0, not +548.0
     assert ex.realized_pnl() == pytest.approx(before_pnl + (54.80 - 60.0) * 10)
     assert "KO" not in ex._native_stops   # cleared after recording
     assert len(ex._trade_log) == 1
@@ -923,7 +1010,9 @@ def test_find_resting_native_stop_ambiguous_touches_nothing(executors):
 
     found = ex._find_resting_native_stop("KO")
 
-    assert found is None
+    # Ambiguous is NOT the same as "confirmed none" — conflating the two
+    # is exactly what let a duplicate stop get placed (2026-09-12 finding).
+    assert found is ibkr_mod._NATIVE_STOP_LOOKUP_AMBIGUOUS
     assert fake.cancelled == []
 
 

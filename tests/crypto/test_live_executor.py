@@ -673,8 +673,12 @@ def test_limit_order_fills_on_first_attempt(mock_cfg, mock_sleep, tmp_path):
     # Post-only flag sent — postOnly=True, NOT timeInForce="PO" (found
     # 2026-08-26: the latter is invalid on Kraken's real API and was
     # silently falling back to market every time since 2026-06-22; this
-    # test had been locking in the buggy value along with the code)
-    assert mock_ex.create_order.call_args[0][5] == {"postOnly": True}
+    # test had been locking in the buggy value along with the code).
+    # clientOrderId (2026-09-12) is a fresh UUID each call, checked for
+    # presence/shape rather than an exact value.
+    sent_params = mock_ex.create_order.call_args[0][5]
+    assert sent_params["postOnly"] is True
+    assert isinstance(sent_params.get("clientOrderId"), str) and sent_params["clientOrderId"]
     # Maker fee deducted
     assert abs(ex.fees_paid - 0.360) < 1e-6
     # No market-order fallback — fetch_order never needed
@@ -824,9 +828,17 @@ def test_submission_exception_adopts_untracked_order_instead_of_market(mock_cfg,
     mock_ex.price_to_precision.return_value = "90009.0"
     mock_ex.create_order.side_effect = ccxt.NetworkError("response lost")
 
+    # Adoption now matches by clientOrderId (2026-09-12), not just "one
+    # untracked same-side order" — pin the UUID this attempt generates so
+    # the mocked resting order can carry a matching clientOrderId.
+    fixed_coid = "11111111-1111-1111-1111-111111111111"
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(le_mod.uuid, "uuid4", lambda: fixed_coid)
+
     resting = {
         "id": "limit-ghost-1", "status": "open", "side": "buy",
         "filled": 0.0, "amount": 0.001, "average": None, "fee": {},
+        "clientOrderId": fixed_coid,
     }
     mock_ex.fetch_open_orders.return_value = [resting]
     mock_ex.fetch_order.return_value = {
@@ -835,6 +847,7 @@ def test_submission_exception_adopts_untracked_order_instead_of_market(mock_cfg,
     }
 
     order = ex.execute(Signal.BUY, 90000.0, 0.001)
+    monkeypatch.undo()
 
     assert order is not None
     assert order.status == OrderStatus.FILLED
@@ -870,6 +883,44 @@ def test_submission_exception_no_untracked_order_falls_back_to_market(mock_cfg, 
     assert mock_ex.create_order.call_count == 2
     last_call = mock_ex.create_order.call_args_list[-1]
     assert last_call[0][1] == "market"
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_submission_exception_already_filled_and_closed_is_not_re_ordered(mock_cfg, mock_sleep, tmp_path):
+    """Reviewer-reproduced gap: the original order didn't just rest — it
+    fully filled and closed before the exception-recovery check ran, so it
+    was ALREADY GONE from fetch_open_orders(). The old heuristic (open
+    orders only) read this as 'nothing to adopt' and placed a second market
+    order on top of a real, already-filled position. clientOrderId lets the
+    check find it in fetch_closed_orders() too."""
+    _limit_cfg(mock_cfg, enabled=True, timeout_s=30)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+    mock_ex.fetch_order_book.return_value   = _ob()
+    mock_ex.price_to_precision.return_value = "90009.0"
+    mock_ex.create_order.side_effect = ccxt.NetworkError("response lost")
+    mock_ex.fetch_open_orders.return_value  = []   # already closed — not resting anymore
+
+    fixed_coid = "22222222-2222-2222-2222-222222222222"
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(le_mod.uuid, "uuid4", lambda: fixed_coid)
+
+    mock_ex.fetch_closed_orders.return_value = [{
+        "id": "limit-already-filled", "status": "closed", "side": "buy",
+        "filled": 0.001, "amount": 0.001, "average": 90009.0,
+        "fee": {"cost": 0.36, "currency": "CAD"}, "clientOrderId": fixed_coid,
+    }]
+
+    order = ex.execute(Signal.BUY, 90000.0, 0.001)
+    monkeypatch.undo()
+
+    assert order is not None
+    assert order.status == OrderStatus.FILLED
+    assert order.quantity == pytest.approx(0.001)
+    # The already-filled order was adopted — no second (market) order placed.
+    assert mock_ex.create_order.call_count == 1
+    mock_ex.fetch_closed_orders.assert_called()
 
 
 @patch("time.sleep")

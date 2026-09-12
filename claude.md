@@ -175,7 +175,7 @@ narrative behind any decision below, and `.memory/decisions/*.md` for the deepes
 
 ## Test Suite Manifest
 
-**Expected total: 940 tests** (`pytest --collect-only -q`). If the count disagrees: a file
+**Expected total: 946 tests** (`pytest --collect-only -q`). If the count disagrees: a file
 has an import error, was deleted, was added without a manifest bump, or was excluded from the
 runner — investigate before trusting a green suite. Suite runtime ~9–26s; minutes means a
 test is reading live `.env` config. The per-row table sum below lags the header total by ~22
@@ -187,7 +187,7 @@ Run: `python -m pytest --tb=short -q` — must show **906 passed**.
 | File | Tests | What it covers |
 |------|-------|----------------|
 | `tests/shared/test_indicators.py` | 30 | RSI, EMA, ADX, MACD, ATR; regime-classification self-referential-ATR-baseline regression |
-| `tests/crypto/test_live_executor.py` | 68 | LiveExecutor: dry-run, market/limit orders, urgent-exit bypass, fee deduction, state save/load, min-size guard, restart recovery, native static + trailing stop-loss backstop (placement/cancel/resync/failure-alert/restart reconciliation/quantity reconciliation/untracked-order adoption/multi-stop ambiguity), `native_stop_price` property, slippage guard, maker→taker silent-fallback alert, native-stop pre-cancel-on-SELL (2026-08-27 deadlock incident), **duplicate-order guards (2026-09-11)**: submission-exception reconciliation adopts an untracked resting order instead of market-ordering on top of it, cancel-timeout retry blocked unless the post-cancel status is confirmed terminal |
+| `tests/crypto/test_live_executor.py` | 70 | LiveExecutor: dry-run, market/limit orders, urgent-exit bypass, fee deduction, state save/load, min-size guard, restart recovery, native static + trailing stop-loss backstop (placement/cancel/resync/failure-alert/restart reconciliation/quantity reconciliation/untracked-order adoption/multi-stop ambiguity), `native_stop_price` property, slippage guard, maker→taker silent-fallback alert, native-stop pre-cancel-on-SELL (2026-08-27 deadlock incident), **duplicate-order guards (2026-09-11)**: submission-exception reconciliation adopts an untracked resting order instead of market-ordering on top of it, cancel-timeout retry blocked unless the post-cancel status is confirmed terminal, **clientOrderId reconciliation (2026-09-12)**: a fresh UUID per attempt lets post-exception recovery check both open AND closed orders, catching the "already fully filled" case fetch_open_orders alone can't see |
 | `tests/crypto/test_capital_pool.py` | 37 | CapitalPool: slot allocation, slot cap, per-symbol slot caps (`slot_caps`, `slot_cash_for()`), release, edge cases; `config._slot_caps_by_base()` env scanner; `PortfolioConfig.max_slot_cash_cad_by_base` validation |
 | `tests/crypto/test_correlation.py` | 17 | Pearson correlation, pct_returns, fetch_correlation |
 | `tests/stock/test_stock_correlation.py` | 5 | `stock_bot/risk/correlation.py`: `fetch_correlation_from_closes` — no-network wrapper reusing the crypto pearson/pct_returns |
@@ -213,11 +213,11 @@ Run: `python -m pytest --tb=short -q` — must show **906 passed**.
 | `tests/stock/test_fast_validator_exits.py` | 6 | FastValidator exits: MAX_HOLD live-price fallback, corruption guard, SL regression |
 | `tests/stock/test_paper_report.py` | 10 | Expectancy math: IBKR commission model, net-of-cost flip, merged paper+IBKR book, IBKR account section, live-cash-snapshot precedence (row parsing is now `_row_to_trade`, tested separately) |
 | `tests/stock/test_exit_policy.py` | 11 | Stock asymmetric exit bars: single-verdict exit, 2-strike SELL streak, streak resets, AC.TO incident regression |
-| `tests/stock/test_stock_backtest_engine.py` | 14 | Stock backtest engine: next-open fills, intra-candle SL/TP, gap handling, slippage/commission math, walk-forward gating, optional ATR(14)×mult stop mode |
+| `tests/stock/test_stock_backtest_engine.py` | 15 | Stock backtest engine: next-open fills, intra-candle SL/TP, gap handling, slippage/commission math, walk-forward gating, optional ATR(14)×mult stop mode, **ATR look-ahead-bias fix (2026-09-12)**: the entry/fill candle's own high/low/close must not feed the ATR sizing its own stop |
 | `tests/stock/test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last, determinism, validated-parameter pin |
 | `tests/crypto/test_audit_scheduler.py` | 14 | REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, monthly 1st-anchored re-screen, missed-run catch-up |
 | `tests/crypto/test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
-| `tests/stock/test_ibkr_executor.py` | 84 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping, broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe, FX/margin-minimum guard (**checks NET-LIQ, not free cash** — 2026-08-31 fix), sector-concentration gate, weekly/drawdown-halt/kill-switch tiers, per-position ATR stop-pct override, projected-exposure check, LiveTradingGate enforcement (incl. Gate 2 SKIPPED-when-AI-disabled bypass, 2026-09-10), TWS-query resilience (last-good cache, incl. **disconnected-but-no-exception preserves cache** — 2026-09-11 fix), `ibkr_trades.csv` write buffer/retry, Error 10349 slow-resubmit fill (20s grace + `tif="DAY"`), daily-loss calendar-day anchoring, **partial-fill tracking to completion or confirmed cancel** (2026-09-12 fix), **concurrent-sell serialization** (2026-09-12 fix, overlap-counter proof), **native broker-side protective stop** (2026-09-12: place/no-op/replace/adopt-on-restart, cancel-before-sell, broker-triggered-fill detection, multi-stop ambiguity), **currency-aware cash check** (2026-09-12 fix: USD-stock affordability now converted to CAD before comparing against CAD cash) |
+| `tests/stock/test_ibkr_executor.py` | 87 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping, broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe, FX/margin-minimum guard (**checks NET-LIQ, not free cash** — 2026-08-31 fix), sector-concentration gate, weekly/drawdown-halt/kill-switch tiers, per-position ATR stop-pct override, projected-exposure check, LiveTradingGate enforcement (incl. Gate 2 SKIPPED-when-AI-disabled bypass, 2026-09-10), TWS-query resilience (last-good cache, incl. **disconnected-but-no-exception preserves cache** — 2026-09-11 fix), `ibkr_trades.csv` write buffer/retry, Error 10349 slow-resubmit fill (20s grace + `tif="DAY"`), daily-loss calendar-day anchoring, **partial-fill tracking to completion or confirmed cancel** (2026-09-12 fix), **concurrent-sell serialization** (2026-09-12 fix, overlap-counter proof), **native broker-side protective stop** (2026-09-12: place/no-op/replace/adopt-on-restart, cancel-before-sell, broker-triggered-fill detection, multi-stop ambiguity — **plus a second-pass fix for 3 bugs an external review found in this same feature**: ambiguous-lookup sentinel distinct from "confirmed none", cost basis cached at placement time not re-read after the position closes, `sync_protective_stop`/`sell()` share one reentrant per-symbol lock), **currency-aware cash check** (2026-09-12 fix: USD-stock affordability now converted to CAD before comparing against CAD cash) |
 | `tests/stock/test_concurrent_sell.py` | 1 | `StockPaperExecutor` concurrent-sell regression (2026-09-12): two threads racing a full-position sell — proves both the overlap invariant (per-symbol lock) and the actual business outcome (one FILLED, one REJECTED, never both filling the same shares) |
 | `tests/stock/test_intraday_price_guard.py` | 5 | `get_live_price()`'s previous-close corruption guard (2026-09-12): a genuine crash confirmed by today's own day_high/day_low is no longer discarded; a corrupted read outside that range still is; day-range lookup failure fails toward the conservative reject |
 | `tests/stock/test_paper_executor_fill_price.py` | 2 | `StockPaperExecutor.buy()`/`sell()` regression (2026-09-12): `order.price`/`quantity`/`total_value` now reflect the actual slippage-adjusted fill, not the pre-slippage requested price — IBKRExecutor already did this correctly, paper.py did not |
@@ -249,7 +249,7 @@ Run: `python -m pytest --tb=short -q` — must show **906 passed**.
 | `tests/crypto/test_shadow_signal_retry.py` | 3 | `shadow_signal.shadow_replay` Kraken fetch wrapped in `fetch_with_retry` |
 | `tests/shared/test_unified_dashboard.py` | 9 | `_read_gate_stats`/`_gate_tracker_section` shadow-match-rate parsing (bounded regex, N/A handling); `_crypto_card` STALE-vs-NO-FILLS badge |
 | `tests/stock/test_stock_position_mark_refresh.py` | 4 | REAL `_mark_positions_to_market()` — breaker trips from a price move alone, silent within limit, None-executor no-op, source guard |
-| `tests/stock/test_sl_tp_watcher_audit_log.py` | 15 | `_check_open_positions_sl_tp` behavior + "N/M positions priced" audit log + rejected-SL/TP-exit `else` branch (`logger.error` + `StuckLoopDetector`) + native-stop wiring (2026-09-12: `sync_protective_stop` called every cycle at the exact SL price, no-op when the executor lacks it, broker-triggered fills alerted and checked before the price-based decision) |
+| `tests/stock/test_sl_tp_watcher_audit_log.py` | 16 | `_check_open_positions_sl_tp` behavior + "N/M positions priced" audit log + rejected-SL/TP-exit `else` branch (`logger.error` + `StuckLoopDetector`) + native-stop wiring (2026-09-12: `sync_protective_stop` called every cycle at the exact SL price, no-op when the executor lacks it, broker-triggered fills alerted and checked before the price-based decision, **and called independently of get_live_price() succeeding — a yfinance outage must not also disable broker-side protection**) |
 | `tests/crypto/test_grid_stress_test.py` | 14 | `grid_stress_test.py` pure helpers (research tooling): crash-period parsing, buy-and-hold P&L, PASS/MARGINAL/FAILED classification |
 | `tests/crypto/test_grid_dca_experiment.py` | 12 | `grid_dca_experiment.py` standalone engines (research tooling): grid fills/reopens/floor-stop, capital split, fee math, DCA averaging + cycle restart |
 | `tests/stock/test_stock_momentum_experiment.py` | 14 | `stock_momentum_experiment.py` (research tooling — NOT the live pipeline): cross-sectional 6-1 momentum rotation. FAILED (see strategy-search note) |
@@ -488,6 +488,98 @@ the dataclass computes `total_value` once in `__post_init__`, so it goes stale t
 `order.total_value` instead of the request. +2 tests proving the paper-executor fix directly
 (non-zero slippage bps, confirmed to fail against the pre-fix code: old code returned the
 exact pre-slippage request). Suite 935→940. Requires a stock bot restart.
+
+### Second-pass review found real bugs in the SAME-DAY fixes above (2026-09-12)
+An independent review of the six 2026-09-12 fixes (native stop, duplicate orders, partial
+fills, concurrent sells) found that several had genuine gaps — verified against the actual
+code before touching anything, same discipline as the original review. Worth stating plainly:
+the first pass introduced new bugs while fixing old ones, most seriously an inverted-sign P&L
+that a hermetic test accidentally masked. All confirmed and fixed same day; both bots restarted
+after. Full list:
+
+- **Native-stop P&L used a cost basis that was already gone (High).** `check_native_stop_fills()`
+  queried `positions_snapshot()` for the avg_cost — but by the time a SELL stop is `isDone()`/
+  filled, the position it closed is already gone from the broker's position list, so this
+  returned `(0.0, 0.0)` and **inverted the sign of every native-stop P&L**. Reproduced: 10
+  shares @ $60 stopped at $54.80 reported **+$548 instead of −$52**. The original test for this
+  exact path passed anyway — its hermetic FakeIB never shrinks its static position list after a
+  fill (a limitation already known and documented for the concurrent-sell fix, but not applied
+  here where it mattered most). Fixed: `avg_cost` is now cached in `self._native_stops[sym]` at
+  placement/adoption time, while the position still genuinely exists, and read back from there
+  — never re-queried after the close. The regression test was rewritten to explicitly zero out
+  the fake's position list before checking the P&L, so this class of bug can't hide again.
+- **Ambiguous stop-lookup was read as "nothing exists, place one" (High).** `_find_resting_
+  native_stop()` returned `None` for BOTH "confirmed zero resting stops" and "query failed /
+  multiple found" — and `sync_protective_stop()` treated any `None` as "safe to place a new
+  stop". Reproduced: two existing stops became three. Fixed: a distinct sentinel,
+  `_NATIVE_STOP_LOOKUP_AMBIGUOUS`, for the unsafe case — only a confirmed-empty result may ever
+  place an order. `_cancel_native_stop()` (used ahead of an executor-initiated sell, where the
+  goal is "clear everything, not just the one exactly-matched stop") was split onto its own
+  `_all_resting_native_stops()` query so it cancels every match found, not just the single-match
+  case `_find_resting_native_stop()` is scoped to.
+- **Cancellation wasn't confirmed before replacing or proceeding (High).** `_cancel_trade_and_
+  wait()` was fire-and-forget — callers proceeded to place a replacement stop (or, for `sell()`,
+  proceed with the sell) whether or not the cancel actually landed, risking two live orders both
+  able to sell the same shares. Fixed: it now returns a bool: confirmed only if `trade.isDone()`
+  by the end of its wait window. `sync_protective_stop()`'s replace path aborts (retries next
+  cycle) rather than placing a second stop on an unconfirmed cancel; `sell()`'s cancel-before-sell
+  still proceeds regardless per its existing best-effort contract, but now logs loudly (`logger.
+  error`, not `warning`) when the cancel didn't confirm, instead of silently continuing.
+- **`sync_protective_stop()` didn't share `sell()`'s per-symbol lock (High).** The whole point of
+  the 2026-09-12 concurrent-sell fix was one lock per symbol guarding every position-mutating
+  operation — but `sync_protective_stop()` (called independently every SL/TP-watcher cycle, not
+  from `sell()`) never acquired it, so it could run concurrently with an executor-initiated sell
+  on the very same symbol. Fixed: `sync_protective_stop()`, `_cancel_native_stop()`, and
+  `check_native_stop_fills()` (per-symbol) all now hold `_position_lock(sym)`. Since `sell()`
+  already holds this lock when it calls `_cancel_native_stop()`, `StockExecutorBase._position_
+  lock()` was changed from `threading.Lock` to `threading.RLock` (reentrant) — a plain Lock would
+  have deadlocked the instant one method called into another on the same thread. Proven with the
+  same overlap-counter technique as the original concurrent-sell fix, across two real threads.
+- **`sync_protective_stop()` was gated behind a live yfinance price (Medium/High in practice).**
+  In `_check_open_positions_sl_tp`, the call was placed AFTER `if get_live_price(symbol) is None:
+  continue` — but it only needs `avg_cost` (from `positions_snapshot()`, the broker's own data),
+  not the live price. A yfinance outage disabled broker-side protection at exactly the moment
+  it's supposed to compensate for a degraded in-process check. Fixed: moved before the
+  `get_live_price()` call, decoupled entirely from yfinance availability.
+- **Crypto: an empty open-orders list can't rule out an order that already filled (High).**
+  `_find_untracked_entry_order()` only checked `fetch_open_orders()` — an order that fully
+  filled and closed between the submission exception and the recovery check is, correctly, no
+  longer "open", so the old check read this as "nothing to adopt" and placed a second market
+  order on top of an already-filled position. Fixed properly, not just patched: every limit
+  placement attempt now carries a fresh `clientOrderId` (a UUID, sent as Kraken's `cl_ord_id` —
+  offline-verified against the real installed ccxt that it coexists with `postOnly`). On a
+  submission exception, the recovery check searches for that exact id across BOTH open and
+  closed orders, resolving the order's fate definitively instead of guessing from order shape.
+- **Stock: the 15s cancel-timeout still returns without confirmed cancellation (High, accepted
+  as a known residual gap, not fully closed).** After a fill-timeout cancel, `_place_market_
+  async()` waits up to 15s then returns regardless of whether `trade.isDone()` ever became true.
+  A later fill on a still-live order past that point is not captured. Fully closing this would
+  mean tracking unresolved orders across cycles the way `check_native_stop_fills()` already does
+  for native stops — a real, understood follow-up, deliberately not built same-day on top of
+  everything else above (today's own mistakes were reason enough for caution about rushing
+  another new tracking mechanism). What WAS done: the silent return is now a loud `logger.error`
+  naming the symbol, so this state is investigable instead of invisible.
+- **ATR look-ahead bias in the (currently disabled) backtest sizing path (lower urgency).**
+  `stock_bot/backtest/engine.py`: the entry fill (at a candle's OPEN) computed its own ATR stop
+  distance using `highs[:i+1]` — including that same candle's own high/low/close, which aren't
+  actually known yet at the moment of filling at its open. Confirmed live trading is unaffected
+  (`stock_bot/main.py`'s `data.get("atr")` is always from an already-completed prior candle by
+  BUY time — this was purely a backtest-simulation gap). Since `PAPER_ATR_SIZING_ENABLED=false`
+  today, nothing live changes, but the 2026-08-23 ATR-sizing validation run (AMD/KO failing)
+  was run against the biased engine and should be re-run before that result is trusted for any
+  future decision to re-enable ATR sizing. Fixed: `highs[:i]` (strictly before the fill candle).
+- **Strategy finding, NOT changed:** `Regime.VOLATILE` returns `Signal.HOLD` unconditionally
+  (`bot/strategy/indicator_strategy.py`), suppressing the strategy's own SELL signal during a
+  volatile regime — existing positions rely entirely on SL/TP/native-stop protection to exit
+  during that window, not a trend-reversal signal. Confirmed as designed behavior baked into the
+  walk-forward-validated strategy fingerprint, not a bug — changing it would touch `bot/strategy/`
+  and invalidate every current fingerprint/ACTIVE status per the Validation Discipline rules
+  above. Left alone deliberately; flagged here for visibility, not as an open item.
+
++8 tests for the execution-layer fixes (2 ambiguous/unconfirmed-cancel, 1 lock-sharing overlap
+proof, 1 yfinance-outage sync, 1 crypto already-filled-and-closed adoption, 1 ATR look-ahead,
+existing native-stop P&L test strengthened to actually exercise the bug), suite 940→946. Both
+bots need a restart.
 
 ### Generic stuck-loop detector (crypto + stock — BUILT 2026-08-27)
 `bot/alerts/stuck_loop.StuckLoopDetector` — error-string-agnostic "same operation keeps

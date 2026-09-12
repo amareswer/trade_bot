@@ -175,10 +175,19 @@ def run_symbol(
                 in_pos, entry_price, entry_ts, shares = True, fill, c.timestamp, n
                 entry_sl_pct = cfg.stop_loss_pct   # flat default; ATR override below
                 if cfg.atr_sl_mult:
-                    # ATR computed from candles up to and including the fill
-                    # candle — same "known at entry, never repriced" semantics
-                    # as the live executor's once-at-BUY _atr_stop_pct.
-                    atr_val = _calc_atr(highs[:i + 1], lows[:i + 1], closes[:i + 1], period=14)
+                    # ATR computed from candles strictly BEFORE the fill
+                    # candle (highs[:i], not [:i+1]) — the entry fills at
+                    # this candle's OPEN, so its own high/low/close aren't
+                    # known yet at that moment. highs[:i+1] was look-ahead
+                    # bias: it let the sizing/stop distance see the very
+                    # candle's full range before that candle had finished
+                    # (2026-09-12 finding). Live trading never had this bug
+                    # — data.get("atr") in stock_bot/main.py is always from
+                    # an already-completed prior candle by the time a BUY
+                    # executes; this was purely a backtest-simulation gap,
+                    # but it means the 2026-08-23 ATR-sizing validation run
+                    # (AMD/KO failing) should be re-run before trusting it.
+                    atr_val = _calc_atr(highs[:i], lows[:i], closes[:i], period=14)
                     if atr_val and atr_val > 0 and fill > 0:
                         entry_sl_pct = min((atr_val * cfg.atr_sl_mult) / fill, cfg.atr_sl_cap)
         elif pending_exit and in_pos:

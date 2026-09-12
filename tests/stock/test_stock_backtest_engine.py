@@ -253,6 +253,42 @@ def test_flat_stop_still_used_as_control_on_same_candles():
     assert t.exit_ts == candles[16].timestamp
 
 
+def test_atr_stop_excludes_the_entry_fill_candles_own_range():
+    """2026-09-12 finding (look-ahead bias): the entry fills at THIS
+    candle's OPEN — its own high/low/close aren't known yet at that
+    instant, so they must not feed the ATR used to size its own stop.
+    Same 15-candle flat warmup as the tests above (ATR settles to exactly
+    2.0), but the entry/fill candle itself (idx 15) has a wildly different
+    range (high-low=100 instead of 2). If that candle's own range leaked
+    into the ATR calc (the pre-fix bug), the stop would be far wider than
+    2.0*atr_sl_mult away; with the fix, entry_sl_pct must be governed only
+    by the 15 prior (identical, ATR=2.0) candles."""
+    candles = mk_candles(
+        _flat_warmup(15) + [
+            # 15: entry @100 — huge high (200) inflates true range, but low
+            # (95) stays above the CORRECT stop (90) so this candle itself
+            # doesn't trigger an intra-candle exit either way.
+            (100, 200, 95, 100),
+            (91, 92, 85, 88),      # 16: low=85 — below the correct ATR SL (90).
+        ]                          # A look-ahead-inflated ATR would push the
+                                    # stop far below 85, missing this exit.
+    )
+    strat = ScriptedStrategy({14: Signal.BUY})
+    cfg = _cfg()
+    cfg.atr_sl_mult = 5.0
+    cfg.take_profit_pct = 10.0   # neutralize TP — candle 15's high=200 would else touch a 15% TP
+    # atr_sl_cap defaults high enough not to itself clip the (correct) 10% stop.
+
+    res = run_symbol("TEST", candles, cfg, strategy=strat)
+    t = res.completed[0]
+    # Correct: ATR=2.0 from candles 0-14 only -> stop = 100*(1 - 5*2/100) = 90.
+    # A look-ahead-biased ATR (including candle 15's range=100) would push
+    # the stop far below candle 16's low=85, missing the exit entirely.
+    assert t.exit_reason == "sl"
+    assert t.exit_price == 90.0
+    assert t.exit_ts == candles[16].timestamp
+
+
 def test_atr_stop_falls_back_to_flat_when_history_too_short():
     # BUY fires immediately (idx 0) — only 2 candles of history at fill time,
     # far short of the 15 a 14-period ATR needs. Must fall back to flat 5%.
