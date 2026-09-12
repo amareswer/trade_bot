@@ -67,6 +67,14 @@ def print_report(metrics: BacktestMetrics, result: BacktestResult) -> None:
         pf_col = _GR if metrics.profit_factor >= 1.0 else _RD
         pf_str = f"{pf_col}{metrics.profit_factor:.2f}{_R}" if metrics.profit_factor != float("inf") else f"{_GR}∞{_R}"
         _row("Profit factor",  pf_str)
+        # Gross (pre-fee) shown alongside, dimmed, for comparison only —
+        # 2026-09-12 fix: "Profit factor" above is now NET of entry+exit
+        # fees (was gross before this fix; a strategy could clear the PF
+        # floor on trading profits that fees alone erased). Never use this
+        # gross figure to judge whether a strategy passes.
+        g_pf = metrics.gross_profit_factor
+        g_pf_str = f"{g_pf:.2f}" if g_pf != float("inf") else "∞"
+        _row("  (gross, pre-fee)", f"{_DIM}{g_pf_str}{_R}")
         _row("Avg win",        _pnl(metrics.avg_win))
         _row("Avg loss",       _pnl(metrics.avg_loss))
         _row("Best trade",     _pnl(metrics.best_trade))

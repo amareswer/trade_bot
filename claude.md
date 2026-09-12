@@ -175,7 +175,7 @@ narrative behind any decision below, and `.memory/decisions/*.md` for the deepes
 
 ## Test Suite Manifest
 
-**Expected total: 950 tests** (`pytest --collect-only -q`). If the count disagrees: a file
+**Expected total: 953 tests** (`pytest --collect-only -q`). If the count disagrees: a file
 has an import error, was deleted, was added without a manifest bump, or was excluded from the
 runner — investigate before trusting a green suite. Suite runtime ~9–26s; minutes means a
 test is reading live `.env` config. The per-row table sum below lags the header total by ~22
@@ -217,12 +217,13 @@ Run: `python -m pytest --tb=short -q` — must show **906 passed**.
 | `tests/stock/test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last, determinism, validated-parameter pin |
 | `tests/crypto/test_audit_scheduler.py` | 14 | REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, monthly 1st-anchored re-screen, missed-run catch-up |
 | `tests/crypto/test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
-| `tests/stock/test_ibkr_executor.py` | 89 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping, broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe, FX/margin-minimum guard (**checks NET-LIQ, not free cash** — 2026-08-31 fix), sector-concentration gate, weekly/drawdown-halt/kill-switch tiers, per-position ATR stop-pct override, projected-exposure check, LiveTradingGate enforcement (incl. Gate 2 SKIPPED-when-AI-disabled bypass, 2026-09-10), TWS-query resilience (last-good cache, incl. **disconnected-but-no-exception preserves cache** — 2026-09-11 fix), `ibkr_trades.csv` write buffer/retry, Error 10349 slow-resubmit fill (20s grace + `tif="DAY"`), daily-loss calendar-day anchoring, **partial-fill tracking to completion or confirmed cancel** (2026-09-12 fix), **concurrent-sell serialization** (2026-09-12 fix, overlap-counter proof), **native broker-side protective stop** (2026-09-12: place/no-op/replace/adopt-on-restart, cancel-before-sell, broker-triggered-fill detection, multi-stop ambiguity — hardened across two further review passes: ambiguous-lookup sentinel distinct from "confirmed none", cost basis captured once before any cancel/place operation rather than re-queried afterward, `_cancel_trade_and_wait` returns a tri-state cancelled/filled/unconfirmed outcome so a stop that fills during its own cancellation is never mistaken for "safe to replace", shared `_record_native_stop_fill` helper, `sync_protective_stop`/`sell()` share one reentrant per-symbol lock), **currency-aware cash check** (2026-09-12 fix: USD-stock affordability now converted to CAD before comparing against CAD cash) |
+| `tests/stock/test_ibkr_executor.py` | 90 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping, broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe, FX/margin-minimum guard (**checks NET-LIQ, not free cash** — 2026-08-31 fix), sector-concentration gate, weekly/drawdown-halt/kill-switch tiers, per-position ATR stop-pct override, projected-exposure check, LiveTradingGate enforcement (incl. Gate 2 SKIPPED-when-AI-disabled bypass, 2026-09-10), TWS-query resilience (last-good cache, incl. **disconnected-but-no-exception preserves cache** — 2026-09-11 fix), `ibkr_trades.csv` write buffer/retry, Error 10349 slow-resubmit fill (20s grace + `tif="DAY"`), daily-loss calendar-day anchoring, **partial-fill tracking to completion or confirmed cancel** (2026-09-12 fix), **concurrent-sell serialization** (2026-09-12 fix, overlap-counter proof), **native broker-side protective stop** (2026-09-12: place/no-op/replace/adopt-on-restart, cancel-before-sell, broker-triggered-fill detection, multi-stop ambiguity — hardened across three further review passes: ambiguous-lookup sentinel distinct from "confirmed none", cost basis captured once before any cancel/place operation rather than re-queried afterward, `_cancel_trade_and_wait` returns a tri-state cancelled/filled/unconfirmed outcome — and a still-active PARTIAL fill is `"unconfirmed"`, not `"filled"`, so it can't be recorded twice across sync calls — shared `_record_native_stop_fill` helper, `sync_protective_stop`/`sell()` share one reentrant per-symbol lock), **currency-aware cash check** (2026-09-12 fix: USD-stock affordability now converted to CAD before comparing against CAD cash) |
 | `tests/stock/test_concurrent_sell.py` | 1 | `StockPaperExecutor` concurrent-sell regression (2026-09-12): two threads racing a full-position sell — proves both the overlap invariant (per-symbol lock) and the actual business outcome (one FILLED, one REJECTED, never both filling the same shares) |
 | `tests/stock/test_intraday_price_guard.py` | 5 | `get_live_price()`'s previous-close corruption guard (2026-09-12): a genuine crash confirmed by today's own day_high/day_low is no longer discarded; a corrupted read outside that range still is; day-range lookup failure fails toward the conservative reject |
 | `tests/stock/test_paper_executor_fill_price.py` | 2 | `StockPaperExecutor.buy()`/`sell()` regression (2026-09-12): `order.price`/`quantity`/`total_value` now reflect the actual slippage-adjusted fill, not the pre-slippage requested price — IBKRExecutor already did this correctly, paper.py did not |
 | `tests/stock/test_fx_sizing.py` | 15 | USD/CAD sizing: `is_cad_symbol`, `get_usd_cad_rate`, mixed-currency `total_value`/`check_exposure`, sector-concentration gate, projected-exposure check, **lazy fast_info failure inside get_usd_cad_rate now falls back gracefully instead of raising** (2026-09-12 fix — same class of bug already fixed in `intraday_price.py`, missed here at the time) |
 | `tests/shared/test_indicator_strategy_macd_history.py` | 1 | `IndicatorStrategy` MACD-history regression (2026-09-12): an ADX-rejected candle must still update `_last_macd_hist` — reproduces the exact reviewer scenario (histogram 1→5→3, middle candle ADX-rejected) that used to read a real momentum *fall* as "rising" and fire a false pullback BUY |
+| `tests/shared/test_backtest_metrics_fees.py` | 2 | `bot/backtest/metrics.compute()` fee-accounting regression (2026-09-12): a $1 gain eaten by $1.608 in fees must count as a net LOSS, not a win — includes a from-scratch recomputation cross-check against the real saved 2026-09-12 BTC/USDT pinned-window CSV confirming net PF ≈0.82 (a documented loss on that window) |
 | `tests/stock/test_screener_in_distribution.py` | 5 | In-distribution ATR%/liquidity filter (`stock_bot/data/screener.py`, replacement safety net after RULE_WHITELIST stopped gating BUYs) |
 | `tests/stock/test_accuracy_tracker.py` | 20 | `LiveTradingGate` gates — Gate 1 (`stock_backtest_latest.json` vs `RULE_WHITELIST`), Gate 2 (AI confidence-band edge, incl. SKIPPED when `AI_ENABLED=false` — 2026-09-10), Gate 3 (≥30 round-trips/PF≥1.2/win≥30%) |
 | `tests/stock/test_checkpoint_tracker.py` | 14 | Post-whitelist review checkpoint tracker (`checkpoint_tracker.py`, dashboard visibility only): sample floors, win-rate/PF/AI-agreement gap triggers, AI-split sample-size guard |
@@ -669,6 +670,61 @@ code — 1 FX-fallback reproduction, 1 dedicated `IndicatorStrategy` unit test r
 exact 1→5→3 scenario with indicator internals mocked to isolate the control-flow bug), suite
 946→950.
 
+### Fourth-pass review: the fee-accounting finding, plus one more native-stop bug (2026-09-12)
+The most consequential finding of this entire multi-round review — see the "⚠️ PF/win-rate
+are NET of fees" callout and the rewritten "Canonical strategy fingerprint" section above for
+the full detail. Summary: `bot/backtest/metrics.py` computed every trade statistic
+(`profit_factor`, `win_rate`, `avg_win`/`avg_loss`, `best_trade`/`worst_trade`) from GROSS
+per-trade P&L — fees were deducted from cash (so `total_return_pct`/`final_value` were always
+correct) but never from the number `profit_factor` is built from. This is a **pre-existing
+gap present since the metrics module's inception**, not something introduced this session —
+it just took a review pass explicitly checking cost accounting to surface it. Independently
+reproduced against the real saved 2026-09-12 BTC/USDT and SOL/USDT CSVs: BTC's pinned-window
+PF was 1.87 gross, **0.82 net — a real loss**; BTC's walk-forward TRAINING window was 1.37
+gross, **0.67 net — also a loss**; SOL's numbers hover barely above 1.0 net everywhere. Fixed
+in `metrics.py` (net figures now populate `profit_factor` etc. — the field every validation
+gate already reads, so the fix reaches `walkforward.py`/`screen_universe.py`/
+`validate_symbol.py`/`stamp_strategy.py` without touching any of them), with
+`gross_profit_factor`/`gross_win_rate` added as new fields for transparency, never used to
+gate anything. `bot/backtest/report.py` and `walkforward.py`'s printers now show both, gross
+dimmed. There was **zero prior unit test coverage of `metrics.compute()` at all** — two tests
+added, one of which cross-checks against the real saved CSV rather than just internal
+self-consistency. **This does not conclude with a code fix that makes the numbers pass again**
+— net of fees, neither BTC/USDT nor SOL/USDT clearly demonstrates the documented profitability
+floors anymore, and no strategy change has been made in response. That is a decision for the
+user, not something to patch silently; see "Current operational status" above.
+
+A second, smaller native-stop bug from the same review pass: `_cancel_trade_and_wait` (fixed
+in the prior round to distinguish cancelled/filled/unconfirmed) still classified ANY
+`filled_qty > 0` as the terminal "filled" outcome — including a PARTIAL fill on an order that
+was still active/working its remainder (`isDone()` false). Reproduced exactly as the review
+described: the same still-active 4-of-10-share partial fill got recorded a second time on a
+later sync call with no new execution, moving realized P&L from -$20 to -$40. Fixed: "filled"
+now requires `isDone()` to ALSO be true — a partial-but-still-active fill correctly falls into
+"unconfirmed" (neither replaced nor recorded), and the existing `check_native_stop_fills()`
+mechanism records the real, final outcome exactly once, whenever the order genuinely resolves.
+
+Two further items from the same review, one addressed, one intentionally not:
+- **Stock Gate 1 was validating a stale report** (`logs/stock_backtest_latest.json` dated
+  2026-09-01, predating the 2026-09-12 MACD fix) **and only checks `RULE_WHITELIST` members**,
+  even though `RULE_WHITELIST` stopped gating real BUYs on 2026-08-23 — watchlist/universe
+  symbols with a documented failing edge (the saved report shows HOOD at full-window PF 0.45,
+  NCLH at 0.32) remain eligible through every other gate. The report has been refreshed
+  (re-run 2026-09-12, post-MACD-fix) — **result: Gate 1 flipped from 16/16 PASS to 15/16
+  FAIL, T failing on a low-sample 250d window (2 trades) while its other three windows all
+  pass**, the same shape as AMD's 2026-08-20 false-FAIL. Left as a real FAIL rather than
+  special-cased — see the "LiveTradingGate" section above. The deeper gap — Gate 1 validates
+  a 16-symbol whitelist that no longer bounds the executable universe — is a real
+  validation-architecture gap, not a same-session patch. "Validate the current executable
+  universe and bind results to code, parameters, costs, and data dates" (the review's own
+  framing) is a genuine redesign, deliberately not attempted here on top of everything else
+  in this session.
+- **Stock re-entry on the same daily signal after a stop-out** (flagged in the prior round
+  too) remains an open policy question, not a bug — still not addressed.
+
++3 tests (2 fee-accounting, 1 partial-fill-still-active reproduction — all three confirmed to
+fail against the pre-fix code), suite 950→953.
+
 ### Generic stuck-loop detector (crypto + stock — BUILT 2026-08-27)
 `bot/alerts/stuck_loop.StuckLoopDetector` — error-string-agnostic "same operation keeps
 failing" watchdog. `record(key, ok, detail)`; `threshold`(5) consecutive failures → one
@@ -935,8 +991,15 @@ updates after a fill. +2 tests, suite 916→918. Requires a stock bot restart.
 gate that is neither PASS nor SKIPPED, unless Gates 1-3 all report PASS/SKIPPED (before any
 TWS connection). Paper-mode callers never reach it.
 - **Gate 1** — every current `RULE_WHITELIST` symbol has `verdict: PASS` in
-  `logs/stock_backtest_latest.json`. **Status: 16/16 PASS** (re-run 2026-08-28 — AMD now
-  passes, small-sample window-boundary effect, was 15/16 on 2026-08-20).
+  `logs/stock_backtest_latest.json`. **Status: 15/16 FAIL — T now fails** (re-run
+  2026-09-12, replacing the stale 2026-09-01 report per the fourth-pass review below).
+  T's overall verdict is FAIL only because its 250-day window is `low_sample: true` (2
+  trades, PF 0.0) — the other three windows all pass (full 1.79, 750d 2.49, 500d 1.13) —
+  the same small-sample window-boundary shape as AMD's 2026-08-20 false-FAIL, not
+  evidence T's edge actually broke. Left as a real FAIL rather than special-cased away:
+  Gate 1 is meant to be a mechanical, unmassaged check. This blocks IBKR go-live (below)
+  until either T clears a re-run with more history, or a human decides to drop T from
+  `RULE_WHITELIST`. (Was 16/16 PASS 2026-08-28 — AMD.)
 - **Gate 2** — AI confidence-band edge: ≥10 completed MED/HIGH-confidence (80+) round-trips,
   ≥55% win rate. **Status: SKIPPED** (2026-09-10 fix — `check_gate2()` now returns SKIPPED,
   not PENDING, whenever `AI_ENABLED=false`. AI was disabled 2026-09-09 (sustained provider
@@ -1009,55 +1072,93 @@ actual rule trade trigger is `IndicatorStrategy` in `bot/strategy/indicator_stra
 pure/stateless, no bug class, no lookahead. `stock_bot/backtest.py` (module) is DEAD TOOLING;
 the load-bearing gate is root `stock_backtest.py` → `stock_bot/backtest/engine.py` (package).
 
+### ⚠️ PF/win-rate are NET of fees as of 2026-09-12 — every number below changed
+`bot/backtest/metrics.py` computed `profit_factor`/`win_rate`/`avg_win`/`avg_loss`/
+`best_trade`/`worst_trade` from `FillRecord.pnl`, which is **gross** price-difference P&L —
+`position_manager.on_sell()` never subtracted fees, and `engine.py` only deducted them from
+cash, never from this per-trade figure. A trade gaining $1 before $1.608 in combined
+entry+exit fees was counted as a **winning trade**, and every validation gate that reads
+`m.profit_factor` (`walkforward.py`, `screen_universe.py`, `validate_symbol.py`, the
+`stamp_strategy.py` floor, ...) was approving strategies on gross trading profit, not real
+edge. This had been true since the metrics module's inception — a review pass caught it
+2026-09-12, independently reproduced against the real saved CSVs (BTC/USDT's pinned-window
+PF was 1.87 gross, **0.82 net — a real loss**), and it is now fixed: `profit_factor` etc. are
+NET of fees; `gross_profit_factor`/`gross_win_rate` are new fields kept alongside for
+comparison only, never used to gate anything. The report/walk-forward printers show both,
+gross dimmed. **Every PF number anywhere in this file from before 2026-09-12 is a gross
+number and should not be trusted as "the edge" — treat this section as the current truth.**
+
 ### How to verify the config is active
 Run: `EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py`
-Expected (rolling, drifts as the window advances): **~29 trades, PF ~2.4–2.5, ~38% win
-rate**, hash `5c6540eccbd2f45f`. If `RSI_FILTER_ENABLED=false` accidentally: trade count
-jumps, PF drops below 1.2. **Use the pinned-window check below for a deterministic pass/fail.**
+Expected (rolling, drifts as the window advances): **~29 trades, net PF ~1.1–1.2, ~35% win
+rate** (gross ~2.4–2.5) — hash `5c6540eccbd2f45f`. If `RSI_FILTER_ENABLED=false` accidentally:
+trade count jumps, PF drops further. **Use the pinned-window check below for a deterministic
+pass/fail.**
 
 Reproducible pinned-window check (deterministic — data range fixed):
 ```
 EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-06-20 python backtest.py
 ```
-Expected: **27 trades, PF 1.87, 40.7% win rate** (5010 candles), hash `5c6540eccbd2f45f`.
-Use the rolling run for the canonical fingerprint, this pinned run for "did my
-environment/data change break something".
+Expected: **27 trades, net PF 0.82 (gross 1.87), 33.3% win rate** (5010 candles), hash
+`5c6540eccbd2f45f`. **This pinned window is a net LOSS once fees are correctly attributed —
+this is the documented, expected result, not a regression.**
 
-### Canonical strategy fingerprint (BTC/USDT)
-- **Strategy hash:** `5c6540eccbd2f45f` — changed 2026-09-12 (was `b30f2f9e769c8d41`), a
-  genuine `bot/strategy/` edit: `IndicatorStrategy` could classify falling MACD momentum as
-  "rising" (`_last_macd_hist` was only updated after ADX/regime gates that could already
-  return HOLD, so an ADX-rejected candle left it stale — an independent review reproduced
-  it with histogram values 1→5→3, the ADX-rejected middle candle causing a false "rising"
-  read on the third). Fixed by moving the MACD computation + history update to run
-  unconditionally on every completed candle (matching how RSI's own history update already
-  worked), before any gate can return early. Full detail: "Second-pass review" section above.
+### Canonical strategy fingerprint (BTC/USDT) — profitability status downgraded 2026-09-12
+- **Strategy hash:** `5c6540eccbd2f45f` — changed 2026-09-12 for the MACD-history fix
+  (`_last_macd_hist` wasn't updated on an ADX-rejected candle, letting falling momentum read
+  as rising; see the "second-pass review" section above for detail). The fee-accounting fix
+  above does NOT change this hash — `metrics.py` isn't in the hashed file list, it only
+  changes how the SAME trades are scored.
 - **Hashed files (behavior-defining only):** `bot/strategy/indicator_strategy.py`,
   `bot/strategy/threshold_strategy.py`, `bot/indicators/indicators.py`
-- **Re-validated 2026-09-12, both live symbols pass:**
-  - **BTC/USDT — byte-identical to the pre-fix baseline** on every number checked: pinned
-    window 27 trades / PF 1.87 / 40.7% win rate; walk-forward TRAIN PF 1.37 / VALIDATION PF
-    3.41. The bug is real (proven in the dedicated unit test) but didn't happen to change
-    any trade decision within BTC's validated windows.
-  - **SOL/USDT — numbers shifted slightly, still solidly passing:** rolling 43 trades / PF
-    1.78 / 41.9% win rate (unchanged from before). Walk-forward: TRAIN PF **1.68** (was
-    1.49), VALIDATION PF **1.84** (was 1.98) — the fix did change at least one SOL decision
-    within the walk-forward window; both numbers still clear the >1.0 gate comfortably
-    ("Strong: PF holds above 1.2 out-of-sample").
-- Stamped: `python stamp_strategy.py` → `logs/validated_strategy_hash` (done 2026-09-12).
+- **Re-validated 2026-09-12 net of fees — neither symbol clears the documented floors
+  (PF≥1.72 backtest, walk-forward PF≥1.2) anymore; both round-trip on paper about thin/none:**
+  - **BTC/USDT:** pinned window 27 trades, **net PF 0.82** (gross 1.87, real loss on this
+    historical window). Rolling: net PF 1.17 (gross 2.46). Walk-forward: **TRAINING net PF
+    0.67** (a loss, gross was 1.37) / **VALIDATION net PF 1.54** (gross 3.41). The
+    walk-forward "✓ holds" verdict only checks validation-vs-training degradation, not
+    whether either window is actually profitable in absolute terms — a training PF of 0.67
+    technically "holds" against a validation PF of 1.54, which is a strategy that lost money
+    in-sample and made some out-of-sample, not a demonstrated edge.
+  - **SOL/USDT:** rolling net PF 1.05 (gross 1.78). Walk-forward: TRAINING net PF 1.06 /
+    VALIDATION net PF 1.05 (gross 1.68/1.84) — barely above breakeven in both windows, no
+    real margin.
+  - The MACD-history fix itself is unrelated to this and remains correctly stamped (BTC was
+    byte-identical pre/post that fix on every gross number; SOL shifted slightly). The
+    profitability picture above is a pre-existing condition the MACD fix didn't cause and
+    doesn't affect — it was simply never visible until fees were accounted for correctly.
+- **This is not a "re-run and see if it still passes" situation — it may not have ever
+  cleared the documented floors net of fees.** No further strategy code change has been made
+  in response to this; it needs a decision (tighten entries, filter low-edge trades, accept a
+  smaller/no live allocation, or something else) before the PF≥1.72 / walk-forward-PF≥1.2
+  floors can be called met again. See "Current operational status" below.
+- Stamped: `python stamp_strategy.py` → `logs/validated_strategy_hash` (done 2026-09-12, for
+  the MACD fix — stamping only certifies the code matches what was tested, not profitability).
 - If the bot or backtest prints `STRATEGY CODE DIFFERS`, re-run walk-forward before trusting any PF numbers.
-- **Both bots need a restart** to run the fixed strategy code — this is a `bot/strategy/`
-  change, so it affects live BTC/CAD and SOL/CAD signal generation, not just execution.
+- **Both bots need a restart** to run the fixed MACD-history strategy code.
 
 ### Current operational status
-- **Crypto bot:** live on Kraken. BTC/CAD ($77 slot) capital gate 0/15 fills (strategy trades
-  ~every 3–6 weeks; 65+ days elapsed with zero progress toward fill #1 as of 2026-08-24 —
-  genuine variance + ranging regime, strategy faithful, keep waiting). SOL/CAD ($376 slot)
-  1/15 fills (BUY 0.080808 @ $134.02 on 2026-08-26 — the fill that surfaced the post-only
-  bug; then TP-closed +$1.27/+10.9% on 2026-08-27, first completed round-trip). ATR SL 2.0 +
-  ATR sizing live. Telegram (t.me/amaresh_tradebot) + healthchecks.io heartbeat + two-way
-  Telegram control live. Native stop-loss ON. All four items from the 2026-08-07 crypto-bot
-  gap review closed (native stop, risk tiering, slippage guard, candle-watchdog breaker).
+- **Crypto bot:** live on Kraken, **but its profitability basis is now in question
+  (2026-09-12)** — see "Canonical strategy fingerprint" above. The walk-forward/backtest
+  floors this deployment rested on (PF≥1.72, walk-forward all windows PF>1.0) were measured
+  on gross P&L; net of real trading fees, BTC/USDT's training window is a loss (PF 0.67) and
+  SOL/USDT is barely above breakeven everywhere (PF ~1.05). Actual live financial exposure to
+  date is small — BTC/CAD 0/15 fills, SOL/CAD exactly one completed round-trip (+$1.27) — but
+  the strategy has NOT been shown to have a demonstrated edge net of costs, and continuing to
+  trade it live is a decision to make deliberately, not a default. **User decision 2026-09-12:
+  new BUYs paused** — `logs/HALT` engaged via the existing manual kill-switch (same mechanism
+  `/pause_crypto` uses). SL/TP exits and the SELL path are unaffected
+  (`RISK_HALT_BLOCKS_STOPS=false`); no open position is at risk either way (BTC/CAD has never
+  filled, SOL/CAD is flat). Lift with `rm logs/HALT` or `/resume_crypto` once the net-of-fees
+  edge question is resolved one way or the other. BTC/CAD ($77 slot) capital
+  gate 0/15 fills (strategy trades ~every 3–6 weeks; 65+ days elapsed with zero progress
+  toward fill #1 as of 2026-08-24). SOL/CAD ($376 slot) 1/15 fills (BUY 0.080808 @ $134.02 on
+  2026-08-26 — the fill that surfaced the post-only bug; TP-closed +$1.27/+10.9% on
+  2026-08-27). ATR SL 2.0 + ATR sizing live. Telegram (t.me/amaresh_tradebot) +
+  healthchecks.io heartbeat + two-way Telegram control live. Native stop-loss ON. All four
+  items from the 2026-08-07 crypto-bot gap review closed (native stop, risk tiering, slippage
+  guard, candle-watchdog breaker) — execution-layer hardening was never the question here;
+  the underlying edge is.
   - **Kraken auth incident 2026-08-15:** every authenticated Kraken call failed
     `EGeneral:Permission denied` for ~4 days (IP restriction / key reset, resolved outside
     the repo). Was invisible to all monitoring. Fixed: `_update_auth_health()` — edge alert +
@@ -1319,7 +1420,7 @@ liquidity) — informational only. Full trail: `CLAUDE_HISTORY.md`.
 | F | VPS logrotate | Config ready (`deploy/logrotate_trade_bot.conf`, `/opt/trade_bot` path). Nothing left until a VPS exists — migration deferred. |
 | G | Stock-bot headless deploy (IB Gateway + IBC) | Scoped + written 2026-08-27 (`deploy/IBKR_GATEWAY_SETUP.md`, `deploy/stock_bot.service`). No bot code change needed (only `IBKR_PORT=7497→4002`). ~4h + a day's observation. Not started — deferred with the VPS migration; the crypto bot moves first. |
 | H | Ollama Cloud key revoke | Confirmed unused 2026-07-16; user parked indefinitely — don't re-raise unprompted. |
-| I | IBKR live go-live | Gate-blocked. `LiveTradingGate` Gates 1-3 code-enforced in `IBKRExecutor.__init__()`. Gate 1 16/16 PASS; Gate 2 SKIPPED (AI disabled, 2026-09-10 fix — no longer a permanent blocker); Gate 3 PENDING (7/30 live trades) — the only remaining blocker. |
+| I | IBKR live go-live | Gate-blocked. `LiveTradingGate` Gates 1-3 code-enforced in `IBKRExecutor.__init__()`. Gate 1 now 15/16 FAIL (T, small-sample window effect — 2026-09-12 re-run); Gate 2 SKIPPED (AI disabled, 2026-09-10 fix — no longer a permanent blocker); Gate 3 PENDING (7/30 live trades). Two blockers now, not one. |
 | J | USD symbol re-screen | Automated monthly via `rescreen.py` (now genuinely covers the USD leg as of 2026-08-24). |
 | K | ATR SL for SYN/LINK/PUMP | SOL/CAD promoted 2026-08-25. SYN/PUMP/LINK validation-complete but blocked on new capital + an un-built FX-conversion layer (both need a deposit). None promoted. Detail: `.memory/decisions/multi-symbol-validation.md`. |
 | — | Crypto capital gate | BTC/CAD 0/15 fills (~3–6 wk/trade — don't force it). SOL/CAD 1/15 fills, 1 completed round-trip. |

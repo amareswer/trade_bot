@@ -881,6 +881,50 @@ def test_sync_protective_stop_records_fill_instead_of_replacing_when_stop_fills_
     assert "KO" not in ex._native_stops
 
 
+def test_partial_fill_still_active_is_not_recorded_or_replaced(executors):
+    """Fourth-round reviewer finding: _cancel_trade_and_wait classified ANY
+    filled_qty > 0 as the terminal "filled" outcome — even a PARTIAL fill
+    on an order that's still active/working the remainder (not isDone()).
+    Reproduced: the same still-active partial fill got recorded again on a
+    later sync call, moving realized P&L -$20 -> -$40 with no new
+    execution. A partial-but-still-active order must be "unconfirmed" —
+    neither replaced nor recorded — until it genuinely reaches a terminal
+    state."""
+    fake = FakeIB(positions=[_ko_position(10, 60.0)])
+    ex = make_executor(fake)
+    executors.append(ex)
+    ex.sync_protective_stop("KO", 55.0)
+    assert len(fake.placed) == 1
+
+    # cancelOrder "accepts" the request, but the order comes back partially
+    # filled (4 of 10) and STILL ACTIVE — not Cancelled, not fully Filled.
+    def _partial_fill_stays_active(order):
+        fake.cancelled.append(order)
+        for _, o, trade in fake.placed:
+            if o is order:
+                trade.orderStatus.status = "Submitted"   # still working
+                trade.orderStatus.filled = 4.0
+                trade.orderStatus.avgFillPrice = 54.80
+    fake.cancelOrder = _partial_fill_stays_active
+
+    before_pnl = ex.realized_pnl()
+    ex.sync_protective_stop("KO", 57.0)   # 1st sync sees the partial-active order
+
+    assert len(fake.placed) == 1, "must not place a replacement over a still-active partial fill"
+    assert ex.realized_pnl() == before_pnl, "must not record a still-active partial fill as done"
+    assert "KO" in ex._native_stops, "must keep tracking it — not yet resolved"
+
+    # A second sync cycle sees the exact same still-active partial fill —
+    # this is the exact scenario that used to double-record.
+    ex.sync_protective_stop("KO", 57.0)
+
+    assert len(fake.placed) == 1
+    assert ex.realized_pnl() == before_pnl, (
+        "the SAME still-active partial fill must not be recorded a second "
+        "time just because it was checked again"
+    )
+
+
 def test_sync_protective_stop_avg_cost_survives_an_immediate_fill_after_placement(executors):
     """Second-round fix (caching avg_cost) still had a race: it re-queried
     positions_snapshot() AFTER placeOrder() returned, which is itself late

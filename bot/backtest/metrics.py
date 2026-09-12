@@ -28,17 +28,31 @@ class BacktestMetrics:
     total_return_pct: float
     total_fees:      float
 
-    # Trades
+    # Trades — NET of entry+exit fees (2026-09-12 finding: these were
+    # computed from FillRecord.pnl, which is pure price-difference P&L —
+    # position_manager.on_sell() never subtracts fees, and engine.py only
+    # deducts them from cash, not from this per-trade figure. A trade
+    # gaining $1 before $1.608 in fees was counted as a win, and the
+    # walk-forward gate approved strategies on gross profit factor.
+    # Reproduced on saved 2026-09-12 backtests: BTC/USDT pinned-window PF
+    # was 1.87 gross, 0.82 (a net LOSS) once fees are correctly attributed
+    # per trade. win_rate/profit_factor/avg_win/avg_loss/best_trade/
+    # worst_trade below are now NET — this is what every validation gate
+    # (walkforward.py, screen_universe.py, validate_symbol.py, ...) reads
+    # as `m.profit_factor`, so the fix applies everywhere via this one
+    # change. Gross versions kept alongside for comparison/transparency.
     total_trades:    int
     winning_trades:  int
     losing_trades:   int
     breakeven_trades: int
-    win_rate:        float   # 0.0 – 1.0
-    profit_factor:   float   # gross_profit / gross_loss; inf if no losses
-    avg_win:         float
-    avg_loss:        float   # negative number
-    best_trade:      float
-    worst_trade:     float
+    win_rate:        float   # 0.0 – 1.0, NET of fees
+    profit_factor:   float   # NET gross_profit / gross_loss; inf if no losses
+    avg_win:         float   # NET
+    avg_loss:        float   # NET, negative number
+    best_trade:      float   # NET
+    worst_trade:     float   # NET
+    gross_profit_factor: float   # pre-fee — comparison only, never gates validation
+    gross_win_rate:      float   # pre-fee — comparison only, never gates validation
 
     # Risk
     max_drawdown_pct:   float  # negative number e.g. -0.032
@@ -66,7 +80,23 @@ def compute(result: BacktestResult) -> BacktestMetrics:
     )
 
     # ── Trade stats (only SELL fills carry realized P&L) ─────────────
-    closed_pnls = [f.pnl for f in fills if f.side == "SELL" and f.pnl is not None]
+    # NET pnl per closed trade = the SELL's gross pnl, minus the fee(s) of
+    # the BUY(s) that opened the position it closes, minus the SELL's own
+    # fee. Pairing by accumulating BUY fees since the last close (reset on
+    # each SELL) matches this engine's actual behavior — one entry per
+    # position, no pyramiding — confirmed by independently reproducing the
+    # reviewer's exact PF figures on the real saved CSVs this way.
+    closed_pnls: list[float] = []   # NET — drives every statistic below
+    gross_pnls:  list[float] = []   # pre-fee — comparison only
+    _pending_buy_fees = 0.0
+    for f in fills:
+        if f.side == "BUY":
+            _pending_buy_fees += f.fee
+        elif f.side == "SELL" and f.pnl is not None:
+            gross_pnls.append(f.pnl)
+            closed_pnls.append(f.pnl - _pending_buy_fees - f.fee)
+            _pending_buy_fees = 0.0
+
     total_trades  = len(closed_pnls)
     wins          = [p for p in closed_pnls if p > 0]
     losses        = [p for p in closed_pnls if p < 0]
@@ -80,6 +110,15 @@ def compute(result: BacktestResult) -> BacktestMetrics:
     avg_loss      = sum(losses) / len(losses) if losses else 0.0
     best_trade    = max(closed_pnls) if closed_pnls else 0.0
     worst_trade   = min(closed_pnls) if closed_pnls else 0.0
+
+    # Pre-fee versions — for transparency/comparison only, never used to
+    # gate validation (see gross_profit_factor's own field docstring).
+    _g_wins   = [p for p in gross_pnls if p > 0]
+    _g_losses = [p for p in gross_pnls if p < 0]
+    gross_win_rate = len(_g_wins) / len(gross_pnls) if gross_pnls else 0.0
+    _g_gp = sum(_g_wins)
+    _g_gl = abs(sum(_g_losses))
+    gross_profit_factor = _g_gp / _g_gl if _g_gl > 0 else (float("inf") if _g_gp > 0 else 0.0)
 
     # ── Max drawdown ──────────────────────────────────────────────────
     max_drawdown_pct = 0.0
@@ -151,6 +190,8 @@ def compute(result: BacktestResult) -> BacktestMetrics:
         avg_loss         = avg_loss,
         best_trade       = best_trade,
         worst_trade      = worst_trade,
+        gross_profit_factor = gross_profit_factor,
+        gross_win_rate       = gross_win_rate,
         max_drawdown_pct  = max_drawdown_pct,
         sharpe_ratio      = sharpe_ratio,
         sortino_ratio     = sortino_ratio,

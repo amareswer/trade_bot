@@ -120,6 +120,11 @@ def print_comparison(train_m, train_r, val_m, val_r):
           f"{pf_tc}{pf_t:>13.2f}{_R}  "
           f"{pf_vc}{pf_v:>13.2f}{_R}  "
           f"{vcol_pf}{verdict_pf:>10}{_R}")
+    # Gross (pre-fee), dimmed, for comparison only — 2026-09-12 fix: the PF
+    # above is now NET of entry+exit fees. Never judge pass/fail on this row.
+    print(f"  {'  (gross, pre-fee)':<{col}}  "
+          f"\033[2m{train_m.gross_profit_factor:>13.2f}{_R}  "
+          f"\033[2m{val_m.gross_profit_factor:>13.2f}{_R}")
 
     wr_t = train_m.win_rate * 100
     wr_v = val_m.win_rate * 100

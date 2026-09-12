@@ -1021,21 +1021,34 @@ class IBKRExecutor(StockExecutorBase):
         """Best-effort cancel of a resting Trade — never raises. Waits for
         the cancel to actually land. Returns exactly one of:
           - "cancelled" — confirmed gone, no fill. Safe to replace.
-          - "filled"    — it filled (possibly during this very call, racing
-                          the cancel) rather than cancelling. NOT safe to
-                          treat as "gone, place a replacement" — the position
-                          this stop was protecting is now closed. A caller
-                          that only checked trade.isDone() (True for both
-                          Cancelled AND Filled) and read that as "cancelled"
-                          would place a fresh stop against a position that
-                          no longer exists (2026-09-12 finding, reproduced:
-                          a new 10-share stop after the original had already
-                          closed all 10 shares).
-          - "unconfirmed" — cancelOrder() raised, or the order was still
-                          neither cancelled nor filled after timeout_s.
-                          NOT safe to replace — the old order may still be
-                          live, and placing a second one risks two orders
-                          both able to sell the same shares."""
+          - "filled"    — reached a genuine TERMINAL state with a fill
+                          (isDone() true) — either fully filled, or a
+                          partial fill that then genuinely stopped being
+                          active (cancelled/rejected for the remainder).
+                          Rather than cancelling, the position this stop
+                          was protecting is (at least partly) closed. A
+                          caller that only checked trade.isDone() (True for
+                          both Cancelled AND Filled) and read that as
+                          "cancelled" would place a fresh stop against a
+                          position that no longer exists (2026-09-12
+                          finding, reproduced: a new 10-share stop after
+                          the original had already closed all 10 shares).
+          - "unconfirmed" — cancelOrder() raised, the order was still
+                          neither cancelled nor filled after timeout_s, OR
+                          — critically — it has a PARTIAL fill but is
+                          still active/working the remainder (filled > 0
+                          but isDone() is False). The latter is NOT safe
+                          to treat as "filled" either: a still-working
+                          partial fill isn't a terminal outcome yet, and
+                          classifying it as one let the exact same partial
+                          fill get recorded again on a later sync call once
+                          the order was (still, correctly) found resting —
+                          reproduced: realized P&L moved -$20 -> -$40 with
+                          no new execution in between (2026-09-12 finding).
+                          Callers must not replace or record on this
+                          outcome — check_native_stop_fills() will record
+                          the real, final outcome exactly once, the moment
+                          isDone() genuinely becomes true."""
         try:
             self._ib.cancelOrder(trade.order)
         except Exception as exc:
@@ -1051,9 +1064,9 @@ class IBKRExecutor(StockExecutorBase):
             self._call(_wait(), timeout=timeout_s + 5)
         except Exception:
             pass
-        if float(trade.orderStatus.filled or 0.0) > 0:
-            return "filled"
-        return "cancelled" if trade.isDone() else "unconfirmed"
+        if not trade.isDone():
+            return "unconfirmed"   # includes: partial fill, still active
+        return "filled" if float(trade.orderStatus.filled or 0.0) > 0 else "cancelled"
 
     def _cancel_native_stop(self, symbol: str) -> None:
         """Cancel every resting native stop found for this symbol (not just
