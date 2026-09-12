@@ -15,6 +15,7 @@ cancel-race guard (a fill racing the cancel is recorded, never dropped —
 import asyncio
 import csv
 import json
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -694,6 +695,56 @@ def test_sell_fills_and_records_realized_pnl(executors):
     assert order.status == OrderStatus.FILLED
     assert order.price == 170.0
     assert ex.realized_pnl() == pytest.approx((170.0 - 168.35) * 4, abs=0.01)
+
+
+def test_concurrent_sell_calls_are_serialized_per_symbol(executors):
+    """2026-09-12 finding: the background SL/TP watcher (its own thread) and
+    the main scan loop can both decide to exit the same symbol at nearly the
+    same moment. Neither had a lock around the full read-position ->
+    validate -> submit sequence, so both could read the same held-shares
+    figure and both submit a sell, overselling. Proven directly: wrap
+    positions_snapshot() (the first read inside the critical section) with a
+    delay and an overlap counter — with the fix, the second sell() call must
+    block on the lock and never read positions while the first is still
+    mid-flight, so the counter must never exceed 1."""
+    fake = FakeIB(positions=[_cm_position(4, 168.35)], fill_price=170.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+
+    active = {"count": 0, "max": 0}
+    guard = threading.Lock()
+    real_snapshot = ex.positions_snapshot
+
+    def _slow_snapshot():
+        with guard:
+            active["count"] += 1
+            active["max"] = max(active["max"], active["count"])
+        time.sleep(0.15)
+        result = real_snapshot()
+        with guard:
+            active["count"] -= 1
+        return result
+
+    ex.positions_snapshot = _slow_snapshot
+
+    results: list = []
+    def _sell():
+        results.append(ex.sell("CM.TO", 4, 169.0, reason="test"))
+
+    t1 = threading.Thread(target=_sell)
+    t2 = threading.Thread(target=_sell)
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+
+    assert active["max"] == 1, (
+        "two sell() calls read positions_snapshot() concurrently — the "
+        "per-symbol lock did not serialize them"
+    )
+    assert len(results) == 2   # both calls completed (one may still reject
+    # downstream once positions genuinely reflect a closed position — this
+    # hermetic fake doesn't shrink its static position list after a fill,
+    # so the business outcome isn't asserted here; the overlap counter
+    # above is the direct, unambiguous proof of the fix).
 
 
 def test_positions_snapshot_maps_back_to_yfinance_symbols(executors):

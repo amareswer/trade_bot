@@ -175,7 +175,7 @@ narrative behind any decision below, and `.memory/decisions/*.md` for the deepes
 
 ## Test Suite Manifest
 
-**Expected total: 916 tests** (`pytest --collect-only -q`). If the count disagrees: a file
+**Expected total: 918 tests** (`pytest --collect-only -q`). If the count disagrees: a file
 has an import error, was deleted, was added without a manifest bump, or was excluded from the
 runner — investigate before trusting a green suite. Suite runtime ~9–26s; minutes means a
 test is reading live `.env` config. The per-row table sum below lags the header total by ~22
@@ -217,7 +217,8 @@ Run: `python -m pytest --tb=short -q` — must show **906 passed**.
 | `tests/stock/test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last, determinism, validated-parameter pin |
 | `tests/crypto/test_audit_scheduler.py` | 14 | REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, monthly 1st-anchored re-screen, missed-run catch-up |
 | `tests/crypto/test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
-| `tests/stock/test_ibkr_executor.py` | 71 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping, broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe, FX/margin-minimum guard (**checks NET-LIQ, not free cash** — 2026-08-31 fix), sector-concentration gate, weekly/drawdown-halt/kill-switch tiers, per-position ATR stop-pct override, projected-exposure check, LiveTradingGate enforcement (incl. Gate 2 SKIPPED-when-AI-disabled bypass, 2026-09-10), TWS-query resilience (last-good cache, incl. **disconnected-but-no-exception preserves cache** — 2026-09-11 fix), `ibkr_trades.csv` write buffer/retry, Error 10349 slow-resubmit fill (20s grace + `tif="DAY"`), daily-loss calendar-day anchoring, **partial-fill tracking to completion or confirmed cancel** (2026-09-12 fix) |
+| `tests/stock/test_ibkr_executor.py` | 72 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping, broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe, FX/margin-minimum guard (**checks NET-LIQ, not free cash** — 2026-08-31 fix), sector-concentration gate, weekly/drawdown-halt/kill-switch tiers, per-position ATR stop-pct override, projected-exposure check, LiveTradingGate enforcement (incl. Gate 2 SKIPPED-when-AI-disabled bypass, 2026-09-10), TWS-query resilience (last-good cache, incl. **disconnected-but-no-exception preserves cache** — 2026-09-11 fix), `ibkr_trades.csv` write buffer/retry, Error 10349 slow-resubmit fill (20s grace + `tif="DAY"`), daily-loss calendar-day anchoring, **partial-fill tracking to completion or confirmed cancel** (2026-09-12 fix), **concurrent-sell serialization** (2026-09-12 fix, overlap-counter proof) |
+| `tests/stock/test_concurrent_sell.py` | 1 | `StockPaperExecutor` concurrent-sell regression (2026-09-12): two threads racing a full-position sell — proves both the overlap invariant (per-symbol lock) and the actual business outcome (one FILLED, one REJECTED, never both filling the same shares) |
 | `tests/stock/test_fx_sizing.py` | 14 | USD/CAD sizing: `is_cad_symbol`, `get_usd_cad_rate`, mixed-currency `total_value`/`check_exposure`, sector-concentration gate, projected-exposure check |
 | `tests/stock/test_screener_in_distribution.py` | 5 | In-distribution ATR%/liquidity filter (`stock_bot/data/screener.py`, replacement safety net after RULE_WHITELIST stopped gating BUYs) |
 | `tests/stock/test_accuracy_tracker.py` | 20 | `LiveTradingGate` gates — Gate 1 (`stock_backtest_latest.json` vs `RULE_WHITELIST`), Gate 2 (AI confidence-band edge, incl. SKIPPED when `AI_ENABLED=false` — 2026-09-10), Gate 3 (≥30 round-trips/PF≥1.2/win≥30%) |
@@ -632,6 +633,33 @@ resubmit ever resolved (caught by a regression during this fix — `test_flicker
 then_fill_is_recorded` failed until the scoping was corrected). +2 tests (each verified to
 fail against the pre-fix code — old behavior recorded 2 of 4 shares and never called
 `cancelOrder` on the stalled remainder), suite 914→916. Requires a stock bot restart.
+
+### Concurrent-sell race across both stock executors (fixed 2026-09-12, code review)
+The background SL/TP watcher (`stock_bot/main.py:_check_open_positions_sl_tp`, its own thread,
+~30s poll) and the main strategy scan loop can both decide to exit the same symbol at nearly
+the same moment. Neither `StockPaperExecutor.sell()` nor `IBKRExecutor.sell()` had a lock
+around the full read-position → validate → submit-order → update-state sequence — `IBKRExecutor
+._state_lock` only ever protected the realized-P&L increment, a few lines *after* the
+unprotected position check and broker order. Two near-simultaneous exits could both read the
+same held-shares figure, both pass the "enough shares to sell" check, and both submit a sell,
+overselling the real position.
+
+Fixed with a shared `_position_lock(symbol)` helper on `StockExecutorBase` (per-symbol, lazily
+created via `dict.setdefault` — atomic under the GIL, no subclass `__init__` change needed, and
+unrelated symbols never serialize against each other). Both `sell()` implementations now wrap
+their entire body in it; `IBKRExecutor`'s holds the lock across the real broker round-trip in
+`_execute()` on purpose — a second sell on the same symbol must wait for the first to actually
+resolve, not just queue behind an in-memory increment. `buy()` was left unchanged — only one
+code path (the main scan loop) ever calls it, so it has no concurrent-caller risk today.
+
+Verified deterministically, not by timing luck: both new tests wrap the first read inside the
+critical section with an artificial delay and an overlap counter, then run two real threads —
+proving directly that the second call never enters the critical section while the first is
+still inside it (confirmed to fail against the pre-fix code on both executors, overlap counter
+hit 2). The `StockPaperExecutor` test additionally confirms the actual business outcome (one
+FILLED closing the position, one REJECTED, never both filling the same shares) since its
+fully in-memory book — unlike the hermetic IBKR test's static fake position list — genuinely
+updates after a fill. +2 tests, suite 916→918. Requires a stock bot restart.
 
 ### LiveTradingGate — stock bot IBKR readiness check (repaired + code-enforced 2026-08-20)
 `stock_bot/analysis/accuracy_tracker.py`. `IBKRExecutor.__init__()` on a live port with

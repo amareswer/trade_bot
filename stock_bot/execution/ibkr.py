@@ -713,47 +713,57 @@ class IBKRExecutor(StockExecutorBase):
 
     def sell(self, symbol: str, shares: float, price: float, reason: str = "") -> StockOrder:
         sym = symbol.upper()
-        held_shares, held_cost = self.positions_snapshot().get(sym, (0.0, 0.0))
+        # Guards the whole read-position -> validate -> submit -> update
+        # sequence against the background SL/TP watcher and the main scan
+        # loop racing an exit on the same symbol (2026-09-12 finding) —
+        # _state_lock alone only ever protected the realized-P&L increment
+        # below, not the position check + broker order that precede it.
+        # Held across the real broker round-trip in _execute() on purpose:
+        # a second sell on this same symbol must wait for the first to
+        # actually resolve against the broker, not just queue behind an
+        # in-memory increment.
+        with self._position_lock(sym):
+            held_shares, held_cost = self.positions_snapshot().get(sym, (0.0, 0.0))
 
-        if shares > held_shares + 1e-9:
-            return self._reject(
-                sym, OrderSide.SELL, shares, price,
-                f"Insufficient position: have {held_shares:.4f} shares, need {shares:.4f}",
-            )
+            if shares > held_shares + 1e-9:
+                return self._reject(
+                    sym, OrderSide.SELL, shares, price,
+                    f"Insufficient position: have {held_shares:.4f} shares, need {shares:.4f}",
+                )
 
-        shares = int(shares)
-        order = self._new_order(sym, OrderSide.SELL, shares, price)
-        try:
-            filled_qty, fill_px = self._execute(sym, OrderSide.SELL, shares)
-        except Exception as exc:
-            order.status = OrderStatus.REJECTED
-            order.reject_reason = f"IBKR order failed: {exc}"
-            logger.error("IBKR SELL REJECTED %s × %d — %s", sym, shares, exc)
+            shares = int(shares)
+            order = self._new_order(sym, OrderSide.SELL, shares, price)
+            try:
+                filled_qty, fill_px = self._execute(sym, OrderSide.SELL, shares)
+            except Exception as exc:
+                order.status = OrderStatus.REJECTED
+                order.reject_reason = f"IBKR order failed: {exc}"
+                logger.error("IBKR SELL REJECTED %s × %d — %s", sym, shares, exc)
+                self._orders.append(order)
+                return order
+
+            pnl = round((fill_px - held_cost) * filled_qty, 2)
+            with self._state_lock:
+                self._realized_pnl += pnl
+
+            if filled_qty >= held_shares - 1e-9 and sym in self._position_stop_pct:   # full close
+                self._position_stop_pct.pop(sym, None)
+                self.save_state()
+
+            order.quantity = filled_qty
+            order.price = fill_px
+            order.total_value = round(abs(fill_px * filled_qty), 2)
+            order.status = OrderStatus.FILLED
+            order.filled_at = datetime.now(timezone.utc)
             self._orders.append(order)
+
+            self._record_trade("SELL", sym, filled_qty, fill_px, reason)
+            logger.info(
+                "IBKR SELL FILLED   %s  %d shares @ $%.2f  trade_pnl=$%.2f  "
+                "total_realized=$%.2f  cash=$%.2f",
+                sym, int(filled_qty), fill_px, pnl, self._realized_pnl, self.cash,
+            )
             return order
-
-        pnl = round((fill_px - held_cost) * filled_qty, 2)
-        with self._state_lock:
-            self._realized_pnl += pnl
-
-        if filled_qty >= held_shares - 1e-9 and sym in self._position_stop_pct:   # full close
-            self._position_stop_pct.pop(sym, None)
-            self.save_state()
-
-        order.quantity = filled_qty
-        order.price = fill_px
-        order.total_value = round(abs(fill_px * filled_qty), 2)
-        order.status = OrderStatus.FILLED
-        order.filled_at = datetime.now(timezone.utc)
-        self._orders.append(order)
-
-        self._record_trade("SELL", sym, filled_qty, fill_px, reason)
-        logger.info(
-            "IBKR SELL FILLED   %s  %d shares @ $%.2f  trade_pnl=$%.2f  "
-            "total_realized=$%.2f  cash=$%.2f",
-            sym, int(filled_qty), fill_px, pnl, self._realized_pnl, self.cash,
-        )
-        return order
 
     # ── portfolio state (queried from IBKR) ──────────────────────────────────
 

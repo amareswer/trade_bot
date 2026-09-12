@@ -520,56 +520,62 @@ class StockPaperExecutor(StockExecutorBase):
         return order
 
     def sell(self, symbol: str, shares: float, price: float, reason: str = "") -> StockOrder:
-        sym   = symbol.upper()
-        order = self._new_order(sym, OrderSide.SELL, shares, price)
+        sym = symbol.upper()
+        # Guards the whole read-position -> validate -> submit -> update
+        # sequence against the background SL/TP watcher and the main scan
+        # loop racing an exit on the same symbol (2026-09-12 finding) —
+        # without this, both threads can read the same held_shares, both
+        # pass the "enough to sell" check, and both submit, overselling.
+        with self._position_lock(sym):
+            order = self._new_order(sym, OrderSide.SELL, shares, price)
 
-        fill_px = self._fill_price(price, "SELL")
-        held_shares, held_cost = self._positions.get(sym, (0.0, 0.0))
-        if shares > held_shares + 1e-9:
-            order.status        = OrderStatus.REJECTED
-            order.reject_reason = (
-                f"Insufficient position: have {held_shares:.4f} shares, need {shares:.4f}"
-            )
-            logger.warning("PAPER SELL REJECTED  %s × %.4f — %s",
-                           sym, shares, order.reject_reason)
-        else:
-            pnl              = round((fill_px - held_cost) * shares, 2)
-            proceeds         = round(shares * fill_px, 2)
-            self._cash      += proceeds
-            self._realized_pnl += pnl
-            new_shares       = round(held_shares - shares, 9)
-            if new_shares < 1e-9:
-                del self._positions[sym]
-                self._position_stop_pct.pop(sym, None)
+            fill_px = self._fill_price(price, "SELL")
+            held_shares, held_cost = self._positions.get(sym, (0.0, 0.0))
+            if shares > held_shares + 1e-9:
+                order.status        = OrderStatus.REJECTED
+                order.reject_reason = (
+                    f"Insufficient position: have {held_shares:.4f} shares, need {shares:.4f}"
+                )
+                logger.warning("PAPER SELL REJECTED  %s × %.4f — %s",
+                               sym, shares, order.reject_reason)
             else:
-                self._positions[sym] = (new_shares, held_cost)
-            order.status    = OrderStatus.FILLED
-            order.filled_at = datetime.now(timezone.utc)
+                pnl              = round((fill_px - held_cost) * shares, 2)
+                proceeds         = round(shares * fill_px, 2)
+                self._cash      += proceeds
+                self._realized_pnl += pnl
+                new_shares       = round(held_shares - shares, 9)
+                if new_shares < 1e-9:
+                    del self._positions[sym]
+                    self._position_stop_pct.pop(sym, None)
+                else:
+                    self._positions[sym] = (new_shares, held_cost)
+                order.status    = OrderStatus.FILLED
+                order.filled_at = datetime.now(timezone.utc)
 
-            trade = PaperTrade(
-                timestamp      = datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                symbol         = sym,
-                side           = "SELL",
-                shares         = shares,
-                price          = fill_px,
-                total_value    = proceeds,
-                cash_remaining = self._cash,
-                reason         = reason,
-            )
-            self._trade_log.append(trade)
-            self._log_trade_csv(trade)
-            self._log_settlement_csv(trade, sym)
-            self.save_state()
-            self._update_position_value({sym: fill_px})
+                trade = PaperTrade(
+                    timestamp      = datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    symbol         = sym,
+                    side           = "SELL",
+                    shares         = shares,
+                    price          = fill_px,
+                    total_value    = proceeds,
+                    cash_remaining = self._cash,
+                    reason         = reason,
+                )
+                self._trade_log.append(trade)
+                self._log_trade_csv(trade)
+                self._log_settlement_csv(trade, sym)
+                self.save_state()
+                self._update_position_value({sym: fill_px})
 
-            logger.info(
-                "PAPER SELL FILLED  %s  %.4f shares @ $%.2f  "
-                "trade_pnl=$%.2f  total_realized=$%.2f  cash=$%.2f",
-                sym, shares, fill_px, pnl, self._realized_pnl, self._cash,
-            )
+                logger.info(
+                    "PAPER SELL FILLED  %s  %.4f shares @ $%.2f  "
+                    "trade_pnl=$%.2f  total_realized=$%.2f  cash=$%.2f",
+                    sym, shares, fill_px, pnl, self._realized_pnl, self._cash,
+                )
 
-        self._orders.append(order)
-        return order
+            self._orders.append(order)
+            return order
 
     # ── Portfolio state ───────────────────────────────────────────────────────
 

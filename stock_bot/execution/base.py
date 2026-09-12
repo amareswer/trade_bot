@@ -17,6 +17,7 @@ PortfolioSummary object the dashboard already knows how to render.
 from __future__ import annotations
 
 import logging
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -90,6 +91,25 @@ class StockExecutorBase(ABC):
     def sell(self, symbol: str, shares: float, price: float, reason: str = "") -> StockOrder:
         """Place a market SELL for `shares` of `symbol` at `price`."""
         ...
+
+    # ── Concurrency guard (2026-09-12) ────────────────────────────────────────
+    #
+    # Two independent code paths can both decide to exit the same symbol at
+    # nearly the same moment: the background SL/TP watcher (its own thread,
+    # ~30s poll) and the main strategy scan loop. Neither `sell()`
+    # implementation had a lock around its full "read position -> validate ->
+    # submit order -> update state" sequence — only realized-P&L accumulation
+    # was ever protected — so both threads could read the same held-shares
+    # figure, both pass the "enough shares to sell" check, and both submit a
+    # sell, overselling the real position. `_position_lock()` is lazily
+    # initialized per symbol (no subclass __init__ change needed — dict/
+    # dict.setdefault are atomic under the GIL for this exact get-or-create
+    # pattern) so unrelated symbols never serialize against each other.
+
+    def _position_lock(self, symbol: str) -> threading.Lock:
+        """Get-or-create the lock guarding this symbol's full sell sequence."""
+        locks = self.__dict__.setdefault("_position_locks_by_symbol", {})
+        return locks.setdefault(symbol.upper(), threading.Lock())
 
     # ── Portfolio state ───────────────────────────────────────────────────────
 
