@@ -178,6 +178,21 @@ class RiskManager:
         self._maybe_reset_week(current_value, candle_date)
         self._update_peak(current_value)
 
+        # Kill-switch TRIP evaluation runs on every tick, regardless of signal
+        # (2026-09-14 fix). Its BLOCKING effect stays BUY-only (Check 2 below,
+        # unchanged) — but the "has this account ever crossed the threshold"
+        # test used to live entirely inside `if signal == Signal.BUY`, which
+        # short-circuited before ever calling it for HOLD or SELL. A drawdown
+        # that happened while the strategy sat in HOLD (no active signal) or
+        # was only issuing SELLs could blow through kill_switch_pct and
+        # recover before the next BUY signal ever arrived — reproduced:
+        # equity $1000→$800 during HOLD, recovered, then a BUY was approved
+        # with the sticky switch never having tripped at all. Evaluating here
+        # unconditionally means the trip is judged against the true trough,
+        # not whatever the account happened to be worth the next time a BUY
+        # was considered.
+        self._is_kill_switch_tripped(current_value)
+
         if signal == Signal.HOLD:
             return APPROVED
 

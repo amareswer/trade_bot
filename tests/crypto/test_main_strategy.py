@@ -20,6 +20,7 @@ def test_build_strategy_passes_full_indicator_config(monkeypatch):
     monkeypatch.setattr(main_mod.cfg.strategy, "rsi_filter_enabled", False)
     monkeypatch.setattr(main_mod.cfg.strategy, "regime_ema_period", 150)
     monkeypatch.setattr(main_mod.cfg.strategy, "regime_ema_slope_filter", True)
+    monkeypatch.setattr(main_mod.cfg.strategy, "atr_volatile_multiplier", 2.5)
 
     strategy = build_strategy()
 
@@ -36,6 +37,14 @@ def test_build_strategy_passes_full_indicator_config(monkeypatch):
     assert strategy.config.rsi_filter_enabled is False
     assert strategy.config.regime_ema_period == 150
     assert strategy.config.regime_ema_slope_filter is True
+    assert strategy.config.atr_volatile_multiplier == 2.5, (
+        "2026-09-14 finding: build_strategy() omitted atr_volatile_multiplier "
+        "entirely, silently falling back to IndicatorConfig's hardcoded 1.5 "
+        "default regardless of ATR_VOLATILE_MULTIPLIER in .env — the backtest "
+        "config builder (bot/backtest/params.py) already passed it correctly, "
+        "so live could silently trade a different volatility filter than "
+        "whatever was validated."
+    )
 
 
 def test_indicator_strategy_exposes_tick_count():

@@ -278,6 +278,7 @@ def build_strategy():
             breakout_lookback        = cfg.strategy.breakout_lookback,
             max_price_extension_pct  = cfg.strategy.max_price_extension_pct,
             breakout_adx_threshold   = cfg.strategy.breakout_adx_threshold,
+            atr_volatile_multiplier  = cfg.strategy.atr_volatile_multiplier,
         ))
     return ThresholdStrategy(
         buy_threshold  = cfg.strategy.buy_threshold,

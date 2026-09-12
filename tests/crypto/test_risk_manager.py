@@ -93,6 +93,27 @@ def test_kill_switch_is_sticky_survives_recovery():
     assert not result
     assert result.block_reason == BlockReason.KILL_SWITCH
 
+def test_kill_switch_trips_from_a_hold_only_drawdown_not_just_at_buy_time():
+    """2026-09-14 finding: the kill-switch trip evaluation only ran inside the
+    `if signal == Signal.BUY` check (and SELL short-circuited past it too,
+    same `and`) — so a drawdown that happened while the strategy sat in HOLD
+    (no active signal) could blow through kill_switch_pct and fully recover
+    before the next BUY signal ever arrived. Reproduced exactly as reported:
+    equity $1000->$800 during HOLD, recovered to $1000, and a subsequent BUY
+    was approved with the sticky switch never having tripped at all."""
+    ex, risk = _make(cash=1_000, max_drawdown_pct=0.50, weekly_loss_limit_pct=0.50, kill_switch_pct=0.15)
+    risk.evaluate(Signal.HOLD, 100, ex.portfolio, 1.0)   # seeds peak at $1000
+    ex.portfolio.cash = 800   # 20% down — past the 15% kill switch — HOLD only, no BUY/SELL
+    risk.evaluate(Signal.HOLD, 100, ex.portfolio, 1.0)
+    assert risk.kill_switch_tripped, (
+        "a HOLD-only drawdown through the threshold must still trip the sticky switch"
+    )
+    ex.portfolio.cash = 1_000   # recovers fully before any BUY signal ever appears
+    result = risk.evaluate(Signal.BUY, 100, ex.portfolio, 0.001)
+    assert not result
+    assert result.block_reason == BlockReason.KILL_SWITCH
+
+
 def test_kill_switch_persists_across_restart():
     ex = PaperExecutor("BTC/USDT", quantity=1.0, starting_cash=10_000)
     with tempfile.TemporaryDirectory() as tmp:

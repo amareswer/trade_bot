@@ -303,34 +303,47 @@ def run(
         exit_price  = price
         forced_exit = False
         if executor.position > 0 and entry_price > 0:
-            # Trailing stop takes priority over fixed/ATR SL if configured
+            # Gap-aware fills (2026-09-14 fix): a stop/TP level is a resting
+            # order price, not a guaranteed fill price. If the candle's own
+            # OPEN already gapped through the level (a sharp move between
+            # candles, common on crypto), the level itself was never
+            # tradable — the realistic fill is the open, not the stale
+            # target. Mirrors the already-tested pattern in the STOCK
+            # engine's `close_trade(min(c.open, sl_price), ...)` /
+            # `close_trade(max(c.open, tp_price), ...)`. Previously this
+            # engine used the theoretical level unconditionally (the ATR
+            # branch's `max(sl_level, candle.low)` was a no-op — the
+            # triggering condition `candle.low <= sl_level` guarantees
+            # `sl_level >= candle.low`, so max() always resolved to
+            # sl_level regardless of how far through the candle actually
+            # traded), silently understating losses on any real gap-through.
             if trail_stop_pct > 0 and _trail_peak > 0:
                 _trail_sl = _trail_peak * (1 - trail_stop_pct)
                 if candle.low <= _trail_sl:
                     raw_signal  = Signal.SELL
                     exit_reason = "trail_stop"
-                    exit_price  = _trail_sl
+                    exit_price  = min(candle.open, _trail_sl)
                     forced_exit = True
             elif atr_sl_mult > 0 and _entry_atr > 0:
                 sl_level = entry_price - _entry_atr * atr_sl_mult
                 if candle.low <= sl_level:
                     raw_signal  = Signal.SELL
                     exit_reason = "stop_loss"
-                    exit_price  = max(sl_level, candle.low)
+                    exit_price  = min(candle.open, sl_level)
                     forced_exit = True
             elif stop_loss_pct > 0:
                 sl_level = entry_price * (1 - stop_loss_pct)
                 if candle.low <= sl_level:
                     raw_signal  = Signal.SELL
                     exit_reason = "stop_loss"
-                    exit_price  = sl_level
+                    exit_price  = min(candle.open, sl_level)
                     forced_exit = True
             if not forced_exit and take_profit_pct > 0:
                 tp_level = entry_price * (1 + take_profit_pct)
                 if candle.high >= tp_level:
                     raw_signal  = Signal.SELL
                     exit_reason = "take_profit"
-                    exit_price  = tp_level
+                    exit_price  = max(candle.open, tp_level)
                     forced_exit = True
 
         filtered_signal, _ = state_machine.filter_signal(raw_signal)
@@ -379,21 +392,35 @@ def run(
                     entry_price = order.price
                     _trail_peak = 0.0  # activates once activation_pct profit is reached
                     _partial_tp_done = False
-                    _entry_atr = strategy.last_atr or 0.0
-                    _adx  = strategy.last_adx   if is_indicator else None
-                    _rsi  = strategy.last_rsi   if is_indicator else None
-                    _trnd = strategy.last_trend if is_indicator else None
-                    _closes_snap = list(strategy._closes)
-                    _ema_fast = _ema(_closes_snap, strategy.config.fast_ema_period)
-                    _ema_slow = _ema(_closes_snap, strategy.config.slow_ema_period)
-                    entry_snapshots.append({
-                        "candle_index": i,
-                        "adx":      _adx,
-                        "rsi":      _rsi,
-                        "ema_fast": _ema_fast,
-                        "ema_slow": _ema_slow,
-                        "trend":    _trnd,
-                    })
+                    # Indicator-only snapshot (2026-09-14 fix): last_atr,
+                    # _closes, and config.*_ema_period only exist on
+                    # IndicatorStrategy — ThresholdStrategy is a bare
+                    # buy_threshold/sell_threshold dataclass with none of
+                    # them. This block used to run unconditionally on every
+                    # BUY fill, so strategy_mode="threshold" crashed with an
+                    # AttributeError on its very first BUY. entry_snapshots
+                    # is attribution/research tooling for the indicator
+                    # strategy only (bot/backtest/attribution.py,
+                    # vol_regime_experiment.py) — nothing downstream expects
+                    # a threshold-mode BUY to have contributed one.
+                    if is_indicator:
+                        _entry_atr = strategy.last_atr or 0.0
+                        _adx  = strategy.last_adx
+                        _rsi  = strategy.last_rsi
+                        _trnd = strategy.last_trend
+                        _closes_snap = list(strategy._closes)
+                        _ema_fast = _ema(_closes_snap, strategy.config.fast_ema_period)
+                        _ema_slow = _ema(_closes_snap, strategy.config.slow_ema_period)
+                        entry_snapshots.append({
+                            "candle_index": i,
+                            "adx":      _adx,
+                            "rsi":      _rsi,
+                            "ema_fast": _ema_fast,
+                            "ema_slow": _ema_slow,
+                            "trend":    _trnd,
+                        })
+                    else:
+                        _entry_atr = 0.0
                 else:
                     pnl = position_manager.on_sell(order.price, order.quantity)
                     entry_price = 0.0
