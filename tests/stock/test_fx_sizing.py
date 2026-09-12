@@ -72,6 +72,26 @@ def test_get_usd_cad_rate_falls_back_on_failure(caplog):
     assert any("USD/CAD rate unavailable" in r.message for r in caplog.records)
 
 
+def test_get_usd_cad_rate_falls_back_when_lazy_price_lookup_raises(caplog):
+    """2026-09-12 finding: fast_info is lazily evaluated in yfinance — a
+    rate-limit/network error surfaces at the .last_price ACCESS, not at
+    .fast_info itself. The old code only wrapped .fast_info in
+    fetch_with_retry, leaving the actual price read unprotected, so a
+    failure there raised past this function's advertised graceful fallback
+    instead of triggering it."""
+    class _BoomFastInfo:
+        @property
+        def last_price(self):
+            raise RuntimeError("simulated lazy quote failure")
+        lastPrice = None
+
+    with patch("yfinance.Ticker") as mock_ticker, patch("time.sleep"):
+        mock_ticker.return_value.fast_info = _BoomFastInfo()
+        rate = get_usd_cad_rate()   # must not raise
+    assert rate == price_feed._FX_FALLBACK_RATE
+    assert any("USD/CAD rate unavailable" in r.message for r in caplog.records)
+
+
 def test_get_usd_cad_rate_caches_within_ttl():
     with patch("yfinance.Ticker") as mock_ticker, patch("time.sleep"):
         mock_ticker.return_value.fast_info = _mock_fx_fast_info(1.40)

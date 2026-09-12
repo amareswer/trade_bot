@@ -91,15 +91,27 @@ def get_usd_cad_rate() -> float:
     if _fx_cache is not None and now - _fx_cache[1] < _FX_TTL:
         return _fx_cache[0]
 
-    fi = fetch_with_retry(lambda: yf.Ticker("CAD=X").fast_info, label="USDCAD:fx")
-    rate = None
-    if fi is not None:
+    # fast_info is lazily evaluated in yfinance — a rate-limit or network
+    # error surfaces at the .last_price ACCESS, not at .fast_info itself
+    # (same gotcha already fixed in stock_bot/data/intraday_price.py's
+    # get_live_price(), 2026-09-12; this second occurrence in a different
+    # file was missed at the time). The old code only wrapped .fast_info in
+    # fetch_with_retry, leaving the actual price read unprotected — a
+    # transient failure there raised past this function's advertised
+    # graceful fallback instead of triggering it, able to interrupt sizing/
+    # affordability checks. Both accesses now happen inside the same
+    # retried lambda.
+    def _fetch() -> float | None:
+        fi = yf.Ticker("CAD=X").fast_info
         raw = getattr(fi, "last_price", None) or getattr(fi, "lastPrice", None)
-        if raw is not None:
-            try:
-                rate = float(raw)
-            except (TypeError, ValueError):
-                rate = None
+        return float(raw) if raw is not None else None
+
+    try:
+        rate = fetch_with_retry(_fetch, label="USDCAD:fx")
+    except (TypeError, ValueError):
+        rate = None
+    if rate is not None and not (rate > 0):
+        rate = None
 
     if rate is None or rate <= 0:
         logger.warning(

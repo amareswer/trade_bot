@@ -219,6 +219,33 @@ class IndicatorStrategy:
         self._last_rsi = rsi_val
         self._last_trend = trend_val
 
+        # ── MACD momentum ─────────────────────────────────────────────
+        # Computed and _last_macd_hist updated HERE, unconditionally, on
+        # every completed candle — same rule as RSI immediately above.
+        # 2026-09-12 finding: this used to happen inside _trend_signal(),
+        # AFTER its ADX/regime rejection checks could already return HOLD
+        # early. An ADX-rejected candle then never updated
+        # _last_macd_hist, so the NEXT eligible candle's "rising" check
+        # compared against a stale value from before the rejected candle
+        # instead of the immediately preceding one — reproduced with
+        # histogram values 1 -> 5 -> 3 (middle candle ADX-rejected): the
+        # final candle read 3 > 1 as "rising" despite real momentum having
+        # fallen from 5 to 3. Moving this above every gate (VOLATILE
+        # regime included, matching RSI's own history update) fixes it.
+        macd_val = calc_macd(
+            closes,
+            self.config.macd_fast_period,
+            self.config.macd_slow_period,
+            self.config.macd_signal_period,
+        )
+        macd_hist = macd_val[2] if macd_val is not None else None
+        macd_hist_rising = (
+            macd_hist is not None
+            and self._last_macd_hist is not None
+            and macd_hist > self._last_macd_hist
+        )
+        self._last_macd_hist = macd_hist
+
         # ── EMA separation ────────────────────────────────────────────
         ema_spread_pct = abs(fast_ema - slow_ema) / slow_ema if slow_ema > 0 else 0.0
 
@@ -242,6 +269,7 @@ class IndicatorStrategy:
         return self._trend_signal(
             price, rsi_val, rsi_rising, rsi_falling,
             trend_val, fast_ema, slow_ema, ema_spread_pct, closes, adx_val,
+            macd_hist, macd_hist_rising,
         )
 
     # ── Private helpers ───────────────────────────────────────────────
@@ -332,10 +360,17 @@ class IndicatorStrategy:
         ema_spread_pct: float,
         closes:        list[float],
         adx_val:       Optional[float],
+        macd_hist:        Optional[float],
+        macd_hist_rising: bool,
     ) -> Signal:
         """
         Trend-following logic with Mode A (pullback) and Mode B (breakout).
         SELL logic is unchanged from the original single-mode implementation.
+
+        macd_hist/macd_hist_rising are computed once per candle in
+        evaluate(), before any gate can early-return — see the 2026-09-12
+        fix note there. Do not recompute or update self._last_macd_hist
+        here; that's what caused the bug this replaced.
         """
         # ADX threshold (always checked; RANGING → called here, adx_val < threshold fires)
         if adx_val is None or adx_val < self.config.adx_threshold:
@@ -375,21 +410,6 @@ class IndicatorStrategy:
         if self.config.volume_k > 0 and len(vols) >= 4:
             avg_vol_3 = sum(vols[-4:-1]) / 3
             volume_ok = vols[-1] >= self.config.volume_k * avg_vol_3
-
-        # MACD momentum
-        macd_val = calc_macd(
-            closes,
-            self.config.macd_fast_period,
-            self.config.macd_slow_period,
-            self.config.macd_signal_period,
-        )
-        macd_hist = macd_val[2] if macd_val is not None else None
-        macd_hist_rising = (
-            macd_hist is not None
-            and self._last_macd_hist is not None
-            and macd_hist > self._last_macd_hist
-        )
-        self._last_macd_hist = macd_hist
 
         if trend_val == "BULLISH":
             if not ema_strong:

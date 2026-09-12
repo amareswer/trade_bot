@@ -175,7 +175,7 @@ narrative behind any decision below, and `.memory/decisions/*.md` for the deepes
 
 ## Test Suite Manifest
 
-**Expected total: 946 tests** (`pytest --collect-only -q`). If the count disagrees: a file
+**Expected total: 950 tests** (`pytest --collect-only -q`). If the count disagrees: a file
 has an import error, was deleted, was added without a manifest bump, or was excluded from the
 runner — investigate before trusting a green suite. Suite runtime ~9–26s; minutes means a
 test is reading live `.env` config. The per-row table sum below lags the header total by ~22
@@ -217,11 +217,12 @@ Run: `python -m pytest --tb=short -q` — must show **906 passed**.
 | `tests/stock/test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last, determinism, validated-parameter pin |
 | `tests/crypto/test_audit_scheduler.py` | 14 | REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, monthly 1st-anchored re-screen, missed-run catch-up |
 | `tests/crypto/test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
-| `tests/stock/test_ibkr_executor.py` | 87 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping, broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe, FX/margin-minimum guard (**checks NET-LIQ, not free cash** — 2026-08-31 fix), sector-concentration gate, weekly/drawdown-halt/kill-switch tiers, per-position ATR stop-pct override, projected-exposure check, LiveTradingGate enforcement (incl. Gate 2 SKIPPED-when-AI-disabled bypass, 2026-09-10), TWS-query resilience (last-good cache, incl. **disconnected-but-no-exception preserves cache** — 2026-09-11 fix), `ibkr_trades.csv` write buffer/retry, Error 10349 slow-resubmit fill (20s grace + `tif="DAY"`), daily-loss calendar-day anchoring, **partial-fill tracking to completion or confirmed cancel** (2026-09-12 fix), **concurrent-sell serialization** (2026-09-12 fix, overlap-counter proof), **native broker-side protective stop** (2026-09-12: place/no-op/replace/adopt-on-restart, cancel-before-sell, broker-triggered-fill detection, multi-stop ambiguity — **plus a second-pass fix for 3 bugs an external review found in this same feature**: ambiguous-lookup sentinel distinct from "confirmed none", cost basis cached at placement time not re-read after the position closes, `sync_protective_stop`/`sell()` share one reentrant per-symbol lock), **currency-aware cash check** (2026-09-12 fix: USD-stock affordability now converted to CAD before comparing against CAD cash) |
+| `tests/stock/test_ibkr_executor.py` | 89 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping, broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe, FX/margin-minimum guard (**checks NET-LIQ, not free cash** — 2026-08-31 fix), sector-concentration gate, weekly/drawdown-halt/kill-switch tiers, per-position ATR stop-pct override, projected-exposure check, LiveTradingGate enforcement (incl. Gate 2 SKIPPED-when-AI-disabled bypass, 2026-09-10), TWS-query resilience (last-good cache, incl. **disconnected-but-no-exception preserves cache** — 2026-09-11 fix), `ibkr_trades.csv` write buffer/retry, Error 10349 slow-resubmit fill (20s grace + `tif="DAY"`), daily-loss calendar-day anchoring, **partial-fill tracking to completion or confirmed cancel** (2026-09-12 fix), **concurrent-sell serialization** (2026-09-12 fix, overlap-counter proof), **native broker-side protective stop** (2026-09-12: place/no-op/replace/adopt-on-restart, cancel-before-sell, broker-triggered-fill detection, multi-stop ambiguity — hardened across two further review passes: ambiguous-lookup sentinel distinct from "confirmed none", cost basis captured once before any cancel/place operation rather than re-queried afterward, `_cancel_trade_and_wait` returns a tri-state cancelled/filled/unconfirmed outcome so a stop that fills during its own cancellation is never mistaken for "safe to replace", shared `_record_native_stop_fill` helper, `sync_protective_stop`/`sell()` share one reentrant per-symbol lock), **currency-aware cash check** (2026-09-12 fix: USD-stock affordability now converted to CAD before comparing against CAD cash) |
 | `tests/stock/test_concurrent_sell.py` | 1 | `StockPaperExecutor` concurrent-sell regression (2026-09-12): two threads racing a full-position sell — proves both the overlap invariant (per-symbol lock) and the actual business outcome (one FILLED, one REJECTED, never both filling the same shares) |
 | `tests/stock/test_intraday_price_guard.py` | 5 | `get_live_price()`'s previous-close corruption guard (2026-09-12): a genuine crash confirmed by today's own day_high/day_low is no longer discarded; a corrupted read outside that range still is; day-range lookup failure fails toward the conservative reject |
 | `tests/stock/test_paper_executor_fill_price.py` | 2 | `StockPaperExecutor.buy()`/`sell()` regression (2026-09-12): `order.price`/`quantity`/`total_value` now reflect the actual slippage-adjusted fill, not the pre-slippage requested price — IBKRExecutor already did this correctly, paper.py did not |
-| `tests/stock/test_fx_sizing.py` | 14 | USD/CAD sizing: `is_cad_symbol`, `get_usd_cad_rate`, mixed-currency `total_value`/`check_exposure`, sector-concentration gate, projected-exposure check |
+| `tests/stock/test_fx_sizing.py` | 15 | USD/CAD sizing: `is_cad_symbol`, `get_usd_cad_rate`, mixed-currency `total_value`/`check_exposure`, sector-concentration gate, projected-exposure check, **lazy fast_info failure inside get_usd_cad_rate now falls back gracefully instead of raising** (2026-09-12 fix — same class of bug already fixed in `intraday_price.py`, missed here at the time) |
+| `tests/shared/test_indicator_strategy_macd_history.py` | 1 | `IndicatorStrategy` MACD-history regression (2026-09-12): an ADX-rejected candle must still update `_last_macd_hist` — reproduces the exact reviewer scenario (histogram 1→5→3, middle candle ADX-rejected) that used to read a real momentum *fall* as "rising" and fire a false pullback BUY |
 | `tests/stock/test_screener_in_distribution.py` | 5 | In-distribution ATR%/liquidity filter (`stock_bot/data/screener.py`, replacement safety net after RULE_WHITELIST stopped gating BUYs) |
 | `tests/stock/test_accuracy_tracker.py` | 20 | `LiveTradingGate` gates — Gate 1 (`stock_backtest_latest.json` vs `RULE_WHITELIST`), Gate 2 (AI confidence-band edge, incl. SKIPPED when `AI_ENABLED=false` — 2026-09-10), Gate 3 (≥30 round-trips/PF≥1.2/win≥30%) |
 | `tests/stock/test_checkpoint_tracker.py` | 14 | Post-whitelist review checkpoint tracker (`checkpoint_tracker.py`, dashboard visibility only): sample floors, win-rate/PF/AI-agreement gap triggers, AI-split sample-size guard |
@@ -581,6 +582,93 @@ proof, 1 yfinance-outage sync, 1 crypto already-filled-and-closed adoption, 1 AT
 existing native-stop P&L test strengthened to actually exercise the bug), suite 940→946. Both
 bots need a restart.
 
+### Third-pass review found MORE bugs in the SAME native-stop feature (2026-09-12)
+A third review pass, checking the fixes above, found two more real bugs in native-stop —
+same feature, third round in a row. Worth being direct about the pattern: this feature keeps
+producing new high-severity findings each time it's looked at more carefully, because it was
+built and self-tested quickly across several same-day passes. Given the user's explicit
+choice to keep patching rather than simplify or disable it, both were fixed properly this
+time — plus two smaller, unrelated findings from the same review, and one real bug in the
+LIVE, real-money crypto strategy.
+
+- **A stop that fills during its own cancellation could be replaced against a closed
+  position (High).** `_cancel_trade_and_wait()` returned a plain bool based on `trade.isDone()`
+  — true for BOTH "cancelled" and "filled". `sync_protective_stop()`'s replace path read any
+  truthy return as "safe to place a new stop", so a stop that filled (closing the whole
+  position) while being cancelled — racing the cancel — was replaced with a fresh stop
+  against a position that no longer existed. Reproduced: a new 10-share SELL stop placed
+  after the original had already closed all 10 shares. Fixed: `_cancel_trade_and_wait` now
+  returns a tri-state outcome — `"cancelled"` / `"filled"` / `"unconfirmed"` — and only
+  `"cancelled"` allows a replacement. A `"filled"` outcome is handed to a new shared helper,
+  `_record_native_stop_fill()`, instead — recording the fill (using the cost basis captured
+  before the race, see next item) rather than pretending nothing happened.
+- **The round-3 cost-basis fix still had a race, just moved (High).** Round 3 fixed the
+  known 0-cost-basis bug by caching `avg_cost` — but it re-queried `positions_snapshot()`
+  *after* `placeOrder()` returned, which is still late if the new stop fills immediately.
+  Reproduced the identical +$548-instead-of-−$52 sign inversion a second time, via an
+  immediate rather than a later fill. Fixed properly this time: `held` and `avg_cost` are
+  now captured together, ONCE, at the very top of `sync_protective_stop()` — before any
+  cancel or place operation — and that single captured value is reused everywhere in the
+  call, never re-queried. `_record_native_stop_fill()` (used by all three fill-recording call
+  sites now: routine `check_native_stop_fills()`, a fill discovered mid-cancel by
+  `sync_protective_stop()`, and one discovered mid-cancel by `_cancel_native_stop()` ahead of
+  a sell) logs loudly and records nothing, rather than guessing, when no cached cost basis is
+  available at all (e.g. a stop adopted from a prior session).
+- **Native-stop fills during bot downtime are permanently invisible (High, acknowledged, not
+  fixed).** `_native_stops` is in-memory only. A stop that fills while the bot is offline is,
+  after a restart, neither resting (so the live-query restart adoption won't find it) nor in
+  the fresh empty dict — `check_native_stop_fills()` has nothing to inspect. The broker's own
+  position still self-corrects (`positions_snapshot()` always reflects live state), but that
+  fill's P&L/CSV row is permanently missed, not just delayed. Closing this needs persisted
+  order tracking plus startup reconciliation against the broker's execution history (with
+  duplicate-record protection against fills the normal `sell()` path already captured) — a
+  real feature, deliberately not built same-day on top of everything else here. Documented in
+  `check_native_stop_fills()`'s own docstring as a known residual gap.
+- **FX rate lookup could raise instead of using its own advertised fallback (Medium).**
+  `get_usd_cad_rate()` (`stock_bot/data/price_feed.py`) — the exact same lazy-`fast_info`
+  gotcha already fixed in `get_live_price()` (`intraday_price.py`, earlier the same day) was
+  present in this second, separate function and missed at the time: `fast_info` was fetched
+  inside `fetch_with_retry`, but its lazy `.last_price` access happened outside it, where a
+  rate-limit/network failure propagates uncaught past this function's documented graceful
+  fallback — able to interrupt sizing/affordability checks. Fixed the same way: both accesses
+  now happen inside the same retried lambda.
+- **Stock: re-entry on the same daily signal after a stop-out (Medium, a policy question, not
+  fixed).** The live scan loop re-evaluates yesterday's still-current daily candle every
+  cycle; `executor.position(symbol) == 0` is the only re-entry gate, so a stop-out that closes
+  a position intraday lets the SAME unchanged daily BUY signal re-fire later the same day,
+  subject to the other risk gates. The daily backtest structurally can't reproduce this (it
+  only ever evaluates once per candle), so this behavior has never been backtested either
+  way. This is a real design decision — allow same-day re-entry, or gate on "already acted on
+  this candle's signal" — not a bug to silently patch; needs an explicit decision and its own
+  backtest before either behavior can be called validated. Not addressed.
+- **Strategy bug in the LIVE, real-money crypto strategy: falling MACD momentum could be
+  classified as rising (High).** `bot/strategy/indicator_strategy.py`'s `_last_macd_hist` was
+  only updated inside `_trend_signal()`, *after* its own ADX/regime-EMA rejection checks could
+  already return HOLD — so a candle rejected by ADX never updated the tracked value, and the
+  next passing candle's "is momentum rising?" check compared against a stale pre-rejection
+  value instead of the immediately preceding real one. Reproduced with histogram values
+  1→5→3 (middle candle ADX-rejected): the old code read the third candle's 3 > 1 as "rising"
+  despite real momentum having fallen 5→3, and would fire a false pullback BUY. Fixed by
+  moving the MACD computation and history update into `evaluate()`, unconditionally on every
+  completed candle — mirroring how RSI's own `_last_rsi`/`_prev_rsi` history already worked
+  correctly (updated before any gate, including the VOLATILE-regime early return). Both bots
+  share this exact strategy file, so the fix applies to crypto and stock identically.
+  **Re-validated 2026-09-12 per this repo's own Validation Discipline** (any `bot/strategy/`
+  change invalidates every fingerprint until walk-forward is re-run): new hash
+  `5c6540eccbd2f45f`. BTC/USDT came back byte-identical to the pre-fix baseline on every
+  number checked (pinned window 27/1.87/40.7%, walk-forward TRAIN 1.37/VALIDATION 3.41) — the
+  bug is real but didn't happen to change any trade decision within BTC's validated windows.
+  SOL/USDT shifted slightly (walk-forward TRAIN 1.68 vs the old 1.49, VALIDATION 1.84 vs the
+  old 1.98) — the fix did change at least one SOL decision — but both numbers still clear the
+  gate comfortably. Stamped via `stamp_strategy.py`. **Both bots need a restart to run the
+  fixed strategy code** — unlike the execution-layer fixes above, this changes live BTC/CAD
+  and SOL/CAD signal generation itself, not just order handling.
+
++5 tests (2 native-stop race reproductions — each confirmed to fail against the pre-fix
+code — 1 FX-fallback reproduction, 1 dedicated `IndicatorStrategy` unit test reproducing the
+exact 1→5→3 scenario with indicator internals mocked to isolate the control-flow bug), suite
+946→950.
+
 ### Generic stuck-loop detector (crypto + stock — BUILT 2026-08-27)
 `bot/alerts/stuck_loop.StuckLoopDetector` — error-string-agnostic "same operation keeps
 failing" watchdog. `record(key, ok, detail)`; `threshold`(5) consecutive failures → one
@@ -924,33 +1012,42 @@ the load-bearing gate is root `stock_backtest.py` → `stock_bot/backtest/engine
 ### How to verify the config is active
 Run: `EXCHANGE=binance SYMBOL=BTC/USDT python backtest.py`
 Expected (rolling, drifts as the window advances): **~29 trades, PF ~2.4–2.5, ~38% win
-rate**, hash `b30f2f9e769c8d41`. Was 32 / 2.10 with the old flat 10% TP; **2026-09-03 BTC
-moved to `TAKE_PROFIT_PCT_BTC=0.20`** (per-symbol exit — SOL keeps 10%), lifting rolling PF
-to ~2.46. If `RSI_FILTER_ENABLED=false` accidentally: trade count jumps, PF drops below 1.2.
-**Use the pinned-window check below for a deterministic pass/fail.**
+rate**, hash `5c6540eccbd2f45f`. If `RSI_FILTER_ENABLED=false` accidentally: trade count
+jumps, PF drops below 1.2. **Use the pinned-window check below for a deterministic pass/fail.**
 
 Reproducible pinned-window check (deterministic — data range fixed):
 ```
 EXCHANGE=binance SYMBOL=BTC/USDT BACKTEST_SINCE=2024-03-07 BACKTEST_UNTIL=2026-06-20 python backtest.py
 ```
-Expected: **27 trades, PF 1.87, 40.7% win rate** (5010 candles), hash `b30f2f9e769c8d41`.
-(Was 30 / 1.94 with the flat 10% TP — the pinned window ends 2026-06 and predates the recent
-strong-trend period where TP20 pays off, so it dips slightly here while the walk-forward
-split improves; PF 1.87 still clears the ≥1.72 floor.) Use the rolling run for the canonical
-fingerprint, this pinned run for "did my environment/data change break something".
+Expected: **27 trades, PF 1.87, 40.7% win rate** (5010 candles), hash `5c6540eccbd2f45f`.
+Use the rolling run for the canonical fingerprint, this pinned run for "did my
+environment/data change break something".
 
 ### Canonical strategy fingerprint (BTC/USDT)
-- **Strategy hash:** `b30f2f9e769c8d41` (UNCHANGED by the 2026-09-03 per-symbol TP change —
-  exit params live in `cfg.backtest` / `engine.run`, not the hashed strategy files).
+- **Strategy hash:** `5c6540eccbd2f45f` — changed 2026-09-12 (was `b30f2f9e769c8d41`), a
+  genuine `bot/strategy/` edit: `IndicatorStrategy` could classify falling MACD momentum as
+  "rising" (`_last_macd_hist` was only updated after ADX/regime gates that could already
+  return HOLD, so an ADX-rejected candle left it stale — an independent review reproduced
+  it with histogram values 1→5→3, the ADX-rejected middle candle causing a false "rising"
+  read on the third). Fixed by moving the MACD computation + history update to run
+  unconditionally on every completed candle (matching how RSI's own history update already
+  worked), before any gate can return early. Full detail: "Second-pass review" section above.
 - **Hashed files (behavior-defining only):** `bot/strategy/indicator_strategy.py`,
   `bot/strategy/threshold_strategy.py`, `bot/indicators/indicators.py`
-- **Current result (BTC, `TAKE_PROFIT_PCT_BTC=0.20`):** rolling ~29 trades, PF ~2.46
-  (pinned window: 27 / 1.87). Walk-forward: TRAIN PF 1.37 / VALIDATION PF 3.41 (both up from
-  the flat-10%-TP 1.20 / 2.78). SOL/USDT unchanged (10% TP): rolling 43 / 1.78, WF 1.49 /
-  1.98. Trade-count evolution and the 2026-08-20 ATR-regime-baseline fix are in
-  `CLAUDE_HISTORY.md`.
-- Stamp after each passing walk-forward: `python stamp_strategy.py` → `logs/validated_strategy_hash`
+- **Re-validated 2026-09-12, both live symbols pass:**
+  - **BTC/USDT — byte-identical to the pre-fix baseline** on every number checked: pinned
+    window 27 trades / PF 1.87 / 40.7% win rate; walk-forward TRAIN PF 1.37 / VALIDATION PF
+    3.41. The bug is real (proven in the dedicated unit test) but didn't happen to change
+    any trade decision within BTC's validated windows.
+  - **SOL/USDT — numbers shifted slightly, still solidly passing:** rolling 43 trades / PF
+    1.78 / 41.9% win rate (unchanged from before). Walk-forward: TRAIN PF **1.68** (was
+    1.49), VALIDATION PF **1.84** (was 1.98) — the fix did change at least one SOL decision
+    within the walk-forward window; both numbers still clear the >1.0 gate comfortably
+    ("Strong: PF holds above 1.2 out-of-sample").
+- Stamped: `python stamp_strategy.py` → `logs/validated_strategy_hash` (done 2026-09-12).
 - If the bot or backtest prints `STRATEGY CODE DIFFERS`, re-run walk-forward before trusting any PF numbers.
+- **Both bots need a restart** to run the fixed strategy code — this is a `bot/strategy/`
+  change, so it affects live BTC/CAD and SOL/CAD signal generation, not just execution.
 
 ### Current operational status
 - **Crypto bot:** live on Kraken. BTC/CAD ($77 slot) capital gate 0/15 fills (strategy trades

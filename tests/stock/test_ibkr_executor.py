@@ -858,6 +858,57 @@ def test_sync_protective_stop_does_not_replace_when_cancel_unconfirmed(executors
     fake.cancelOrder = real_cancel
 
 
+def test_sync_protective_stop_records_fill_instead_of_replacing_when_stop_fills_during_cancel(executors):
+    """Third-round reviewer finding: _cancel_trade_and_wait's caller must
+    not treat 'filled' the same as 'cancelled' just because both make
+    isDone() true. fill_mode='on_cancel' makes the OLD stop fill (closing
+    the whole 10-share position) the instant its cancellation is attempted
+    — reproducing the old stop closing all 10 shares moments before a
+    replacement would have been placed against a position that no longer
+    exists."""
+    fake = FakeIB(positions=[_ko_position(10, 60.0)], fill_mode="on_cancel", fill_price=54.80)
+    ex = make_executor(fake)
+    executors.append(ex)
+    ex.sync_protective_stop("KO", 55.0)
+    assert len(fake.placed) == 1
+
+    before_pnl = ex.realized_pnl()
+    ex.sync_protective_stop("KO", 57.0)   # tries to replace — old stop fills instead of cancelling
+
+    assert len(fake.placed) == 1, "must NOT place a new stop against a position the old stop just closed"
+    assert ex.realized_pnl() == pytest.approx(before_pnl + (54.80 - 60.0) * 10), \
+        "the fill must be recorded (correct P&L sign) instead of silently dropped"
+    assert "KO" not in ex._native_stops
+
+
+def test_sync_protective_stop_avg_cost_survives_an_immediate_fill_after_placement(executors):
+    """Second-round fix (caching avg_cost) still had a race: it re-queried
+    positions_snapshot() AFTER placeOrder() returned, which is itself late
+    if the new stop fills immediately. Reproduced by making a placed STP
+    order auto-fill the instant it's placed; the cost basis used for its
+    eventual fill-recording must still be correct (captured before
+    placement, not after)."""
+    fake = FakeIB(positions=[_ko_position(10, 60.0)], fill_price=54.80)
+    ex = make_executor(fake)
+    executors.append(ex)
+
+    real_place = fake.placeOrder
+    def _place_and_immediately_fill(contract, order):
+        trade = real_place(contract, order)
+        if str(getattr(order, "orderType", "")).upper() in ("STP", "STOP"):
+            fake._fill(trade, order)   # fills the instant it's placed
+            fake._positions = []       # ...and the broker's position closes with it
+        return trade
+    fake.placeOrder = _place_and_immediately_fill
+
+    ex.sync_protective_stop("KO", 55.0)
+
+    assert ex._native_stops.get("KO", {}).get("avg_cost") == 60.0, (
+        "avg_cost must be the pre-placement value (60.0), not a post-placement "
+        "re-query that could already see the position closed"
+    )
+
+
 def test_sync_protective_stop_noop_when_no_position(executors):
     fake = FakeIB(positions=[])
     ex = make_executor(fake)
