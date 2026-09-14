@@ -141,7 +141,14 @@ def test_digest_flags_stuck_loop(monkeypatch, tmp_path):
 def test_wired_into_run_loop():
     src = inspect.getsource(bot_main.run)
     assert "_maybe_send_health_digest(" in src
-    # generic stuck-loop watchdog is created and fed from the execute path
+    # generic stuck-loop watchdog is created and fed from the execute path.
+    # stuck_detector.record() itself moved into _execute_approved_signal()
+    # (2026-09-13, extracted for dynamic-universe testability — see that
+    # function's own docstring) — run() now feeds it by calling that
+    # function with stuck_detector= passed through, rather than recording
+    # inline. Check both ends of that wiring rather than the old inline text.
     assert "StuckLoopDetector(alerter.error)" in src
-    assert "stuck_detector.record(" in src
-    assert "stuck_detector=stuck_detector" in src   # passed to the digest
+    assert "_execute_approved_signal(" in src
+    assert "stuck_detector=stuck_detector" in src   # passed into _execute_approved_signal AND the digest
+    exec_src = inspect.getsource(bot_main._execute_approved_signal)
+    assert "stuck_detector.record(" in exec_src

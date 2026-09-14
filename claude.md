@@ -175,14 +175,17 @@ narrative behind any decision below, and `.memory/decisions/*.md` for the deepes
 
 ## Test Suite Manifest
 
-**Expected total: 964 tests** (`pytest --collect-only -q`). If the count disagrees: a file
+**Expected total: 1051 tests** (`pytest --collect-only -q`). If the count disagrees: a file
 has an import error, was deleted, was added without a manifest bump, or was excluded from the
-runner — investigate before trusting a green suite. Suite runtime ~9–26s; minutes means a
+runner — investigate before trusting a green suite. Suite runtime ~9–48s; minutes means a
 test is reading live `.env` config. The per-row table sum below lags the header total by ~22
 (pre-existing row-vs-total drift; `--collect-only` and this header agree). Full count-delta
-history: `CLAUDE_HISTORY.md` → "CLAUDE.md trim, 2026-09-01" → "count-delta history".
+history: `CLAUDE_HISTORY.md` → "CLAUDE.md trim, 2026-09-01" → "count-delta history"; +45 for the
+2026-09-13 paper-only dynamic-universe build (964→1009), +30 for the same-day live-engine
+integration (1009→1039), +7 for the same-day second-pass review fixes (1039→1047), +4 for the
+same-day third-pass fixes (1047→1051, see "Dynamic Crypto Universe" section below).
 
-Run: `python -m pytest --tb=short -q` — must show **906 passed**.
+Run: `python -m pytest --tb=short -q` — must show **1051 passed**.
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -251,7 +254,7 @@ Run: `python -m pytest --tb=short -q` — must show **906 passed**.
 | `tests/stock/test_research_aggregator_timeout.py` | 1 | Per-source research-fetch timeout: earnings 45s vs news 15s |
 | `tests/crypto/test_kraken_retry.py` | 4 | `bot/exchanges/retry.fetch_with_retry`: no-retry success, retry-and-recover, raise last after exhaustion, custom params |
 | `tests/crypto/test_shadow_signal_retry.py` | 3 | `shadow_signal.shadow_replay` Kraken fetch wrapped in `fetch_with_retry` |
-| `tests/shared/test_unified_dashboard.py` | 9 | `_read_gate_stats`/`_gate_tracker_section` shadow-match-rate parsing (bounded regex, N/A handling); `_crypto_card` STALE-vs-NO-FILLS badge |
+| `tests/shared/test_unified_dashboard.py` | 13 | `_read_gate_stats`/`_gate_tracker_section` shadow-match-rate parsing (bounded regex, N/A handling); `_crypto_card` STALE-vs-NO-FILLS badge; **`_dynamic_universe_card()` (2026-09-13)** — absent-file returns empty, renders eligible/rejected/blocked, stale-scan badge |
 | `tests/stock/test_stock_position_mark_refresh.py` | 4 | REAL `_mark_positions_to_market()` — breaker trips from a price move alone, silent within limit, None-executor no-op, source guard |
 | `tests/stock/test_sl_tp_watcher_audit_log.py` | 16 | `_check_open_positions_sl_tp` behavior + "N/M positions priced" audit log + rejected-SL/TP-exit `else` branch (`logger.error` + `StuckLoopDetector`) + native-stop wiring (2026-09-12: `sync_protective_stop` called every cycle at the exact SL price, no-op when the executor lacks it, broker-triggered fills alerted and checked before the price-based decision, **and called independently of get_live_price() succeeding — a yfinance outage must not also disable broker-side protection**) |
 | `tests/crypto/test_grid_stress_test.py` | 14 | `grid_stress_test.py` pure helpers (research tooling): crash-period parsing, buy-and-hold P&L, PASS/MARGINAL/FAILED classification |
@@ -271,6 +274,11 @@ Run: `python -m pytest --tb=short -q` — must show **906 passed**.
 | `tests/stock/test_blocked_rule_buys_alert.py` | 10 | `_evaluate_blocked_rule_buys_alert`: end-of-cycle debounced digest, edge-triggered on the `{symbol: gate}` mapping, `_BLOCKED_BUY_ABSENT_CYCLES_TO_CLEAR=3` debounce, all-clear message, source guard |
 | `tests/stock/test_trade_csv_parsing.py` | 8 | `paper_report._row_to_trade` (shared by `accuracy_tracker.load_trades`): clean row, header/junk reject, **unquoted-comma-in-`reason` recovery** (>9 cols → rejoin), bad `confidence` never zeroes `price`/`shares` (2026-09-07 RY phantom -$842 regression), missing-confidence default, end-to-end RY round-trip = +$6.32 |
 | `tests/stock/test_weekly_monitor.py` | 17 | `stock_bot/analysis/weekly_monitor.py` (report-only): verdict tiers (EARLY/EDGE_FAILING/EDGE_WEAK/THROUGHPUT_STALLED/NEEDS_ATTENTION/ON_TRACK), EARLY suppresses stalled, throughput needs a prior run, severity ordering, log-scan fault-vs-noise bucketing + time window, render sections, `run()` writes report + baseline, `--quiet` suppresses ON_TRACK, `main()` exit code on fault |
+| `tests/crypto/test_dynamic_eligibility.py` | 20 | `DynamicUniverseScreener` (dynamic-universe, paper-only — see "Dynamic Crypto Universe"): every filter (inactive/stablecoin/leveraged/volume/min-order/spread/depth/history), `max_candidates` cap, duplicate-base dedup across quotes, discovery-failure fail-safe (cache fallback, expired-cache rejection, never-arbitrary empty result), real-ccxt order-book-shape regression (`[price, amount, timestamp]`, not 2 elements) |
+| `tests/crypto/test_dynamic_lifecycle.py` | 12 | `DynamicSymbolManager`: admit/warmup wiring, idempotent re-admit, manifest persistence, retire-if-flat vs. keep-if-holding, `sync_to_candidates` retires only flat+dropped symbols, restart recovery from manifest + defensive orphaned-open-position state-file scan |
+| `tests/crypto/test_dynamic_ranking.py` | 4 | `rank_buy_signals`: ADX-descending, volume tiebreak, missing-ADX sorts-last-not-dropped, empty list |
+| `tests/crypto/test_dynamic_paper_isolation.py` | 5 | Source guards on the retired `dynamic_universe_bot.py` paper runner: `dry_run=True` hardcoded (not config-derived), no `logs/HALT` reference in code, no live `live_state_BTC`/`live_state_SOL` reference, isolated state directory, empty API credentials |
+| `tests/crypto/test_dynamic_live_integration.py` | 41 | **LIVE-engine dynamic-universe integration (2026-09-13, +7 second-pass +4 third-pass, same day)** — behavioral tests against real `TradingStateMachine`/`PositionManager`/`CapitalPool` + fake executors/risk (no network, no Telegram, no production state): `_admit_dynamic_symbol` (success, warmup failure, restart-recovery-with-position seeding incl. capital-pool re-allocation), `_retire_dynamic_symbol_if_eligible` (flat/holding/resting-stop), `_sync_dynamic_universe` (admit/skip-present/retire-dropped/never-retire-fixed-roster/never-retire-while-holding/one-bad-admission-doesn't-block-others/discovery-failure-safety), `_execute_approved_signal` (BUY fill state+fees, full-close SELL, partial SELL, rejected order, min-order rejection, executor exception, qty=0 guard), `_execute_ranked_dynamic_buys` (ADX-ranked contested slot, fresh per-candidate risk re-check, HALT-equivalent blocks everyone), completed-candle dedup, fixed-mode-untouched guards, `_compute_account_value` no-inflation-on-admission (Critical #1), `_dynamic_mode_active` requires `LIVE_TRADING` (Critical #2), correlation recheck blocks a correlated pair mid-batch (High #4), an ambiguous `None` order conservatively reserves its capital slot (High #5), an unsupported quote currency disables dynamic mode (High #6), **discovery runs after position management not before (third-pass)**, **ranked execution uses/tolerates/falls-back-on a refreshed price (third-pass)** |
 
 ---
 
@@ -1660,6 +1668,411 @@ liquidity) — informational only. Full trail: `CLAUDE_HISTORY.md`.
 - SL-exit rate cap relaxed
 - Automated monthly via `rescreen.py` (both CAD + USD legs; flags decay/new-qualifiers, never auto-changes whitelists)
 - Out-of-cycle manual check: `SCREEN_QUOTE=USD python screen_universe.py`
+
+---
+
+## Dynamic Crypto Universe (LIVE-ENGINE INTEGRATION — 2026-09-13, activation still pending)
+
+User-authorized redesign, explicitly overriding the fixed BTC/CAD+SOL/CAD whitelist so the
+**existing live Kraken bot itself** (`bot/main.py`) can discover and trade qualifying coins
+beyond BTC/SOL, using its own established execution/risk paths — not a separate trading engine.
+Gated entirely behind `DYNAMIC_UNIVERSE_ENABLED` (default `false`): fixed mode is byte-identical
+to before this feature existed. **`logs/HALT` stayed engaged throughout development and testing;
+no real order, fund conversion, or live-trading enablement occurred at any point — see
+"Activation & rollback" below for what a human needs to do to actually turn this on.**
+
+### History — two builds, one superseded
+- **2026-09-13, first pass:** a standalone, paper-only runner (`dynamic_universe_bot.py`) with
+  its own simplified tick loop. Working and tested at the time, but a follow-up review found it
+  re-implemented (imperfectly) logic the live bot already had right — **superseded the same day**;
+  see "Retired standalone runner" below for the specific bugs found and why none were carried
+  into the integration that replaced it.
+- **2026-09-13, second pass (current):** direct integration into `bot/main.py`'s existing
+  `run()` — the only trading engine now involved. This section describes the current state.
+
+### What it is
+- `bot/dynamic/eligibility.py` (`DynamicUniverseScreener`) and `bot/dynamic/ranking.py`
+  (`rank_buy_signals`) — **reused unchanged** from the first pass; both were already
+  self-contained, hermetically-tested pure logic with no execution-loop involvement, so nothing
+  about them needed to change for the live integration. Screener filters: active+spot,
+  stablecoin/leveraged-token base exclusion, 24h quote volume, exchange minimum order size vs.
+  slot cash, top-of-book spread, order-book depth, OHLCV history length, duplicate-base dedup
+  across quote currencies. Fail-safe: a discovery failure serves the last bounded-age-validated
+  cache (`logs/dynamic_universe_cache.json`, stale past `DYNAMIC_CACHE_MAX_AGE_HOURS`) or, with
+  no usable cache, an **empty** eligible list — never an arbitrary fallback symbol; existing
+  positions are always still managed regardless. Ranking: ADX (the strategy's own trend-strength
+  gate) then 24h volume — deliberately not a new/untested scoring model.
+- `bot/dynamic/lifecycle.py` (`DynamicSymbolManager`) — **not used by the live integration.**
+  It predates a settled design decision to produce `bot/main.py`'s own richer `symbol_state[sym]`
+  dict shape directly (trail_peak, atr_sl, native_stop_price, dash_* fields, etc.) rather than a
+  more generic `SymbolHandle`, so admission/retirement/restart-recovery for the live bot are new,
+  purpose-built functions in `bot/main.py` itself (below) that produce that exact shape. Left in
+  place, unused by the live path, in case a future generic (non-`bot.main`-shaped) consumer needs
+  it — not deleted, not documented as load-bearing for live trading.
+- **New in `bot/main.py`** (all module-level, explicitly-parameterized functions — same
+  "extract for testability" convention as `_evaluate_drift`/`_check_candle_watchdog`/
+  `_seed_native_stop_state`, chosen specifically so each is independently unit-testable without
+  invoking the ~1800-line `run()` loop):
+  - `_new_symbol_state_dict()` — the one authoritative `symbol_state[sym]` shape, used by both
+    the original static-roster startup init and dynamic admission (previously a literal dict
+    typed out once at startup with no second call site at all).
+  - `_make_dynamic_executor(sym)` — builds a `LiveExecutor` for a newly-admitted symbol using
+    the EXACT SAME parameters (exchange, order type, adopt-external-holdings, native-stop,
+    slippage guard, `dry_run` rule) as the fixed roster's own construction — a dynamically
+    admitted symbol's fee accounting, slippage guard, and native-stop handling are identical to
+    BTC/CAD's or SOL/CAD's the moment this is ever activated. `starting_cash` is always 0.0;
+    the caller funds it via `capital_pool.slot_cash_for(sym)` right after construction — scanning
+    more coins never changes any single position's sizing basis.
+  - `_admit_dynamic_symbol(sym, live_exchange, timeframe, capital_pool)` — initializes strategy,
+    historical warmup, candle timestamp, executor, position manager, and trading state for a
+    new symbol WITHOUT a restart, reusing `build_strategy()`/`_warmup_strategy()` unchanged (so
+    behavior is byte-identical to the fixed roster's). If the executor's own persisted state
+    already shows a position (a restart re-admitting a symbol that was already trading, not a
+    fresh candidate), applies the SAME recovery seeding the fixed roster's restart-recovery
+    block gets (`pm.seed`/`sm.recover_long`/native-stop mirror) **plus
+    `capital_pool.allocate(sym)`** — see "Confirmed bugs addressed" below. Never raises: returns
+    `(None, error_str)` on failure so one bad candidate can never block management of every
+    OTHER symbol's existing positions this cycle.
+  - `_retire_dynamic_symbol_if_eligible(sym, ss, capital_pool)` — retires ONLY once genuinely
+    flat AND with no resting protective order left outstanding; releases the capital-pool slot
+    (no-op if never allocated).
+  - `_sync_dynamic_universe(...)` — one full refresh cycle: discover → admit new eligible
+    symbols not already in `symbol_state` → retire flat-and-dropped dynamically-admitted symbols.
+    Only ever retires a symbol IT previously admitted (tracked in a separate `dynamic_admitted`
+    set) — the original fixed roster is never touched here no matter what the screener says.
+  - `_execute_approved_signal(...)` — a **verbatim extraction** of what was previously the inline
+    "9. Execute" block: fee-aware fill recording, PnL, native-stop sync, ATR-SL computation,
+    trailing-stop seeding, `capital_pool.allocate()`/`release()`, trade log, Telegram fill/reject
+    alert, and the stuck-loop watchdog. Both the fixed-roster immediate call site and the new
+    ranked-dynamic-BUY call site invoke this SAME function — one code path, not two copies that
+    could silently drift apart.
+  - `_execute_ranked_dynamic_buys(...)` — ranks every BUY signal gathered this tick and executes
+    in that order, re-checking `capital_pool.can_open_position()` and `risk.evaluate()` FRESH
+    per candidate (not a stale gather-time snapshot) — see "Capital allocation" below for why
+    this is sufficient without a separate reservation mechanism.
+  - `_resync_native_stop()` — hoisted from a `run()`-local closure to module level (pure
+    relocation, zero behavior change) purely so it too is independently testable.
+- Config: `DynamicUniverseConfig` in `config.py` (`cfg.dynamic`), entirely separate dataclass
+  and env namespace (`DYNAMIC_*`) from the live `UniverseConfig`/`PortfolioConfig` — no shared
+  keys, no way for a `.env` edit here to affect fixed-mode behavior. `cfg.dynamic.enabled` IS
+  the fixed-vs-dynamic switch.
+- Dashboard: `unified_dashboard.py`'s `_dynamic_universe_card()` (unchanged) reads
+  `logs/dynamic_universe_dashboard.json`, now written by `bot/main.py` itself
+  (`_write_dynamic_universe_dashboard()`) every refresh cycle — same JSON shape as before, so
+  the card works against the live integration's output with no changes needed. Shows
+  discovered/eligible counts, eligible symbols, rejection reasons, admitted symbols, open
+  positions, per-cycle blocked-gate reasons, and pool cash — labeled "PAPER — not live" (the
+  label is accurate today since `DYNAMIC_UNIVERSE_ENABLED=false`; it stops being paper-only the
+  moment a human flips that on with real `dry_run=False` execution, per "Activation" below).
+
+### Fixed vs. dynamic universe selection — the actual switch
+```
+DYNAMIC_UNIVERSE_ENABLED=false   # default — fixed mode, byte-identical to before this feature existed
+DYNAMIC_UNIVERSE_ENABLED=true    # dynamic mode — bot/main.py additionally discovers/admits/retires
+                                  # symbols at runtime; the ORIGINAL UNIVERSE_WHITELIST/registry
+                                  # roster still seeds the initial symbol set either way
+```
+When `false`: `_dynamic_screener` is never constructed, `_sync_dynamic_universe`/
+`_execute_ranked_dynamic_buys` are never called, and section 9's BUY path takes the exact
+`elif approval:` immediate-execute branch it always has — proven by
+`test_fixed_mode_buy_still_executes_immediately_not_queued` and
+`test_run_source_gates_every_dynamic_addition_behind_cfg_dynamic_enabled`.
+
+### Discovery, ranking, sizing, and position limits
+- **Discovery**: CAD-quoted pairs only today (`DYNAMIC_QUOTE_CURRENCIES=CAD`) — matches current
+  funding; the config is a list specifically so a future USD leg gets its OWN capital pool,
+  never silently drawing CAD cash for a USD order.
+- **Filters**: active+spot, not a stablecoin/leveraged-token base, 24h quote volume floor,
+  spread ceiling, order-book depth floor, minimum OHLCV history, exchange minimum order size
+  checked against the SLOT cash (a cheap pre-filter) — the AUTHORITATIVE check against the
+  ACTUAL proposed order size happens where it always has, inside `LiveExecutor.execute()`'s own
+  min-size guard (unchanged, already covered by its 70 existing tests) — reused, not duplicated.
+- **Ranking**: ADX then 24h volume, computed at decision time only, no future data.
+- **Sizing**: unchanged — `calc_trade_qty()` / `calc_trade_qty_atr_risk()`, exactly as the fixed
+  roster uses, off of `capital_pool.slot_cash_for(sym)` — a slot's cash is always
+  `total_capital / max_concurrent_positions` (or a per-symbol cap), independent of how many
+  symbols are merely being SCANNED. Scanning more coins never divides any position's sizing
+  basis further.
+- **Position limits**: **one shared limit for everything** — `MAX_CONCURRENT_POSITIONS`
+  (`cfg.portfolio.max_concurrent_positions`, the SAME existing live config, currently 2 for
+  BTC/CAD+SOL/CAD) via the SAME `CapitalPool.can_open_position()` — the fixed roster and every
+  dynamically-admitted symbol compete for this ONE pool of slots, per "use a shared capital
+  budget." **`DYNAMIC_MAX_CONCURRENT_POSITIONS` does NOT control this for the live integration**
+  (a real inconsistency caught and fixed 2026-09-13 — it's used only by the retired standalone
+  paper runner's own separate, isolated pool; see config.py's field comment). Practically: with
+  `MAX_CONCURRENT_POSITIONS=2` unchanged, enabling dynamic mode means BTC/CAD, SOL/CAD, and every
+  dynamic candidate all compete for those same 2 slots — a human wanting dynamic symbols to have
+  room WITHOUT displacing the fixed roster's existing capacity must raise
+  `MAX_CONCURRENT_POSITIONS` (and `STARTING_CASH` together, per the existing documented capital
+  rule) BEFORE activating. Scanning is bounded separately by `DYNAMIC_MAX_CANDIDATES` (default
+  40), a cost/rate-limit control on the SCREENER, not a position limit.
+- **Capital allocation / no double allocation**: `capital_pool.allocate()` still fires only on a
+  CONFIRMED fill (unchanged from the fixed-roster design) — this is sufficient to prevent double
+  allocation WITHOUT a separate pre-reservation mechanism because (a) `execute()` is
+  synchronous/blocking (a limit-chase fully resolves before returning) and (b)
+  `_execute_ranked_dynamic_buys` processes ranked candidates strictly sequentially, one at a
+  time, never concurrently — so the next candidate's `can_open_position()` check always sees the
+  true post-fill slot count. Account exposure and the crypto correlation gate (`bot/risk/
+  correlation.py`, already generic over `symbol_state.items()`) needed zero changes — both were
+  already written without any BTC/SOL-specific assumption.
+
+### Confirmed bugs from the retired standalone runner — NOT carried into this integration
+| # | Bug in `dynamic_universe_bot.py`'s `run_cycle()` | Fixed how, in the live integration |
+|---|---|---|
+| 1 | A fill never called `sm.on_fill()` — state stuck IDLE, later SELLs suppressed | `_execute_approved_signal` calls it on every confirmed fill (same line the fixed roster always used) — `test_execute_buy_fill_updates_all_state_and_fees` proves `sm.state == LONG` after a BUY fill |
+| 2 | No stop-loss/take-profit execution path at all | Not applicable — the live integration adds NO separate exit path; it reuses `run()`'s own intra-candle SL/TP block (section 2) unchanged for every symbol in `symbol_state`, dynamic or fixed |
+| 3 | `LiveExecutor(dry_run=True)` modeled zero fees/slippage | `_make_dynamic_executor` builds the SAME `LiveExecutor` the fixed roster uses, with the SAME `dry_run` rule (`paper_mode or cfg.exchange.dry_run`) — no dynamic-specific executor variant exists |
+| 4 | Restart recovery restored positions but not capital-pool allocations | `_admit_dynamic_symbol` calls `capital_pool.allocate(sym)` when the recovered executor already holds a position; the equivalent FIXED-roster gap (latent, never reachable with only 2 always-present symbols) was fixed too, in `run()`'s own restart-recovery block |
+| 5 | `risk.record_fill()` never called | `_execute_approved_signal` calls it on every confirmed fill — `test_execute_buy_fill_updates_all_state_and_fees` asserts `risk.record_fill_calls == ["ETH/CAD"]` |
+
+`dynamic_universe_bot.py` itself is marked deprecated-for-evaluation in its own module
+docstring (not deleted — its recorded logs/state/backtest report are left in place) rather than
+removed, since it's still safe to read/run for inspection (dry_run stays hardcoded) — it just
+proves nothing about performance.
+
+### Tests — 30 new integration tests + updates, suite 1009→1039 (+7 more from the same-day
+second-pass review below, 1039→1047, then +4 from the third-pass review, 1047→1051; 87
+dynamic-universe tests total)
+`tests/crypto/test_dynamic_live_integration.py` (30, new) — all against REAL
+`TradingStateMachine`/`PositionManager`/`CapitalPool` instances (pure, already-tested classes,
+used unmocked) plus hand-built fake executors/risk objects (no ccxt, no network, no Telegram,
+no production file writes):
+- admission success, warmup failure (returns error, never raises), restart-recovery-with-
+  existing-position seeding (pm/sm/capital-pool all correctly seeded)
+- retirement: flat→retired, holding-position→kept, resting-native-stop→kept even if flat
+- `_sync_dynamic_universe`: admits new/skips already-present/retires flat-dropped/never retires
+  the fixed roster/never retires a symbol holding a position even once ineligible/one bad
+  admission doesn't block another's/a raised discovery failure doesn't corrupt existing state
+- `_execute_approved_signal`: BUY fill (state transitions + fees asserted), full-close SELL
+  (capital released, native stop cleared), partial SELL (position retained, stop resynced,
+  slot NOT released), rejected order (alerted, no state mutation), an order-minimum rejection
+  (proves the existing `LiveExecutor` min-size guard's rejection is handled like any other),
+  an executor exception (caught, alerted, returns None), a FILLED-qty-0 guard
+- `_execute_ranked_dynamic_buys`: higher-ADX-ranked candidate wins a single contested slot,
+  the second candidate's risk approval is re-evaluated FRESH (not a stale snapshot) and can be
+  independently rejected, a HALT-equivalent risk rejection blocks EVERY candidate (none execute)
+- completed-candle dedup after dynamic admission (the seeded `last_ts_ms` is honored)
+- fixed-mode: `DynamicUniverseConfig().enabled` defaults `False`; every new `run()` addition is
+  gated behind `cfg.dynamic.enabled`; fixed-mode BUYs take the immediate-execute branch, never
+  the deferred-queue one
+- two supplementary SOURCE guards (explicitly not the sole proof for anything — every claim
+  above has a companion behavioral test) for the two spots irreducibly inline in the ~1800-line
+  `run()` loop: the fixed-roster restart-recovery `capital_pool.allocate()` call, and the
+  dynamic-vs-fixed gating structure itself.
+Plus 1 existing test updated (`test_health_digest.py::test_wired_into_run_loop` — the
+`stuck_detector.record()` call it checked for moved into `_execute_approved_signal`; the test
+now checks both ends of that wiring instead of the old inline text). Full suite: 1039 passed,
+0 failed — includes every prior crypto/stock test, unmodified except that one.
+
+**Not attempted, honestly**: a fully wired, real-network smoke test of `bot/main.py run()` with
+`DYNAMIC_UNIVERSE_ENABLED=true` was deliberately NOT run against the real Kraken account —
+`run()` is the SAME entry point as the actual live/paused bot process, using the same API keys
+and the same `logs/live_state_BTC_CAD.json`/`logs/live_state_SOL_CAD.json`; running a second
+instance concurrently with the real running bot risks a file-write race and duplicate
+authenticated API activity regardless of HALT. Verification instead relied entirely on the
+hermetic tests above plus source guards — exactly what point 7 of the request asked for
+("verify without real orders... mocked exchange responses and controlled signals").
+
+### Evaluation (`dynamic_universe_backtest.py`) — result: does NOT support expanding today
+**Still describes independent single-symbol backtests only — it does NOT evaluate the dynamic
+shared-capital selection/ranking process this integration adds.** No new performance claim is
+made for the live-integration's actual behavior (ranking + shared slots + capital reservation);
+building a true multi-symbol, shared-capital, timestamp-interleaved portfolio replay was not
+attempted this pass (a real gap, stated plainly — see "Remaining limitations" below). The table
+below is unchanged from the first pass and answers a narrower, still-relevant question: is there
+ANY edge in the extra candidate coins at all, independent of how capital would be shared.
+Compares the current BTC/SOL whitelist against BTC+SOL+ETH+XRP (the only other CAD pairs that
+clear Kraken's liquidity/spread/depth bar today — PEPE/DOGE/XDC all fail volume, confirmed by
+the live screener run above) using the SAME unmodified strategy, on both the deterministic
+pinned window and the current rolling window. Report: `logs/dynamic_universe_backtest_<date>.md`.
+
+**Result (2026-09-13, hash `5c6540eccbd2f45f`, net of real fees):**
+| Symbol | Pinned net PF | Pinned return | Rolling net PF | Rolling return |
+|---|---|---|---|---|
+| BTC/USDT | 0.82 | -0.72% | 1.17 | +0.71% |
+| SOL/USDT | 0.94 | -0.33% | 1.05 | +0.25% |
+| ETH/USDT | **0.42** | -2.93% | **0.31** | -3.83% |
+| XRP/USDT | **0.55** | -2.47% | **0.57** | -2.26% |
+
+Both candidate expansion symbols are worse than EITHER currently-live symbol on BOTH windows,
+under the identical unmodified strategy. Blended (naive equal-weight, no shared-slot contention
+modeled): expanding to 4 symbols is worse than staying at 2 on both windows (-1.61% vs -0.52%
+pinned; -1.28% vs +0.48% rolling). **This independently reconfirms, with freshly-generated
+numbers post the 2026-09-12 fee-accounting and kill-switch fixes, the same conclusion already
+on record in memory (`project_crypto_usd_expansion_closed_2026-09-09`) from the prior
+exhaustive CAD/USD screening — on the actual available Kraken CAD universe, there is currently
+nothing to expand into, not because the infrastructure doesn't work, but because the only real
+candidates don't have a demonstrated edge under this strategy.**
+
+**Explicit limitations (see the script's own docstring for full detail):**
+- **Not genuinely fresh data.** All market data here predates 2026-09-12 and has been examined
+  before (BTC/SOL) or is a new RUN on old data (ETH/XRP). This does NOT satisfy the "fresh
+  post-2026-09-12 walk-forward" bar the 2026-09-12 review-deadline decision requires before
+  resuming live BUYs — only the forward paper run above (`dynamic_universe_bot.py`, ~0 days of
+  history as of this writing) can eventually produce that.
+- **Proxy-market data.** ETH/CAD and XRP/CAD are backtested via their Binance USDT pair (same
+  methodology as the existing BTC/SOL backtests) — not independently re-verified per-symbol
+  for price-difference drift the way BTC's ~0.048% was.
+- **No point-in-time historical universe reconstruction.** Exchanges don't expose "which pairs
+  were liquid on date X" historically; this evaluates today's real eligible set across the
+  whole historical window — it cannot suffer from picking today's winners in hindsight (the
+  screen doesn't know the outcome), but also can't prove what a genuinely time-varying universe
+  would have looked like further back.
+- **No shared-slot-contention model.** The "expanded universe" numbers are each symbol's own
+  independent single-symbol backtest, not a true multi-symbol engine sharing one capital pool
+  and competing for capped slots (that engine doesn't exist and wasn't built this pass) — a
+  simplification disclosed, not hidden.
+
+### Config reference (`DYNAMIC_*`, all in `config.py`'s `DynamicUniverseConfig`)
+```
+DYNAMIC_UNIVERSE_ENABLED=false        # THE fixed-vs-dynamic switch for the LIVE bot/main.py integration
+DYNAMIC_QUOTE_CURRENCIES=CAD          # comma-separated; each quote WOULD get its own capital pool if ever
+                                        # added — CAD is the only funded/live one today
+DYNAMIC_EXCLUDE_BASES=EUR,USD,USDC,USDT,DAI,BUSD,TUSD,PYUSD,FDUSD,GUSD,USDP
+DYNAMIC_MIN_QUOTE_VOLUME=50000        # matches the existing $50k/day liquidity gate
+DYNAMIC_MAX_SPREAD_PCT=0.0015         # matches the existing 0.15% spread gate
+DYNAMIC_MIN_DEPTH_QUOTE=500           # min resting notional within DYNAMIC_DEPTH_BAND_PCT of mid, each side
+DYNAMIC_DEPTH_BAND_PCT=0.01
+DYNAMIC_MIN_HISTORY_CANDLES=200
+DYNAMIC_MAX_CANDIDATES=40             # scan cap only (cost/rate-limit control) — used by the live integration
+DYNAMIC_MAX_CONCURRENT_POSITIONS=3    # ⚠️ NOT used by the live integration — see "Position limits" above.
+                                        # Real position limit is the EXISTING MAX_CONCURRENT_POSITIONS,
+                                        # shared with the fixed roster. This field only matters to the
+                                        # retired standalone dynamic_universe_bot.py paper runner.
+DYNAMIC_STARTING_CASH_CAD=1000        # ⚠️ NOT used by the live integration either — same reason. The live
+                                        # integration's capital comes from the real shared capital_pool
+                                        # (cfg.portfolio.starting_cash / the real Kraken balance), not this.
+DYNAMIC_REFRESH_HOURS=4
+DYNAMIC_CACHE_MAX_AGE_HOURS=48
+```
+
+### Remaining limitations (stated plainly)
+- **No shared-capital portfolio replay exists yet.** Point 8 of the live-integration request is
+  explicit that the independent BTC/SOL/ETH/XRP backtests above do NOT evaluate the actual
+  dynamic ranking + shared-slot-contention process this integration adds — building a true
+  multi-symbol, timestamp-interleaved, shared-capital backtest engine was not attempted this
+  pass. **No profitability claim is made for the live integration's actual behavior** — only for
+  the narrower, already-answered question of whether the extra candidate coins have any edge at
+  all in isolation (they don't, on the evidence above).
+- **Zero live-adjacent track record.** Even with a positive backtest, this system has never run
+  against live data at all (the standalone runner's own output is explicitly disqualified — see
+  "Confirmed bugs" above). A real evaluation needs elapsed time accumulating genuine forward
+  trades, the same way the BTC/CAD+SOL/CAD walk-forward gates required real fills, not just a
+  backtest, before being trusted.
+- **No real-network smoke test of `run()` itself with dynamic mode on** — see "Not attempted,
+  honestly" under Tests above; verification is hermetic tests + source guards only.
+- Discovery/proxy-data/point-in-time-universe limitations from the first pass (see the
+  Evaluation section below) are unchanged and still apply to the backtest table.
+
+### Whether the evidence supports going live with this
+**No, not yet, on two independent grounds, unchanged in substance from the first pass:**
+(1) the only real expansion candidates (ETH, XRP) have a worse net-of-fee edge than the
+currently-live pair on every window checked (an isolated-symbol result, not yet a portfolio
+one — see limitation above), and (2) this system — now correctly wired into the live
+engine — has zero live-adjacent track record of its own; the forward-running BTC/CAD+SOL/CAD
+positions inside it are the same real fixed-mode positions as always, but no dynamic symbol has
+ever actually traded. The infrastructure itself (screening, lifecycle, ranking, capital
+allocation, extraction-for-testability of the fill-processing path) is real, tested, and reused
+from — not duplicated alongside — the bot's existing execution engine. "We can now let the live
+bot discover more coins safely" and "there is more money to be made" remain two separate
+questions; only the first is currently answered yes.
+
+### Second-pass review, same day (2026-09-13) — 2 Critical + 4 High confirmed, all fixed
+An external review of the just-completed live integration (before any activation, HALT still
+engaged throughout) found six real bugs — verified each against the actual code before fixing,
+same discipline as every other review pass in this file. Worth stating plainly: a same-day
+second look found genuine correctness gaps in code that had just been built and self-tested,
+matching this repo's own well-established pattern (see the native-stop feature's four review
+rounds earlier in this file) — reviewing your own work once is not sufficient for live-money code.
+
+| # | Sev | Bug | Fix |
+|---|---|---|---|
+| 1 | Critical | `_account_value()` summed `.cash` across EVERY executor, including flat, merely-funded-for-sizing dynamic candidates — admitting ETH with zero trades/deposits measurably inflated account value ($453→$530, reproduced). Would have corrupted every drawdown/kill-switch/position-size check. | Rewritten as `_compute_account_value()`: pool's unallocated cash counted ONCE + only symbols with a real allocated slot contribute their own cash+position. Extracted to module level, 2 new tests reproduce the exact scenario. |
+| 2 | Critical | `_make_dynamic_executor()` derived `dry_run` from `paper_mode`/`DRY_RUN` without checking `LIVE_TRADING` — confirmed the factory could receive `dry_run=False` with `LIVE_TRADING=False`, building a real, live-capable `LiveExecutor` in a config where the rest of the bot deliberately uses a non-live-capable `PaperExecutor` instead. | New `_dynamic_mode_active = cfg.dynamic.enabled and cfg.exchange.live_trading` — the actual gate everywhere dynamic mode is checked, replacing the bare `cfg.dynamic.enabled`. A misconfiguration now logs a clear warning and stays inert instead of silently building a live-capable executor. |
+| 3 | High | Restart/rollback could leave a held position unmanaged: dynamic membership starts empty, only currently-eligible coins get re-admitted, and the existing orphan check only alerted — never recovered. Disabling dynamic mode has the identical problem. | `_check_orphaned_positions`'s return value is now acted on: every orphaned symbol is unconditionally (independent of `cfg.dynamic.enabled`) re-admitted via `_admit_dynamic_symbol`, restoring full SL/TP/drift management regardless of current screener eligibility. Gated on `live_trading=True` (PaperExecutor mode never produces these state files and never had a recovery mechanism). |
+| 4 | High | Two simultaneously-ranked BUY candidates correlated with EACH OTHER both passed section 2f's gather-time correlation check (neither held a position yet) and could both fill. Reproduced: two ranked fills, zero correlation calls during execution. | `_execute_ranked_dynamic_buys` now rechecks correlation against CURRENT open positions (including any filled earlier in the same batch) immediately before each candidate executes — 2 new tests (blocks the correlated pair, allows an uncorrelated pair). |
+| 5 | High | The "synchronous execution always resolves" assumption was wrong: `LiveExecutor.execute()` can return `None` for a BUY when the fill quantity is genuinely AMBIGUOUS (a limit order with `filled=0`, not confirmed closed/cancelled either — its own "qty=0 GUARD" path), not only on a clean rejection. The ranked loop treated `None` as "nothing happened, slot free," letting a different candidate claim the same capital while the ambiguous order might still be resting live. | An ambiguous (`None`) BUY outcome now conservatively calls `capital_pool.allocate()` itself, holding the slot until a future reconciliation resolves it — bounded by the existing flat-check in `_retire_dynamic_symbol_if_eligible` once it's confirmed flat. Full automatic reconciliation of the ambiguous order's real outcome still relies on `LiveExecutor`'s existing untracked-order adoption on this symbol's next submission (same mechanism the fixed roster already depends on) — not deepened, not fully closed, documented like the analogous accepted stock-bot gap. |
+| 6 | High | `DYNAMIC_QUOTE_CURRENCIES` accepted `USD` (or anything) with no enforcement — the live integration has exactly ONE capital pool, implicitly CAD, with no separate USD accounting built. | Any configured quote currency other than `CAD` now disables dynamic mode outright (loud error, not a silent scan) until real multi-currency accounting exists. |
+
+**Dashboard fixes, same pass:** the card no longer hardcodes "PAPER — not live" (now reads a
+real `dry_run` field, showing a red "LIVE — REAL ORDERS" badge when it isn't dry-run) and the
+JSON snapshot is now written AFTER admission/ranked-execution instead of before (the
+`blocked_this_cycle` map was previously always empty).
+
++7 new regression tests (suite 1040→1047), each reproducing its bug's exact scenario against
+the pre-fix code before confirming the fix. Full suite: 1047 passed. `logs/HALT` and both live
+state files re-verified byte-identical throughout this second pass too.
+
+### Third pass, same day (2026-09-13) — the two remaining acknowledged gaps, closed
+The two "other findings, not fixed this pass" items from the second-pass review, addressed on
+request rather than left open indefinitely:
+
+- **Screening no longer delays position management.** `_sync_dynamic_universe()` (discovery —
+  potentially `load_markets` + `fetch_tickers` + per-candidate order-book/OHLCV calls, up to
+  `DYNAMIC_MAX_CANDIDATES` of them) was called in step "0b", BEFORE the per-symbol SL/TP loop —
+  a slow discovery cycle delayed checking every existing position's stop-loss by however long
+  that took. Moved to a new step "0c.", running AFTER both the per-symbol loop and the ranked-
+  BUY execution pass, so existing-position risk management always runs first, unconditionally,
+  every tick, regardless of how long discovery takes. Cost: a symbol admitted at the end of a
+  refresh tick isn't evaluated for a BUY until the NEXT tick (one `loop_interval`) instead of
+  the same one — accepted as a trivial trade for never delaying real position risk. Proven by a
+  source-guard confirming the sync call's position in `run()`'s source is strictly after both
+  the per-symbol loop and the ranked-execution block.
+- **Prices are refreshed immediately before a ranked candidate executes.** Each candidate's
+  `price` was captured at GATHER time (during the per-symbol loop) but the ranked pass runs
+  AFTER every other symbol has already been processed (each its own network round trip) — a
+  candidate ranked last could execute against a meaningfully stale price. `_execute_ranked_
+  dynamic_buys` gained `refresh_price_fn` (defaults to a live ticker fetch via
+  `fetch_with_retry`, wired in `run()`): immediately before each candidate's risk-check/execute,
+  the current price is re-fetched; if it's moved more than `max_price_deviation_pct` (defaults
+  to `MAX_SLIPPAGE_PCT`, 1%) since gather time, the candidate is skipped this tick (reason
+  `stale_price`, slot never touched — free for the next tick) rather than executed on stale
+  sizing math or a limit order routed far from the current market. Within tolerance, the
+  refreshed price (not the gather-time one) is what actually gets risk-evaluated and executed
+  against. **Deliberately narrower than a full fix**: `trade_qty` itself is NOT re-derived from
+  the new price (that would mean re-running the entire ATR/notional sizing pipeline, currently
+  inline in `run()`'s section 5, not extracted) — a small in-tolerance move doesn't materially
+  change the position's risk profile the way an out-of-tolerance one would, so bounding
+  staleness was judged sufficient without that larger refactor. A refresh failure (network
+  error) falls back to the gather-time price rather than crashing the batch or blocking the
+  candidate.
+
++4 tests (suite 1047→1051: uses-refreshed-price-within-tolerance, skips-on-stale-price,
+refresh-failure-falls-back-gracefully, and the reordering source guard). `logs/HALT` and both
+live state files re-verified byte-identical; the real running bot process was not touched
+(same verification discipline as every prior pass).
+
+### Activation & rollback (for later review — not done as part of this build)
+**Activation steps** (a human decision, deliberately not taken here):
+1. Decide the real position-limit tradeoff: raise `MAX_CONCURRENT_POSITIONS` (and `STARTING_CASH`
+   together, per the existing capital-sizing rule) if dynamic symbols should get room WITHOUT
+   displacing BTC/CAD+SOL/CAD's current 2 slots; leave it at 2 if dynamic symbols should simply
+   compete for the existing pool.
+2. Review/tune the `DYNAMIC_*` filter thresholds (volume/spread/depth/history) for the account's
+   actual real size — the defaults mirror the existing $50k/0.15% liquidity gate but haven't been
+   walk-forward-validated as a promotion bar the way BTC/SOL's whitelist was.
+3. Set `DYNAMIC_UNIVERSE_ENABLED=true` in the LIVE `.env` (not the backtest/validation one).
+4. Restart the crypto bot — `cfg.dynamic` is read once at startup like every other config value.
+5. `logs/HALT` should be LIFTED only as its own separate, explicit decision — dynamic mode being
+   enabled and HALT being engaged are fully independent; leaving HALT engaged after step 4 is a
+   safe way to first confirm (via logs / the dashboard card) that discovery/admission is behaving
+   as expected with zero risk of a real order, before ever lifting it.
+6. Before actually trading real dynamic capital: get at least one credible answer to the
+   shared-capital-portfolio-replay gap above, or accept running it forward-only (no real capital)
+   for a defined period first — the same "set a review deadline now" discipline already applied
+   to the BTC/SOL question in the 2026-09-12 review-deadline decision.
+
+**Rollback steps** (fast, low-risk, always available):
+1. `DYNAMIC_UNIVERSE_ENABLED=false` in `.env`, restart the crypto bot — fixed mode resumes
+   exactly as before this feature existed; no migration, no state cleanup needed (a
+   dynamically-admitted symbol's own `logs/live_state_<SYM>.json` file is simply no longer read
+   by anything once dynamic mode is off, and is harmless left in place).
+2. If a dynamic symbol is HOLDING a position at the moment of rollback: it keeps trading —
+   turning `DYNAMIC_UNIVERSE_ENABLED` off does not itself close any position; a human must
+   manage that position manually (or re-enable dynamic mode briefly to let the bot's own SL/TP
+   continue managing it) exactly as they would for any other held position.
+3. `logs/HALT` remains the immediate, independent full-stop for anything going wrong regardless
+   of fixed/dynamic mode — untouched by any of the above.
 
 ---
 

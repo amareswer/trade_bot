@@ -491,6 +491,73 @@ class PaperConfig:
     paper_starting_cash: float = 1000.0
 
 
+@dataclass
+class DynamicUniverseConfig:
+    """
+    Config for the dynamic, broadly-screened crypto universe (added
+    2026-09-13) — a PAPER-ONLY system, entirely separate from the live
+    BTC/CAD + SOL/CAD whitelist (cfg.universe / UNIVERSE_WHITELIST). Nothing
+    here can affect live trading: dynamic_universe_bot.py hardcodes
+    dry_run=True and never reads or writes the live .env / live state files.
+
+    quote_currencies is a list (not a single value) on purpose — see
+    bot/dynamic/README or CLAUDE.md "Dynamic universe" section: each quote
+    currency gets its OWN capital pool, funded independently, so adding
+    "USD" later can never silently spend CAD cash on a USD order.
+    """
+    enabled:              bool  = False   # DYNAMIC_UNIVERSE_ENABLED
+    quote_currencies:     str   = "CAD"   # DYNAMIC_QUOTE_CURRENCIES — comma-separated
+    exclude_bases:        str   = "EUR,USD,USDC,USDT,DAI,BUSD,TUSD,PYUSD,FDUSD,GUSD,USDP"  # DYNAMIC_EXCLUDE_BASES — stablecoins
+    min_quote_volume:     float = 50_000.0  # DYNAMIC_MIN_QUOTE_VOLUME — 24h volume floor (matches the existing $50k/day liquidity gate)
+    max_spread_pct:       float = 0.0015    # DYNAMIC_MAX_SPREAD_PCT — 0.15%, matches the existing screen_universe.py liquidity gate
+    min_depth_quote:      float = 500.0     # DYNAMIC_MIN_DEPTH_QUOTE — min notional resting within DYNAMIC_DEPTH_BAND_PCT of mid, each side
+    depth_band_pct:       float = 0.01      # DYNAMIC_DEPTH_BAND_PCT — 1% band around mid price for the depth check
+    min_history_candles:  int   = 200       # DYNAMIC_MIN_HISTORY_CANDLES — must have at least this many candles at the live timeframe
+    max_candidates:       int   = 40        # DYNAMIC_MAX_CANDIDATES — cap on how many symbols get scanned per cycle (cost/rate-limit control)
+    max_concurrent_positions: int = 3       # DYNAMIC_MAX_CONCURRENT_POSITIONS — used ONLY by the standalone
+                                             # dynamic_universe_bot.py paper runner's own isolated CapitalPool.
+                                             # The LIVE bot/main.py integration does NOT use this field — it
+                                             # shares ONE CapitalPool/position-limit (cfg.portfolio.
+                                             # max_concurrent_positions, i.e. MAX_CONCURRENT_POSITIONS) across
+                                             # the fixed roster AND every dynamically-admitted symbol together,
+                                             # per the "one shared capital budget" design. Raise
+                                             # MAX_CONCURRENT_POSITIONS (+ STARTING_CASH together) to give
+                                             # dynamic symbols room beyond the fixed roster's current slots.
+    starting_cash_cad:    float = 1000.0    # DYNAMIC_STARTING_CASH_CAD — isolated paper bankroll, unrelated to live STARTING_CASH
+    refresh_hours:        float = 4.0       # DYNAMIC_REFRESH_HOURS — how often the candidate universe is re-screened
+    cache_max_age_hours:  float = 48.0      # DYNAMIC_CACHE_MAX_AGE_HOURS — a cached universe older than this is treated as unusable (block new entries, not "trust it forever")
+
+    def __post_init__(self):
+        if self.min_quote_volume < 0:
+            raise ValueError("DYNAMIC_MIN_QUOTE_VOLUME must be >= 0")
+        if not (0 <= self.max_spread_pct < 1):
+            raise ValueError("DYNAMIC_MAX_SPREAD_PCT must be in [0, 1)")
+        if self.min_depth_quote < 0:
+            raise ValueError("DYNAMIC_MIN_DEPTH_QUOTE must be >= 0")
+        if not (0 < self.depth_band_pct < 1):
+            raise ValueError("DYNAMIC_DEPTH_BAND_PCT must be in (0, 1)")
+        if self.min_history_candles < 1:
+            raise ValueError("DYNAMIC_MIN_HISTORY_CANDLES must be >= 1")
+        if self.max_candidates < 1:
+            raise ValueError("DYNAMIC_MAX_CANDIDATES must be >= 1")
+        if self.max_concurrent_positions < 1:
+            raise ValueError("DYNAMIC_MAX_CONCURRENT_POSITIONS must be >= 1")
+        if self.starting_cash_cad <= 0:
+            raise ValueError("DYNAMIC_STARTING_CASH_CAD must be > 0")
+        if self.refresh_hours <= 0:
+            raise ValueError("DYNAMIC_REFRESH_HOURS must be > 0")
+        if self.cache_max_age_hours <= 0:
+            raise ValueError("DYNAMIC_CACHE_MAX_AGE_HOURS must be > 0")
+
+    @property
+    def quote_list(self) -> list[str]:
+        return [q.strip().upper() for q in self.quote_currencies.split(",") if q.strip()]
+
+    @property
+    def exclude_set(self) -> set[str]:
+        return {b.strip().upper() for b in self.exclude_bases.split(",") if b.strip()}
+
+
 # ---------------------------------------------------------------------------
 # Root config
 # ---------------------------------------------------------------------------
@@ -507,6 +574,7 @@ class AppConfig:
     alerts:    AlertConfig
     universe:  UniverseConfig
     paper:     PaperConfig = field(default_factory=PaperConfig)
+    dynamic:   DynamicUniverseConfig = field(default_factory=DynamicUniverseConfig)
 
     def calc_trade_qty(self, cash: float, price: float) -> float:
         """
@@ -788,6 +856,22 @@ def _load() -> AppConfig:
         paper=PaperConfig(
             paper_mode          = _bool ("PAPER_MODE",          False),
             paper_starting_cash = _float("PAPER_STARTING_CASH", 1000.0),
+        ),
+        dynamic=DynamicUniverseConfig(
+            enabled                   = _bool ("DYNAMIC_UNIVERSE_ENABLED",       False),
+            quote_currencies          = _str  ("DYNAMIC_QUOTE_CURRENCIES",       "CAD"),
+            exclude_bases             = _str  ("DYNAMIC_EXCLUDE_BASES",
+                                                "EUR,USD,USDC,USDT,DAI,BUSD,TUSD,PYUSD,FDUSD,GUSD,USDP"),
+            min_quote_volume          = _float("DYNAMIC_MIN_QUOTE_VOLUME",       50_000.0),
+            max_spread_pct            = _float("DYNAMIC_MAX_SPREAD_PCT",         0.0015),
+            min_depth_quote           = _float("DYNAMIC_MIN_DEPTH_QUOTE",        500.0),
+            depth_band_pct            = _float("DYNAMIC_DEPTH_BAND_PCT",         0.01),
+            min_history_candles       = _int  ("DYNAMIC_MIN_HISTORY_CANDLES",    200),
+            max_candidates            = _int  ("DYNAMIC_MAX_CANDIDATES",         40),
+            max_concurrent_positions  = _int  ("DYNAMIC_MAX_CONCURRENT_POSITIONS", 3),
+            starting_cash_cad         = _float("DYNAMIC_STARTING_CASH_CAD",      1000.0),
+            refresh_hours             = _float("DYNAMIC_REFRESH_HOURS",          4.0),
+            cache_max_age_hours       = _float("DYNAMIC_CACHE_MAX_AGE_HOURS",    48.0),
         ),
     )
 

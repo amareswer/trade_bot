@@ -81,6 +81,8 @@ from bot.alerts.telegram import TelegramAlerter
 from bot.alerts.stuck_loop import StuckLoopDetector
 from bot.data.trade_log import TradeLog
 from bot.data.crypto_universe import CryptoUniverse
+from bot.dynamic.eligibility import DynamicUniverseScreener
+from bot.dynamic.ranking import RankableSignal, rank_buy_signals
 
 # ── Dashboard path ────────────────────────────────────────────────────────────
 _DASHBOARD_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dashboard.html")
@@ -877,6 +879,760 @@ def _seed_native_stop_state(executor) -> tuple[float | None, bool]:
     return executor.native_stop_price, executor.native_stop_is_trailing
 
 
+def _resync_native_stop(ss: dict) -> None:
+    """
+    Re-place the native backstop sized to the position AFTER a quantity-
+    changing event that doesn't close it (partial TP, a partial fill on
+    an urgent SL/TP exit) — preserving whichever kind (static or native
+    trailing) is currently resting. Quantity is the one thing a resting
+    Kraken order can't be amended in place for via create_order, so this
+    always cancels and re-places; a trailing order loses its
+    exchange-tracked peak on the re-place (a fresh trail starts from the
+    price at re-placement) — accepted, same precision loss the static
+    order already takes on every resize. Full-close paths call
+    sync_protective_stop(None) directly instead of this helper.
+
+    Hoisted from a run()-local closure to module level (2026-09-13, for
+    dynamic-universe integration) — it only ever touched `ss` and the
+    module-level `cfg`, no other run()-local state, so this is a pure
+    relocation with identical behavior (same pattern as
+    _seed_native_stop_state / _evaluate_drift above): every existing call
+    site (bare `_resync_native_stop(ss)`, unchanged) now resolves to this
+    module-level definition instead of the nested one, and it's directly
+    unit-testable without invoking run().
+    """
+    if not ss['pm'].has_position:
+        ss['executor'].sync_protective_stop(None)
+        ss['native_stop_is_trailing'] = False
+        return
+    if ss['native_stop_is_trailing']:
+        ss['executor'].sync_protective_stop(
+            None,
+            trailing_pct=cfg.backtest.exit_params_for(
+                ss['executor'].symbol)["trail_stop_pct"],
+        )
+    else:
+        ss['executor'].sync_protective_stop(ss.get('native_stop_price'))
+
+
+def _compute_account_value(capital_pool: CapitalPool, executors: dict, symbol_state: dict) -> float:
+    """
+    Aggregate account value: the pool's own unallocated cash (counted
+    ONCE) plus, for every symbol that actually holds an allocated slot,
+    that symbol's real cash + marked position value.
+
+    FIXED 2026-09-13 (real bug, confirmed by external review): the
+    previous version summed executor.cash across EVERY executor in
+    `executors`, unconditionally. In fixed mode this happened to be
+    correct only because slot_cash_for() partitions the whole pool across
+    EXACTLY as many executors as there are permanent slots, with no
+    overlap. Once dynamic admission can fund MANY MORE executors than
+    there are slots (every admitted-but-flat candidate gets told "you
+    could have up to $X" via slot_cash_for(), purely as a sizing basis —
+    see _admit_dynamic_symbol), summing all of their .cash double- (triple-,
+    N-) counted the same underlying pool total: admitting one extra symbol
+    with zero trades or deposits measurably inflated account value, which
+    would have corrupted every drawdown/kill-switch/position-size check
+    reading this number. Reproduced and fixed same-review: admitting ETH
+    turned $453 into $530 with no trade. capital_pool.available_cash is the
+    single source of truth for unallocated shared cash; only symbols with a
+    REAL allocated slot (capital_pool.allocated_symbols) contribute their
+    own cash+position on top of it. With the fixed 2-symbol roster and none
+    of them holding a position (today's actual live state), this returns
+    capital_pool.available_cash alone — the same number the old formula
+    coincidentally also produced in that specific case, which is why the
+    bug was invisible until a dynamic admission exercised the code path
+    where the two formulas diverge.
+
+    Extracted to module level (was a run()-local closure) purely for
+    direct unit testability — same pattern as every other function in
+    this section.
+    """
+    total = capital_pool.available_cash
+    for _s in capital_pool.allocated_symbols:
+        _e = executors.get(_s)
+        if _e is None:
+            continue
+        _px = symbol_state[_s]['last_price'] if _s in symbol_state else 0.0
+        if not _px:
+            _px = getattr(_e, "avg_entry", 0.0) or 0.0
+        total += _e.cash + _e.position * _px
+    return total
+
+
+def _execute_approved_signal(
+    sym: str,
+    ss: dict,
+    final_signal: Signal,
+    price: float,
+    trade_qty: float,
+    raw_signal: Signal,
+    filter_reason: str,
+    *,
+    capital_pool: CapitalPool,
+    risk: RiskManager,
+    alerter,
+    trade_log,
+    stuck_detector,
+    is_indicator: bool,
+):
+    """
+    Execute an approved (risk-gate-passed, non-HOLD) signal and apply every
+    downstream effect exactly as bot.main.run()'s tick loop always has:
+    fee-aware fill recording, PnL, native-stop sync, ATR-SL computation,
+    trailing-stop seeding, capital-pool allocate/release, trade log,
+    Telegram fill/reject alert, and the stuck-loop watchdog.
+
+    Extracted verbatim from the inline "9. Execute" block (2026-09-13, for
+    dynamic-universe integration) — same "extract for testability" pattern
+    as _seed_native_stop_state / _resync_native_stop / _evaluate_drift
+    above. This is what lets a dynamically-ranked BUY (executed later,
+    after a cross-symbol ranking pass) and a fixed-roster immediate
+    BUY/SELL share IDENTICAL fill-processing, instead of two copies of this
+    logic silently drifting apart over time — every parameter here beyond
+    the signal itself (capital_pool, risk, alerter, trade_log,
+    stuck_detector, is_indicator) is exactly what the original inline block
+    closed over; cfg/_atr_fn/display/OrderStatus/OrderSide/Signal/logger
+    are module-level already and don't need to be passed.
+
+    Caller is responsible for checking approval (risk.evaluate() or
+    equivalent) BEFORE calling this — it unconditionally executes.
+    Returns the Order (whatever its final status), or None if execute()
+    itself raised.
+    """
+    try:
+        order = ss['executor'].execute(final_signal, price, quantity=trade_qty)
+    except Exception as _exec_exc:
+        logger.error(
+            "EXECUTOR EXCEPTION [%s] %s: %s", sym, final_signal.value, _exec_exc,
+            exc_info=True,
+        )
+        alerter.error(
+            f"EXECUTOR EXCEPTION [{sym}] {final_signal.value}: {_exec_exc} — "
+            f"order not confirmed placed or filled, check the exchange manually"
+        )
+        order = None
+    if order:
+        if order.status == OrderStatus.FILLED and order.quantity <= 0:
+            logger.error(
+                "FILLED order returned with qty=0 for %s %s — skipping fill record."
+                " Check Kraken manually.",
+                order.side.value, sym,
+            )
+            order = None
+        if order and order.status == OrderStatus.FILLED:
+            risk.record_fill(sym)
+            ss['sm'].on_fill(final_signal, order.price)
+
+            pnl = None
+            if order.side == OrderSide.BUY:
+                ss['pm'].on_buy(order.price, order.quantity)
+                capital_pool.allocate(sym)
+                # Seed the trail peak only when there is no activation
+                # threshold — otherwise the intra-candle block arms it
+                # once price reaches entry × (1 + activation_pct).
+                # Seeding unconditionally here bypassed that gate.
+                ss['trail_peak'] = (
+                    order.price
+                    if cfg.backtest.exit_params_for(sym)["trail_stop_activation_pct"] <= 0
+                    else 0.0
+                )
+                ss['partial_done'] = False
+                ss['atr_sl'] = 0.0
+                if is_indicator:
+                    _atr_val = _atr_fn(
+                        list(ss['strategy']._highs),
+                        list(ss['strategy']._lows),
+                        list(ss['strategy']._closes),
+                        cfg.strategy.atr_period,
+                    )
+                    if _atr_val is None or _atr_val <= 0 or cfg.strategy.atr_sl_mult <= 0:
+                        ss['atr_sl'] = 0.0
+                        logger.info("ATR SL disabled or unavailable — using fixed SL")
+                    else:
+                        ss['atr_sl'] = order.price - _atr_val * cfg.strategy.atr_sl_mult
+                        logger.info(
+                            "ATR SL [%s]: entry=%.2f atr=%.2f sl=%.2f mult=%.1f",
+                            sym, order.price, _atr_val, ss['atr_sl'], cfg.strategy.atr_sl_mult,
+                        )
+                # Native stop-loss backstop (static — see
+                # sync_protective_stop docstring): mirrors whatever
+                # level the software SL just armed for this fill.
+                # Always static at entry — a native trailing-stop
+                # is only swapped in later, once trail_peak arms
+                # (intra-candle block above), matching the
+                # software trailing logic's own activation delay.
+                ss['native_stop_price'] = (
+                    ss['atr_sl'] if ss['atr_sl'] > 0
+                    else (
+                        order.price * (1 - cfg.backtest.stop_loss_pct)
+                        if cfg.backtest.stop_loss_pct > 0 else None
+                    )
+                )
+                ss['native_stop_is_trailing'] = False
+                ss['executor'].sync_protective_stop(ss['native_stop_price'])
+            else:
+                pnl = ss['pm'].on_sell(order.price, order.quantity)
+                ss['trail_peak'] = 0.0
+                ss['partial_done'] = False
+                ss['atr_sl'] = 0.0
+                if not ss['pm'].has_position:
+                    capital_pool.release(sym, ss['executor'].cash)
+                    ss['executor'].sync_protective_stop(None)
+                    ss['native_stop_is_trailing'] = False
+                else:
+                    # Partial fill leaving a residual position (not
+                    # currently reachable with strategy SELLs, which
+                    # always close in full — defensive parity with
+                    # the partial-TP path below).
+                    _resync_native_stop(ss)
+
+            display.fill(
+                order.side.value, order.quantity,
+                sym, order.price, order.total_value, pnl,
+            )
+            trade_log.log_fill(
+                side          = order.side.value,
+                symbol        = sym,
+                quantity      = order.quantity,
+                price         = order.price,
+                pnl           = pnl,
+                exchange      = cfg.exchange.exchange,
+                signal_reason = filter_reason or raw_signal.value,
+                fee_cost      = order.fee_cost,
+                fee_currency  = order.fee_currency,
+            )
+            alerter.fill(
+                side        = order.side.value,
+                symbol      = sym,
+                quantity    = order.quantity,
+                price       = order.price,
+                total_value = order.total_value,
+                pnl         = pnl,
+                exchange    = cfg.exchange.exchange,
+                reason      = f"strategy {order.side.value.lower()} signal"
+                              + (f" — {filter_reason}" if filter_reason else ""),
+            )
+        else:
+            # order can be None here (see the qty<=0-after-FILLED guard
+            # above) — guard against .reject_reason on None instead of
+            # crashing the loop.
+            _reject_reason = (
+                order.reject_reason if order
+                else "internal: FILLED order returned qty<=0 — see log for detail"
+            )
+            _reject_side = order.side.value if order else final_signal.value
+            display.reject(_reject_reason or "")
+            alerter.error(
+                f"ORDER REJECTED [{sym}] {_reject_side}: "
+                f"{_reject_reason or 'unknown reason'}"
+            )
+
+    # Generic stuck-loop watchdog: a strategy BUY/SELL that keeps
+    # failing every tick (not just SL/TP — that has its own counter).
+    _exec_filled = bool(
+        order and order.status == OrderStatus.FILLED and order.quantity > 0
+    )
+    stuck_detector.record(
+        f"execute:{sym}:{final_signal.value}",
+        ok=_exec_filled,
+        detail="" if _exec_filled else (
+            getattr(order, "reject_reason", None) or "no order returned"
+        ),
+    )
+    return order
+
+
+def _execute_ranked_dynamic_buys(
+    buy_queue: list,
+    *,
+    capital_pool: CapitalPool,
+    risk: RiskManager,
+    account_value_fn,
+    alerter,
+    trade_log,
+    stuck_detector,
+    is_indicator: bool,
+    max_concurrent: int,
+    symbol_state: "dict | None" = None,
+    live_exchange=None,
+    correlation_fn=None,
+    correlation_threshold: "float | None" = None,
+    refresh_price_fn=None,
+    max_price_deviation_pct: "float | None" = None,
+) -> "tuple[list, dict]":
+    """
+    Rank every BUY signal gathered this tick (bot.dynamic.ranking — ADX
+    then 24h volume, both already known at decision time, no future data)
+    and execute in that order, checking capital_pool.can_open_position(),
+    the correlation gate, and risk.evaluate() FRESH for each candidate —
+    never reusing an earlier snapshot — so an earlier-ranked fill in this
+    same batch (which changes account_value(), the slot count, AND which
+    symbols now hold a position) is correctly reflected before the next
+    candidate is decided.
+
+    Correlation recheck (FIXED 2026-09-13, real gap confirmed by external
+    review): section 2f's own correlation gate runs once per symbol at
+    GATHER time, checking peers that ALREADY hold a position — but two
+    simultaneously-ranked candidates correlated with EACH OTHER both pass
+    that check (neither holds a position yet at gather time), then both
+    could fill here. Rechecking here, after each fill, catches this: once
+    the first of two correlated candidates fills, the second's recheck
+    sees it as a newly-open peer and blocks. symbol_state/live_exchange/
+    correlation_fn are optional (default no-op) purely so unit tests that
+    don't care about correlation can omit them without a network
+    dependency — bot.main.run() always passes the real ones.
+
+    Unresolved-order capital reservation (FIXED 2026-09-13, real gap
+    confirmed by external review): LiveExecutor.execute() can return None
+    for a BUY not because nothing happened, but because the fill quantity
+    is genuinely AMBIGUOUS (a limit order with filled=0 that isn't
+    confirmed closed/cancelled either — see live_executor.py's own
+    "qty=0 GUARD" comments) — the order may still be resting live on the
+    exchange. Treating None as "nothing happened, slot still free" (the
+    original design) let a DIFFERENT ranked candidate claim that same slot
+    in the same batch, risking two real orders both able to consume the
+    same capital. Fixed: an ambiguous (None) BUY outcome now conservatively
+    calls capital_pool.allocate(rsym) itself — holding the slot until the
+    ambiguity resolves. This does not create a NEW way to get stuck: once
+    the symbol is confirmed flat, _retire_dynamic_symbol_if_eligible's own
+    flat-check (unaffected by this) still frees it the moment it drops out
+    of eligibility, exactly as it already does for any other flat admitted
+    symbol. Full automatic reconciliation of what the ambiguous order
+    actually did still relies on LiveExecutor's existing untracked-order
+    adoption firing on this symbol's next real submission attempt (the
+    same mechanism the fixed roster already depends on) — not deepened,
+    not fully closed, documented like the analogous accepted stock-bot gap.
+
+    This is what "reserve capital for pending orders and prevent double
+    allocation" otherwise reduces to under this bot's existing design for
+    a CLEANLY resolved fill: execute() is synchronous/blocking (a
+    limit-chase fully resolves before returning in the non-ambiguous case)
+    and this function processes candidates strictly sequentially (one at a
+    time, never concurrently), so capital_pool.allocate() firing on a
+    CONFIRMED fill can never be double-claimed.
+
+    Price refresh (FIXED 2026-09-13, real gap confirmed by external
+    review: "refresh liquidity checks and prices before executing queued
+    orders"): each candidate's `price` was captured at GATHER time, during
+    the per-symbol loop — but the ranked pass runs AFTER every other
+    symbol in that loop has already been processed (each doing its own
+    network round trips), so a candidate ranked last could execute against
+    a meaningfully stale price. refresh_price_fn (optional — defaults to a
+    no-op so unit tests can omit it) re-fetches the current price
+    immediately before each candidate's risk-check/execute; if it has
+    moved more than max_price_deviation_pct since gather time, the
+    candidate is skipped this tick (reason "stale_price") rather than
+    executed on stale sizing math or a limit order routed far from the
+    current market — it re-qualifies naturally on a fresh signal next
+    tick. Within tolerance, the refreshed price (not the gather-time one)
+    is what actually gets risk-evaluated and executed against; trade_qty
+    itself is NOT re-derived from the new price (a bounded, deliberately
+    narrower fix than re-running the full ATR/notional sizing pipeline —
+    a small in-tolerance price move doesn't materially change the
+    position's risk profile the way an out-of-tolerance one would).
+
+    buy_queue entries are dicts with keys: sym, ss, final_signal, price,
+    trade_qty, raw_signal, filter_reason, adx, quote_volume (exactly what
+    bot.main.run()'s section 9 gathers). Returns (filled, blocked): the
+    list of symbols that actually filled this pass, and a {symbol: reason}
+    map of every OTHER candidate skipped this pass — the latter exists so
+    the dashboard snapshot (written AFTER this call, not before — FIXED
+    2026-09-13, external review: "its blocked-reasons snapshot is written
+    before execution") reflects what actually happened this tick instead
+    of an always-empty dict frozen before any candidate was evaluated.
+    """
+    correlation_fn = correlation_fn or fetch_correlation
+    correlation_threshold = correlation_threshold if correlation_threshold is not None else CORRELATION_THRESHOLD
+    max_price_deviation_pct = (
+        max_price_deviation_pct if max_price_deviation_pct is not None
+        else (cfg.exchange.max_slippage_pct or 0.02)
+    )
+
+    ranked = rank_buy_signals([
+        RankableSignal(symbol=c['sym'], adx=c['adx'], quote_volume=c['quote_volume'])
+        for c in buy_queue
+    ])
+    queue_by_sym = {c['sym']: c for c in buy_queue}
+    filled: list = []
+    blocked: dict = {}
+
+    for rsym in ranked:
+        cand = queue_by_sym[rsym]
+        if not capital_pool.can_open_position(rsym):
+            if not cand['ss'].get('last_buy_block_alert'):
+                cand['ss']['last_buy_block_alert'] = "capital_pool"
+            blocked[rsym] = "capital_pool"
+            logger.info(
+                "Dynamic ranked BUY [%s]: capital_pool has no free slot"
+                " (%d/%d used) — skipped this tick",
+                rsym, len(capital_pool.allocated_symbols), max_concurrent,
+            )
+            continue
+
+        exec_price = cand['price']
+        if refresh_price_fn is not None:
+            try:
+                _fresh_price = refresh_price_fn(rsym)
+            except Exception as _price_exc:
+                _fresh_price = None
+                logger.warning(
+                    "Dynamic ranked BUY [%s]: price refresh failed (%s) —"
+                    " using gather-time price", rsym, _price_exc,
+                )
+            if _fresh_price and _fresh_price > 0 and cand['price'] > 0:
+                _deviation = abs(_fresh_price - cand['price']) / cand['price']
+                if _deviation > max_price_deviation_pct:
+                    blocked[rsym] = "stale_price"
+                    logger.warning(
+                        "Dynamic ranked BUY [%s]: price moved %.2f%% since"
+                        " gather (%.6f → %.6f) > %.2f%% tolerance — skipped"
+                        " this tick, will re-qualify on a fresh signal next tick",
+                        rsym, _deviation * 100, cand['price'], _fresh_price,
+                        max_price_deviation_pct * 100,
+                    )
+                    continue
+                exec_price = _fresh_price
+
+        if symbol_state is not None and live_exchange is not None:
+            _open_peers = [
+                _peer for _peer, _pss in symbol_state.items()
+                if _peer != rsym and _pss['pm'].has_position
+            ]
+            _corr_blocked = False
+            for _peer in _open_peers:
+                _corr = correlation_fn(live_exchange, rsym, _peer)
+                if _corr is not None and _corr > correlation_threshold:
+                    logger.warning(
+                        "Dynamic ranked BUY [%s]: correlation %.2f with"
+                        " %s (filled earlier this batch or already open)"
+                        " > %.2f — skipped this tick",
+                        rsym, _corr, _peer, correlation_threshold,
+                    )
+                    if not cand['ss'].get('last_buy_block_alert'):
+                        cand['ss']['last_buy_block_alert'] = "correlation"
+                    blocked[rsym] = "correlation"
+                    _corr_blocked = True
+                    break
+            if _corr_blocked:
+                continue
+
+        fresh_approval = risk.evaluate(
+            cand['final_signal'], exec_price,
+            cand['ss']['executor'].portfolio, cand['trade_qty'],
+            account_value=account_value_fn(), symbol=rsym,
+        )
+        if not fresh_approval:
+            blocked[rsym] = "risk_manager"
+            logger.info(
+                "Dynamic ranked BUY [%s]: risk gate re-check failed at"
+                " execution time (%s) — skipped this tick",
+                rsym, fresh_approval.message,
+            )
+            continue
+        order = _execute_approved_signal(
+            rsym, cand['ss'], cand['final_signal'], exec_price,
+            cand['trade_qty'], cand['raw_signal'], cand['filter_reason'],
+            capital_pool=capital_pool, risk=risk, alerter=alerter,
+            trade_log=trade_log, stuck_detector=stuck_detector,
+            is_indicator=is_indicator,
+        )
+        if order is not None and order.status == OrderStatus.FILLED:
+            filled.append(rsym)
+        elif order is None:
+            # Ambiguous outcome — see docstring. Conservatively hold the
+            # slot rather than let another candidate claim it. No-op if
+            # already allocated.
+            if not capital_pool.is_allocated(rsym):
+                capital_pool.allocate(rsym)
+                logger.warning(
+                    "Dynamic ranked BUY [%s]: execute() returned an"
+                    " AMBIGUOUS outcome (order status uncertain) —"
+                    " conservatively holding its capital-pool slot until"
+                    " a future reconciliation confirms the real outcome.",
+                    rsym,
+                )
+            blocked[rsym] = "unresolved_order"
+        else:
+            blocked[rsym] = "order_rejected"
+
+    return filled, blocked
+
+
+# ---------------------------------------------------------------------------
+# Dynamic universe integration (2026-09-13) — discovery/screening/ranking
+# reused unchanged from bot/dynamic/; everything below is admission,
+# retirement, and lifecycle wiring INTO this file's existing symbol_state /
+# executors / capital_pool / risk-gate / execute() machinery. No separate
+# trading engine. Gated entirely behind cfg.dynamic.enabled — when False
+# (the default), none of this is ever called and the fixed BTC/CAD+SOL/CAD
+# roster behaves byte-identically to before this feature existed.
+# ---------------------------------------------------------------------------
+
+def _new_symbol_state_dict(strategy, sm, pm, executor, last_ts_ms=None) -> dict:
+    """
+    The exact symbol_state[sym] shape every part of run()'s tick loop
+    expects — single source of truth for both the initial static-roster
+    init (bot startup) and dynamic runtime admission, so the two paths can
+    never drift into producing different shapes (extracted 2026-09-13;
+    previously this was a literal dict typed out at each startup call site
+    with no dynamic-admission equivalent at all).
+    """
+    return {
+        'strategy':          strategy,
+        'sm':                sm,
+        'pm':                pm,
+        'executor':          executor,
+        'last_ts_ms':        last_ts_ms,
+        'trail_peak':        0.0,
+        'partial_done':      False,
+        'atr_sl':            0.0,
+        'native_stop_price': None,
+        'native_stop_is_trailing': False,
+        'candle_feed_stale': False,
+        'last_price':        0.0,
+        'err_count':         0,
+        'drift_count':       0,
+        'drift_acked':       0.0,
+        'last_candle_time':  time.time(),
+        'mtf_1d_closes':     [],
+        'dash_signal':       "HOLD",
+        'dash_rsi':          None,
+        'dash_trend':        None,
+        'dash_filter':       "",
+        'dash_block':        "",
+        'last_buy_block_alert':    "",
+        'last_buy_signal_alerted': False,
+        'exit_fail_count':   0,
+    }
+
+
+def _make_dynamic_executor(sym: str, state_path: "str | None" = None) -> LiveExecutor:
+    """
+    Build a LiveExecutor for a dynamically-admitted symbol using EXACTLY
+    the same construction parameters (exchange, order type, adopt-external-
+    holdings, native-stop-loss, slippage guard) as the fixed startup
+    roster's own executor-construction block — see run()'s "Capital pool"
+    setup above — so a dynamically-admitted symbol's fee accounting,
+    slippage guard, and native-stop handling are identical to BTC/CAD's the
+    moment this feature is ever activated. dry_run mirrors the fixed
+    roster's own rule exactly: True whenever paper_mode is on, else
+    whatever LIVE_TRADING/DRY_RUN resolves to in .env — no dynamic-specific
+    safety flag is introduced here; the same logs/HALT + risk-gate
+    protection that already covers BTC/CAD and SOL/CAD covers this too.
+    starting_cash is always 0.0 — the caller funds it via
+    capital_pool.slot_cash_for(sym) right after construction, matching the
+    fixed roster's own pattern, so scanning more coins never changes any
+    single position's sizing basis.
+    """
+    if state_path is None:
+        state_path = f"logs/live_state_{sym.replace('/', '_')}.json"
+    return LiveExecutor(
+        exchange_id              = cfg.exchange.exchange,
+        symbol                   = sym,
+        api_key                  = cfg.exchange.api_key,
+        api_secret               = cfg.exchange.api_secret,
+        starting_cash            = 0.0,
+        dry_run                  = cfg.paper.paper_mode or cfg.exchange.dry_run,
+        order_type               = cfg.exchange.order_type,
+        state_path               = state_path,
+        adopt_external_holdings  = cfg.exchange.adopt_external_holdings,
+        native_stop_loss_enabled = cfg.exchange.native_stop_loss_enabled,
+        max_slippage_pct         = cfg.exchange.max_slippage_pct,
+    )
+
+
+def _admit_dynamic_symbol(
+    sym: str, live_exchange, timeframe: str, capital_pool: CapitalPool,
+) -> "tuple[dict | None, str | None]":
+    """
+    Initialize strategy, historical warmup, candle timestamp, executor,
+    position manager, and trading state for a newly-eligible symbol —
+    WITHOUT restarting the process. Reuses build_strategy() /
+    _warmup_strategy() unchanged (the same functions the fixed startup
+    roster calls), so a dynamically-admitted symbol's strategy is
+    byte-identical in behavior to BTC/CAD's or SOL/CAD's — this is the
+    "preserve the complete strategy, new coins get explicit defaults"
+    requirement: exit_params_for(sym) (used throughout the tick loop, not
+    here) already merges any TAKE_PROFIT_PCT_<BASE>-style override for this
+    symbol's base over the shared defaults, or falls through to the shared
+    defaults untouched if none exists — a newly admitted coin with no
+    override gets exactly the documented shared TAKE_PROFIT_PCT/
+    STOP_LOSS_PCT/ATR_SL_MULT etc., not a silently different behavior.
+
+    If the executor's OWN persisted state (loaded inside its constructor)
+    shows an existing position — a restart re-admitting a symbol that was
+    already trading, not a genuinely fresh candidate — the exact same
+    recovery seeding the fixed roster's restart-recovery block applies
+    (pm.seed/sm.recover_long/native-stop mirror) is applied here too, PLUS
+    capital_pool.allocate(sym) — closing the "restart recovery restores
+    executor positions but not capital-pool allocations" gap for dynamic
+    symbols. (The fixed roster gets the equivalent fix in run()'s own
+    restart-recovery block — see the call there.)
+
+    Never raises: returns (None, error_str) on any failure (most likely a
+    warmup network error) so one bad candidate can never prevent the tick
+    loop from continuing to manage every OTHER symbol's existing positions
+    and pending orders this cycle.
+    """
+    try:
+        strat = build_strategy()
+        last_ts = _warmup_strategy(strat, live_exchange, timeframe, symbol=sym)
+        executor = _make_dynamic_executor(sym)
+        executor._portfolio.cash = capital_pool.slot_cash_for(sym)
+        try:
+            executor._save_state()
+        except Exception as _save_exc:
+            logger.warning("Dynamic symbol %s: state save after funding failed: %s", sym, _save_exc)
+        sm = TradingStateMachine(cooldown_ticks=cfg.risk.cooldown_ticks)
+        pm = PositionManager()
+        ss = _new_symbol_state_dict(strategy=strat, sm=sm, pm=pm, executor=executor, last_ts_ms=last_ts)
+
+        if executor.position > 1e-9:
+            pm.seed(
+                quantity=executor.position, avg_entry=executor.avg_entry,
+                realized_pnl=executor.portfolio.realized_pnl,
+            )
+            sm.recover_long(executor.avg_entry)
+            ss['native_stop_price'], ss['native_stop_is_trailing'] = _seed_native_stop_state(executor)
+            capital_pool.allocate(sym)
+            logger.warning(
+                "Dynamic symbol %s admitted WITH an existing position"
+                " (qty=%.6f @ %.2f) — restart-recovery seeding applied",
+                sym, executor.position, executor.avg_entry,
+            )
+        return ss, None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _retire_dynamic_symbol_if_eligible(sym: str, ss: dict, capital_pool: CapitalPool) -> bool:
+    """
+    Retire a dynamically-admitted symbol from active management ONLY once
+    it is genuinely flat (no open position) AND has no resting protective
+    order left outstanding — never while either is true, no matter how
+    long it's been ineligible. Releases its capital-pool slot (a no-op if
+    it was never allocated one). Returns whether it was retired.
+    """
+    executor = ss['executor']
+    if executor.position > 1e-9:
+        return False
+    if getattr(executor, 'has_resting_stop', False):
+        return False
+    capital_pool.release(sym, executor.cash)
+    return True
+
+
+def _sync_dynamic_universe(
+    symbol_state: dict,
+    executors: dict,
+    dynamic_admitted: set,
+    screener: DynamicUniverseScreener,
+    live_exchange,
+    timeframe: str,
+    capital_pool: CapitalPool,
+    slot_cash_estimate: float,
+) -> "tuple[list, list, object]":
+    """
+    One full dynamic-universe refresh cycle: discover eligible symbols,
+    admit new ones, retire flat-and-no-longer-eligible ones. Mutates
+    symbol_state/executors/dynamic_admitted IN PLACE (same convention as
+    the rest of run()'s setup code) and returns
+    (admitted_this_cycle, retired_this_cycle, screen_result) for
+    logging/dashboard/testing.
+
+    Only ever retires a symbol previously admitted by THIS function
+    (tracked via dynamic_admitted) — the original fixed roster (BTC/CAD,
+    SOL/CAD, or whatever UNIVERSE_WHITELIST/registry seeded at startup) is
+    never touched here regardless of what the screener says about it.
+
+    A discovery failure (screener.discover() itself never raises — see its
+    own fail-safe/cache docstring) or a single candidate's admission
+    failure never raises out of this function — existing positions are
+    always still managed by the caller's tick loop regardless of what
+    happens here.
+    """
+    screen = screener.discover(live_exchange, slot_cash=slot_cash_estimate)
+    eligible = set(screen.eligible_symbols)
+
+    admitted: list[str] = []
+    for sym in eligible:
+        if sym in symbol_state:
+            continue
+        ss, err = _admit_dynamic_symbol(sym, live_exchange, timeframe, capital_pool)
+        if ss is None:
+            logger.warning("Dynamic universe: failed to admit %s: %s", sym, err)
+            continue
+        symbol_state[sym] = ss
+        executors[sym] = ss['executor']
+        dynamic_admitted.add(sym)
+        admitted.append(sym)
+        logger.info("Dynamic universe: admitted %s", sym)
+
+    retired: list[str] = []
+    for sym in list(dynamic_admitted):
+        if sym in eligible:
+            continue
+        ss = symbol_state.get(sym)
+        if ss is None:
+            dynamic_admitted.discard(sym)
+            continue
+        if _retire_dynamic_symbol_if_eligible(sym, ss, capital_pool):
+            del symbol_state[sym]
+            del executors[sym]
+            dynamic_admitted.discard(sym)
+            retired.append(sym)
+            logger.info("Dynamic universe: retired %s (flat, no longer eligible)", sym)
+
+    return admitted, retired, screen
+
+
+def _write_dynamic_universe_dashboard(
+    path: str, screen, symbol_state: dict, dynamic_admitted: set,
+    capital_pool: CapitalPool, blocked: dict, dry_run: bool = True,
+) -> None:
+    """
+    Snapshot for unified_dashboard.py's dynamic-universe card — same JSON
+    shape the (now-retired-for-evaluation) standalone paper runner wrote,
+    so the existing dashboard card keeps working unchanged against the
+    LIVE integration's output too. Never raises.
+
+    dry_run (FIXED 2026-09-13, external review — "the dashboard still
+    labels live integration PAPER — not live"): the CARD's hardcoded label
+    was accurate for the retired standalone runner (dry_run always True,
+    unconditionally) but not for this integration, where dry_run mirrors
+    whatever the real fixed-roster executors use. The renderer reads this
+    field to show the true mode instead of an always-"paper" label.
+    """
+    try:
+        payload = {
+            "generated_at": datetime.now(_tz.utc).isoformat(),
+            "enabled": cfg.dynamic.enabled,
+            "dry_run": dry_run,
+            "discovered": len(screen.all_candidates()) if screen else 0,
+            "eligible": screen.eligible_symbols if screen else [],
+            "rejected": [
+                {"symbol": c.symbol, "reasons": c.reasons} for c in (screen.rejected if screen else [])
+            ][:50],
+            "admitted": sorted(dynamic_admitted),
+            "open_positions": [
+                s for s in dynamic_admitted
+                if s in symbol_state and symbol_state[s]['executor'].position > 1e-9
+            ],
+            "blocked_this_cycle": blocked,
+            "paper_cash_available": capital_pool.available_cash,
+            "paper_total_capital": capital_pool.total_capital,
+            "fills_count": None,   # live integration — see trade_log/ibkr_trades.csv for real fill history, not tracked separately here
+            "screen_stale": screen.stale if screen else True,
+            "live_integration": True,  # distinguishes this from the retired standalone paper runner's own dashboard writes
+        }
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2, default=str)
+    except Exception as exc:
+        logger.warning("Dynamic universe: dashboard snapshot write failed: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # Two-way Telegram control — command bodies (2026-08-20)
 #
@@ -1165,6 +1921,65 @@ def run():
     _active_symbol = cfg.exchange.symbol
     _universe_symbols = [cfg.exchange.symbol]
 
+    # Dynamic universe state (2026-09-13) — entirely independent of the
+    # legacy top-movers mechanism above (UNIVERSE_ENABLED/get_top_movers),
+    # which only ever selects among symbols already initialized at startup
+    # ("A brand-new symbol would trade cold ... skip until restart" — see
+    # its own comment below). This is the fixed-vs-dynamic switch: when
+    # cfg.dynamic.enabled is False (the default), _dynamic_screener/
+    # _dynamic_admitted are simply never touched again and the tick loop's
+    # dynamic-mode branches never activate — fixed mode is unchanged.
+    #
+    # _dynamic_mode_active ALSO requires cfg.exchange.live_trading (FIXED
+    # 2026-09-13, real bug confirmed by external review): _make_dynamic_
+    # executor always builds a LiveExecutor, but the FIXED roster only does
+    # that when live_trading is True — when it's False, the fixed roster
+    # uses a completely different, simpler PaperExecutor (no ccxt, no
+    # native stops, no state file) instead. Gating cfg.dynamic.enabled
+    # alone would have let dynamic admission build a real, live-capable
+    # LiveExecutor (with real API keys) in a config where the REST of the
+    # bot is deliberately not live-capable at all — confirmed reproducible:
+    # the factory received dry_run=False with LIVE_TRADING=False. Dynamic
+    # admission's own code (native-stop sync, _save_state) also assumes
+    # LiveExecutor's interface, which PaperExecutor doesn't have, so
+    # dynamic mode simply requires live_trading=True rather than trying to
+    # support both executor shapes.
+    _dynamic_mode_active = cfg.dynamic.enabled and cfg.exchange.live_trading
+    if cfg.dynamic.enabled and not cfg.exchange.live_trading:
+        logger.warning(
+            "DYNAMIC_UNIVERSE_ENABLED=true but LIVE_TRADING is not enabled — "
+            "dynamic universe discovery/admission is disabled this run. It "
+            "requires a LiveExecutor-based roster (live_trading=True), not "
+            "the plain PaperExecutor this config uses."
+        )
+    # Quote-currency enforcement (FIXED 2026-09-13, real gap confirmed by
+    # external review): DynamicUniverseConfig.quote_currencies accepts any
+    # string, and DynamicUniverseScreener would happily scan a configured
+    # USD leg — but this live integration has exactly ONE capital_pool,
+    # implicitly denominated in the account's real funding currency (CAD).
+    # There is no separate USD accounting/pool built. "Do not assume CAD
+    # can fund USD orders" means refusing to run with an unsupported quote
+    # currency, not silently scanning (and potentially trying to trade) it
+    # against the wrong pool. CAD is the only currency this integration
+    # actually funds today.
+    if _dynamic_mode_active:
+        _unsupported_quotes = [q for q in cfg.dynamic.quote_list if q != "CAD"]
+        if _unsupported_quotes:
+            logger.error(
+                "DYNAMIC_QUOTE_CURRENCIES includes %s, which this live "
+                "integration does not have separate capital accounting for "
+                "— dynamic universe discovery/admission is DISABLED this "
+                "run rather than risk funding a non-CAD order from the CAD "
+                "pool. Set DYNAMIC_QUOTE_CURRENCIES=CAD (or remove the "
+                "unsupported entries) to re-enable.",
+                _unsupported_quotes,
+            )
+            _dynamic_mode_active = False
+    _dynamic_screener   = DynamicUniverseScreener(cfg.dynamic) if _dynamic_mode_active else None
+    _dynamic_admitted:   set = set()     # symbols admitted BY the dynamic screener — never includes the fixed roster
+    _dynamic_last_refresh = 0.0
+    _dynamic_last_screen  = None         # most recent ScreenResult, for the dashboard snapshot
+
     # Build live exchange + run universe scan BEFORE feed init
     live_exchange = None
     last_candle_ts_ms: "int | None" = None
@@ -1444,7 +2259,7 @@ def run():
     _mode_label = "LIVE" if cfg.exchange.live_trading else ("DRY RUN" if cfg.exchange.dry_run else "PAPER")
     alerter.startup(cfg.exchange.exchange, cfg.exchange.symbol, _mode_label)
     _record_startup_and_check_crash_loop(alerter)
-    _check_orphaned_positions(set(executors.keys()), alerter)
+    _orphaned_symbols = _check_orphaned_positions(set(executors.keys()), alerter)
 
     # ── Derive live candle timeframe from CANDLE_MINUTES ─────────────────────
     # This is the timeframe used for ALL live candle operations:
@@ -1454,6 +2269,44 @@ def run():
 
     # ── Multi-symbol state initialisation ────────────────────────────────────
     symbol_state: dict[str, dict] = {}
+
+    # Recover orphaned positions FOUND ABOVE — independent of cfg.dynamic.
+    # enabled and of current screener eligibility (FIXED 2026-09-13, real
+    # gap confirmed by external review: "the orphan check merely alerts...
+    # a held coin that fails screening after restart can lose software exit
+    # management. Disabling dynamic mode has the same problem."). This is
+    # about not losing track of a REAL position, not about the discover-
+    # new-coins feature being on — so it runs unconditionally whenever the
+    # roster is LiveExecutor-based (live_trading=True; PaperExecutor mode
+    # never produces these state files and has never had any recovery
+    # mechanism, unchanged). Reuses _admit_dynamic_symbol exactly (same
+    # warmup/pm-seed/sm-recover/native-stop-mirror/capital-pool-allocate
+    # logic already proven for a restart-recovered dynamic admission) and
+    # tracks the recovered symbol in _dynamic_admitted so normal retirement
+    # rules apply to it once flat again — regardless of whether dynamic
+    # discovery is itself enabled.
+    if _orphaned_symbols and cfg.exchange.live_trading:
+        for _osym in _orphaned_symbols:
+            _oss, _oerr = _admit_dynamic_symbol(_osym, live_exchange, _LIVE_TF, capital_pool)
+            if _oss is None:
+                logger.error(
+                    "Failed to recover orphaned position %s: %s — still UNMONITORED,"
+                    " see the ORPHANED POSITION alert above. Close manually or fix"
+                    " and restart.", _osym, _oerr,
+                )
+                continue
+            symbol_state[_osym] = _oss
+            executors[_osym] = _oss['executor']
+            _dynamic_admitted.add(_osym)
+            logger.warning(
+                "Orphaned position %s RECOVERED into active management"
+                " (qty=%.6f) — SL/TP/drift monitoring resumed.",
+                _osym, _oss['executor'].position,
+            )
+            alerter.message(
+                f"✅ Orphaned position {_osym} recovered into active management"
+                f" — SL/TP monitoring resumed."
+            )
 
     if is_indicator and cfg.exchange.feed_mode == "live":
         for sym in _universe_symbols:
@@ -1610,6 +2463,23 @@ def run():
                     _rsym, _rec_ss['native_stop_price'], _rec_ss['native_stop_is_trailing'],
                 )
 
+                # capital_pool starts with NO slots allocated (a fresh
+                # CapitalPool() instance every process start) — a recovered
+                # open position must claim its slot explicitly, or
+                # can_open_position() would (incorrectly) report every slot
+                # free even though this symbol already holds one. Latent in
+                # the fixed 2-symbol roster (there's never a 3rd symbol to
+                # wrongly admit into "the same" slot, so this was invisible
+                # in practice) but a real, active gap once dynamic
+                # admission means MORE candidates than slots can compete
+                # for one — fixed here for both modes uniformly (2026-09-13,
+                # same fix applied in _admit_dynamic_symbol for a
+                # dynamically re-admitted position). Zero behavior change
+                # for fixed mode: with exactly max_concurrent fixed symbols,
+                # allocating both/all of them still leaves can_open_position()
+                # returning the same answer it always effectively did.
+                capital_pool.allocate(_rsym)
+
     # Aliases for _render_dashboard closure and display.stopped()
     state_machine    = symbol_state[_active_symbol]['sm']
     position_manager = symbol_state[_active_symbol]['pm']
@@ -1637,43 +2507,15 @@ def run():
     _dash_snapshots: dict[str, dict] = {}
 
     def _account_value() -> float:
-        """Aggregate account value across ALL symbol slots (cash + marked positions).
-        Fed to the risk gate so daily-loss/drawdown breakers measure the whole
-        account, not just the slot being evaluated. With one symbol this equals
-        that slot's portfolio value — behavior unchanged."""
-        total = 0.0
-        for _s, _e in executors.items():
-            _px = symbol_state[_s]['last_price'] if _s in symbol_state else 0.0
-            if not _px:
-                _px = getattr(_e, "avg_entry", 0.0) or 0.0
-            total += _e.cash + _e.position * _px
-        return total
+        """Aggregate account value — see _compute_account_value's own
+        docstring for the fixed-2026-09-13 account-value-inflation bug this
+        replaced. A thin closure so callers inside run() keep the
+        zero-argument call they already use everywhere."""
+        return _compute_account_value(capital_pool, executors, symbol_state)
 
-    def _resync_native_stop(ss: dict) -> None:
-        """
-        Re-place the native backstop sized to the position AFTER a quantity-
-        changing event that doesn't close it (partial TP, a partial fill on
-        an urgent SL/TP exit) — preserving whichever kind (static or native
-        trailing) is currently resting. Quantity is the one thing a resting
-        Kraken order can't be amended in place for via create_order, so this
-        always cancels and re-places; a trailing order loses its
-        exchange-tracked peak on the re-place (a fresh trail starts from the
-        price at re-placement) — accepted, same precision loss the static
-        order already takes on every resize. Full-close paths call
-        sync_protective_stop(None) directly instead of this helper.
-        """
-        if not ss['pm'].has_position:
-            ss['executor'].sync_protective_stop(None)
-            ss['native_stop_is_trailing'] = False
-            return
-        if ss['native_stop_is_trailing']:
-            ss['executor'].sync_protective_stop(
-                None,
-                trailing_pct=cfg.backtest.exit_params_for(
-                    ss['executor'].symbol)["trail_stop_pct"],
-            )
-        else:
-            ss['executor'].sync_protective_stop(ss.get('native_stop_price'))
+    # _resync_native_stop is now a module-level function (hoisted 2026-09-13
+    # for dynamic-universe integration/testability) — see its definition
+    # near _seed_native_stop_state above. Every call site below is unchanged.
 
     # Trailing stop and partial TP state — reset on each new trade
     _trail_peak:      float = 0.0
@@ -1882,6 +2724,38 @@ def run():
                     "Universe refresh failed: %s — keeping %s",
                     _univ_exc, _active_symbol,
                 )
+
+        # ── 0b. Dynamic universe — per-tick state reset only ──────────────
+        # Discovery/admission/retirement itself is no longer run here (FIXED
+        # 2026-09-13, external review: "move expensive screening off the
+        # exit-processing loop; slow discovery currently delays position
+        # management" — this used to call _sync_dynamic_universe() BEFORE
+        # the per-symbol SL/TP loop below, so a slow discovery cycle
+        # (load_markets + fetch_tickers + per-candidate order-book/OHLCV
+        # calls, up to DYNAMIC_MAX_CANDIDATES of them) could delay checking
+        # every existing position's stop-loss by however long that took).
+        # The sync call itself now runs AFTER the per-symbol loop AND the
+        # ranked-BUY execution pass, at the very end of the tick — see
+        # "0c." below — so existing-position risk management always runs
+        # first, unconditionally, every tick. The one-time cost: a symbol
+        # newly admitted at the end of a refresh tick isn't evaluated for a
+        # BUY until the NEXT tick, since it isn't in symbol_state yet
+        # during THIS tick's per-symbol loop. A one-tick (loop_interval)
+        # delay on a brand-new candidate is a trivial price for never
+        # delaying an existing position's exit management.
+        _dynamic_blocked_this_cycle: dict = {}
+
+        # BUY signals gathered this tick under dynamic mode (see section 9
+        # inside the per-symbol loop below) — ranked and executed AFTER
+        # every symbol has been scanned, not inline per-symbol. Reset every
+        # tick. quote_volume lookup feeds the ranking tiebreak, from
+        # whichever screen result is current as of the END of the PREVIOUS
+        # tick (see "0c." below for when it's actually refreshed).
+        _dynamic_buy_queue: list = []
+        _dynamic_quote_volume: dict = (
+            {c.symbol: c.quote_volume for c in _dynamic_last_screen.eligible if c.quote_volume}
+            if (_dynamic_mode_active and _dynamic_last_screen is not None) else {}
+        )
 
         # ── Per-symbol processing ─────────────────────────────────────
         for sym, ss in symbol_state.items():
@@ -2721,156 +3595,30 @@ def run():
                     )
 
             # ── 9. Execute ────────────────────────────────────────────
-            if approval:
-                # 2026-08-24: wrap the executor call itself — everything inside
-                # LiveExecutor.execute() already alerts on the *known* failure
-                # modes it recognizes (min-size, insufficient funds, exchange
-                # rejection), but a genuinely unexpected exception (a bug, an
-                # unhandled ccxt error shape, etc.) previously had no guarantee
-                # of reaching Telegram — it would only surface if it happened to
-                # fall inside one of execute()'s many internal try/excepts.
-                # This is the last line of defense: log + alert + degrade to
-                # "no order this tick" rather than let it crash the loop or go
-                # unnoticed. Does not change what gets sent to the exchange.
-                try:
-                    order = ss['executor'].execute(final_signal, price, quantity=trade_qty)
-                except Exception as _exec_exc:
-                    logger.error(
-                        "EXECUTOR EXCEPTION [%s] %s: %s", sym, final_signal.value, _exec_exc,
-                        exc_info=True,
-                    )
-                    alerter.error(
-                        f"EXECUTOR EXCEPTION [{sym}] {final_signal.value}: {_exec_exc} — "
-                        f"order not confirmed placed or filled, check the exchange manually"
-                    )
-                    order = None
-                if order:
-                    if order.status == OrderStatus.FILLED and order.quantity <= 0:
-                        logger.error(
-                            "FILLED order returned with qty=0 for %s %s — skipping fill record."
-                            " Check Kraken manually.",
-                            order.side.value, sym,
-                        )
-                        order = None
-                    if order and order.status == OrderStatus.FILLED:
-                        risk.record_fill(sym)
-                        ss['sm'].on_fill(final_signal, order.price)
-
-                        pnl = None
-                        if order.side == OrderSide.BUY:
-                            ss['pm'].on_buy(order.price, order.quantity)
-                            capital_pool.allocate(sym)
-                            # Seed the trail peak only when there is no activation
-                            # threshold — otherwise the intra-candle block arms it
-                            # once price reaches entry × (1 + activation_pct).
-                            # Seeding unconditionally here bypassed that gate.
-                            ss['trail_peak'] = (
-                                order.price
-                                if cfg.backtest.exit_params_for(sym)["trail_stop_activation_pct"] <= 0
-                                else 0.0
-                            )
-                            ss['partial_done'] = False
-                            ss['atr_sl'] = 0.0
-                            if is_indicator:
-                                _atr_val = _atr_fn(
-                                    list(ss['strategy']._highs),
-                                    list(ss['strategy']._lows),
-                                    list(ss['strategy']._closes),
-                                    cfg.strategy.atr_period,
-                                )
-                                if _atr_val is None or _atr_val <= 0 or cfg.strategy.atr_sl_mult <= 0:
-                                    ss['atr_sl'] = 0.0
-                                    logger.info("ATR SL disabled or unavailable — using fixed SL")
-                                else:
-                                    ss['atr_sl'] = order.price - _atr_val * cfg.strategy.atr_sl_mult
-                                    logger.info(
-                                        "ATR SL [%s]: entry=%.2f atr=%.2f sl=%.2f mult=%.1f",
-                                        sym, order.price, _atr_val, ss['atr_sl'], cfg.strategy.atr_sl_mult,
-                                    )
-                            # Native stop-loss backstop (static — see
-                            # sync_protective_stop docstring): mirrors whatever
-                            # level the software SL just armed for this fill.
-                            # Always static at entry — a native trailing-stop
-                            # is only swapped in later, once trail_peak arms
-                            # (intra-candle block above), matching the
-                            # software trailing logic's own activation delay.
-                            ss['native_stop_price'] = (
-                                ss['atr_sl'] if ss['atr_sl'] > 0
-                                else (
-                                    order.price * (1 - cfg.backtest.stop_loss_pct)
-                                    if cfg.backtest.stop_loss_pct > 0 else None
-                                )
-                            )
-                            ss['native_stop_is_trailing'] = False
-                            ss['executor'].sync_protective_stop(ss['native_stop_price'])
-                        else:
-                            pnl = ss['pm'].on_sell(order.price, order.quantity)
-                            ss['trail_peak'] = 0.0
-                            ss['partial_done'] = False
-                            ss['atr_sl'] = 0.0
-                            if not ss['pm'].has_position:
-                                capital_pool.release(sym, ss['executor'].cash)
-                                ss['executor'].sync_protective_stop(None)
-                                ss['native_stop_is_trailing'] = False
-                            else:
-                                # Partial fill leaving a residual position (not
-                                # currently reachable with strategy SELLs, which
-                                # always close in full — defensive parity with
-                                # the partial-TP path below).
-                                _resync_native_stop(ss)
-
-                        display.fill(
-                            order.side.value, order.quantity,
-                            sym, order.price, order.total_value, pnl,
-                        )
-                        trade_log.log_fill(
-                            side          = order.side.value,
-                            symbol        = sym,
-                            quantity      = order.quantity,
-                            price         = order.price,
-                            pnl           = pnl,
-                            exchange      = cfg.exchange.exchange,
-                            signal_reason = filter_reason or raw_signal.value,
-                            fee_cost      = order.fee_cost,
-                            fee_currency  = order.fee_currency,
-                        )
-                        alerter.fill(
-                            side        = order.side.value,
-                            symbol      = sym,
-                            quantity    = order.quantity,
-                            price       = order.price,
-                            total_value = order.total_value,
-                            pnl         = pnl,
-                            exchange    = cfg.exchange.exchange,
-                            reason      = f"strategy {order.side.value.lower()} signal"
-                                          + (f" — {filter_reason}" if filter_reason else ""),
-                        )
-                    else:
-                        # order can be None here (see the qty<=0-after-FILLED guard
-                        # above) — guard against .reject_reason on None instead of
-                        # crashing the loop.
-                        _reject_reason = (
-                            order.reject_reason if order
-                            else "internal: FILLED order returned qty<=0 — see log for detail"
-                        )
-                        _reject_side = order.side.value if order else final_signal.value
-                        display.reject(_reject_reason or "")
-                        alerter.error(
-                            f"ORDER REJECTED [{sym}] {_reject_side}: "
-                            f"{_reject_reason or 'unknown reason'}"
-                        )
-
-                # Generic stuck-loop watchdog: a strategy BUY/SELL that keeps
-                # failing every tick (not just SL/TP — that has its own counter).
-                _exec_filled = bool(
-                    order and order.status == OrderStatus.FILLED and order.quantity > 0
-                )
-                stuck_detector.record(
-                    f"execute:{sym}:{final_signal.value}",
-                    ok=_exec_filled,
-                    detail="" if _exec_filled else (
-                        getattr(order, "reject_reason", None) or "no order returned"
-                    ),
+            # Dynamic-mode BUYs are deferred to a ranked, cross-symbol pass
+            # AFTER this per-symbol loop finishes (see "Dynamic universe:
+            # ranked BUY execution" below _account_value-scope, right after
+            # the loop) — one symbol must not consume a shared capital slot
+            # before every OTHER symbol's simultaneous BUY signal has even
+            # been seen this tick. Fixed-mode BUYs and EVERY SELL (dynamic
+            # or fixed — exits are never ranked/deferred, only entries
+            # compete for a slot) still execute immediately, exactly as
+            # before this refactor — _execute_approved_signal is a verbatim
+            # extraction of what used to be inline here (see its docstring).
+            order = None
+            if approval and _dynamic_mode_active and final_signal == Signal.BUY:
+                _dynamic_buy_queue.append(dict(
+                    sym=sym, ss=ss, final_signal=final_signal, price=price,
+                    trade_qty=trade_qty, raw_signal=raw_signal, filter_reason=filter_reason,
+                    adx=(ss['strategy'].last_adx if is_indicator else None),
+                    quote_volume=_dynamic_quote_volume.get(sym),
+                ))
+            elif approval:
+                order = _execute_approved_signal(
+                    sym, ss, final_signal, price, trade_qty, raw_signal, filter_reason,
+                    capital_pool=capital_pool, risk=risk, alerter=alerter,
+                    trade_log=trade_log, stuck_detector=stuck_detector,
+                    is_indicator=is_indicator,
                 )
 
             # ── 10. Position summary ──────────────────────────────────
@@ -2903,6 +3651,78 @@ def run():
                 "sym":    sym,
             })
             _render_dashboard(sym, final_signal.value, rsi_val, trend_val)
+
+        # ── Dynamic universe: ranked BUY execution ────────────────────────
+        # Every symbol's BUY signal this tick has been gathered into
+        # _dynamic_buy_queue (section 9 above deferred them instead of
+        # executing inline) without yet touching capital_pool or the
+        # exchange — see _execute_ranked_dynamic_buys' own docstring for
+        # why sequential, freshly-re-checked execution here is what
+        # "reserve capital for pending orders and prevent double
+        # allocation" reduces to under this bot's existing design.
+        if _dynamic_mode_active and _dynamic_buy_queue:
+            def _refresh_dynamic_price(_sym, _ex=live_exchange):
+                return float(fetch_with_retry(
+                    lambda: _ex.fetch_ticker(_sym)['last'],
+                    label=f"dynamic ranked-buy price refresh [{_sym}]",
+                ))
+            _, _dynamic_blocked_this_cycle = _execute_ranked_dynamic_buys(
+                _dynamic_buy_queue, capital_pool=capital_pool, risk=risk,
+                account_value_fn=_account_value, alerter=alerter,
+                trade_log=trade_log, stuck_detector=stuck_detector,
+                is_indicator=is_indicator, max_concurrent=_max_conc,
+                symbol_state=symbol_state, live_exchange=live_exchange,
+                refresh_price_fn=_refresh_dynamic_price,
+            )
+
+        # ── 0c. Dynamic universe discovery + admission/retirement ─────────
+        # Runs LAST, after every existing position's SL/TP/exit management
+        # (the per-symbol loop above) AND this tick's ranked-BUY execution
+        # — moved here 2026-09-13 (see "0b." above for why). A discovery/
+        # admission failure here never raises (both functions are
+        # internally exception-safe) and, because it's now positioned
+        # after all position management for this tick, can never delay it
+        # regardless of how long discovery takes.
+        if _dynamic_mode_active and live_exchange is not None:
+            if time.time() - _dynamic_last_refresh > cfg.dynamic.refresh_hours * 3600:
+                try:
+                    # Single shared capital pool/position limit for BOTH the
+                    # fixed roster and dynamic candidates — cfg.dynamic has
+                    # NO separate max_concurrent_positions of its own for
+                    # this live path (that field only matters to the
+                    # retired standalone paper runner's own isolated pool).
+                    # A human wanting dynamic symbols to have room beyond
+                    # the current fixed-roster slots must raise
+                    # MAX_CONCURRENT_POSITIONS (and STARTING_CASH together,
+                    # per the existing documented capital-sizing rule) —
+                    # see CLAUDE.md "Dynamic Crypto Universe" activation steps.
+                    _slot_est = capital_pool.total_capital / max(1, _max_conc)
+                    _admitted, _retired, _dynamic_last_screen = _sync_dynamic_universe(
+                        symbol_state, executors, _dynamic_admitted,
+                        _dynamic_screener, live_exchange, _LIVE_TF,
+                        capital_pool, _slot_est,
+                    )
+                    if _admitted:
+                        logger.info("Dynamic universe: admitted this cycle: %s", _admitted)
+                    if _retired:
+                        logger.info("Dynamic universe: retired this cycle: %s", _retired)
+                except Exception as _dyn_exc:
+                    logger.warning("Dynamic universe sync failed: %s — existing positions unaffected", _dyn_exc)
+                _dynamic_last_refresh = time.time()
+
+        # Dashboard snapshot — written HERE, after admission/retirement AND
+        # ranked execution have both happened this tick, so blocked-reason
+        # data is real rather than frozen-empty (see the "0b" step above).
+        if _dynamic_mode_active:
+            try:
+                _write_dynamic_universe_dashboard(
+                    "logs/dynamic_universe_dashboard.json", _dynamic_last_screen,
+                    symbol_state, _dynamic_admitted, capital_pool,
+                    _dynamic_blocked_this_cycle,
+                    dry_run=(cfg.paper.paper_mode or cfg.exchange.dry_run),
+                )
+            except Exception:
+                pass
 
         # ── End of per-symbol loop ────────────────────────────────────
         _liveness.touch()

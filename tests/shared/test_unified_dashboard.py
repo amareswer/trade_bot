@@ -133,3 +133,96 @@ def test_fresh_state_shows_live_regardless_of_log_age(monkeypatch):
     assert "LIVE · BTC/CAD" in html
     assert "STALE" not in html
     assert "NO FILLS" not in html
+
+
+# ── _dynamic_universe_card() ────────────────────────────────────────────
+
+def test_dynamic_universe_card_absent_file_returns_empty(sandbox):
+    assert ud._dynamic_universe_card() == ""
+
+
+def test_dynamic_universe_card_renders_eligible_and_rejected(sandbox):
+    import json
+    (sandbox / "logs" / "dynamic_universe_dashboard.json").write_text(json.dumps({
+        "generated_at": "2026-09-13T12:00:00+00:00",
+        "discovered": 11,
+        "eligible": ["BTC/CAD", "SOL/CAD"],
+        "rejected": [{"symbol": "PEPE/CAD", "reasons": ["24h quote volume 1,139 < minimum 50,000"]}],
+        "admitted": ["BTC/CAD", "SOL/CAD"],
+        "open_positions": [],
+        "blocked_this_cycle": {},
+        "paper_account_value": 1000.0,
+        "fills_count": 0,
+        "screen_stale": False,
+    }))
+
+    html = ud._dynamic_universe_card()
+
+    assert "paper / dry-run" in html   # field absent -> defaults to dry_run=True
+    assert "LIVE — REAL ORDERS" not in html
+    assert "BTC/CAD, SOL/CAD" in html
+    assert "PEPE/CAD" in html
+    assert "STALE SCAN" not in html
+
+
+def test_dynamic_universe_card_shows_live_badge_when_not_dry_run(sandbox):
+    import json
+    (sandbox / "logs" / "dynamic_universe_dashboard.json").write_text(json.dumps({
+        "generated_at": "2026-09-13T12:00:00+00:00",
+        "dry_run": False,
+        "discovered": 1,
+        "eligible": ["ETH/CAD"],
+        "rejected": [],
+        "admitted": ["ETH/CAD"],
+        "open_positions": ["ETH/CAD"],
+        "blocked_this_cycle": {},
+        "paper_account_value": 1000.0,
+        "fills_count": 0,
+        "screen_stale": False,
+    }))
+
+    html = ud._dynamic_universe_card()
+
+    assert "LIVE — REAL ORDERS" in html
+    assert "paper / dry-run" not in html
+
+
+def test_dynamic_universe_card_shows_stale_badge(sandbox):
+    import json
+    (sandbox / "logs" / "dynamic_universe_dashboard.json").write_text(json.dumps({
+        "generated_at": "2026-09-13T12:00:00+00:00",
+        "discovered": 0,
+        "eligible": [],
+        "rejected": [],
+        "admitted": [],
+        "open_positions": [],
+        "blocked_this_cycle": {},
+        "paper_account_value": 1000.0,
+        "fills_count": 0,
+        "screen_stale": True,
+    }))
+
+    html = ud._dynamic_universe_card()
+
+    assert "STALE SCAN" in html
+
+
+def test_dynamic_universe_card_shows_blocked_reasons(sandbox):
+    import json
+    (sandbox / "logs" / "dynamic_universe_dashboard.json").write_text(json.dumps({
+        "generated_at": "2026-09-13T12:00:00+00:00",
+        "discovered": 4,
+        "eligible": ["ETH/CAD"],
+        "rejected": [],
+        "admitted": ["ETH/CAD"],
+        "open_positions": ["BTC/CAD"],
+        "blocked_this_cycle": {"ETH/CAD": "capital_pool"},
+        "paper_account_value": 950.0,
+        "fills_count": 1,
+        "screen_stale": False,
+    }))
+
+    html = ud._dynamic_universe_card()
+
+    assert "ETH/CAD (capital_pool)" in html
+    assert "BTC/CAD" in html   # open position shown

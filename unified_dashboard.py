@@ -652,6 +652,100 @@ def _regime_card() -> str:
     )
 
 
+def _dynamic_universe_card() -> str:
+    """
+    Dynamic universe (paper-only) status — discovered/eligible/rejected
+    coins, admitted symbols, open paper positions, and paper P&L, read from
+    logs/dynamic_universe_dashboard.json (written by dynamic_universe_bot.py).
+    Returns "" if that file doesn't exist — this card is invisible until
+    the paper system has actually been run at least once, same as every
+    other optional card on this dashboard (e.g. _fast_validator_card()).
+    """
+    import json as _json
+    try:
+        with open("logs/dynamic_universe_dashboard.json", encoding="utf-8") as f:
+            data = _json.load(f)
+    except Exception:
+        return ""
+
+    eligible = data.get("eligible", [])
+    rejected = data.get("rejected", [])
+    admitted = data.get("admitted", [])
+    open_pos = data.get("open_positions", [])
+    blocked  = data.get("blocked_this_cycle", {})
+    stale    = data.get("screen_stale", False)
+    # Default True (not False) when the field is absent — matches the
+    # retired standalone runner's own dashboard writes (dry_run always
+    # True, unconditionally), which predate this field's existence.
+    dry_run  = data.get("dry_run", True)
+
+    eligible_str = ", ".join(eligible) if eligible else "(none this cycle)"
+    open_str     = ", ".join(open_pos) if open_pos else "none"
+
+    rejected_rows = ""
+    for r in rejected[:8]:
+        reasons = "; ".join(r.get("reasons", []))[:90]
+        rejected_rows += (
+            f'<div style="font-size:11px;color:#8b949e;padding:2px 0">'
+            f'<span style="color:#c9d1d9">{r.get("symbol", "?")}</span> — {reasons}</div>'
+        )
+    if len(rejected) > 8:
+        rejected_rows += (
+            f'<div style="font-size:11px;color:#8b949e;padding:2px 0">'
+            f'… and {len(rejected) - 8} more</div>'
+        )
+
+    blocked_str = (
+        ", ".join(f"{s} ({g})" for s, g in blocked.items()) if blocked else "none"
+    )
+
+    stale_badge = (
+        '<span class="pf-card-badge" style="background:#d2992222;color:#d29922;'
+        'border-color:#d2992255">STALE SCAN</span>'
+        if stale else ""
+    )
+
+    # FIXED 2026-09-13 (external review — "still labels live integration
+    # PAPER — not live"): the card used to hardcode a paper-only title
+    # unconditionally. It now reflects the real dry_run flag the runner
+    # actually wrote — a live-capable (dry_run=False) admission shows a
+    # red "LIVE — REAL ORDERS" badge instead of the paper one.
+    if dry_run:
+        _mode_title = "🧪 Dynamic Universe (paper / dry-run)"
+        _mode_badge = (
+            '<span class="pf-card-badge" style="background:#7c8cf822;color:#7c8cf8;'
+            'border-color:#7c8cf855">dry-run</span>'
+        )
+    else:
+        _mode_title = "🧪 Dynamic Universe (LIVE)"
+        _mode_badge = (
+            '<span class="pf-card-badge" style="background:#f8514922;color:#f85149;'
+            'border-color:#f8514955">LIVE — REAL ORDERS</span>'
+        )
+
+    return (
+        '<div class="pf-card" style="margin-bottom:24px">'
+        '<div class="pf-card-header">'
+        f'<span class="pf-card-title">{_mode_title}</span>'
+        f'{_mode_badge}{stale_badge}'
+        '</div>'
+        + _kv("Discovered / eligible", f"{data.get('discovered', 0)} scanned → {len(eligible)} eligible")
+        + _kv("Eligible symbols", eligible_str)
+        + _kv("Admitted (ticked each cycle)", ", ".join(admitted) if admitted else "none")
+        + _kv("Open positions", open_str)
+        + _kv("Blocked this cycle", blocked_str)
+        + _kv("Paper account value", f"${data.get('paper_account_value', 0):,.2f} CAD")
+        + _kv("Paper fills so far", str(data.get("fills_count", 0)))
+        + _kv("Last cycle", str(data.get("generated_at", "?")))
+        + (
+            '<div style="margin-top:8px;font-size:12px;color:#8b949e">Recently rejected:</div>'
+            + rejected_rows
+            if rejected_rows else ""
+        )
+        + "</div>"
+    )
+
+
 def _ops_status_section() -> str:
     """Kill-switch + risk-breaker state strip (files written by the live bot)."""
     halted = os.path.exists(HALT_FLAG_PATH)
@@ -1280,6 +1374,7 @@ def _portfolio_tab_html(
         + _stock_card(stock)
         + "</div>"
         + _regime_card()
+        + _dynamic_universe_card()
         + _fast_validator_card()
         + _retired_slots_note(retired)
         + _signals_section(read_live_signals())
