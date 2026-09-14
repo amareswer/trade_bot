@@ -3423,3 +3423,525 @@ option needs it fixed first. Its own careful change.
 scripts only — no `bot/strategy/` files). New canonical BTC fingerprint: pinned 27 / PF 1.87,
 rolling ~29 / PF ~2.46. Tests +11 (`tests/crypto/test_exit_overrides.py`), suite 864→875.
 **Crypto bot needs a restart** to pick up `TAKE_PROFIT_PCT_BTC=0.20`.
+
+---
+
+## CLAUDE.md trim, 2026-09-15 — review-pass narratives moved here
+
+CLAUDE.md had grown to 176k chars (limit 150k), same problem as the 2026-07-25 and
+2026-09-01 trims. The five dated review-pass write-ups (2026-09-12 through 2026-09-15,
+covering native-stop hardening, fee-accounting, Gate 1 staleness, halt-scope, and the
+kill-switch/backtest-engine fixes) and the dynamic-universe second/third review passes
+were moved out; CLAUDE.md keeps only compact current-state summaries in their place.
+Nothing here changes behavior — it's the "why" / reproduction-detail backstop.
+
+### Crypto + stock: review passes 2–7 (2026-09-12 → 2026-09-15) — full write-ups
+
+### Second-pass review found real bugs in the SAME-DAY fixes above (2026-09-12)
+An independent review of the six 2026-09-12 fixes (native stop, duplicate orders, partial
+fills, concurrent sells) found that several had genuine gaps — verified against the actual
+code before touching anything, same discipline as the original review. Worth stating plainly:
+the first pass introduced new bugs while fixing old ones, most seriously an inverted-sign P&L
+that a hermetic test accidentally masked. All confirmed and fixed same day; both bots restarted
+after. Full list:
+
+- **Native-stop P&L used a cost basis that was already gone (High).** `check_native_stop_fills()`
+  queried `positions_snapshot()` for the avg_cost — but by the time a SELL stop is `isDone()`/
+  filled, the position it closed is already gone from the broker's position list, so this
+  returned `(0.0, 0.0)` and **inverted the sign of every native-stop P&L**. Reproduced: 10
+  shares @ $60 stopped at $54.80 reported **+$548 instead of −$52**. The original test for this
+  exact path passed anyway — its hermetic FakeIB never shrinks its static position list after a
+  fill (a limitation already known and documented for the concurrent-sell fix, but not applied
+  here where it mattered most). Fixed: `avg_cost` is now cached in `self._native_stops[sym]` at
+  placement/adoption time, while the position still genuinely exists, and read back from there
+  — never re-queried after the close. The regression test was rewritten to explicitly zero out
+  the fake's position list before checking the P&L, so this class of bug can't hide again.
+- **Ambiguous stop-lookup was read as "nothing exists, place one" (High).** `_find_resting_
+  native_stop()` returned `None` for BOTH "confirmed zero resting stops" and "query failed /
+  multiple found" — and `sync_protective_stop()` treated any `None` as "safe to place a new
+  stop". Reproduced: two existing stops became three. Fixed: a distinct sentinel,
+  `_NATIVE_STOP_LOOKUP_AMBIGUOUS`, for the unsafe case — only a confirmed-empty result may ever
+  place an order. `_cancel_native_stop()` (used ahead of an executor-initiated sell, where the
+  goal is "clear everything, not just the one exactly-matched stop") was split onto its own
+  `_all_resting_native_stops()` query so it cancels every match found, not just the single-match
+  case `_find_resting_native_stop()` is scoped to.
+- **Cancellation wasn't confirmed before replacing or proceeding (High).** `_cancel_trade_and_
+  wait()` was fire-and-forget — callers proceeded to place a replacement stop (or, for `sell()`,
+  proceed with the sell) whether or not the cancel actually landed, risking two live orders both
+  able to sell the same shares. Fixed: it now returns a bool: confirmed only if `trade.isDone()`
+  by the end of its wait window. `sync_protective_stop()`'s replace path aborts (retries next
+  cycle) rather than placing a second stop on an unconfirmed cancel; `sell()`'s cancel-before-sell
+  still proceeds regardless per its existing best-effort contract, but now logs loudly (`logger.
+  error`, not `warning`) when the cancel didn't confirm, instead of silently continuing.
+- **`sync_protective_stop()` didn't share `sell()`'s per-symbol lock (High).** The whole point of
+  the 2026-09-12 concurrent-sell fix was one lock per symbol guarding every position-mutating
+  operation — but `sync_protective_stop()` (called independently every SL/TP-watcher cycle, not
+  from `sell()`) never acquired it, so it could run concurrently with an executor-initiated sell
+  on the very same symbol. Fixed: `sync_protective_stop()`, `_cancel_native_stop()`, and
+  `check_native_stop_fills()` (per-symbol) all now hold `_position_lock(sym)`. Since `sell()`
+  already holds this lock when it calls `_cancel_native_stop()`, `StockExecutorBase._position_
+  lock()` was changed from `threading.Lock` to `threading.RLock` (reentrant) — a plain Lock would
+  have deadlocked the instant one method called into another on the same thread. Proven with the
+  same overlap-counter technique as the original concurrent-sell fix, across two real threads.
+- **`sync_protective_stop()` was gated behind a live yfinance price (Medium/High in practice).**
+  In `_check_open_positions_sl_tp`, the call was placed AFTER `if get_live_price(symbol) is None:
+  continue` — but it only needs `avg_cost` (from `positions_snapshot()`, the broker's own data),
+  not the live price. A yfinance outage disabled broker-side protection at exactly the moment
+  it's supposed to compensate for a degraded in-process check. Fixed: moved before the
+  `get_live_price()` call, decoupled entirely from yfinance availability.
+- **Crypto: an empty open-orders list can't rule out an order that already filled (High).**
+  `_find_untracked_entry_order()` only checked `fetch_open_orders()` — an order that fully
+  filled and closed between the submission exception and the recovery check is, correctly, no
+  longer "open", so the old check read this as "nothing to adopt" and placed a second market
+  order on top of an already-filled position. Fixed properly, not just patched: every limit
+  placement attempt now carries a fresh `clientOrderId` (a UUID, sent as Kraken's `cl_ord_id` —
+  offline-verified against the real installed ccxt that it coexists with `postOnly`). On a
+  submission exception, the recovery check searches for that exact id across BOTH open and
+  closed orders, resolving the order's fate definitively instead of guessing from order shape.
+- **Stock: the 15s cancel-timeout still returns without confirmed cancellation (High, accepted
+  as a known residual gap, not fully closed).** After a fill-timeout cancel, `_place_market_
+  async()` waits up to 15s then returns regardless of whether `trade.isDone()` ever became true.
+  A later fill on a still-live order past that point is not captured. Fully closing this would
+  mean tracking unresolved orders across cycles the way `check_native_stop_fills()` already does
+  for native stops — a real, understood follow-up, deliberately not built same-day on top of
+  everything else above (today's own mistakes were reason enough for caution about rushing
+  another new tracking mechanism). What WAS done: the silent return is now a loud `logger.error`
+  naming the symbol, so this state is investigable instead of invisible.
+- **ATR look-ahead bias in the (currently disabled) backtest sizing path (lower urgency).**
+  `stock_bot/backtest/engine.py`: the entry fill (at a candle's OPEN) computed its own ATR stop
+  distance using `highs[:i+1]` — including that same candle's own high/low/close, which aren't
+  actually known yet at the moment of filling at its open. Confirmed live trading is unaffected
+  (`stock_bot/main.py`'s `data.get("atr")` is always from an already-completed prior candle by
+  BUY time — this was purely a backtest-simulation gap). Since `PAPER_ATR_SIZING_ENABLED=false`
+  today, nothing live changes, but the 2026-08-23 ATR-sizing validation run (AMD/KO failing)
+  was run against the biased engine and should be re-run before that result is trusted for any
+  future decision to re-enable ATR sizing. Fixed: `highs[:i]` (strictly before the fill candle).
+- **Strategy finding, NOT changed:** `Regime.VOLATILE` returns `Signal.HOLD` unconditionally
+  (`bot/strategy/indicator_strategy.py`), suppressing the strategy's own SELL signal during a
+  volatile regime — existing positions rely entirely on SL/TP/native-stop protection to exit
+  during that window, not a trend-reversal signal. Confirmed as designed behavior baked into the
+  walk-forward-validated strategy fingerprint, not a bug — changing it would touch `bot/strategy/`
+  and invalidate every current fingerprint/ACTIVE status per the Validation Discipline rules
+  above. Left alone deliberately; flagged here for visibility, not as an open item.
+
++8 tests for the execution-layer fixes (2 ambiguous/unconfirmed-cancel, 1 lock-sharing overlap
+proof, 1 yfinance-outage sync, 1 crypto already-filled-and-closed adoption, 1 ATR look-ahead,
+existing native-stop P&L test strengthened to actually exercise the bug), suite 940→946. Both
+bots need a restart.
+
+### Third-pass review found MORE bugs in the SAME native-stop feature (2026-09-12)
+A third review pass, checking the fixes above, found two more real bugs in native-stop —
+same feature, third round in a row. Worth being direct about the pattern: this feature keeps
+producing new high-severity findings each time it's looked at more carefully, because it was
+built and self-tested quickly across several same-day passes. Given the user's explicit
+choice to keep patching rather than simplify or disable it, both were fixed properly this
+time — plus two smaller, unrelated findings from the same review, and one real bug in the
+LIVE, real-money crypto strategy.
+
+- **A stop that fills during its own cancellation could be replaced against a closed
+  position (High).** `_cancel_trade_and_wait()` returned a plain bool based on `trade.isDone()`
+  — true for BOTH "cancelled" and "filled". `sync_protective_stop()`'s replace path read any
+  truthy return as "safe to place a new stop", so a stop that filled (closing the whole
+  position) while being cancelled — racing the cancel — was replaced with a fresh stop
+  against a position that no longer existed. Reproduced: a new 10-share SELL stop placed
+  after the original had already closed all 10 shares. Fixed: `_cancel_trade_and_wait` now
+  returns a tri-state outcome — `"cancelled"` / `"filled"` / `"unconfirmed"` — and only
+  `"cancelled"` allows a replacement. A `"filled"` outcome is handed to a new shared helper,
+  `_record_native_stop_fill()`, instead — recording the fill (using the cost basis captured
+  before the race, see next item) rather than pretending nothing happened.
+- **The round-3 cost-basis fix still had a race, just moved (High).** Round 3 fixed the
+  known 0-cost-basis bug by caching `avg_cost` — but it re-queried `positions_snapshot()`
+  *after* `placeOrder()` returned, which is still late if the new stop fills immediately.
+  Reproduced the identical +$548-instead-of-−$52 sign inversion a second time, via an
+  immediate rather than a later fill. Fixed properly this time: `held` and `avg_cost` are
+  now captured together, ONCE, at the very top of `sync_protective_stop()` — before any
+  cancel or place operation — and that single captured value is reused everywhere in the
+  call, never re-queried. `_record_native_stop_fill()` (used by all three fill-recording call
+  sites now: routine `check_native_stop_fills()`, a fill discovered mid-cancel by
+  `sync_protective_stop()`, and one discovered mid-cancel by `_cancel_native_stop()` ahead of
+  a sell) logs loudly and records nothing, rather than guessing, when no cached cost basis is
+  available at all (e.g. a stop adopted from a prior session).
+- **Native-stop fills during bot downtime are permanently invisible (High, acknowledged, not
+  fixed).** `_native_stops` is in-memory only. A stop that fills while the bot is offline is,
+  after a restart, neither resting (so the live-query restart adoption won't find it) nor in
+  the fresh empty dict — `check_native_stop_fills()` has nothing to inspect. The broker's own
+  position still self-corrects (`positions_snapshot()` always reflects live state), but that
+  fill's P&L/CSV row is permanently missed, not just delayed. Closing this needs persisted
+  order tracking plus startup reconciliation against the broker's execution history (with
+  duplicate-record protection against fills the normal `sell()` path already captured) — a
+  real feature, deliberately not built same-day on top of everything else here. Documented in
+  `check_native_stop_fills()`'s own docstring as a known residual gap.
+- **FX rate lookup could raise instead of using its own advertised fallback (Medium).**
+  `get_usd_cad_rate()` (`stock_bot/data/price_feed.py`) — the exact same lazy-`fast_info`
+  gotcha already fixed in `get_live_price()` (`intraday_price.py`, earlier the same day) was
+  present in this second, separate function and missed at the time: `fast_info` was fetched
+  inside `fetch_with_retry`, but its lazy `.last_price` access happened outside it, where a
+  rate-limit/network failure propagates uncaught past this function's documented graceful
+  fallback — able to interrupt sizing/affordability checks. Fixed the same way: both accesses
+  now happen inside the same retried lambda.
+- **Stock: re-entry on the same daily signal after a stop-out (Medium, a policy question, not
+  fixed).** The live scan loop re-evaluates yesterday's still-current daily candle every
+  cycle; `executor.position(symbol) == 0` is the only re-entry gate, so a stop-out that closes
+  a position intraday lets the SAME unchanged daily BUY signal re-fire later the same day,
+  subject to the other risk gates. The daily backtest structurally can't reproduce this (it
+  only ever evaluates once per candle), so this behavior has never been backtested either
+  way. This is a real design decision — allow same-day re-entry, or gate on "already acted on
+  this candle's signal" — not a bug to silently patch; needs an explicit decision and its own
+  backtest before either behavior can be called validated. Not addressed.
+- **Strategy bug in the LIVE, real-money crypto strategy: falling MACD momentum could be
+  classified as rising (High).** `bot/strategy/indicator_strategy.py`'s `_last_macd_hist` was
+  only updated inside `_trend_signal()`, *after* its own ADX/regime-EMA rejection checks could
+  already return HOLD — so a candle rejected by ADX never updated the tracked value, and the
+  next passing candle's "is momentum rising?" check compared against a stale pre-rejection
+  value instead of the immediately preceding real one. Reproduced with histogram values
+  1→5→3 (middle candle ADX-rejected): the old code read the third candle's 3 > 1 as "rising"
+  despite real momentum having fallen 5→3, and would fire a false pullback BUY. Fixed by
+  moving the MACD computation and history update into `evaluate()`, unconditionally on every
+  completed candle — mirroring how RSI's own `_last_rsi`/`_prev_rsi` history already worked
+  correctly (updated before any gate, including the VOLATILE-regime early return). Both bots
+  share this exact strategy file, so the fix applies to crypto and stock identically.
+  **Re-validated 2026-09-12 per this repo's own Validation Discipline** (any `bot/strategy/`
+  change invalidates every fingerprint until walk-forward is re-run): new hash
+  `5c6540eccbd2f45f`. BTC/USDT came back byte-identical to the pre-fix baseline on every
+  number checked (pinned window 27/1.87/40.7%, walk-forward TRAIN 1.37/VALIDATION 3.41) — the
+  bug is real but didn't happen to change any trade decision within BTC's validated windows.
+  SOL/USDT shifted slightly (walk-forward TRAIN 1.68 vs the old 1.49, VALIDATION 1.84 vs the
+  old 1.98) — the fix did change at least one SOL decision — but both numbers still clear the
+  gate comfortably. Stamped via `stamp_strategy.py`. **Both bots need a restart to run the
+  fixed strategy code** — unlike the execution-layer fixes above, this changes live BTC/CAD
+  and SOL/CAD signal generation itself, not just order handling.
+
++5 tests (2 native-stop race reproductions — each confirmed to fail against the pre-fix
+code — 1 FX-fallback reproduction, 1 dedicated `IndicatorStrategy` unit test reproducing the
+exact 1→5→3 scenario with indicator internals mocked to isolate the control-flow bug), suite
+946→950.
+
+### Fourth-pass review: the fee-accounting finding, plus one more native-stop bug (2026-09-12)
+The most consequential finding of this entire multi-round review — see the "⚠️ PF/win-rate
+are NET of fees" callout and the rewritten "Canonical strategy fingerprint" section above for
+the full detail. Summary: `bot/backtest/metrics.py` computed every trade statistic
+(`profit_factor`, `win_rate`, `avg_win`/`avg_loss`, `best_trade`/`worst_trade`) from GROSS
+per-trade P&L — fees were deducted from cash (so `total_return_pct`/`final_value` were always
+correct) but never from the number `profit_factor` is built from. This is a **pre-existing
+gap present since the metrics module's inception**, not something introduced this session —
+it just took a review pass explicitly checking cost accounting to surface it. Independently
+reproduced against the real saved 2026-09-12 BTC/USDT and SOL/USDT CSVs: BTC's pinned-window
+PF was 1.87 gross, **0.82 net — a real loss**; BTC's walk-forward TRAINING window was 1.37
+gross, **0.67 net — also a loss**; SOL's numbers hover barely above 1.0 net everywhere. Fixed
+in `metrics.py` (net figures now populate `profit_factor` etc. — the field every validation
+gate already reads, so the fix reaches `walkforward.py`/`screen_universe.py`/
+`validate_symbol.py`/`stamp_strategy.py` without touching any of them), with
+`gross_profit_factor`/`gross_win_rate` added as new fields for transparency, never used to
+gate anything. `bot/backtest/report.py` and `walkforward.py`'s printers now show both, gross
+dimmed. There was **zero prior unit test coverage of `metrics.compute()` at all** — two tests
+added, one of which cross-checks against the real saved CSV rather than just internal
+self-consistency. **This does not conclude with a code fix that makes the numbers pass again**
+— net of fees, neither BTC/USDT nor SOL/USDT clearly demonstrates the documented profitability
+floors anymore, and no strategy change has been made in response. That is a decision for the
+user, not something to patch silently; see "Current operational status" above.
+
+A second, smaller native-stop bug from the same review pass: `_cancel_trade_and_wait` (fixed
+in the prior round to distinguish cancelled/filled/unconfirmed) still classified ANY
+`filled_qty > 0` as the terminal "filled" outcome — including a PARTIAL fill on an order that
+was still active/working its remainder (`isDone()` false). Reproduced exactly as the review
+described: the same still-active 4-of-10-share partial fill got recorded a second time on a
+later sync call with no new execution, moving realized P&L from -$20 to -$40. Fixed: "filled"
+now requires `isDone()` to ALSO be true — a partial-but-still-active fill correctly falls into
+"unconfirmed" (neither replaced nor recorded), and the existing `check_native_stop_fills()`
+mechanism records the real, final outcome exactly once, whenever the order genuinely resolves.
+
+Two further items from the same review, one addressed, one intentionally not:
+- **Stock Gate 1 was validating a stale report** (`logs/stock_backtest_latest.json` dated
+  2026-09-01, predating the 2026-09-12 MACD fix) **and only checks `RULE_WHITELIST` members**,
+  even though `RULE_WHITELIST` stopped gating real BUYs on 2026-08-23 — watchlist/universe
+  symbols with a documented failing edge (the saved report shows HOOD at full-window PF 0.45,
+  NCLH at 0.32) remain eligible through every other gate. The report has been refreshed
+  (re-run 2026-09-12, post-MACD-fix) — **result: Gate 1 flipped from 16/16 PASS to 15/16
+  FAIL, T failing on a low-sample 250d window (2 trades) while its other three windows all
+  pass**, the same shape as AMD's 2026-08-20 false-FAIL. Left as a real FAIL rather than
+  special-cased — see the "LiveTradingGate" section above. The deeper gap — Gate 1 validates
+  a 16-symbol whitelist that no longer bounds the executable universe — is a real
+  validation-architecture gap, not a same-session patch. "Validate the current executable
+  universe and bind results to code, parameters, costs, and data dates" (the review's own
+  framing) is a genuine redesign, deliberately not attempted here on top of everything else
+  in this session.
+- **Stock re-entry on the same daily signal after a stop-out** (flagged in the prior round
+  too) remains an open policy question, not a bug — still not addressed.
+
++3 tests (2 fee-accounting, 1 partial-fill-still-active reproduction — all three confirmed to
+fail against the pre-fix code), suite 950→953.
+
+### Fifth-pass review: partial-exit fee split, Gate 1 staleness closed for real, halt scope clarified (2026-09-13)
+A fifth review pass, checking the fourth round's fixes, found one more real (if currently
+dormant) bug and one real observability gap, plus one place where I had described existing,
+correct, by-design behavior inaccurately to the user. No new strategy or execution-layer bugs
+this round — the multi-round native-stop/execution churn from earlier passes has settled.
+
+- **Partial-exit fee allocation was still wrong for a case round 4 didn't test (Medium,
+  confirmed dormant).** The round-4 fee-accounting fix (`bot/backtest/metrics.py`) correctly
+  computes NET P&L for a single-BUY/single-SELL full-position close, but for a position closed
+  via TWO partial SELLs (`engine.py`'s opt-in `partial_tp_pct`), it dumped 100% of the entry
+  fee onto whichever SELL closed first and 0% onto the rest. Reproduced exactly as described:
+  two SELLs that are BOTH real economic losses once the entry fee is fairly split were
+  classified as one loss + one win (total realized P&L identical either way — only per-trade
+  win/loss classification, `win_rate`, and `profit_factor` were distorted). **Confirmed dormant
+  against every currently-live and currently-validated number** — `PARTIAL_TP_PCT` is unset
+  live and every walk-forward/backtest run to date used single-fill full-position exits, so
+  nothing already documented in this file changes. Fixed: the entry fee is now allocated
+  proportionally by quantity across however many SELLs close a position, carried forward as a
+  running remainder rather than reset to zero after the first SELL. A real bug for whoever
+  enables partial take-profit in the future, not before.
+- **Gate 1 had no way to detect its own staleness in code — only a human noticing an old
+  `run_at` date caught it (High observability gap, now closed).** The 2026-09-12 fourth-pass
+  review flagged that Gate 1 was validating a report computed before that day's MACD-history
+  strategy fix — I fixed it by manually re-running `stock_backtest.py`, but nothing in the code
+  would have caught a FUTURE staleness the same way; the crypto side has had exactly this
+  mechanism (`stamp_strategy.py` / `compute_strategy_hash()`) since early in the project, and
+  the stock side's Gate 1 simply never adopted it. Fixed: `stock_backtest.py` now writes
+  `compute_strategy_hash()`'s result into `stock_backtest_latest.json` (the SAME hash function
+  and hashed-file list the crypto bot stamps — both bots share `bot/strategy/
+  indicator_strategy.py`), and `check_gate1()` compares it against the current code's hash on
+  every check, hard-FAILing with a named "re-run stock_backtest.py" message on any mismatch —
+  not just leaving the existing symbol-verdict table to quietly validate the wrong code
+  forever. A report with no `strategy_hash` field at all (every report written before this fix,
+  including the one already on disk) falls back to the pre-existing symbol-verdict check rather
+  than being treated as an automatic failure. Re-ran `stock_backtest.py` immediately after this
+  fix so the on-disk report now actually carries the field.
+- **Halt scope: my own description to the user was wrong, the code was not (Low, corrected in
+  place, no fix needed).** `logs/HALT` was engaged 2026-09-12 with the stated rationale "pause
+  new BUYs... SELL/exit safety mechanisms fully active." That's true only for SL/TP exits
+  (`RiskManager.evaluate()` is never in that code path, gated only by
+  `RISK_HALT_BLOCKS_STOPS=false`) — an ordinary strategy-driven SELL signal DOES still route
+  through `risk.evaluate()` and IS blocked by `config.halt`, the one breaker in that file that
+  isn't BUY-only (every other tier — kill switch, drawdown, weekly/daily loss, position size —
+  explicitly checks `if signal == Signal.BUY`, confirmed by reading each one). This is
+  confirmed as intentional, pre-existing, documented full-stop kill-switch behavior (the
+  `_pause_crypto_flag()` docstring already says "BUY and strategy SELL will be blocked; SL/TP
+  exits still fire") — not a bug introduced or found this session, just a place where my own
+  summary conflated "SL/TP" with "the SELL path" in general. **User's explicit call
+  (2026-09-13): keep it as the broad full-stop it already is** rather than build a narrower
+  BUY-only pause — no open position exists to be affected either way today. CLAUDE.md's
+  "Current operational status" section corrected in place.
+- **Re-confirmed, not re-litigated:** T remaining in `RULE_WHITELIST` despite its Gate 1 FAIL,
+  and the deeper "whitelist no longer bounds the executable universe" gap, are unchanged from
+  the fourth-pass writeup above — both are real, both are already documented as deliberate,
+  undecided-by-design open items, not overlooked.
+
++4 tests (1 partial-exit fee-split reproduction, 3 Gate-1 staleness — all four confirmed to
+fail against the pre-fix code), suite 953→957.
+
+### Sixth-pass review: a real gap in the kill switch, plus two backtest-engine execution-model bugs (2026-09-14)
+A sixth review pass, this time on code that hadn't been touched by the previous five rounds
+(the risk engine's kill switch, and `bot/backtest/engine.run()`'s execution model itself,
+which — unlike `metrics.compute()` and the config-builder wiring — had zero prior direct unit
+test coverage at all). Two High findings, one Medium, all confirmed against real code and
+fixed; no AskUserQuestion needed this round, all four were unambiguous bugs, not policy calls.
+
+- **The kill switch could miss a real drawdown entirely (High, live-risk-relevant).**
+  `RiskManager.evaluate()`'s trip evaluation (`_is_kill_switch_tripped()`) only ever ran inside
+  `if signal == Signal.BUY and ...` — and `Signal.HOLD` returns `APPROVED` several lines
+  earlier, before that check is ever reached; a SELL signal skipped it too, via the same `and`
+  short-circuit. So a severe drawdown that happened while the strategy was sitting in HOLD (no
+  active signal — the common case for a trend-following strategy sitting out a bad regime) or
+  only issuing SELLs never got evaluated against the kill-switch threshold at all. Reproduced
+  exactly as reported: equity $1000→$800 during HOLD (past a 15% kill-switch threshold),
+  recovered fully to $1000, then a BUY was approved with the sticky flag never having tripped
+  — because the ONLY moment the code ever checked the threshold was at that final, already-
+  recovered BUY, not at the actual trough. Fixed: the trip evaluation now runs unconditionally
+  on every `evaluate()` call, immediately after `_update_peak()` and before the `Signal.HOLD`
+  early return — so it always judges against the true peak-to-current drawdown, whatever the
+  signal. The BLOCKING effect stays exactly as before (BUY-only, Check 2, unchanged) — SELL is
+  still never blocked by the kill switch, matching every other tier in this file. Checked
+  `logs/risk_state.json`: `kill_switch_tripped` is currently `false` with peak $465 and no
+  drawdown anywhere near the 15% threshold, so this wasn't silently missed in the account's
+  actual history to date — it's a fixed gap, not a retroactive incident. **Requires a crypto
+  bot restart** — `RiskManager` state is in-process; the old code path is still running until
+  then.
+- **Backtest stop-loss/take-profit fills ignored gap risk (High, backtest-accuracy).**
+  `bot/backtest/engine.py`'s SL/TP block always filled at the theoretical trigger level
+  (`sl_level`/`tp_level`/`_trail_sl`) whenever a candle's low/high crossed it — even when the
+  candle's own OPEN had already gapped past that level, meaning the level itself was never
+  actually tradable. Reproduced exactly as reported: BUY at $100 with a $98 (2%) stop, next
+  candle trading entirely between $75 and $85 (never touching $98) — old code still filled the
+  stop at exactly $98, understating the real loss. (The ATR-SL branch's existing `max(sl_level,
+  candle.low)` looked like a gap guard but was actually a no-op: the branch's own triggering
+  condition `candle.low <= sl_level` guarantees `sl_level >= candle.low`, so `max()` always
+  resolved to `sl_level` regardless of how far through the candle price actually traded.) Fixed
+  by mirroring an already-tested, already-correct pattern that exists one directory over: the
+  STOCK backtest engine's `close_trade(min(c.open, sl_price), ...)` / `close_trade(max(c.open,
+  tp_price), ...)` — a stop/TP now fills at whichever is worse (SL) or better (TP) for the
+  position between the candle's open and the theoretical level, so a genuine gap-through fills
+  at the realistic open price instead of a level that was never actually available. Applies to
+  all three SL modes (trailing/ATR/fixed) and take-profit. **This changes historical backtest
+  results for any run with a gap large enough to jump past a stop/TP within one candle** — on
+  crypto's 4h timeframe this is rare but real (the SOL/CAD post-only-bug and Kraken-auth-outage
+  incidents both involved multi-hour price moves); the documented fingerprint numbers in this
+  file were not re-verified against this fix specifically (no gap-through event happened to
+  occur in the validated windows on the numbers already checked), but a future re-validation
+  run may show small differences on windows containing a real gap.
+- **Threshold-mode backtests crashed on their very first BUY (Medium, but total for that
+  mode).** The same BUY-fill block that records an entry snapshot for research/attribution
+  tooling (`bot/backtest/attribution.py`, `vol_regime_experiment.py`) accessed
+  `strategy.last_atr`, `strategy._closes`, and `strategy.config.fast_ema_period`/
+  `slow_ema_period` — all `IndicatorStrategy`-only attributes — unconditionally on every BUY,
+  regardless of `strategy_mode`. `ThresholdStrategy` (the simple buy_threshold/sell_threshold
+  mode from the original Phase 1 design) is a bare two-field dataclass with none of them, so
+  `strategy_mode="threshold"` crashed with an `AttributeError` the instant its first BUY filled
+  — total inability to backtest in that mode at all. Confirmed this mode isn't live anywhere
+  (both bots run `strategy_mode="indicator"` via `IndicatorStrategy` exclusively) so there was
+  no live impact, but it's dead functionality that silently regressed at some point after
+  `ThresholdStrategy` was kept only as a documented fallback/reference implementation. Fixed:
+  the whole indicator-snapshot block (including the entry-snapshot append) is now gated behind
+  the existing `is_indicator` flag, mirroring how the ADX/RSI/trend fields right next to it
+  were already correctly guarded — only `last_atr`, `_closes`, and `config.*_ema_period` had
+  been missed.
+- **Live silently ignored a configured volatility-regime multiplier (Medium, dormant).**
+  `bot/main.py`'s `build_strategy()` constructs live's `IndicatorConfig` from ~20 `cfg.strategy.*`
+  fields but never included `atr_volatile_multiplier` (ATR > multiplier × average ATR → sit
+  flat, VOLATILE regime) — so live always used `IndicatorConfig`'s hardcoded default (1.5)
+  regardless of `ATR_VOLATILE_MULTIPLIER` in `.env`. The backtest config builder
+  (`bot/backtest/params.py`'s `engine_kwargs_from_cfg()`) already passed it correctly — the
+  exact "validated on one config, live trades a different one" drift class this repo has
+  incident history with (the 2026-07-02 XRP/CAD case, called out explicitly in the Validation
+  Discipline section above). **Confirmed dormant today** — `.env` has never set
+  `ATR_VOLATILE_MULTIPLIER`, so both sides have coincidentally been using 1.5 all along — but a
+  real bug for the moment anyone ever tunes this in `.env` without realizing live wouldn't
+  follow. Fixed: `atr_volatile_multiplier = cfg.strategy.atr_volatile_multiplier` added to the
+  `IndicatorConfig(...)` construction in `build_strategy()`.
+
++4 tests (1 kill-switch HOLD-drawdown reproduction, 2 new direct `engine.run()` execution-model
+tests — the first ever for `run()` itself — 1 `build_strategy()` config-wiring assertion — all
+confirmed to fail against the pre-fix code), suite 957→960. **Crypto bot restarted 2026-09-14**
+(new PID, 13:21 — picks up the kill-switch and volatility-multiplier fixes); the backtest-engine fixes only affect
+validation tooling, not live trading directly.
+
+### Seventh-pass review: the kill switch STILL had a gap, plus a trailing-stop timing bug (2026-09-15)
+A seventh pass — checking the sixth round's own kill-switch fix — found it was necessary but
+not sufficient, plus one more backtest-engine execution-model bug in the same file the sixth
+pass had just touched. Both confirmed and fixed; the live-affecting one required understanding
+exactly how `bot/main.py`'s tick loop is gated, not just the risk-manager code in isolation.
+
+- **The kill switch could still miss a drawdown-and-recovery entirely between candle closes
+  (High, live-risk-relevant, and the more serious of the two).** The 2026-09-14 fix made
+  `RiskManager.evaluate()`'s trip check run on every call regardless of signal — but
+  `evaluate()` itself is only reached by the live loop on a tick where a NEW 4h candle has
+  closed. `bot/main.py`'s per-symbol loop fetches a live ticker price every cycle (much more
+  often than every 4h) but `continue`s straight past `risk.evaluate()` entirely whenever no new
+  candle exists yet — which is most ticks, by construction, on a 4h timeframe. So a severe
+  drawdown that happened and fully recovered between two candle closes still escaped the kill
+  switch even after the sixth-pass fix, because the code path that fix lived in was simply
+  never being executed on that tick. Fixed by separating the concerns properly rather than
+  patching around the same choke point again: `RiskManager` gained a new public
+  `mark_valuation(current_value, candle_date=None)` method — the exact day/week/peak/
+  kill-switch-trip logic `evaluate()` already ran internally, now callable on its own, needing
+  no signal, trade quantity, or candle. `evaluate()` was refactored to call it internally
+  (behavior unchanged there). `bot/main.py`'s "no new candle" branch now calls
+  `risk.mark_valuation(_account_value())` — using the live tick price already fetched into
+  `ss['last_price']` moments earlier in the same loop iteration, and the same whole-account
+  valuation `evaluate()` itself is fed elsewhere — before its `continue`. Checked
+  `logs/risk_state.json` again after this fix: still `kill_switch_tripped: false`, no evidence
+  this was ever silently missed in the account's actual history. `run()` is a ~1700-line
+  tick loop needing a full live-exchange/strategy stack to exercise behaviorally, so the
+  `bot/main.py` wiring itself is covered by a source-inspection guard (same idiom as the
+  existing MTF/VIX/macro/auth-health guards) rather than a behavioral test; `mark_valuation()`
+  itself has a direct, fully behavioral unit test proving it alone (zero calls to `evaluate()`)
+  trips the sticky switch. **Crypto bot needs another restart** for this fix.
+- **A trailing stop could fire on the exact candle that activated it, at a price from before
+  it existed (Medium — trailing is disabled for BTC/CAD and SOL/CAD today, so this affects
+  optional/future backtests, not the current live configuration).** The "Trailing peak update"
+  section updates `_trail_peak` using the CURRENT candle's own high, and the SL/TP check
+  further down used that freshly-updated peak against that SAME candle's low — so a candle
+  whose high newly activated (or raised) the trail, and whose low also happened to dip below
+  the resulting stop level, exited using a level that had no chance to exist as a resting order
+  before that candle's low was reached, and — compounding it — filled at that candle's OPEN
+  (the sixth-pass gap-fill logic), a price from before the trail existed at all. Reproduced
+  exactly as reported: entry $100, next candle opens $100 and reaches $120 (activating a 10%
+  trail at $108), old code sold at the $100 open on that SAME candle. Fixed by snapshotting the
+  peak as it stood BEFORE the candle's own update (`_trail_peak_for_sl_check`) and checking
+  THIS candle's low against THAT snapshot, not the freshly-updated peak — a candle that
+  activates or raises the trail no longer checks itself for an exit; the check (and, if
+  breached, a correctly gap-aware fill at the following candle's open) happens starting the
+  NEXT candle, once the level has genuinely had a chance to be resting. **Re-ran the pinned and
+  rolling BTC/USDT backtests plus rolling SOL/USDT (2026-09-15) to check whether this fix, or
+  the sixth-pass gap-fill fix, moved any of the documented numbers now that both are in the
+  engine together — they don't**: BTC pinned 27 trades/net PF 0.82, BTC rolling 29/1.17, SOL
+  rolling 43/1.05, all identical to what's already documented above, strategy hash unchanged
+  (`5c6540eccbd2f45f` — neither fix touches a hashed file). No gap-through or same-candle
+  trail-activation event occurred in any of these windows under the current live SL
+  configuration (ATR×2.0, trailing stops off) — confirmed empirically, not just argued as
+  theoretically unlikely. Walk-forward wasn't re-run separately: its sub-windows are strict
+  slices of these same full runs' trade sequences, which are now confirmed byte-identical, so
+  its numbers are unchanged by the same logic.
+
++4 tests (1 `mark_valuation()` standalone kill-switch trip, 2 source-guard tests for the
+`bot/main.py` wiring, 1 same-candle trailing-stop-activation reproduction — all four confirmed
+to fail against the pre-fix code), suite 960→964.
+
+
+### Dynamic universe: second + third review passes (2026-09-13) — full write-up
+
+### Second-pass review, same day (2026-09-13) — 2 Critical + 4 High confirmed, all fixed
+An external review of the just-completed live integration (before any activation, HALT still
+engaged throughout) found six real bugs — verified each against the actual code before fixing,
+same discipline as every other review pass in this file. Worth stating plainly: a same-day
+second look found genuine correctness gaps in code that had just been built and self-tested,
+matching this repo's own well-established pattern (see the native-stop feature's four review
+rounds earlier in this file) — reviewing your own work once is not sufficient for live-money code.
+
+| # | Sev | Bug | Fix |
+|---|---|---|---|
+| 1 | Critical | `_account_value()` summed `.cash` across EVERY executor, including flat, merely-funded-for-sizing dynamic candidates — admitting ETH with zero trades/deposits measurably inflated account value ($453→$530, reproduced). Would have corrupted every drawdown/kill-switch/position-size check. | Rewritten as `_compute_account_value()`: pool's unallocated cash counted ONCE + only symbols with a real allocated slot contribute their own cash+position. Extracted to module level, 2 new tests reproduce the exact scenario. |
+| 2 | Critical | `_make_dynamic_executor()` derived `dry_run` from `paper_mode`/`DRY_RUN` without checking `LIVE_TRADING` — confirmed the factory could receive `dry_run=False` with `LIVE_TRADING=False`, building a real, live-capable `LiveExecutor` in a config where the rest of the bot deliberately uses a non-live-capable `PaperExecutor` instead. | New `_dynamic_mode_active = cfg.dynamic.enabled and cfg.exchange.live_trading` — the actual gate everywhere dynamic mode is checked, replacing the bare `cfg.dynamic.enabled`. A misconfiguration now logs a clear warning and stays inert instead of silently building a live-capable executor. |
+| 3 | High | Restart/rollback could leave a held position unmanaged: dynamic membership starts empty, only currently-eligible coins get re-admitted, and the existing orphan check only alerted — never recovered. Disabling dynamic mode has the identical problem. | `_check_orphaned_positions`'s return value is now acted on: every orphaned symbol is unconditionally (independent of `cfg.dynamic.enabled`) re-admitted via `_admit_dynamic_symbol`, restoring full SL/TP/drift management regardless of current screener eligibility. Gated on `live_trading=True` (PaperExecutor mode never produces these state files and never had a recovery mechanism). |
+| 4 | High | Two simultaneously-ranked BUY candidates correlated with EACH OTHER both passed section 2f's gather-time correlation check (neither held a position yet) and could both fill. Reproduced: two ranked fills, zero correlation calls during execution. | `_execute_ranked_dynamic_buys` now rechecks correlation against CURRENT open positions (including any filled earlier in the same batch) immediately before each candidate executes — 2 new tests (blocks the correlated pair, allows an uncorrelated pair). |
+| 5 | High | The "synchronous execution always resolves" assumption was wrong: `LiveExecutor.execute()` can return `None` for a BUY when the fill quantity is genuinely AMBIGUOUS (a limit order with `filled=0`, not confirmed closed/cancelled either — its own "qty=0 GUARD" path), not only on a clean rejection. The ranked loop treated `None` as "nothing happened, slot free," letting a different candidate claim the same capital while the ambiguous order might still be resting live. | An ambiguous (`None`) BUY outcome now conservatively calls `capital_pool.allocate()` itself, holding the slot until a future reconciliation resolves it — bounded by the existing flat-check in `_retire_dynamic_symbol_if_eligible` once it's confirmed flat. Full automatic reconciliation of the ambiguous order's real outcome still relies on `LiveExecutor`'s existing untracked-order adoption on this symbol's next submission (same mechanism the fixed roster already depends on) — not deepened, not fully closed, documented like the analogous accepted stock-bot gap. |
+| 6 | High | `DYNAMIC_QUOTE_CURRENCIES` accepted `USD` (or anything) with no enforcement — the live integration has exactly ONE capital pool, implicitly CAD, with no separate USD accounting built. | Any configured quote currency other than `CAD` now disables dynamic mode outright (loud error, not a silent scan) until real multi-currency accounting exists. |
+
+**Dashboard fixes, same pass:** the card no longer hardcodes "PAPER — not live" (now reads a
+real `dry_run` field, showing a red "LIVE — REAL ORDERS" badge when it isn't dry-run) and the
+JSON snapshot is now written AFTER admission/ranked-execution instead of before (the
+`blocked_this_cycle` map was previously always empty).
+
++7 new regression tests (suite 1040→1047), each reproducing its bug's exact scenario against
+the pre-fix code before confirming the fix. Full suite: 1047 passed. `logs/HALT` and both live
+state files re-verified byte-identical throughout this second pass too.
+
+### Third pass, same day (2026-09-13) — the two remaining acknowledged gaps, closed
+The two "other findings, not fixed this pass" items from the second-pass review, addressed on
+request rather than left open indefinitely:
+
+- **Screening no longer delays position management.** `_sync_dynamic_universe()` (discovery —
+  potentially `load_markets` + `fetch_tickers` + per-candidate order-book/OHLCV calls, up to
+  `DYNAMIC_MAX_CANDIDATES` of them) was called in step "0b", BEFORE the per-symbol SL/TP loop —
+  a slow discovery cycle delayed checking every existing position's stop-loss by however long
+  that took. Moved to a new step "0c.", running AFTER both the per-symbol loop and the ranked-
+  BUY execution pass, so existing-position risk management always runs first, unconditionally,
+  every tick, regardless of how long discovery takes. Cost: a symbol admitted at the end of a
+  refresh tick isn't evaluated for a BUY until the NEXT tick (one `loop_interval`) instead of
+  the same one — accepted as a trivial trade for never delaying real position risk. Proven by a
+  source-guard confirming the sync call's position in `run()`'s source is strictly after both
+  the per-symbol loop and the ranked-execution block.
+- **Prices are refreshed immediately before a ranked candidate executes.** Each candidate's
+  `price` was captured at GATHER time (during the per-symbol loop) but the ranked pass runs
+  AFTER every other symbol has already been processed (each its own network round trip) — a
+  candidate ranked last could execute against a meaningfully stale price. `_execute_ranked_
+  dynamic_buys` gained `refresh_price_fn` (defaults to a live ticker fetch via
+  `fetch_with_retry`, wired in `run()`): immediately before each candidate's risk-check/execute,
+  the current price is re-fetched; if it's moved more than `max_price_deviation_pct` (defaults
+  to `MAX_SLIPPAGE_PCT`, 1%) since gather time, the candidate is skipped this tick (reason
+  `stale_price`, slot never touched — free for the next tick) rather than executed on stale
+  sizing math or a limit order routed far from the current market. Within tolerance, the
+  refreshed price (not the gather-time one) is what actually gets risk-evaluated and executed
+  against. **Deliberately narrower than a full fix**: `trade_qty` itself is NOT re-derived from
+  the new price (that would mean re-running the entire ATR/notional sizing pipeline, currently
+  inline in `run()`'s section 5, not extracted) — a small in-tolerance move doesn't materially
+  change the position's risk profile the way an out-of-tolerance one would, so bounding
+  staleness was judged sufficient without that larger refactor. A refresh failure (network
+  error) falls back to the gather-time price rather than crashing the batch or blocking the
+  candidate.
+
++4 tests (suite 1047→1051: uses-refreshed-price-within-tolerance, skips-on-stale-price,
+refresh-failure-falls-back-gracefully, and the reordering source guard). `logs/HALT` and both
+live state files re-verified byte-identical; the real running bot process was not touched
+(same verification discipline as every prior pass).
+
