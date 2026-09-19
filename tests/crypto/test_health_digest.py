@@ -144,11 +144,11 @@ def _fake_executor(**overrides):
     set — avoids the classic MagicMock trap where an unset attribute reads
     back as a truthy auto-created Mock instead of a real default."""
     exc = MagicMock()
-    exc.state_write_healthy   = overrides.get("state_write_healthy", True)
-    exc.startup_sync_healthy  = overrides.get("startup_sync_healthy", True)
-    exc.pending_journal_entry = overrides.get("pending_journal_entry", None)
-    exc.position              = overrides.get("position", 0.0)
-    exc.has_resting_stop      = overrides.get("has_resting_stop", True)
+    exc.state_write_healthy    = overrides.get("state_write_healthy", True)
+    exc.startup_sync_healthy   = overrides.get("startup_sync_healthy", True)
+    exc.pending_journal_entries = overrides.get("pending_journal_entries", [])
+    exc.position               = overrides.get("position", 0.0)
+    exc.has_resting_stop       = overrides.get("has_resting_stop", True)
     return exc
 
 
@@ -183,14 +183,29 @@ def test_digest_flags_state_write_and_startup_sync_unhealthy(monkeypatch, tmp_pa
 def test_digest_flags_unacked_journal_entry(monkeypatch, tmp_path):
     risk, alerter, execs = _mk(monkeypatch, tmp_path)
     ss = {"BTC/CAD": {"executor": _fake_executor(
-        pending_journal_entry={"order_id": "o1", "side": "BUY"},
+        pending_journal_entries=[{"order_id": "o1", "side": "BUY"}],
     )}}
     monkeypatch.setenv("HEALTH_DIGEST_TIME", "08:00")
     bot_main._maybe_send_health_digest(
         execs, ss, risk, alerter, True, False, datetime(2026, 8, 27, 9, 0),
     )
     body = alerter.message.call_args[0][0]
-    assert "BTC/CAD: unacked fill journal entry" in body
+    assert "BTC/CAD: 1 unacked fill journal entry" in body
+
+
+def test_digest_flags_multiple_unacked_journal_entries_plural(monkeypatch, tmp_path):
+    risk, alerter, execs = _mk(monkeypatch, tmp_path)
+    ss = {"BTC/CAD": {"executor": _fake_executor(
+        pending_journal_entries=[
+            {"order_id": "o1", "side": "BUY"}, {"order_id": "o2", "side": "SELL"},
+        ],
+    )}}
+    monkeypatch.setenv("HEALTH_DIGEST_TIME", "08:00")
+    bot_main._maybe_send_health_digest(
+        execs, ss, risk, alerter, True, False, datetime(2026, 8, 27, 9, 0),
+    )
+    body = alerter.message.call_args[0][0]
+    assert "BTC/CAD: 2 unacked fill journal entries" in body
 
 
 def test_digest_flags_unprotected_open_position(monkeypatch, tmp_path):

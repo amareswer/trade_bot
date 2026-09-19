@@ -51,9 +51,10 @@ def test_recent_column_count_matches_schema(tl):
     the table actually has — not a stale count."""
     tl.log_fill("BUY", "BTC/CAD", 0.001, 90_000.0, exchange="kraken")
     row = tl.recent()[0]
-    assert len(row) == 14   # id, timestamp, side, symbol, quantity, price,
+    assert len(row) == 15   # id, timestamp, side, symbol, quantity, price,
                              # value, pnl, exchange, signal_reason,
-                             # risk_decision, notes, fee_cost, fee_currency
+                             # risk_decision, notes, fee_cost, fee_currency,
+                             # exec_key
 
 
 def test_recent_respects_limit_and_order(tl):
@@ -99,3 +100,66 @@ def test_summary_win_rate_uses_gross_pnl_sign():
 def test_log_fill_rejects_zero_quantity(tl):
     with pytest.raises(ValueError):
         tl.log_fill("BUY", "BTC/CAD", 0.0, 90_000.0)
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-18 FOLLOW-UP review finding (P1): journal replay could duplicate a
+# committed fill if a crash landed between the DB insert succeeding and the
+# caller's ack being persisted. exec_key makes the insert idempotent.
+# ---------------------------------------------------------------------------
+
+def test_exec_key_makes_insert_idempotent(tl):
+    """Reproduced by the follow-up review: insert a fill, then simulate the
+    crash-before-ack window by calling log_fill again with the SAME
+    exec_key — must produce exactly one row, not two."""
+    tl.log_fill("SELL", "BTC/CAD", 0.001, 91_000.0, pnl=1.0,
+                exchange="kraken", exec_key="native-stop:s1#1")
+    tl.log_fill("SELL", "BTC/CAD", 0.001, 91_000.0, pnl=1.0,
+                exchange="kraken", exec_key="native-stop:s1#1")   # retried replay
+
+    rows = tl.recent(limit=10)
+    assert len(rows) == 1
+
+
+def test_different_exec_keys_both_insert(tl):
+    tl.log_fill("SELL", "BTC/CAD", 0.001, 91_000.0, exec_key="a#1")
+    tl.log_fill("SELL", "BTC/CAD", 0.001, 92_000.0, exec_key="a#2")
+    assert len(tl.recent(limit=10)) == 2
+
+
+def test_empty_exec_key_never_deduplicates(tl):
+    """Ordinary fills (no exec_key) must never be treated as duplicates of
+    each other, even if every other field is identical."""
+    tl.log_fill("SELL", "BTC/CAD", 0.001, 91_000.0, pnl=1.0, exchange="kraken")
+    tl.log_fill("SELL", "BTC/CAD", 0.001, 91_000.0, pnl=1.0, exchange="kraken")
+    assert len(tl.recent(limit=10)) == 2
+
+
+def test_timestamp_override_preserves_original_execution_time(tl):
+    """2026-09-18 follow-up review finding: a replayed row's timestamp used
+    to become replay time, not the original fill time."""
+    tl.log_fill(
+        "SELL", "BTC/CAD", 0.001, 91_000.0, pnl=1.0, exchange="kraken",
+        timestamp="2026-09-01T00:00:00Z",
+    )
+    row = tl.recent()[0]
+    assert row["timestamp"] == "2026-09-01T00:00:00Z"
+
+
+def test_recovered_sell_carries_real_pnl_not_null(tl):
+    """2026-09-18 follow-up review finding: a recovered SELL row had
+    pnl=NULL and was silently excluded from every live PF/win-rate calc
+    (which filters on pnl IS NOT NULL). Journal replay now passes pnl
+    through explicitly."""
+    tl.log_fill(
+        "SELL", "BTC/CAD", 0.001, 78_000.0, pnl=-20.0, exchange="kraken",
+        signal_reason="recovered_from_crash", exec_key="native-stop:s1#1",
+    )
+    row = tl.recent()[0]
+    assert row["pnl"] == -20.0
+
+    with tl._connect() as conn:
+        sell_rows = conn.execute(
+            "SELECT pnl FROM fills WHERE side='SELL' AND pnl IS NOT NULL"
+        ).fetchall()
+    assert len(sell_rows) == 1   # not excluded by the NOT NULL filter

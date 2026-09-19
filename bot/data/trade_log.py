@@ -34,8 +34,20 @@ CREATE TABLE IF NOT EXISTS fills (
     risk_decision TEXT,
     notes         TEXT,
     fee_cost      REAL    DEFAULT 0.0,
-    fee_currency  TEXT    DEFAULT ''
+    fee_currency  TEXT    DEFAULT '',
+    exec_key      TEXT
 )
+"""
+# Partial unique index (SQLite): only enforces uniqueness among NON-NULL/
+# non-empty exec_key values, so every pre-existing row (exec_key NULL) and
+# every ordinary log_fill() call that doesn't pass one are completely
+# unaffected — only callers that opt into idempotent replay (2026-09-18
+# follow-up review finding: journal replay could duplicate a fill if a
+# crash landed between the DB insert succeeding and the ack being
+# persisted) get the uniqueness guarantee.
+_CREATE_EXEC_KEY_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_exec_key
+ON fills(exec_key) WHERE exec_key IS NOT NULL AND exec_key != ''
 """
 
 
@@ -66,30 +78,69 @@ class TradeLog:
         fee_cost:      float           = 0.0,
         fee_currency:  str             = "",
         source:        str             = "",
+        exec_key:      str             = "",
+        timestamp:     Optional[str]   = None,
     ) -> None:
+        """
+        exec_key (2026-09-18 follow-up review finding): pass a stable,
+        globally-unique key to make this insert IDEMPOTENT — a second call
+        with the same exec_key is a confirmed no-op (logged, not raised),
+        not a duplicate row. Exists for crash-recovery replay (a crash
+        between the insert succeeding and the caller's own ack being
+        persisted must not duplicate the row on a retried replay); ordinary
+        fills leave it empty and are unaffected (multiple empty-exec_key
+        rows are explicitly allowed — see the partial unique index).
+
+        timestamp: override the row's timestamp with an ISO string instead
+        of "now" — for replaying a fill whose ORIGINAL execution time is
+        known (the journal's own filled_at), so a recovered row doesn't
+        masquerade as having happened at replay time.
+        """
         if quantity <= 0:
             raise ValueError(
                 f"log_fill called with quantity={quantity} for {side.upper()} {symbol}"
                 f" — would write a phantom row. Caller must provide a real fill quantity."
             )
+        if exec_key:
+            with self._connect() as conn:
+                existing = conn.execute(
+                    "SELECT id FROM fills WHERE exec_key = ?", (exec_key,)
+                ).fetchone()
+            if existing is not None:
+                logger.info(
+                    "TradeLog: exec_key=%s already recorded (row id=%s) — "
+                    "skipping duplicate insert", exec_key, existing[0],
+                )
+                return
         value = quantity * price
-        ts    = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        ts    = timestamp or datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         # Prepend source tag to notes if provided
         if source:
             notes = f"[{source}] {notes}".strip()
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO fills
-                    (timestamp, side, symbol, quantity, price, value,
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO fills
+                        (timestamp, side, symbol, quantity, price, value,
+                         pnl, exchange, signal_reason, risk_decision, notes,
+                         fee_cost, fee_currency, exec_key)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (ts, side.upper(), symbol, quantity, price, value,
                      pnl, exchange, signal_reason, risk_decision, notes,
-                     fee_cost, fee_currency)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (ts, side.upper(), symbol, quantity, price, value,
-                 pnl, exchange, signal_reason, risk_decision, notes,
-                 fee_cost, fee_currency),
+                     fee_cost, fee_currency, exec_key or None),
+                )
+        except sqlite3.IntegrityError:
+            # A concurrent/retried call raced this exact exec_key between
+            # the SELECT check above and this INSERT — the other writer
+            # won; treat it identically to the pre-check finding it,
+            # rather than raising and losing an otherwise-successful replay.
+            logger.info(
+                "TradeLog: exec_key=%s inserted concurrently — skipping "
+                "duplicate", exec_key,
             )
+            return
         logger.debug("TradeLog: %s %s qty=%.6f @ %.2f pnl=%s fee=%.6f %s",
                      side, symbol, quantity, price, pnl, fee_cost, fee_currency)
 
@@ -112,20 +163,25 @@ class TradeLog:
     def summary(self) -> dict:
         """
         Quick performance summary from logged fills.
-        Returns trade count, win rate, and both gross and net-of-fee
-        realized P&L.
+        Returns trade count, a GROSS win rate, and both gross and net-of-
+        fee realized P&L.
 
         2026-09-18 review finding: this reported ONLY gross `pnl` (the
         stored value never has fees subtracted — see
         PositionManager.on_sell) with no fee awareness at all. `net_pnl`
-        here is an exact identity, not an approximation: total realized
-        gross P&L across every SELL, minus every fee (BUY entry + SELL
-        exit) actually paid across the whole logged history — a true
-        accounting total, even though no single trade's fee is currently
-        attributed as "this trade's entry fee" in this flat schema (that
-        finer per-trade allocation is a separate, larger effort — see
-        live_comparison.py's own per-trade net calculation and its
-        docstring for the same caveat).
+        here is an exact identity: total realized gross P&L across every
+        SELL, minus every fee (BUY entry + SELL exit) actually paid across
+        the whole logged history — a true accounting total.
+
+        `win_rate` here is still classified from GROSS pnl (unchanged,
+        never claimed otherwise) — it does NOT do the finer per-symbol
+        FIFO entry-fee allocation live_comparison.py's _compute_live_metrics()
+        implements (2026-09-18 follow-up review finding fixed there: a
+        trade can be a real net loss yet show a gross win, which flips
+        win-rate/PF classification, not just the total). This method has
+        no production caller today (a quick/manual summary only) — use
+        live_comparison.py for any decision that depends on a correct NET
+        win rate or profit factor.
         """
         with self._connect() as conn:
             sell_rows = conn.execute(
@@ -162,6 +218,10 @@ class TradeLog:
             if "fee_currency" not in existing:
                 conn.execute("ALTER TABLE fills ADD COLUMN fee_currency TEXT DEFAULT ''")
                 logger.info("TradeLog: migrated — added fee_currency column")
+            if "exec_key" not in existing:
+                conn.execute("ALTER TABLE fills ADD COLUMN exec_key TEXT")
+                logger.info("TradeLog: migrated — added exec_key column")
+            conn.execute(_CREATE_EXEC_KEY_INDEX)
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self._db_path, timeout=10)

@@ -214,7 +214,36 @@ class LiveExecutor:
         # the specific crash window between accounting and logging; it is
         # not a general transactional journal across every write in the
         # system.
-        self._pending_journal_entry: dict | None = None
+        # 2026-09-18 FOLLOW-UP review finding (P1): a single dict here meant
+        # a second fill recorded before the first was acked silently
+        # OVERWROTE the first's still-pending recovery record. Now a list —
+        # every unacked fill survives independently until its own ack.
+        self._pending_journal_entries: list[dict] = []
+        # Monotonic per-executor counter — disambiguates multiple distinct
+        # fill events that can share the same order_id (a native stop's
+        # order_id is the SAME across each of its own partial-fill deltas;
+        # "an order ID alone is insufficient to distinguish separate
+        # execution deltas" — 2026-09-18 follow-up review finding). Not
+        # persisted: only needs to be unique among entries in THIS
+        # in-memory queue, which is always small and short-lived.
+        self._journal_seq: int = 0
+        # 2026-09-18 follow-up review finding (P0): an unresolved submission
+        # (_SubmissionOutcomeUnknown) previously left no trace at all — the
+        # NEXT execute() call (this tick or after a restart) generated a
+        # fresh client_order_id and submitted again, risking two live
+        # orders for one signal. Persisted so a same-side submission is
+        # never attempted while a prior one's outcome is still unknown —
+        # see _create_order_persisted().
+        self._pending_submission: dict | None = None
+        # 2026-09-18 follow-up review finding (P0): a native stop that is
+        # PARTIALLY filled but still OPEN (resting for the remainder) was
+        # being treated as fully resolved the instant any fill was seen,
+        # clearing the tracked id while the real order was still live on
+        # the exchange. Tracks how much of the CURRENT native stop's fill
+        # has already been recorded, so only the NEW delta is booked on
+        # each check and the id is retained until a genuinely terminal
+        # status is observed. Reset to 0 whenever a fresh stop is placed.
+        self._native_stop_last_recorded_filled: float = 0.0
         # Set False if a fill's accounting update could not be durably
         # persisted (_save_state() raised) — execute() then refuses new
         # BUYs until a later save succeeds, rather than trading on top of
@@ -712,6 +741,11 @@ class LiveExecutor:
         self._native_stop_order_id    = order_id
         self._native_stop_price       = None if is_trailing else stop_price
         self._native_stop_is_trailing = is_trailing
+        # Seed from whatever this order already shows filled at adoption
+        # time — any fill that happened before we started tracking it this
+        # session is not ours to invent accounting for; only NEW fill
+        # observed from this point forward should ever be recorded.
+        self._native_stop_last_recorded_filled = float(order.get("filled") or 0.0)
         logger.warning(
             "NATIVE STOP ADOPTED [%s]: found untracked resting %s order %s "
             "— adopted instead of placing a duplicate.",
@@ -767,6 +801,18 @@ class LiveExecutor:
 
         stop_price, trailing_pct = _extract_stop_trigger(order)
         was_trailing = _raw_ordertype(order) == "trailing-stop"
+        # _fill_order (if any) is not surfaced further here: this method
+        # runs only from _verify_resting_stop_on_startup(), i.e. INSIDE
+        # LiveExecutor.__init__() before bot/main.py has constructed this
+        # symbol's PositionManager/state machine/capital-pool slot — there
+        # is no live bookkeeping to route it to yet. The fill's accounting
+        # is still correct and complete via _record_stop_triggered_fill
+        # (cash/position) and _pending_journal_entry (trade_log, replayed
+        # at startup) — main.py's own restart-recovery seeding then reads
+        # the executor's already-correct post-fill position when it
+        # constructs pm/sm/capital_pool for this run, so nothing here is
+        # silently lost, just resolved through a different (startup-time)
+        # path than the runtime one _process_discovered_sell_fill covers.
         outcome, _fill_order = self._cancel_native_stop()
         if outcome != "cancelled":
             # "filled" — the stop already executed and closed/reduced the
@@ -855,6 +901,7 @@ class LiveExecutor:
             filled_at     = datetime.now(timezone.utc),
             fee_cost      = fee_cost,
             fee_currency  = fee_currency,
+            pnl           = pnl,
         )
         self._fills.append(order)
         logger.warning(
@@ -879,11 +926,24 @@ class LiveExecutor:
           "cancelled", None  — confirmed terminal cancel, nothing filled.
               Safe for the caller to place a replacement or proceed with
               its own exit.
-          "filled", Order    — the stop itself executed (in the race between
-              our cancel and its own trigger) before cancellation took
-              effect. Already fully recorded via _record_stop_triggered_fill
-              — the returned Order IS that exit; the caller must not also
-              place its own SELL or a replacement stop.
+          "filled", Order    — the stop itself executed to a CONFIRMED
+              terminal status (in the race between our cancel and its own
+              trigger) before cancellation took effect. Already fully
+              recorded via _record_stop_triggered_fill — the returned
+              Order IS that exit; the caller must not also place its own
+              SELL or a replacement stop. Tracked id is cleared.
+          "partial", Order   — the stop filled SOME (new) quantity but is
+              CONFIRMED still open/resting for the remainder — a genuine
+              partial fill on a live order, not a completed exit. The new
+              delta is recorded via _record_stop_triggered_fill (never a
+              previously-recorded amount — see
+              _native_stop_last_recorded_filled), but the tracked id/price
+              are DELIBERATELY RETAINED (still live on the exchange). The
+              caller must NOT place a replacement stop (would duplicate
+              the still-resting original) — 2026-09-18 follow-up review
+              finding: the old version conflated this with "filled" purely
+              because `filled > 0`, ignoring `status`, and cleared the
+              tracked id while the real order was still resting.
           "unknown", None    — cancellation could not be confirmed (the
               cancel call and/or the follow-up verification failed, or the
               order still reads back open/unresolved). Tracked protection
@@ -932,34 +992,62 @@ class LiveExecutor:
             )
             return "unknown", None
 
-        filled_qty = float(order.get("filled") or 0.0)
-        status     = str(order.get("status") or "").lower()
+        cumulative_filled = float(order.get("filled") or 0.0)
+        status            = str(order.get("status") or "").lower()
+        is_terminal        = status in _CANCELLED_TERMINAL_STATUSES
+        # 2026-09-18 follow-up review finding (P0): this used to treat ANY
+        # positive `filled` as proof the stop was fully resolved, even
+        # when `status` still read "open" (a genuine partial fill on a
+        # stop that is STILL resting for the remainder) — clearing the
+        # tracked id while the real order remained live, so a later
+        # protection sync could place a REPLACEMENT stop on top of it.
+        # Reproduced: starting position 0.002, cancel timeout, fetch
+        # returns status="open" with cumulative filled=0.001 — old code
+        # returned "filled"/tracked-id=None despite 0.001 still resting.
+        # Fixed: only clear tracked state on a CONFIRMED terminal status.
+        # A positive filled with a non-terminal status is a genuine
+        # partial fill of a STILL-OPEN order — record only the NEW delta
+        # (never re-record what a prior check already booked) and keep
+        # tracking the (still resting, now-reduced) stop.
+        new_delta = max(0.0, cumulative_filled - self._native_stop_last_recorded_filled)
 
-        if filled_qty > 0:
+        fill_order = None
+        if new_delta > 0:
             fill_info = {
                 "order_id": _order_id,
-                "filled":   filled_qty,
+                "filled":   new_delta,
                 "price":    float(order.get("average") or order.get("price") or 0.0),
                 "fee":      order.get("fee") or {},
             }
-            self._native_stop_order_id    = None
-            self._native_stop_price       = None
-            self._native_stop_is_trailing = False
+            self._native_stop_last_recorded_filled = cumulative_filled
             fill_order = self._record_stop_triggered_fill(fill_info)
-            return "filled", fill_order
 
-        if status in _CANCELLED_TERMINAL_STATUSES:
+        if is_terminal:
             self._native_stop_order_id    = None
             self._native_stop_price       = None
             self._native_stop_is_trailing = False
+            self._native_stop_last_recorded_filled = 0.0
             self._save_state()
-            return "cancelled", None
+            return "filled" if fill_order is not None else "cancelled", fill_order
+
+        if fill_order is not None:
+            # Partial fill, order still genuinely open/resting — the
+            # tracked id/price are DELIBERATELY retained (still live on
+            # the exchange), only the delta is booked.
+            logger.warning(
+                "NATIVE STOP PARTIAL FILL [%s]: order %s filled %.8f more "
+                "(cumulative %.8f) but remains open — tracked protection "
+                "retained, not cleared.",
+                self.symbol, _order_id, new_delta, cumulative_filled,
+            )
+            self._save_state()
+            return "partial", fill_order
 
         logger.error(
             "NATIVE STOP CANCEL NOT CONFIRMED [%s]: order %s reads back "
             "status=%r filled=%.8f after a cancel attempt — leaving tracked "
             "protection in place.",
-            self.symbol, _order_id, order.get("status"), filled_qty,
+            self.symbol, _order_id, order.get("status"), cumulative_filled,
         )
         self._alerter.error(
             f"NATIVE STOP CANCEL NOT CONFIRMED [{self.symbol}]: stop "
@@ -1008,6 +1096,7 @@ class LiveExecutor:
             self._native_stop_order_id    = str(raw.get("id", ""))
             self._native_stop_price       = stop_price
             self._native_stop_is_trailing = False
+            self._native_stop_last_recorded_filled = 0.0
             logger.warning(
                 "Native stop placed [%s]: %.6f @ %.2f (order %s)",
                 self.symbol, quantity, stop_price, self._native_stop_order_id,
@@ -1095,6 +1184,7 @@ class LiveExecutor:
             self._native_stop_order_id    = str(raw.get("id", ""))
             self._native_stop_price       = None
             self._native_stop_is_trailing = True
+            self._native_stop_last_recorded_filled = 0.0
             logger.warning(
                 "Native TRAILING stop placed [%s]: %.6f trailing %.2f%% (order %s)",
                 self.symbol, quantity, trailing_pct * 100, self._native_stop_order_id,
@@ -1128,7 +1218,7 @@ class LiveExecutor:
 
     def sync_protective_stop(
         self, stop_price: float | None, trailing_pct: float | None = None,
-    ) -> None:
+    ) -> "Order | None":
         """
         Reconcile the resting native stop with the current position. Call
         after every fill that changes position (BUY, strategy SELL, SL/TP
@@ -1150,30 +1240,49 @@ class LiveExecutor:
         No-op when the feature is disabled or dry-run. Never raises —
         failures are logged/alerted from the helpers above, not here; this
         must never be able to crash the trading loop.
+
+        Returns the fill Order if a native stop was discovered to have
+        filled (fully or partially) during this call's cancel-and-verify
+        cycle — None otherwise. 2026-09-18 follow-up review finding (P1):
+        this return value used to be silently discarded by every caller;
+        the executor's own cash/position updated correctly (via
+        _record_stop_triggered_fill) but the caller's PositionManager,
+        state machine, capital pool, risk fill counter, and trade log never
+        learned about it at the time. Callers (bot/main.py) must now route
+        a non-None return through the same fill-bookkeeping path a normal
+        SELL gets — see _process_discovered_sell_fill.
         """
         if self.dry_run or not self._native_stop_loss_enabled:
-            return
-        outcome, _fill_order = self._cancel_native_stop()
-        if outcome == "unknown":
-            # Cancellation of the existing stop is unconfirmed — placing a
-            # replacement now risks two live stops resting at once. Leave
-            # it; the next sync_protective_stop call (next fill/cycle)
-            # tries again.
+            return None
+        outcome, fill_order = self._cancel_native_stop()
+        if outcome in ("unknown", "partial"):
+            # "unknown" — cancellation of the existing stop couldn't be
+            # confirmed. "partial" — the stop filled SOME of its quantity
+            # but is CONFIRMED still open/resting for the remainder
+            # (_cancel_native_stop deliberately retained its tracked id
+            # for exactly this case) — a real fill DID happen (fill_order
+            # is not None) even though no replacement is placed. Either
+            # way, placing a replacement now risks two live stops resting
+            # on the exchange at once — leave it; the next
+            # sync_protective_stop call (next fill/cycle) tries again.
             logger.error(
-                "PROTECTIVE STOP SYNC ABORTED [%s]: cancellation of the "
-                "existing resting stop is unconfirmed — not placing a "
-                "replacement this cycle.", self.symbol,
+                "PROTECTIVE STOP SYNC ABORTED [%s]: existing resting stop "
+                "is %s — not placing a replacement this cycle.",
+                self.symbol, outcome,
             )
-            return
+            return fill_order
         # outcome == "filled" already ran _record_stop_triggered_fill,
         # which reduced self._portfolio.position — the check below then
-        # naturally sees the updated (likely zero) position and no-ops.
+        # naturally sees the updated (likely zero, or a genuine still-open
+        # remainder with no resting stop at all — tracked id was cleared)
+        # position and does the right thing either way.
         if self._portfolio.position <= 0:
-            return
+            return fill_order
         if trailing_pct is not None and trailing_pct > 0:
             self._place_native_trailing_stop(self._portfolio.position, trailing_pct)
         elif stop_price is not None and stop_price > 0:
             self._place_native_stop(self._portfolio.position, stop_price)
+        return fill_order
 
     # ── State persistence ─────────────────────────────────────────────
 
@@ -1190,7 +1299,9 @@ class LiveExecutor:
             "native_stop_order_id":    self._native_stop_order_id,
             "native_stop_price":       self._native_stop_price,
             "native_stop_is_trailing": self._native_stop_is_trailing,
-            "pending_journal_entry":   self._pending_journal_entry,
+            "pending_journal_entries": self._pending_journal_entries,
+            "pending_submission":      self._pending_submission,
+            "native_stop_last_recorded_filled": self._native_stop_last_recorded_filled,
             "saved_at":     datetime.now(timezone.utc).isoformat(),
         }
         try:
@@ -1216,48 +1327,72 @@ class LiveExecutor:
         trade_log row, BEFORE the state save that persists it — so a crash
         between the accounting update and the (separate, downstream)
         trade_log write is recoverable on restart via
-        pending_journal_entry, instead of the fill silently having no
-        record anywhere despite the portfolio already reflecting it."""
-        self._pending_journal_entry = {
+        pending_journal_entries, instead of the fill silently having no
+        record anywhere despite the portfolio already reflecting it.
+        Appends (never overwrites) — a second fill recorded before the
+        first is acked must not lose the first's recovery record.
+
+        exec_key disambiguates entries that share the same order_id (a
+        native stop's order_id is identical across each of its own
+        partial-fill deltas) — TradeLog uses it for an idempotent insert,
+        so a replay that runs twice (e.g. the ack itself is what didn't
+        survive a second crash) writes the row at most once. pnl is
+        included so a replayed SELL carries real P&L instead of NULL —
+        2026-09-18 follow-up review findings."""
+        self._journal_seq += 1
+        self._pending_journal_entries.append({
             "order_id":     order.order_id,
+            "exec_key":     f"{order.order_id}#{self._journal_seq}",
             "side":         order.side.value,
             "symbol":       self.symbol,
             "quantity":     order.quantity,
             "price":        order.price,
+            "pnl":          order.pnl,
             "fee_cost":     order.fee_cost,
             "fee_currency": order.fee_currency,
             "filled_at":    (order.filled_at or order.created_at).isoformat(),
-        }
+        })
 
     def ack_journal_entry(self, order_id: str) -> None:
         """Called by bot/main.py once the trade_log row for order_id has
-        actually been written — clears the pending journal marker so a
-        future restart doesn't replay an already-logged fill. A mismatched
-        order_id is ignored (defensive: never clear a DIFFERENT fill's
-        still-pending entry than the one the caller confirms)."""
-        if self._pending_journal_entry is None:
-            return
-        if self._pending_journal_entry.get("order_id") != order_id:
+        actually been written — removes that ONE entry (the first queued
+        match, FIFO) so a future restart doesn't replay an already-logged
+        fill. A mismatched order_id (nothing queued for it) is a no-op,
+        logged: never clears a DIFFERENT fill's still-pending entry."""
+        for i, entry in enumerate(self._pending_journal_entries):
+            if entry.get("order_id") == order_id:
+                del self._pending_journal_entries[i]
+                self._save_state()
+                return
+        if self._pending_journal_entries:
             logger.warning(
-                "ack_journal_entry(%s) does not match pending entry for %s "
-                "— not clearing", order_id, self._pending_journal_entry.get("order_id"),
+                "ack_journal_entry(%s) does not match any pending entry "
+                "(pending order_ids: %s) — not clearing anything",
+                order_id, [e.get("order_id") for e in self._pending_journal_entries],
             )
-            return
-        self._pending_journal_entry = None
-        self._save_state()
 
     @property
-    def pending_journal_entry(self) -> dict | None:
-        """A fill whose accounting effect is already persisted but whose
-        trade_log row may be missing (crash between the two writes) —
-        None means every recorded fill has been acknowledged. Read at
-        startup by bot/main.py to replay any such entry before resuming
-        normal trading."""
-        return self._pending_journal_entry
+    def pending_journal_entries(self) -> list[dict]:
+        """Fills whose accounting effect is already persisted but whose
+        trade_log row may be missing (crash between the two writes) — an
+        empty list means every recorded fill has been acknowledged. Read
+        at startup by bot/main.py to replay each before resuming normal
+        trading. A copy — callers must use ack_journal_entry() to mutate."""
+        return list(self._pending_journal_entries)
 
     @property
     def state_write_healthy(self) -> bool:
         return self._state_write_healthy
+
+    @property
+    def pending_submission(self) -> dict | None:
+        """A submission whose outcome could not be confirmed (the
+        reconciliation lookup itself failed) — None means no submission is
+        currently unresolved. A new same-side submission refuses to
+        proceed while this is set, always trying to resolve THIS entry
+        (via its own client_order_id) first. Survives a restart via
+        _save_state()/_load_state()."""
+        return self._pending_submission
 
     @property
     def startup_sync_healthy(self) -> bool:
@@ -1315,19 +1450,40 @@ class LiveExecutor:
         # trailing distance FROM). Restored here only so a still-open order
         # confirmed by _verify_resting_stop_on_startup logs its real kind.
         self._native_stop_is_trailing = bool(state.get("native_stop_is_trailing", False))
-        self._pending_journal_entry   = state.get("pending_journal_entry")
+        # Backward-compat migration: an older state file has the singular
+        # "pending_journal_entry" key (a dict or None) instead of today's
+        # "pending_journal_entries" list — wrap it rather than silently
+        # losing an unacked entry across the upgrade.
+        if "pending_journal_entries" in state:
+            self._pending_journal_entries = list(state.get("pending_journal_entries") or [])
+        else:
+            _legacy = state.get("pending_journal_entry")
+            self._pending_journal_entries = [_legacy] if _legacy is not None else []
+        self._pending_submission      = state.get("pending_submission")
+        self._native_stop_last_recorded_filled = float(
+            state.get("native_stop_last_recorded_filled", 0.0) or 0.0
+        )
+        if self._pending_submission is not None:
+            logger.error(
+                "UNRESOLVED SUBMISSION ON RESTART [%s]: %s — this process "
+                "will try to reconcile it (via its own client_order_id) "
+                "before attempting any new same-side submission.",
+                self.symbol, self._pending_submission,
+            )
         logger.warning(
             "Accounting restored: cost_basis=%.2f pnl=%.2f fees=%.4f (saved %s)",
             self._portfolio._cost_basis, self._portfolio.realized_pnl,
             self._fees_paid, state.get("saved_at", "?"),
         )
-        if self._pending_journal_entry is not None:
+        if self._pending_journal_entries:
             logger.error(
-                "UNACKED FILL JOURNAL ENTRY [%s]: %s — this fill's accounting "
-                "is already reflected above, but its trade_log row may be "
-                "missing (a crash between the two writes). Caller must "
-                "replay it into trade_log and call ack_journal_entry().",
-                self.symbol, self._pending_journal_entry,
+                "UNACKED FILL JOURNAL ENTRIES [%s]: %d — this fill's "
+                "accounting is already reflected above, but its trade_log "
+                "row(s) may be missing (a crash between the two writes). "
+                "Caller must replay each into trade_log and call "
+                "ack_journal_entry() for it. %s",
+                self.symbol, len(self._pending_journal_entries),
+                self._pending_journal_entries,
             )
         return True
 
@@ -1471,40 +1627,112 @@ class LiveExecutor:
             )
         return None, True
 
-    def _reconcile_or_raise_unknown(
-        self, ccxt_side: str, client_order_id: str, original_exc: Exception, label: str,
+    def _create_order_persisted(
+        self,
+        ccxt_side: str,
+        quantity: float,
+        price: "float | None",
+        order_call,
+        label: str,
+        fast_reject_exceptions: tuple = (),
     ) -> dict:
-        """Shared post-exception handling for the direct (non-chased) order
-        paths in execute() — the passive-limit BUY and the market/urgent
-        order. Mirrors _place_limit_order's own reconciliation, minus the
-        "fall back to market" step those don't have (market already IS the
-        order type for one of them; the passive-limit path has no cheaper
-        alternative to fall back to and never did).
+        """
+        THE single choke point for every live order submission this
+        executor makes — the limit-chase primary attempt, every one of its
+        market fallbacks, the direct passive-limit BUY, and the direct
+        market order all route through this. `order_call(client_order_id)`
+        performs the actual self._exchange.create_order(...) call (each
+        call site has a different positional/keyword shape — this wrapper
+        doesn't try to unify that, only the submission bookkeeping around it).
 
-        Adopts a confirmed match; re-raises the ORIGINAL exception on a
-        confirmed-empty lookup (a genuine, safe-to-retry rejection — the
-        existing ccxt.InsufficientFunds/ccxt.BaseError handlers below still
-        produce the same REJECTED order they always did); raises
-        _SubmissionOutcomeUnknown when the lookup itself could not be
-        completed, so execute() holds back rather than guessing."""
-        logger.warning(
-            "%s: %s (%s) — checking whether the exchange accepted it "
-            "before treating as failed", label, type(original_exc).__name__, original_exc,
-        )
-        adopted, confirmed_empty = self._find_untracked_entry_order(ccxt_side, client_order_id)
-        if adopted is not None:
+        2026-09-18 follow-up review finding (P0): an unresolved submission
+        (_SubmissionOutcomeUnknown) previously left no trace — the next
+        execute() call, this tick or after a restart, generated a fresh
+        client_order_id and submitted again, reproduced as two live
+        create_order calls for two consecutive execute() calls with the
+        same unresolved failure. This wrapper persists the pending intent
+        (self._pending_submission) BEFORE calling create_order, and before
+        attempting ANY new same-side submission, first tries to resolve a
+        still-pending one using ITS OWN client_order_id — never starting a
+        fresh attempt blind to an unresolved prior one.
+
+        fast_reject_exceptions: exception types that are a definite,
+        synchronous rejection from the exchange (e.g. ccxt.InvalidOrder —
+        Kraken saying "no" is not an ambiguous lost response) — these skip
+        the reconciliation round-trip entirely and re-raise immediately,
+        clearing the pending marker. Callers still handle these exceptions
+        themselves exactly as before this wrapper existed.
+        """
+        if self._pending_submission and self._pending_submission.get("side") == ccxt_side:
+            _entry = self._pending_submission
+            _cid   = _entry.get("client_order_id")
+            adopted, confirmed_empty = self._find_untracked_entry_order(ccxt_side, _cid)
+            if adopted is not None:
+                logger.warning(
+                    "SUBMISSION RECOVERY [%s]: prior unresolved %s submission "
+                    "(client_order_id=%s) found resting/filled — adopting it "
+                    "instead of placing a new order this cycle.",
+                    self.symbol, ccxt_side, _cid,
+                )
+                self._pending_submission = None
+                self._save_state()
+                return adopted
+            if confirmed_empty:
+                logger.warning(
+                    "SUBMISSION RECOVERY [%s]: prior unresolved %s submission "
+                    "(client_order_id=%s) confirmed never placed — clearing "
+                    "it and proceeding.", self.symbol, ccxt_side, _cid,
+                )
+                self._pending_submission = None
+                self._save_state()
+            else:
+                raise _SubmissionOutcomeUnknown(
+                    f"a prior {ccxt_side} submission on {self.symbol} "
+                    f"(client_order_id={_cid}) is still unresolved — "
+                    f"refusing a new submission until it resolves"
+                )
+
+        client_order_id = str(uuid.uuid4())
+        self._pending_submission = {
+            "side": ccxt_side, "client_order_id": client_order_id,
+            "quantity": quantity, "price": price, "label": label,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._save_state()
+
+        try:
+            raw = order_call(client_order_id)
+        except fast_reject_exceptions:
+            self._pending_submission = None
+            self._save_state()
+            raise
+        except Exception as exc:
             logger.warning(
-                "%s order %s found resting/filled despite the submission "
-                "error — adopting it instead of assuming failure",
-                label, adopted.get("id"),
+                "%s: %s (%s) — checking whether the exchange accepted it "
+                "before treating as failed", label, type(exc).__name__, exc,
             )
-            return adopted
-        if not confirmed_empty:
+            adopted, confirmed_empty = self._find_untracked_entry_order(ccxt_side, client_order_id)
+            if adopted is not None:
+                logger.warning(
+                    "%s order %s found resting/filled despite the submission "
+                    "error — adopting it instead of assuming failure",
+                    label, adopted.get("id"),
+                )
+                self._pending_submission = None
+                self._save_state()
+                return adopted
+            if confirmed_empty:
+                self._pending_submission = None
+                self._save_state()
+                raise
             raise _SubmissionOutcomeUnknown(
                 f"could not verify {label} order state after a submission "
-                f"error on {self.symbol} ({type(original_exc).__name__})"
-            ) from original_exc
-        raise original_exc
+                f"error on {self.symbol} ({type(exc).__name__})"
+            ) from exc
+
+        self._pending_submission = None
+        self._save_state()
+        return raw
 
     def _place_limit_order(self, side: str, quantity: float, price: float) -> dict:
         """
@@ -1553,7 +1781,13 @@ class LiveExecutor:
                     type(exc).__name__, exc,
                 )
                 self._maker_fallback_reason = f"orderbook fetch failed ({type(exc).__name__})"
-                return self._exchange.create_order(self.symbol, "market", side, quantity)
+                return self._create_order_persisted(
+                    side, quantity, None,
+                    lambda cid: self._exchange.create_order(
+                        self.symbol, "market", side, quantity, None, {"clientOrderId": cid},
+                    ),
+                    label=f"market fallback (orderbook fetch failed) [{self.symbol}]",
+                )
 
             logger.warning(
                 "LIMIT %s attempt %d/%d: %.6f %s @ %.2f (post-only, tick_pct=%.6f)",
@@ -1568,7 +1802,6 @@ class LiveExecutor:
             # oflags=post). See the exception handler below for why this
             # exists: fetch_open_orders() alone can't tell "never reached
             # Kraken" apart from "reached Kraken and already fully filled".
-            client_order_id = str(uuid.uuid4())
             try:
                 # postOnly (not timeInForce="PO") — found 2026-08-26 after
                 # SOL/CAD's first live BUY silently fell back to market.
@@ -1582,9 +1815,24 @@ class LiveExecutor:
                 # oflags=post) — verified against the real installed ccxt via
                 # verify_kraken_postonly_param.py (no network calls in the
                 # assertion itself; only the one public load_markets() call).
-                raw = self._exchange.create_order(
-                    self.symbol, "limit", side, quantity, limit_price,
-                    {"postOnly": True, "clientOrderId": client_order_id},
+                #
+                # Routed through _create_order_persisted (2026-09-18
+                # follow-up review finding): persists the submission intent
+                # before calling create_order and refuses a fresh same-side
+                # attempt while a prior one is still unresolved.
+                # ccxt.InvalidOrder is a definite, synchronous rejection
+                # (Kraken saying "would cross the spread"), not an
+                # ambiguous lost response — fast_reject_exceptions skips
+                # the reconciliation round-trip for it so the immediate
+                # tick_pct-halving retry below stays exactly as fast as before.
+                raw = self._create_order_persisted(
+                    side, quantity, limit_price,
+                    lambda cid: self._exchange.create_order(
+                        self.symbol, "limit", side, quantity, limit_price,
+                        {"postOnly": True, "clientOrderId": cid},
+                    ),
+                    label=f"limit chase attempt [{self.symbol}]",
+                    fast_reject_exceptions=(ccxt.InvalidOrder,),
                 )
                 order_id = str(raw.get("id", ""))
             except ccxt.InvalidOrder:
@@ -1598,43 +1846,35 @@ class LiveExecutor:
                 if tick_pct < _MIN_TICK_PCT:
                     logger.warning("spread too tight for post-only, using market")
                     self._maker_fallback_reason = "spread too tight for post-only"
-                    return self._exchange.create_order(self.symbol, "market", side, quantity)
+                    return self._create_order_persisted(
+                        side, quantity, None,
+                        lambda cid: self._exchange.create_order(
+                            self.symbol, "market", side, quantity, None, {"clientOrderId": cid},
+                        ),
+                        label=f"market fallback (spread too tight) [{self.symbol}]",
+                    )
                 continue
+            except _SubmissionOutcomeUnknown:
+                # Outcome genuinely unresolved — do NOT fall back to
+                # market (that's exactly the duplicate-order risk this
+                # exception exists to prevent). Propagate up to execute(),
+                # which holds back entirely. _pending_submission stays
+                # persisted so the next attempt reconciles this one first.
+                raise
             except Exception as exc:
-                # The exception means the RESPONSE to create_order failed
-                # (network timeout, connection drop, etc.) — it does NOT
-                # mean the REQUEST never reached Kraken. Placing a market
-                # order here unconditionally risks a duplicate against an
-                # order that actually went through. Verify first.
-                logger.warning(
-                    "_place_limit_order: %s (%s) — checking whether the "
-                    "exchange accepted it before falling back to market",
-                    type(exc).__name__, exc,
+                # _create_order_persisted already tried reconciliation and
+                # confirmed the limit order genuinely never landed (not an
+                # unknown outcome — that path raises _SubmissionOutcomeUnknown
+                # instead, caught above) — safe to fall back to market, same
+                # as this method always has for a confirmed limit failure.
+                self._maker_fallback_reason = f"exchange rejected limit order ({type(exc).__name__})"
+                return self._create_order_persisted(
+                    side, quantity, None,
+                    lambda cid: self._exchange.create_order(
+                        self.symbol, "market", side, quantity, None, {"clientOrderId": cid},
+                    ),
+                    label=f"market fallback (limit rejected) [{self.symbol}]",
                 )
-                adopted, confirmed_empty = self._find_untracked_entry_order(side, client_order_id)
-                if adopted is None and not confirmed_empty:
-                    # The reconciliation lookup itself failed — we do not
-                    # know whether the limit order reached Kraken. Falling
-                    # back to market here (the old behavior) risked placing
-                    # a second live order on top of one that actually went
-                    # through. Abstain instead — execute() holds back
-                    # entirely rather than guess.
-                    raise _SubmissionOutcomeUnknown(
-                        f"could not verify limit {side} order state after a "
-                        f"submission error on {self.symbol} ({type(exc).__name__})"
-                    ) from exc
-                if adopted is None:
-                    self._maker_fallback_reason = f"exchange rejected limit order ({type(exc).__name__})"
-                    return self._exchange.create_order(self.symbol, "market", side, quantity)
-                logger.warning(
-                    "LIMIT %s order %s found resting despite the submission "
-                    "error — adopting it instead of placing a market order "
-                    "on top (would have double-ordered)",
-                    side.upper(), adopted.get("id"),
-                )
-                raw = adopted
-                order_id = str(raw.get("id", ""))
-                # falls through into the same poll loop as a normal placement
 
             # Quick return if exchange already shows the order as closed
             if raw.get("status") == "closed":
@@ -1716,7 +1956,13 @@ class LiveExecutor:
         self._maker_fallback_reason = (
             f"limit chase timed out after {cfg.exchange.limit_chase_max_retries} retries"
         )
-        return self._exchange.create_order(self.symbol, "market", side, quantity)
+        return self._create_order_persisted(
+            side, quantity, None,
+            lambda cid: self._exchange.create_order(
+                self.symbol, "market", side, quantity, None, {"clientOrderId": cid},
+            ),
+            label=f"market fallback (chase exhausted) [{self.symbol}]",
+        )
 
     # ── Core execution ────────────────────────────────────────────────
 
@@ -1940,18 +2186,14 @@ class LiveExecutor:
                         )
                     quantity = filled_qty
                 else:
-                    # A fresh id per direct-submission attempt — same
-                    # reconciliation key the limit-chase path already uses,
-                    # extended here so an exception on THESE two paths
-                    # (direct passive-limit BUY, direct/urgent market order)
-                    # can also be verified rather than assumed failed.
-                    # 2026-09-18 review finding: neither path previously
-                    # carried a client id or attempted reconciliation at
-                    # all — any exception here fell straight to the outer
-                    # except ccxt.BaseError handler below, which marked the
-                    # order REJECTED unconditionally even for a timeout/
-                    # network error whose actual outcome was unknown.
-                    _direct_client_order_id = str(uuid.uuid4())
+                    # Routed through _create_order_persisted — same
+                    # reconciliation the limit-chase path already uses,
+                    # extended to these two paths (direct passive-limit
+                    # BUY, direct/urgent market order) so an exception here
+                    # is verified rather than assumed failed, AND (2026-09-18
+                    # follow-up review finding) so an unresolved outcome is
+                    # persisted and blocks a fresh same-side submission
+                    # instead of silently retrying blind on the next call.
                     if self._order_type == "limit" and side == OrderSide.BUY and not urgent:
                         # Passive bid 0.2% below market — post-only guarantees maker rate (0.40%, confirmed Jun 14 fill)
                         limit_price = round(price * 0.998, 2)
@@ -1959,37 +2201,28 @@ class LiveExecutor:
                             "LIMIT BUY: %.6f %s @ %.2f (0.2%% below %.2f, post-only)",
                             quantity, self.symbol, limit_price, price,
                         )
-                        try:
-                            raw = self._exchange.create_order(
-                                symbol = self.symbol,
-                                type   = "limit",
-                                side   = ccxt_side,
-                                amount = quantity,
-                                price  = limit_price,
-                                params = {"postOnly": True, "clientOrderId": _direct_client_order_id},
-                            )
-                        except Exception as exc:
-                            raw = self._reconcile_or_raise_unknown(
-                                ccxt_side, _direct_client_order_id, exc, "direct LIMIT BUY",
-                            )
+                        raw = self._create_order_persisted(
+                            ccxt_side, quantity, limit_price,
+                            lambda cid: self._exchange.create_order(
+                                symbol=self.symbol, type="limit", side=ccxt_side,
+                                amount=quantity, price=limit_price,
+                                params={"postOnly": True, "clientOrderId": cid},
+                            ),
+                            label="direct LIMIT BUY",
+                        )
                     else:
                         logger.warning(
                             "LIVE ORDER: %s %.6f %s",
                             side.value, quantity, self.symbol,
                         )
-                        try:
-                            raw = self._exchange.create_order(
-                                symbol = self.symbol,
-                                type   = "market",
-                                side   = ccxt_side,
-                                amount = quantity,
-                                params = {"clientOrderId": _direct_client_order_id},
-                            )
-                        except Exception as exc:
-                            raw = self._reconcile_or_raise_unknown(
-                                ccxt_side, _direct_client_order_id, exc,
-                                "urgent/direct MARKET" if urgent else "direct MARKET",
-                            )
+                        raw = self._create_order_persisted(
+                            ccxt_side, quantity, None,
+                            lambda cid: self._exchange.create_order(
+                                symbol=self.symbol, type="market", side=ccxt_side,
+                                amount=quantity, params={"clientOrderId": cid},
+                            ),
+                            label="urgent/direct MARKET" if urgent else "direct MARKET",
+                        )
                     order_id_str = str(raw.get("id", ""))
                     filled_qty   = float(raw.get("filled") or 0.0)
                     fill_price   = float(raw.get("average") or raw.get("price") or price)
@@ -2214,6 +2447,7 @@ class LiveExecutor:
                     f"happened — this is a post-fill alert, not a block."
                 )
 
+        pnl = None
         if side == OrderSide.BUY:
             prev_cost = self._portfolio._cost_basis * self._portfolio.position
             self._portfolio.cash      -= total_value
@@ -2262,6 +2496,7 @@ class LiveExecutor:
             filled_at    = datetime.now(timezone.utc),
             fee_cost     = fee_cost,
             fee_currency = fee_currency,
+            pnl          = pnl,
         )
         self._fills.append(order)
         self._record_pending_journal_entry(order)

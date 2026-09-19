@@ -693,6 +693,47 @@ class AppConfig:
                     _saved, _shash,
                 )
 
+        # ── Execution/config fingerprint + drift guard ───────────────────────
+        # 2026-09-18 follow-up review finding (P2): compute_execution_hash()/
+        # compute_full_run_fingerprint() existed but had no production caller
+        # — defining them alone strengthens nothing. Wired in here, at the one
+        # place both bots' config validation already runs at every startup
+        # (same call site as the strategy-hash check above), with a real
+        # normalized snapshot of the non-secret config that affects trade
+        # OUTCOMES without living in the hashed strategy files themselves.
+        # Informational only, same as the strategy-hash check — neither
+        # blocks startup; both exist so a human sees the drift instead of
+        # silently trusting an old walk-forward against changed behavior.
+        from bot.strategy.fingerprint import compute_execution_hash
+        _exec_snapshot = {
+            "order_type":                self.exchange.order_type,
+            "limit_order_enabled":       self.exchange.limit_order_enabled,
+            "native_stop_loss_enabled":  self.exchange.native_stop_loss_enabled,
+            "max_slippage_pct":          self.exchange.max_slippage_pct,
+            "atr_sizing_enabled":        self.strategy.atr_sizing_enabled,
+            "atr_sl_mult":               self.strategy.atr_sl_mult,
+            "risk_max_position_pct":     self.risk.max_position_pct,
+            "risk_daily_loss_limit_pct": self.risk.daily_loss_limit_pct,
+            "risk_max_drawdown_pct":     self.risk.max_drawdown_pct,
+            "risk_max_trades_per_day":   self.risk.max_trades_per_day,
+            "risk_weekly_loss_limit_pct": self.risk.weekly_loss_limit_pct,
+            "risk_kill_switch_pct":      self.risk.kill_switch_pct,
+        }
+        _ehash = compute_execution_hash(_exec_snapshot)
+        logger.info("CONFIG  execution_hash=%s", _ehash)
+        _exec_hash_file = Path(os.getenv("EXECUTION_HASH_FILE", "logs/validated_execution_hash"))
+        if _exec_hash_file.exists():
+            _saved_exec = _exec_hash_file.read_text().strip()
+            if _saved_exec != _ehash:
+                logger.warning(
+                    "EXECUTION/CONFIG DIFFERS FROM LAST VALIDATED VERSION  "
+                    "saved=%s  current=%s  "
+                    "Order type, sizing, or risk-gate thresholds changed since the last "
+                    "stamp — re-run stamp_strategy.py after confirming the new behavior "
+                    "is intended.",
+                    _saved_exec, _ehash,
+                )
+
         logger.info("─" * 60)
 
 

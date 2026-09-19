@@ -59,6 +59,16 @@ class Order:
     fee_cost:     float = field(default=0.0)
     fee_currency: str   = field(default="")
 
+    # Realized P&L for a SELL fill (gross, cost-basis-based — the same
+    # figure the executor's own _portfolio.realized_pnl accumulates).
+    # None for a BUY (no P&L on entry) or when not computed. 2026-09-18
+    # follow-up review finding: without this, a fill recorded outside the
+    # normal per-tick main.py bookkeeping path (crash-recovery journal
+    # replay) had no way to carry its own P&L at all — trade_log rows for
+    # such fills went in with pnl=NULL and were silently excluded from
+    # every live PF/win-rate calculation (which filters on pnl IS NOT NULL).
+    pnl: Optional[float] = field(default=None)
+
     # Computed on fill
     total_value:  float = field(default=0.0, init=False)
 

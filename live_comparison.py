@@ -117,48 +117,71 @@ def _compute_live_metrics(fills: list[dict]) -> dict:
     now NET (the trustworthy, primary figures); `gross_pf`/`gross_win_rate`
     are kept alongside for comparison only, never for gating.
 
-    `net_pnl` is an EXACT identity — total realized gross P&L minus every
-    fee actually paid (BUY entry + SELL exit) across the whole loaded
-    fill set. Per-trade `pf`/`win_rate` are a documented APPROXIMATION —
-    each SELL's own exit fee is attributed to it, but the matching entry
-    BUY's fee is not (this flat fills table has no cost-basis linkage
-    between a BUY and the SELL(s) that later close it — a true per-trade
-    allocation is the "shared closed-position accounting component" the
-    review calls for as future work, matching the backtest engine's own
-    already-built position-tracking machinery). A fee whose currency
-    doesn't match its own fill's quote currency is excluded rather than
-    silently mixed into a differently-denominated total — counted in
-    `unmatched_fee_ct` so the report can say so.
+    2026-09-18 FOLLOW-UP review finding: the first fix's per-trade net pnl
+    subtracted only the SELL's own exit fee, not its share of the matching
+    BUY's entry fee — reproduced: BUY fee $0.80, SELL gross profit $1.00,
+    SELL fee $0.40 (real round-trip result -$0.20) was reported as
+    win_rate=1.0, pf=inf. Fixed to share the EXACT same per-symbol FIFO
+    fee-allocation algorithm bot/backtest/metrics.py already uses: a
+    closed SELL's net pnl = its gross pnl, minus its own fee, minus its
+    proportional (by quantity) share of the BUY fee(s) that opened the
+    position it's closing — allocated by symbol, in fill order, tracking a
+    running (pending BUY fee, pending BUY quantity) per symbol exactly as
+    the backtest engine does over its own single-symbol fill sequence.
+
+    A fee whose currency doesn't match its own fill's quote currency is
+    excluded from allocation entirely (counted in `unmatched_fee_ct`)
+    rather than silently mixed into a differently-denominated total.
+    `unallocated_buy_fees` reports BUY fees for symbols with inventory
+    still open at the end of the loaded window — a real cost already paid
+    that isn't yet attributable to any closed trade (not silently dropped,
+    not wrongly charged against a trade that hasn't closed).
     """
-    sells    = [f for f in fills if f["side"] == "SELL" and f["pnl"] is not None]
-    n        = len(sells)
+    sells_with_pnl = [f for f in fills if f["side"] == "SELL" and f["pnl"] is not None]
+    n = len(sells_with_pnl)
     if n == 0:
         return {}
 
-    total_fees       = 0.0
-    unmatched_fee_ct = 0
-    for f in fills:
+    def _fee_or_zero(f: dict) -> "tuple[float, bool]":
         fee = f.get("fee_cost") or 0.0
         if fee <= 0:
-            continue
+            return 0.0, True
         cur = (f.get("fee_currency") or "").upper()
         if cur and cur != _quote_ccy(f["symbol"]):
+            return 0.0, False
+        return fee, True
+
+    pending_buy_fee: dict[str, float] = {}
+    pending_buy_qty: dict[str, float] = {}
+    unmatched_fee_ct = 0
+    closed_gross: list[float] = []
+    closed_net:   list[float] = []
+
+    for f in fills:
+        sym = f.get("symbol") or ""
+        fee, matched = _fee_or_zero(f)
+        if not matched:
             unmatched_fee_ct += 1
-            continue
-        total_fees += fee
+        if f["side"] == "BUY":
+            pending_buy_fee[sym] = pending_buy_fee.get(sym, 0.0) + fee
+            pending_buy_qty[sym] = pending_buy_qty.get(sym, 0.0) + (f.get("quantity") or 0.0)
+        elif f["side"] == "SELL" and f["pnl"] is not None:
+            closed_gross.append(f["pnl"])
+            _pq  = pending_buy_qty.get(sym, 0.0)
+            _pf  = pending_buy_fee.get(sym, 0.0)
+            qty  = f.get("quantity") or 0.0
+            allocated = (_pf * min(qty / _pq, 1.0)) if _pq > 0 else 0.0
+            closed_net.append(f["pnl"] - allocated - fee)
+            pending_buy_fee[sym] = _pf - allocated
+            pending_buy_qty[sym] = max(0.0, _pq - qty)
+            if pending_buy_qty[sym] <= 1e-9:
+                pending_buy_fee[sym] = 0.0
+                pending_buy_qty[sym] = 0.0
 
-    def _net_pnl(f: dict) -> float:
-        fee = f.get("fee_cost") or 0.0
-        cur = (f.get("fee_currency") or "").upper()
-        if cur and cur != _quote_ccy(f["symbol"]):
-            return f["pnl"]   # unknown basis for this trade — report gross rather than guess
-        return f["pnl"] - fee
+    unallocated_buy_fees = sum(pending_buy_fee.values())
 
-    pnls     = [f["pnl"] for f in sells]
-    net_pnls = [_net_pnl(f) for f in sells]
-
-    wins,     losses     = [p for p in pnls if p > 0],     [p for p in pnls if p < 0]
-    net_wins, net_losses = [p for p in net_pnls if p > 0], [p for p in net_pnls if p < 0]
+    wins,     losses     = [p for p in closed_gross if p > 0], [p for p in closed_gross if p < 0]
+    net_wins, net_losses = [p for p in closed_net if p > 0],   [p for p in closed_net if p < 0]
     gross_win_rate = len(wins) / n
     net_win_rate   = len(net_wins) / n
 
@@ -176,7 +199,7 @@ def _compute_live_metrics(fills: list[dict]) -> dict:
     # Sharpe. 2026-09-18 review finding: labeled explicitly in the report
     # rather than implying comparability.
     equity = [0.0]
-    for p in net_pnls:
+    for p in closed_net:
         equity.append(equity[-1] + p)
     returns = [equity[i + 1] - equity[i] for i in range(len(equity) - 1)]
     mean_r = sum(returns) / len(returns)
@@ -191,22 +214,23 @@ def _compute_live_metrics(fills: list[dict]) -> dict:
         max_dd = min(max_dd, e - peak)
 
     return {
-        "n_trades":         n,
-        "win_rate":         net_win_rate,
-        "pf":               net_pf,
-        "gross_win_rate":   gross_win_rate,
-        "gross_pf":         gross_pf,
-        "total_pnl":        sum(pnls),
-        "net_pnl":          sum(pnls) - total_fees,
-        "unmatched_fee_ct": unmatched_fee_ct,
-        "avg_win":          net_profit / len(net_wins) if net_wins else 0.0,
-        "avg_loss":         sum(net_losses) / len(net_losses) if net_losses else 0.0,
-        "sharpe":           sharpe,
-        "max_dd":           max_dd,
-        "first_trade":      sells[0]["timestamp"],
-        "last_trade":       sells[-1]["timestamp"],
-        "exchanges":        list({f["exchange"] for f in fills if f["exchange"]}),
-        "symbols":          list({f["symbol"] for f in fills if f["symbol"]}),
+        "n_trades":            n,
+        "win_rate":            net_win_rate,
+        "pf":                  net_pf,
+        "gross_win_rate":      gross_win_rate,
+        "gross_pf":            gross_pf,
+        "total_pnl":           sum(closed_gross),
+        "net_pnl":             sum(closed_net),
+        "unallocated_buy_fees": unallocated_buy_fees,
+        "unmatched_fee_ct":    unmatched_fee_ct,
+        "avg_win":             net_profit / len(net_wins) if net_wins else 0.0,
+        "avg_loss":            sum(net_losses) / len(net_losses) if net_losses else 0.0,
+        "sharpe":              sharpe,
+        "max_dd":              max_dd,
+        "first_trade":         sells_with_pnl[0]["timestamp"],
+        "last_trade":          sells_with_pnl[-1]["timestamp"],
+        "exchanges":           list({f["exchange"] for f in fills if f["exchange"]}),
+        "symbols":             list({f["symbol"] for f in fills if f["symbol"]}),
     }
 
 
@@ -264,6 +288,9 @@ def _print_report(metrics: dict, min_trades: int) -> None:
         print(f"  {_YL}⚠ {metrics['unmatched_fee_ct']} fill(s) had a fee in a currency that "
               f"didn't match the symbol's quote — excluded from net figures rather than "
               f"mixed in; net numbers above may understate real cost.{_R}")
+    if metrics.get("unallocated_buy_fees"):
+        print(f"  {_DIM}({metrics['unallocated_buy_fees']:.2f} in BUY fees not yet allocated — "
+              f"open inventory, not attributable to a closed trade yet){_R}")
 
     # ── Sharpe ───────────────────────────────────────────────────────────
     # Trade-level (cumulative per-trade P&L), NOT a regularly sampled

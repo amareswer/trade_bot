@@ -57,10 +57,67 @@ def test_price_profitable_trade_is_a_net_loss_after_fees(db):
     assert metrics["total_pnl"] == pytest.approx(0.5)     # gross: looks like a win
     assert metrics["net_pnl"]   == pytest.approx(0.5 - 0.5 - 0.9)   # net: a real loss
     assert metrics["net_pnl"] < 0
-    # Per-trade net PF/win-rate: only the SELL's own exit fee is
-    # attributable per-trade (documented approximation) — 0.5 - 0.9 < 0
     assert metrics["win_rate"] == 0.0     # the one trade nets negative
     assert metrics["gross_win_rate"] == 1.0   # gross still shows it as a win
+
+
+def test_follow_up_review_exact_reproduction_buy_fee_flips_win_to_loss(db):
+    """2026-09-18 FOLLOW-UP review finding: the first fix's per-trade net
+    pnl subtracted only the SELL's own exit fee, not its share of the
+    matching BUY's entry fee. Exact reproduction: BUY fee $0.80, SELL gross
+    profit $1.00, SELL fee $0.40 — real round-trip result is -$0.20, but
+    the old code returned win_rate=1.0 and pf=infinity."""
+    tl = TradeLog(db_path=db)
+    _fill(tl, "BUY",  0.001, 90_000.0, fee_cost=0.80)
+    _fill(tl, "SELL", 0.001, 91_000.0, pnl=1.00, fee_cost=0.40)
+
+    fills   = lc._load_fills(db)
+    metrics = lc._compute_live_metrics(fills)
+
+    assert metrics["net_pnl"] == pytest.approx(-0.20)
+    assert metrics["win_rate"] == 0.0       # not 1.0 — this is a real net loss
+    assert metrics["pf"] == 0.0             # not infinity — no net winners at all
+    assert metrics["gross_win_rate"] == 1.0  # gross still (correctly) shows it as a win
+
+
+def test_partial_exit_allocates_buy_fee_proportionally_by_quantity(db):
+    """Mirrors bot/backtest/metrics.py's own partial-exit regression: a
+    position closed via two partial SELLs must split the entry fee
+    proportionally by quantity, not dump 100% onto whichever SELL closes
+    first."""
+    tl = TradeLog(db_path=db)
+    _fill(tl, "BUY",  0.002, 90_000.0, fee_cost=1.0)   # one BUY, $1.00 entry fee
+    _fill(tl, "SELL", 0.001, 91_000.0, pnl=1.0, fee_cost=0.1)   # closes half
+    _fill(tl, "SELL", 0.001, 91_000.0, pnl=1.0, fee_cost=0.1)   # closes the other half
+
+    fills   = lc._load_fills(db)
+    metrics = lc._compute_live_metrics(fills)
+
+    # Each SELL gets exactly half the $1.00 entry fee ($0.50), not 100%/0%.
+    assert metrics["net_pnl"] == pytest.approx((1.0 - 0.5 - 0.1) + (1.0 - 0.5 - 0.1))
+    assert metrics["win_rate"] == 1.0   # both trades still net positive at this split
+    assert metrics["unallocated_buy_fees"] == pytest.approx(0.0)   # fully allocated, nothing open
+
+
+def test_unallocated_buy_fee_reported_for_open_inventory(db):
+    """Inventory still open at the end of the window (a SELL only partially
+    closes the pooled BUY quantity) leaves a real, already-paid fee that
+    isn't yet attributable to any closed trade — reported separately, not
+    silently dropped or wrongly charged in full against the one trade that
+    HAS closed. Pooled proportionally by quantity (same convention as
+    bot/backtest/metrics.py): SELL closes half the combined 0.002 BUY
+    quantity, so it's allocated exactly half the combined $0.90 fee."""
+    tl = TradeLog(db_path=db)
+    _fill(tl, "BUY", 0.001, 90_000.0, fee_cost=0.5)
+    _fill(tl, "BUY", 0.001, 90_000.0, fee_cost=0.4)
+    _fill(tl, "SELL", 0.001, 91_000.0, pnl=1.0, fee_cost=0.2)   # closes half the pooled quantity
+
+    fills   = lc._load_fills(db)
+    metrics = lc._compute_live_metrics(fills)
+
+    assert metrics["n_trades"] == 1
+    assert metrics["unallocated_buy_fees"] == pytest.approx(0.45)   # half of the pooled $0.90
+    assert metrics["net_pnl"] == pytest.approx(1.0 - 0.45 - 0.2)
 
 
 def test_gross_and_net_pf_reported_separately(db):

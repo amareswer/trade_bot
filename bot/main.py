@@ -66,7 +66,7 @@ from bot.data.price_feed import SimulatedFeed, CcxtFeed
 from bot.data.historical_feed import Candle as _Candle
 from bot.strategy.threshold_strategy import ThresholdStrategy, Signal
 from bot.strategy.indicator_strategy import IndicatorStrategy, IndicatorConfig
-from bot.execution.executor import PaperExecutor, OrderStatus, OrderSide
+from bot.execution.executor import PaperExecutor, OrderStatus, OrderSide, Order
 from bot.execution.live_executor import LiveExecutor
 from bot.exchanges.retry import fetch_with_retry
 from bot.risk.risk_manager import RiskManager, RiskConfig
@@ -558,54 +558,68 @@ def _replay_pending_journal_entries(executors: dict, trade_log, alerter: "Telegr
     a crash between those two writes leaves the portfolio state correctly
     updated but the fill invisible to trade_log/reporting forever.
 
-    Called once at startup, before any new trading: every executor exposing
-    a non-None pending_journal_entry recorded a fill whose accounting is
-    already real and persisted, but whose trade_log row may be missing.
-    Replays it into trade_log (tagged so it's distinguishable from a
-    normally-logged fill) and acks it so a later restart doesn't replay it
-    again. Never raises — a replay failure is alerted and left pending for
-    the next startup rather than silently dropped or crashing the boot.
-    Returns the list of symbols that had a pending entry (for tests/logs).
+    Called once at startup, before any new trading: every executor's
+    pending_journal_entries lists fills whose accounting is already real
+    and persisted, but whose trade_log row may be missing. Replays each
+    into trade_log (tagged, with its ORIGINAL execution timestamp and P&L
+    preserved — not replay time / NULL) and acks it so a later restart
+    doesn't replay it again.
+
+    2026-09-18 FOLLOW-UP review finding (P1): a crash between the DB
+    insert succeeding and the ack being persisted used to duplicate the
+    row on the NEXT replay — trade_log.log_fill()'s exec_key parameter
+    makes this insert idempotent (a second attempt with the same exec_key
+    is a confirmed no-op, not a duplicate row), so retrying a replay whose
+    ack didn't survive is safe. Multiple entries per executor (a second
+    fill recorded before the first was acked) are now each replayed and
+    acked independently, in order — not just one, silently overwritten.
+
+    Never raises — a replay failure is alerted and left pending for the
+    next startup rather than silently dropped or crashing the boot.
+    Returns the list of symbols that had at least one pending entry (for
+    tests/logs) — may list a symbol more than once if it had more than one.
     """
     recovered: list[str] = []
     for sym, executor in executors.items():
-        entry = getattr(executor, "pending_journal_entry", None)
-        if entry is None:
-            continue
-        try:
-            trade_log.log_fill(
-                side          = entry["side"],
-                symbol        = entry["symbol"],
-                quantity      = entry["quantity"],
-                price         = entry["price"],
-                exchange      = cfg.exchange.exchange,
-                signal_reason = "recovered_from_crash",
-                notes         = f"replayed from pending_journal_entry, filled_at={entry.get('filled_at')}",
-                fee_cost      = entry.get("fee_cost", 0.0),
-                fee_currency  = entry.get("fee_currency", ""),
-            )
-            executor.ack_journal_entry(entry["order_id"])
-            recovered.append(sym)
-            logger.warning(
-                "FILL JOURNAL RECOVERED [%s]: replayed missed trade_log row "
-                "for order %s (a crash previously interrupted logging it)",
-                sym, entry.get("order_id"),
-            )
-            alerter.message(
-                f"ℹ️ FILL JOURNAL RECOVERED [{sym}]: a fill from a prior crash "
-                f"({entry['side']} {entry['quantity']:.8f} @ {entry['price']:,.2f}) "
-                f"had its accounting already applied but was missing from "
-                f"trade_log — replayed now."
-            )
-        except Exception as exc:
-            logger.error(
-                "FILL JOURNAL REPLAY FAILED [%s]: %s — entry stays pending, "
-                "will retry on next startup", sym, exc,
-            )
-            alerter.error(
-                f"FILL JOURNAL REPLAY FAILED [{sym}]: {exc} — a crash-recovered "
-                f"fill could not be logged; will retry on the next restart."
-            )
+        entries = list(getattr(executor, "pending_journal_entries", []) or [])
+        for entry in entries:
+            try:
+                trade_log.log_fill(
+                    side          = entry["side"],
+                    symbol        = entry["symbol"],
+                    quantity      = entry["quantity"],
+                    price         = entry["price"],
+                    pnl           = entry.get("pnl"),
+                    exchange      = cfg.exchange.exchange,
+                    signal_reason = "recovered_from_crash",
+                    notes         = f"replayed from pending_journal_entry, filled_at={entry.get('filled_at')}",
+                    fee_cost      = entry.get("fee_cost", 0.0),
+                    fee_currency  = entry.get("fee_currency", ""),
+                    exec_key      = entry.get("exec_key", ""),
+                    timestamp     = entry.get("filled_at"),
+                )
+                executor.ack_journal_entry(entry["order_id"])
+                recovered.append(sym)
+                logger.warning(
+                    "FILL JOURNAL RECOVERED [%s]: replayed missed trade_log row "
+                    "for order %s (a crash previously interrupted logging it)",
+                    sym, entry.get("order_id"),
+                )
+                alerter.message(
+                    f"ℹ️ FILL JOURNAL RECOVERED [{sym}]: a fill from a prior crash "
+                    f"({entry['side']} {entry['quantity']:.8f} @ {entry['price']:,.2f}) "
+                    f"had its accounting already applied but was missing from "
+                    f"trade_log — replayed now."
+                )
+            except Exception as exc:
+                logger.error(
+                    "FILL JOURNAL REPLAY FAILED [%s]: %s — entry stays pending, "
+                    "will retry on next startup", sym, exc,
+                )
+                alerter.error(
+                    f"FILL JOURNAL REPLAY FAILED [{sym}]: {exc} — a crash-recovered "
+                    f"fill could not be logged; will retry on the next restart."
+                )
     return recovered
 
 
@@ -977,7 +991,7 @@ def _seed_native_stop_state(executor) -> tuple[float | None, bool]:
     return executor.native_stop_price, executor.native_stop_is_trailing
 
 
-def _resync_native_stop(ss: dict) -> None:
+def _resync_native_stop(ss: dict) -> "Order | None":
     """
     Re-place the native backstop sized to the position AFTER a quantity-
     changing event that doesn't close it (partial TP, a partial fill on
@@ -998,19 +1012,27 @@ def _resync_native_stop(ss: dict) -> None:
     site (bare `_resync_native_stop(ss)`, unchanged) now resolves to this
     module-level definition instead of the nested one, and it's directly
     unit-testable without invoking run().
+
+    Returns whatever LiveExecutor.sync_protective_stop() returns — non-None
+    when a native stop was discovered to have filled (fully or partially)
+    during the cancel-and-verify cycle this triggers. 2026-09-18 follow-up
+    review finding (P1): every call site used to discard this return value
+    entirely — callers must now route a non-None result through
+    _process_discovered_sell_fill so PositionManager/state machine/capital
+    pool/risk/trade log all learn about it, not just the executor's own
+    internal accounting.
     """
     if not ss['pm'].has_position:
-        ss['executor'].sync_protective_stop(None)
+        _fo = ss['executor'].sync_protective_stop(None)
         ss['native_stop_is_trailing'] = False
-        return
+        return _fo
     if ss['native_stop_is_trailing']:
-        ss['executor'].sync_protective_stop(
+        return ss['executor'].sync_protective_stop(
             None,
             trailing_pct=cfg.backtest.exit_params_for(
                 ss['executor'].symbol)["trail_stop_pct"],
         )
-    else:
-        ss['executor'].sync_protective_stop(ss.get('native_stop_price'))
+    return ss['executor'].sync_protective_stop(ss.get('native_stop_price'))
 
 
 def _compute_account_value(capital_pool: CapitalPool, executors: dict, symbol_state: dict) -> float:
@@ -1168,7 +1190,13 @@ def _execute_approved_signal(
                     )
                 )
                 ss['native_stop_is_trailing'] = False
-                ss['executor'].sync_protective_stop(ss['native_stop_price'])
+                _discovered = ss['executor'].sync_protective_stop(ss['native_stop_price'])
+                if _discovered is not None:
+                    _process_discovered_sell_fill(
+                        sym, ss, _discovered, "native_stop_discovered",
+                        capital_pool=capital_pool, risk=risk,
+                        alerter=alerter, trade_log=trade_log,
+                    )
             else:
                 pnl = ss['pm'].on_sell(order.price, order.quantity)
                 ss['trail_peak'] = 0.0
@@ -1176,14 +1204,26 @@ def _execute_approved_signal(
                 ss['atr_sl'] = 0.0
                 if not ss['pm'].has_position:
                     capital_pool.release(sym, ss['executor'].cash)
-                    ss['executor'].sync_protective_stop(None)
+                    _discovered = ss['executor'].sync_protective_stop(None)
                     ss['native_stop_is_trailing'] = False
+                    if _discovered is not None:
+                        _process_discovered_sell_fill(
+                            sym, ss, _discovered, "native_stop_discovered",
+                            capital_pool=capital_pool, risk=risk,
+                            alerter=alerter, trade_log=trade_log,
+                        )
                 else:
                     # Partial fill leaving a residual position (not
                     # currently reachable with strategy SELLs, which
                     # always close in full — defensive parity with
                     # the partial-TP path below).
-                    _resync_native_stop(ss)
+                    _discovered = _resync_native_stop(ss)
+                    if _discovered is not None:
+                        _process_discovered_sell_fill(
+                            sym, ss, _discovered, "native_stop_discovered",
+                            capital_pool=capital_pool, risk=risk,
+                            alerter=alerter, trade_log=trade_log,
+                        )
 
             display.fill(
                 order.side.value, order.quantity,
@@ -1246,6 +1286,85 @@ def _execute_approved_signal(
         ),
     )
     return order
+
+
+def _process_discovered_sell_fill(
+    sym: str, ss: dict, order: Order, reason: str,
+    *, capital_pool: CapitalPool, risk: RiskManager, alerter, trade_log,
+) -> None:
+    """
+    Route a SELL fill DISCOVERED outside the normal execute() call path —
+    specifically, a native stop found to have filled (fully or partially)
+    during sync_protective_stop()'s own cancel-and-verify cycle, called via
+    _resync_native_stop() — through the SAME PositionManager / state
+    machine / capital pool / risk / trade-log bookkeeping a strategy-driven
+    SELL gets via _execute_approved_signal.
+
+    2026-09-18 follow-up review finding (P1): sync_protective_stop() and
+    _resync_native_stop() were returning this fill_order, and every call
+    site was discarding it. The EXECUTOR's own cash/position updated
+    correctly (via LiveExecutor._record_stop_triggered_fill), but
+    PositionManager, the state machine, the capital pool, the risk fill
+    counter, and trade_log never learned about it at the time — only
+    reachable (for trade_log alone) via a restart replaying the pending
+    journal entry, which does nothing for the other four in-memory
+    representations. This closes that gap for the RUNTIME case (mid-run,
+    after this symbol's pm/sm/capital_pool already exist) — the startup
+    case (_reconcile_resting_stop_quantity, called from inside
+    LiveExecutor.__init__ before any of this exists yet) is unaffected and
+    self-consistent for a different reason — see that method's own comment.
+
+    order.side must be SELL — a native stop never fires on a BUY.
+    """
+    if order.side != OrderSide.SELL:
+        logger.error(
+            "_process_discovered_sell_fill called with a non-SELL order "
+            "for %s (%s) — ignoring, this should never happen.",
+            sym, order.side,
+        )
+        return
+
+    pnl = ss['pm'].on_sell(order.price, order.quantity)
+    ss['trail_peak']   = 0.0
+    ss['partial_done'] = False
+    ss['atr_sl']       = 0.0
+    if not ss['pm'].has_position:
+        capital_pool.release(sym, ss['executor'].cash)
+        ss['native_stop_is_trailing'] = False
+    # else: a genuine residual remains (a PARTIAL stop fill) — the stop
+    # that produced this fill is, per sync_protective_stop's own contract,
+    # either already resolved (fully closed) or still correctly tracked
+    # (a "partial" outcome deliberately keeps the id) — no additional
+    # resync is triggered here to avoid re-entering the same cancel/verify
+    # cycle this fill was already discovered inside of.
+
+    risk.record_fill(sym)
+    ss['sm'].on_fill(Signal.SELL, order.price)
+
+    display.fill(order.side.value, order.quantity, sym, order.price, order.total_value, pnl)
+    trade_log.log_fill(
+        side          = "SELL",
+        symbol        = sym,
+        quantity      = order.quantity,
+        price         = order.price,
+        pnl           = pnl,
+        exchange      = cfg.exchange.exchange,
+        signal_reason = reason,
+        fee_cost      = order.fee_cost,
+        fee_currency  = order.fee_currency,
+    )
+    if hasattr(ss['executor'], 'ack_journal_entry'):
+        ss['executor'].ack_journal_entry(order.order_id)
+    alerter.fill(
+        side        = "SELL",
+        symbol      = sym,
+        quantity    = order.quantity,
+        price       = order.price,
+        total_value = order.total_value,
+        pnl         = pnl,
+        exchange    = cfg.exchange.exchange,
+        reason      = reason,
+    )
 
 
 def _execute_ranked_dynamic_buys(
@@ -2005,8 +2124,13 @@ def _maybe_send_health_digest(
                     attention.append(f"{_sym}: last state save failed — new BUYs blocked")
                 if not getattr(_exc, "startup_sync_healthy", True):
                     attention.append(f"{_sym}: startup balance/position sync failed this run")
-                if getattr(_exc, "pending_journal_entry", None) is not None:
-                    attention.append(f"{_sym}: unacked fill journal entry — trade_log may be missing a fill")
+                _pending_entries = getattr(_exc, "pending_journal_entries", None) or []
+                if _pending_entries:
+                    attention.append(
+                        f"{_sym}: {len(_pending_entries)} unacked fill journal "
+                        f"entr{'y' if len(_pending_entries) == 1 else 'ies'} — "
+                        f"trade_log may be missing a fill"
+                    )
                 if (
                     getattr(_exc, "position", 0) > 0
                     and cfg.exchange.native_stop_loss_enabled
@@ -3046,10 +3170,16 @@ def run():
                         and not ss['native_stop_is_trailing']
                         and cfg.exchange.native_stop_loss_enabled
                     ):
-                        ss['executor'].sync_protective_stop(
+                        _tr_discovered = ss['executor'].sync_protective_stop(
                             None, trailing_pct=_trail_stop_pct,
                         )
                         ss['native_stop_is_trailing'] = True
+                        if _tr_discovered is not None:
+                            _process_discovered_sell_fill(
+                                sym, ss, _tr_discovered, "native_stop_discovered",
+                                capital_pool=capital_pool, risk=risk,
+                                alerter=alerter, trade_log=trade_log,
+                            )
 
                     _partial_tp_level = (
                         _ic_entry * (1 + cfg.backtest.partial_tp_pct)
@@ -3099,7 +3229,13 @@ def run():
                                     # reduced position (same static price or
                                     # same trailing % — partial TP changes
                                     # quantity, not level).
-                                    _resync_native_stop(ss)
+                                    _pt_discovered = _resync_native_stop(ss)
+                                    if _pt_discovered is not None:
+                                        _process_discovered_sell_fill(
+                                            sym, ss, _pt_discovered, "native_stop_discovered",
+                                            capital_pool=capital_pool, risk=risk,
+                                            alerter=alerter, trade_log=trade_log,
+                                        )
                                     print(f"           📊 PARTIAL TP [{sym}]:  {_p_qty:.6f} @ {price:,.2f}  PnL={_p_pnl:+.2f}", flush=True)
                                     logger.warning("PARTIAL TP [%s]: sold %.6f @ %.2f  pnl=%.2f", sym, _p_qty, price, _p_pnl)
                                     trade_log.log_fill(
@@ -3203,8 +3339,14 @@ def run():
                                     # no-op belt-and-suspenders for the full-close
                                     # case; kept so a future refactor that skips
                                     # the executor-side cancel still clears it.
-                                    ss['executor'].sync_protective_stop(None)
+                                    _ic_discovered = ss['executor'].sync_protective_stop(None)
                                     ss['native_stop_is_trailing'] = False
+                                    if _ic_discovered is not None:
+                                        _process_discovered_sell_fill(
+                                            sym, ss, _ic_discovered, "native_stop_discovered",
+                                            capital_pool=capital_pool, risk=risk,
+                                            alerter=alerter, trade_log=trade_log,
+                                        )
                                 else:
                                     # Urgent market SELL only partially filled — a
                                     # residual position remains. execute() cancelled
@@ -3212,7 +3354,13 @@ def run():
                                     # sell; re-place one sized to what's actually
                                     # still held. Same resize the partial-TP and
                                     # strategy-SELL paths already do.
-                                    _resync_native_stop(ss)
+                                    _ic_discovered = _resync_native_stop(ss)
+                                    if _ic_discovered is not None:
+                                        _process_discovered_sell_fill(
+                                            sym, ss, _ic_discovered, "native_stop_discovered",
+                                            capital_pool=capital_pool, risk=risk,
+                                            alerter=alerter, trade_log=trade_log,
+                                        )
                                 _ic_reason = (
                                     "trail_stop" if (_trail_sl_level > 0 and price <= _trail_sl_level)
                                     else "stop_loss" if _ic_sl
