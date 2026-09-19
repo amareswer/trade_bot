@@ -160,6 +160,12 @@ def _make_live_executor_with_position(
         "free":  {"BTC": position, "CAD": 100.0},
         "total": {"BTC": position, "CAD": 100.0},
     }
+    # Real ccxt always returns a string from price_to_precision(); an
+    # unconfigured MagicMock returns another MagicMock, which is not JSON
+    # serializable — 2026-09-18 PASS-3's persisted pending-submission
+    # marker now stores this value via _save_state() BEFORE submitting,
+    # so a save failure here would (correctly) abort the submission.
+    mock_ex.price_to_precision.return_value = "0.0"
 
     with patch.object(le_mod.ccxt, "kraken") as mock_cls:
         mock_cls.return_value = mock_ex

@@ -1239,6 +1239,12 @@ def _execute_approved_signal(
                 signal_reason = filter_reason or raw_signal.value,
                 fee_cost      = order.fee_cost,
                 fee_currency  = order.fee_currency,
+                # 2026-09-18 PASS-3 review finding: pass the SAME identity
+                # journal replay would use for this exact fill — makes a
+                # normal write and a later replay of the same fill (crash
+                # between them) mutually idempotent instead of colliding
+                # only replay-to-replay.
+                exec_key      = order.exec_key,
             )
             # 2026-09-18 review finding (P1-3, durable fill journal): the
             # trade_log write above and the accounting update inside
@@ -1325,21 +1331,53 @@ def _process_discovered_sell_fill(
         return
 
     pnl = ss['pm'].on_sell(order.price, order.quantity)
-    ss['trail_peak']   = 0.0
-    ss['partial_done'] = False
-    ss['atr_sl']       = 0.0
-    if not ss['pm'].has_position:
-        capital_pool.release(sym, ss['executor'].cash)
-        ss['native_stop_is_trailing'] = False
-    # else: a genuine residual remains (a PARTIAL stop fill) — the stop
-    # that produced this fill is, per sync_protective_stop's own contract,
-    # either already resolved (fully closed) or still correctly tracked
-    # (a "partial" outcome deliberately keeps the id) — no additional
-    # resync is triggered here to avoid re-entering the same cancel/verify
-    # cycle this fill was already discovered inside of.
-
     risk.record_fill(sym)
     ss['sm'].on_fill(Signal.SELL, order.price)
+
+    # 2026-09-18 PASS-3 review finding (P1): this used to unconditionally
+    # clear trail_peak/atr_sl and let on_fill's COOLDOWN transition stand,
+    # regardless of whether a residual position actually remained after a
+    # PARTIAL discovered exit. Reproduced: LONG with 0.002 BTC and a trail
+    # peak of 95000, a discovered 0.001 BTC stop fill left 0.001 BTC still
+    # held, but state became COOLDOWN with trail_peak/atr_sl reset to 0 —
+    # the residual position's own exit levels, erased. Fixed to derive the
+    # transition from remaining inventory, mirroring EXACTLY the pattern
+    # the existing partial-TP block (same file) already uses for the
+    # identical situation (a SELL that doesn't fully close the position).
+    if not ss['pm'].has_position:
+        # Full exit — the COOLDOWN transition on_fill already made is correct.
+        ss['trail_peak']   = 0.0
+        ss['partial_done'] = False
+        ss['atr_sl']       = 0.0
+        capital_pool.release(sym, ss['executor'].cash)
+        ss['native_stop_is_trailing'] = False
+    else:
+        # Genuine residual remains — force back to LONG (same
+        # on_fill-then-recover_long sequence the partial-TP block uses)
+        # and PRESERVE the residual's existing trailing/ATR exit state
+        # rather than erasing it; the stop that produced this fill is,
+        # per sync_protective_stop's own contract, either already
+        # resolved (fully closed — an unusual under-sized-stop edge case,
+        # flagged below) or still correctly tracked with its remaining
+        # quantity auto-adjusted by the exchange itself (a "partial"
+        # outcome deliberately keeps the order's id) — no additional
+        # resync is triggered here to avoid re-entering the same
+        # cancel/verify cycle this fill was already discovered inside of.
+        ss['partial_done'] = True
+        ss['sm'].recover_long(order.price)
+        if not ss['executor'].has_resting_stop:
+            logger.error(
+                "UNPROTECTED RESIDUAL [%s]: a discovered stop fill closed "
+                "to a CONFIRMED TERMINAL state but left %.8f still held with "
+                "no resting native stop — the stop was sized smaller than "
+                "the position. Manual review needed.",
+                sym, ss['pm'].quantity,
+            )
+            alerter.error(
+                f"UNPROTECTED RESIDUAL [{sym}]: {ss['pm'].quantity:.8f} still "
+                f"held after a discovered stop fill, but no native stop is "
+                f"resting — check Kraken and re-arm manually if needed."
+            )
 
     display.fill(order.side.value, order.quantity, sym, order.price, order.total_value, pnl)
     trade_log.log_fill(
@@ -1352,6 +1390,7 @@ def _process_discovered_sell_fill(
         signal_reason = reason,
         fee_cost      = order.fee_cost,
         fee_currency  = order.fee_currency,
+        exec_key      = order.exec_key,
     )
     if hasattr(ss['executor'], 'ack_journal_entry'):
         ss['executor'].ack_journal_entry(order.order_id)
@@ -3257,6 +3296,7 @@ def run():
                                         signal_reason = "partial_tp",
                                         fee_cost      = _p_order.fee_cost,
                                         fee_currency  = _p_order.fee_currency,
+                                        exec_key      = _p_order.exec_key,
                                     )
                                     if hasattr(ss['executor'], 'ack_journal_entry'):
                                         ss['executor'].ack_journal_entry(_p_order.order_id)
@@ -3381,6 +3421,7 @@ def run():
                                     signal_reason = _ic_reason,
                                     fee_cost      = _ic_order.fee_cost,
                                     fee_currency  = _ic_order.fee_currency,
+                                    exec_key      = _ic_order.exec_key,
                                 )
                                 if hasattr(ss['executor'], 'ack_journal_entry'):
                                     ss['executor'].ack_journal_entry(_ic_order.order_id)

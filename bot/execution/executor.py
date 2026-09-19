@@ -69,6 +69,22 @@ class Order:
     # every live PF/win-rate calculation (which filters on pnl IS NOT NULL).
     pnl: Optional[float] = field(default=None)
 
+    # A durable, globally-unique identity for THIS fill event — a fresh
+    # UUID assigned once per Order, regardless of order_id (which can
+    # repeat: dry-run always uses "dry_run"; a native stop's order_id is
+    # identical across each of its own partial-fill deltas). 2026-09-18
+    # PASS-3 review finding: normal trade_log writes and crash-recovery
+    # journal replay previously used DIFFERENT identity schemes (none, and
+    # a non-persisted per-executor counter respectively) — a fill logged
+    # normally, then replayed after a crash before the ack was durable,
+    # produced two rows because NULL and the journal's key never
+    # conflicted; a counter reset by a restart could also collide with an
+    # already-used key from before the restart and silently discard a
+    # genuinely new fill as "already recorded". Passing THIS SAME value to
+    # every log_fill() call for this Order — normal write and journal
+    # replay alike — makes them mutually idempotent by construction.
+    exec_key: str = field(default_factory=lambda: str(uuid.uuid4()))
+
     # Computed on fill
     total_value:  float = field(default=0.0, init=False)
 

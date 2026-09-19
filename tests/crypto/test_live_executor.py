@@ -1517,8 +1517,8 @@ def test_two_consecutive_calls_with_unresolved_outcome_submit_only_once(mock_cfg
     assert order1 is None
     assert order2 is None
     assert mock_ex.create_order.call_count == 1   # NOT 2
-    assert ex.pending_submission is not None
-    assert ex.pending_submission["side"] == "buy"
+    assert "buy" in ex.pending_submissions
+    assert ex.pending_submissions["buy"]["side"] == "buy"
 
 
 def test_pending_submission_resolves_once_reconciliation_recovers(tmp_path):
@@ -1534,8 +1534,8 @@ def test_pending_submission_resolves_once_reconciliation_recovers(tmp_path):
         mock_ex.create_order.side_effect = ccxt.RequestTimeout("response lost")
         mock_ex.fetch_open_orders.side_effect = ccxt.NetworkError("still unreachable")
         ex.execute(Signal.BUY, 90_000.0, 0.001)
-        assert ex.pending_submission is not None
-        _cid = ex.pending_submission["client_order_id"]
+        assert "buy" in ex.pending_submissions
+        _cid = ex.pending_submissions["buy"]["client_order_id"]
 
         # Exchange reachable again — the stale submission is discovered
         # already closed (filled) when reconciliation is retried.
@@ -1553,7 +1553,7 @@ def test_pending_submission_resolves_once_reconciliation_recovers(tmp_path):
     assert order is not None and order.status == OrderStatus.FILLED
     assert order.order_id == "recovered-001"
     assert mock_ex.create_order.call_count == 1   # never placed a second, fresh order
-    assert ex.pending_submission is None
+    assert "buy" not in ex.pending_submissions
 
 
 def test_pending_submission_survives_restart(tmp_path):
@@ -1568,8 +1568,8 @@ def test_pending_submission_survives_restart(tmp_path):
         mock_ex.create_order.side_effect = ccxt.RequestTimeout("response lost")
         mock_ex.fetch_open_orders.side_effect = ccxt.NetworkError("still unreachable")
         ex.execute(Signal.BUY, 90_000.0, 0.001)
-        assert ex.pending_submission is not None
-        _pending = ex.pending_submission
+        assert "buy" in ex.pending_submissions
+        _pending = ex.pending_submissions["buy"]
 
     mock_ex.fetch_balance.return_value = {
         "free": {"CAD": ex.cash, "BTC": ex.position}, "total": {"CAD": ex.cash, "BTC": ex.position},
@@ -1581,8 +1581,150 @@ def test_pending_submission_survives_restart(tmp_path):
             starting_cash=1000.0, dry_run=False, state_path=state_path,
         )
 
-    assert ex2.pending_submission is not None
-    assert ex2.pending_submission["client_order_id"] == _pending["client_order_id"]
+    assert "buy" in ex2.pending_submissions
+    assert ex2.pending_submissions["buy"]["client_order_id"] == _pending["client_order_id"]
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-18 PASS-3 review findings — the submission lifecycle must stay
+# unresolved until a CONFIRMED TERMINAL outcome, not merely a successful
+# (but possibly still-open) network round-trip.
+# ---------------------------------------------------------------------------
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_accepted_but_still_open_order_across_two_calls_submits_once(mock_cfg, mock_sleep, tmp_path):
+    """Reproduced by PASS-3: create_order (and every subsequent poll)
+    returns an ACCEPTED order that stays status="open"/filled=0 — no
+    exception anywhere. Two consecutive execute(BUY, ...) calls must still
+    submit only once; the order remaining genuinely unresolved (not a
+    submission exception) must keep the pending-submission slot occupied.
+    fetch_open_orders reflects the real (still-resting) order on the
+    second call's reconciliation check, exactly as the real exchange
+    would — a genuinely still-open order IS found there, unlike a
+    confirmed-empty lookup."""
+    mock_cfg.exchange.limit_order_enabled = False
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+    open_order = {"id": "x1", "status": "open", "filled": 0.0}
+    mock_ex.create_order.return_value = open_order
+    mock_ex.fetch_order.return_value = open_order
+
+    order1 = ex.execute(Signal.BUY, 90_000.0, 0.001)
+    _cid = ex.pending_submissions["buy"]["client_order_id"]
+    mock_ex.fetch_open_orders.return_value = [{**open_order, "clientOrderId": _cid}]
+
+    order2 = ex.execute(Signal.BUY, 90_000.0, 0.001)
+
+    assert order1 is None
+    assert order2 is None
+    assert mock_ex.create_order.call_count == 1   # NOT 2
+    assert "buy" in ex.pending_submissions
+    assert ex.pending_submissions["buy"]["order_id"] == "x1"
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_accepted_order_resolves_once_it_actually_closes(mock_cfg, mock_sleep, tmp_path):
+    """Once the SAME order the previous test left pending is discovered to
+    have actually closed, the pending-submission slot must clear and a
+    genuinely new BUY must be allowed afterward."""
+    mock_cfg.exchange.limit_order_enabled = False
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+    open_order = {"id": "x1", "status": "open", "filled": 0.0}
+    mock_ex.create_order.return_value = open_order
+    mock_ex.fetch_order.return_value = open_order
+    ex.execute(Signal.BUY, 90_000.0, 0.001)
+    _cid = ex.pending_submissions["buy"]["client_order_id"]
+    assert "buy" in ex.pending_submissions
+
+    closed_order = {
+        "id": "x1", "status": "closed", "filled": 0.001,
+        "average": 90_000.0, "fee": {"cost": 0.36, "currency": "CAD"},
+        "clientOrderId": _cid,
+    }
+    mock_ex.fetch_open_orders.return_value = [closed_order]
+
+    order = ex.execute(Signal.BUY, 91_000.0, 0.001)
+
+    assert order is not None and order.status == OrderStatus.FILLED
+    assert "buy" not in ex.pending_submissions
+    assert mock_ex.create_order.call_count == 1   # never placed a second order
+
+
+def test_opposite_side_submission_does_not_overwrite_pending_slot(tmp_path):
+    """PASS-3 review finding: an opposite-side submission must never
+    overwrite the only tracked entry — each side gets its own slot."""
+    with patch("bot.execution.live_executor.cfg") as mock_cfg, patch("time.sleep"):
+        mock_cfg.exchange.limit_order_enabled = False
+        ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+        open_buy = {"id": "buy-1", "status": "open", "filled": 0.0}
+        mock_ex.create_order.return_value = open_buy
+        mock_ex.fetch_order.return_value = open_buy
+        ex.execute(Signal.BUY, 90_000.0, 0.001)
+        assert "buy" in ex.pending_submissions
+
+        # An unrelated SELL now happens (e.g. an urgent exit on an
+        # existing position) — must not disturb the still-pending BUY.
+        ex._portfolio.position    = 0.002
+        ex._portfolio._cost_basis = 85_000.0
+        sell_raw = {"id": "sell-1", "status": "closed", "filled": 0.002,
+                    "average": 91_000.0, "fee": {"cost": 0.5, "currency": "CAD"}}
+        mock_ex.create_order.return_value = sell_raw
+        mock_ex.fetch_order.return_value = sell_raw
+        sell_order = ex.execute(Signal.SELL, 91_000.0, quantity=0.002, urgent=True)
+
+    assert sell_order is not None and sell_order.status == OrderStatus.FILLED
+    assert "buy" in ex.pending_submissions        # untouched by the SELL
+    assert ex.pending_submissions["buy"]["order_id"] == "buy-1"
+    assert "sell" not in ex.pending_submissions   # SELL resolved and cleared
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_failed_pre_submit_persistence_causes_zero_submissions(mock_cfg, mock_sleep, tmp_path):
+    """PASS-3 review finding, reproduced exactly: a durable pre-submit
+    persistence failure (simulated disk-full) must cause ZERO entry
+    submissions — the old code proceeded to contact the exchange anyway."""
+    mock_cfg.exchange.limit_order_enabled = False
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+    with patch("bot.atomic_json.atomic_write_json", side_effect=OSError("disk full")):
+        with patch.object(ex._alerter, "error"):
+            order = ex.execute(Signal.BUY, 90_000.0, 0.001)
+
+    assert order is not None and order.status == OrderStatus.REJECTED
+    mock_ex.create_order.assert_not_called()   # exchange was NEVER contacted
+    assert "buy" not in ex.pending_submissions  # nothing to recover — it never happened
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_failed_pre_submit_persistence_after_healthy_start_still_aborts(mock_cfg, mock_sleep, tmp_path):
+    """PASS-3 review finding: the entry-health check (state_write_healthy)
+    happens BEFORE execute()'s own submission attempt — a write failure
+    that occurs DURING this specific submission (not a pre-existing false
+    health flag) must still be caught, not just an already-false flag."""
+    mock_cfg.exchange.limit_order_enabled = False
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+    assert ex.state_write_healthy is True   # healthy going in — not a pre-existing flag
+
+    call_count = {"n": 0}
+    real_write = None
+    from bot.atomic_json import atomic_write_json as _real_write
+    def _flaky_write(path, data, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise OSError("disk full")
+        return _real_write(path, data, **kwargs)
+
+    with patch("bot.atomic_json.atomic_write_json", side_effect=_flaky_write):
+        order = ex.execute(Signal.BUY, 90_000.0, 0.001)
+
+    assert order is not None and order.status == OrderStatus.REJECTED
+    mock_ex.create_order.assert_not_called()
 
 
 @patch("time.sleep")
@@ -1644,7 +1786,7 @@ def test_market_fallback_reconciles_and_adopts_on_confirmed_fill(mock_cfg, mock_
     assert order is not None and order.status == OrderStatus.FILLED
     assert order.order_id == "mkt-recovered"
     assert mock_ex.create_order.call_count == 1
-    assert ex.pending_submission is None
+    assert "buy" not in ex.pending_submissions
 
 
 # ---------------------------------------------------------------------------
@@ -2028,6 +2170,53 @@ def test_native_stop_additional_fill_after_partial_records_only_new_delta(tmp_pa
     assert len(ex.filled_orders()) == 2   # one row per real fill event, not duplicated
 
 
+def test_native_stop_partial_fills_use_delta_price_and_fee_not_cumulative(tmp_path):
+    """2026-09-18 PASS-3 review finding (P1), reproduced exactly: fill 1 is
+    0.001 @ average 90000 with cumulative fee $0.36; fill 2's snapshot
+    shows cumulative 0.002 @ average 95000 with cumulative fee $0.76. The
+    correct total proceeds are $190 (0.002 * true average cost) minus
+    $0.76 total fee = $189.24. The old code applied fill 2's CUMULATIVE
+    average ($95,000, not its own true price of $100,000) to only its
+    delta quantity, and re-charged the FULL cumulative fee on top of fill
+    1's already-deducted fee — producing $183.88 instead."""
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True,
+                        starting_cash=1000.0, tmp_path=tmp_path)
+    ex._portfolio.position    = 0.002
+    ex._portfolio._cost_basis = 80_000.0
+    starting_cash = ex._portfolio.cash
+    mock_ex.create_order.return_value = {"id": "stop-001"}
+    ex.sync_protective_stop(78_000.0)
+
+    mock_ex.cancel_order.side_effect = ccxt.NetworkError("cancel timeout")
+    # Fill 1: cumulative 0.001 @ average 90000 (cost $90), fee $0.36.
+    mock_ex.fetch_order.return_value = {
+        "id": "stop-001", "status": "open", "filled": 0.001,
+        "average": 90_000.0, "cost": 90.0,
+        "fee": {"cost": 0.36, "currency": "CAD"},
+    }
+    outcome1, fill1 = ex._cancel_native_stop()
+    assert outcome1 == "partial"
+    assert fill1.price == 90_000.0
+    assert fill1.fee_cost == pytest.approx(0.36)
+
+    # Fill 2 snapshot: cumulative 0.002 @ average 95000 (cost $190), fee
+    # $0.76 cumulative. Fill 2's OWN price is therefore $100,000
+    # ((190-90)/0.001) and its OWN fee is $0.40 (0.76-0.36).
+    mock_ex.fetch_order.return_value = {
+        "id": "stop-001", "status": "closed", "filled": 0.002,
+        "average": 95_000.0, "cost": 190.0,
+        "fee": {"cost": 0.76, "currency": "CAD"},
+    }
+    outcome2, fill2 = ex._cancel_native_stop()
+
+    assert outcome2 == "filled"
+    assert fill2.price == pytest.approx(100_000.0)
+    assert fill2.fee_cost == pytest.approx(0.40)
+    # Total cash increase across both fills: (90 - 0.36) + (100 - 0.40) = 189.24
+    assert (ex._portfolio.cash - starting_cash) == pytest.approx(189.24)
+    assert ex._fees_paid == pytest.approx(0.76)   # total fee, not 1.12 (double-counted)
+
+
 def test_sync_protective_stop_does_not_replace_when_partial_fill_still_open(tmp_path):
     """2026-09-18 follow-up review finding: sync_protective_stop must not
     place a REPLACEMENT stop when the existing one is confirmed still
@@ -2065,6 +2254,103 @@ def test_native_stop_placement_failure_alerts_and_stays_unprotected(tmp_path):
     assert not ex.has_resting_stop
     mock_alert.assert_called_once()
     assert "NATIVE STOP FAILED" in mock_alert.call_args[0][0]
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-18 PASS-3 review finding (P0): native protective-stop placement
+# bypassed persisted submission tracking entirely — a response-lost timeout
+# on two sync calls placed TWO real stops, with pending_submissions left
+# empty either way (no recovery record at all).
+# ---------------------------------------------------------------------------
+
+def test_native_stop_response_lost_timeout_across_two_sync_calls_places_one(tmp_path):
+    """Reproduced exactly: position 0.002 BTC, both sync_protective_stop(89000)
+    calls hit a create_order timeout with reconciliation unavailable. Must
+    place AT MOST ONE stop, not two."""
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True, tmp_path=tmp_path)
+    ex._portfolio.position = 0.002
+
+    mock_ex.create_order.side_effect = ccxt.RequestTimeout("response lost")
+    mock_ex.fetch_open_orders.side_effect = ccxt.NetworkError("still unreachable")
+
+    with patch.object(ex._alerter, "error"):
+        ex.sync_protective_stop(89_000.0)
+        ex.sync_protective_stop(89_000.0)
+
+    assert mock_ex.create_order.call_count == 1   # NOT 2
+    assert "protect" in ex.pending_submissions
+    assert not ex.has_resting_stop   # genuinely unresolved — not fabricated as tracked
+
+
+def test_native_stop_response_lost_timeout_recovers_on_reconciliation(tmp_path):
+    """Once the exchange becomes reachable again, sync_protective_stop must
+    resolve the STALE pending submission (adopt the stop that actually
+    landed) rather than placing a second one on top."""
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True, tmp_path=tmp_path)
+    ex._portfolio.position = 0.002
+
+    mock_ex.create_order.side_effect = ccxt.RequestTimeout("response lost")
+    mock_ex.fetch_open_orders.side_effect = ccxt.NetworkError("still unreachable")
+    with patch.object(ex._alerter, "error"):
+        ex.sync_protective_stop(89_000.0)
+    _cid = ex.pending_submissions["protect"]["client_order_id"]
+
+    landed_stop = {
+        "id": "stop-landed", "clientOrderId": _cid,
+        "info": {"descr": {"ordertype": "stop-loss"}},
+    }
+    mock_ex.fetch_open_orders.side_effect = None
+    mock_ex.fetch_open_orders.return_value = [landed_stop]
+
+    ex.sync_protective_stop(89_000.0)
+
+    assert mock_ex.create_order.call_count == 1   # never placed a second stop
+    assert "protect" not in ex.pending_submissions
+    assert ex._native_stop_order_id == "stop-landed"
+
+
+def test_native_trailing_stop_response_lost_timeout_places_one(tmp_path):
+    """Same fix, trailing-stop variant."""
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True, tmp_path=tmp_path)
+    ex._portfolio.position = 0.002
+
+    mock_ex.create_order.side_effect = ccxt.RequestTimeout("response lost")
+    mock_ex.fetch_open_orders.side_effect = ccxt.NetworkError("still unreachable")
+
+    with patch.object(ex._alerter, "error"):
+        ex.sync_protective_stop(None, trailing_pct=0.02)
+        ex.sync_protective_stop(None, trailing_pct=0.02)
+
+    assert mock_ex.create_order.call_count == 1
+    assert "protect" in ex.pending_submissions
+
+
+def test_protective_stop_pending_does_not_block_ordinary_buy_sell(tmp_path):
+    """A protective-stop submission stuck pending must never block an
+    ordinary BUY/SELL — role-keyed slots keep them fully independent."""
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True,
+                        starting_cash=1000.0, tmp_path=tmp_path)
+    ex._portfolio.position = 0.002
+
+    mock_ex.create_order.side_effect = ccxt.RequestTimeout("response lost")
+    mock_ex.fetch_open_orders.side_effect = ccxt.NetworkError("still unreachable")
+    with patch.object(ex._alerter, "error"):
+        ex.sync_protective_stop(89_000.0)
+    assert "protect" in ex.pending_submissions
+
+    # Now an ordinary BUY, on the same executor — must not be blocked by
+    # the still-pending protective-stop submission.
+    mock_ex.create_order.side_effect = None
+    mock_ex.create_order.return_value = {
+        "id": "buy-1", "status": "closed", "filled": 0.001,
+        "average": 90_000.0, "fee": {"cost": 0.0, "currency": "CAD"},
+    }
+    mock_ex.fetch_order.return_value = mock_ex.create_order.return_value
+    with patch("bot.execution.live_executor.cfg") as mock_cfg, patch("time.sleep"):
+        mock_cfg.exchange.limit_order_enabled = False
+        order = ex.execute(Signal.BUY, 90_000.0, 0.001)
+
+    assert order is not None and order.status == OrderStatus.FILLED
 
 
 def test_native_stop_state_persists_and_restores_across_restart(tmp_path):

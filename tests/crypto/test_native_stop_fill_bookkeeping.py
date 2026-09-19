@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 import bot.main as bot_main
 from bot.execution.executor import Order, OrderSide, OrderStatus
 from bot.portfolio.capital_pool import CapitalPool
@@ -37,11 +39,12 @@ class _FakeExecutorForResync:
     """Only implements what _resync_native_stop/_process_discovered_sell_fill
     actually touch: symbol, cash, sync_protective_stop(), ack_journal_entry()."""
 
-    def __init__(self, cash=50.0):
+    def __init__(self, cash=50.0, has_resting_stop=True):
         self.symbol = "BTC/CAD"
         self.cash = cash
         self._next_fill = None
         self.acked_order_ids = []
+        self.has_resting_stop = has_resting_stop
 
     def queue_fill(self, order):
         self._next_fill = order
@@ -239,3 +242,110 @@ def test_resync_native_stop_return_value_flows_into_bookkeeping():
     assert not capital_pool.is_allocated("BTC/CAD")
     trade_log.log_fill.assert_called_once()
     risk.record_fill.assert_called_once_with("BTC/CAD")
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-18 PASS-3 review finding (P1): a discovered PARTIAL exit
+# incorrectly forced COOLDOWN and erased trail_peak/atr_sl for the residual
+# position, using REAL TradingStateMachine to prove the actual state
+# transition, not just a mocked call count.
+# ---------------------------------------------------------------------------
+
+def test_partial_discovered_exit_stays_long_not_cooldown():
+    """Reproduced exactly: LONG with 0.002 BTC and a trail peak of 95000;
+    process a discovered 0.001 BTC stop fill. Remaining position must be
+    0.001 BTC with state LONG (not COOLDOWN), trail_peak/atr_sl PRESERVED
+    (not reset to 0) — the residual's own exit levels are still correct
+    and must not be erased."""
+    from bot.strategy.threshold_strategy import Signal
+
+    pm = PositionManager()
+    pm.on_buy(80_000.0, 0.002)
+    sm = TradingStateMachine(cooldown_ticks=3)
+    sm.on_fill(Signal.BUY, 80_000.0)   # real LONG state, not a mock
+    assert sm.state.value == "LONG"
+
+    executor = _FakeExecutorForResync(has_resting_stop=True)
+    ss = _ss(executor, pm, sm)
+    ss['trail_peak'] = 95_000.0
+    ss['atr_sl']     = 76_000.0
+    capital_pool = CapitalPool(total_capital=100.0, max_concurrent=1)
+    capital_pool.allocate("BTC/CAD")
+    risk = MagicMock()
+    alerter = MagicMock()
+    trade_log = MagicMock()
+
+    order = _fill_order(quantity=0.001, price=94_000.0)   # partial — half the position
+    bot_main._process_discovered_sell_fill(
+        "BTC/CAD", ss, order, "native_stop_discovered",
+        capital_pool=capital_pool, risk=risk, alerter=alerter, trade_log=trade_log,
+    )
+
+    assert pm.quantity == pytest.approx(0.001)         # residual remains
+    assert sm.state.value == "LONG"                     # NOT COOLDOWN
+    assert ss['trail_peak'] == 95_000.0                 # preserved, not reset
+    assert ss['atr_sl'] == 76_000.0                      # preserved, not reset
+    assert ss['partial_done'] is True
+    assert capital_pool.is_allocated("BTC/CAD")          # slot NOT released
+
+
+def test_full_discovered_exit_still_enters_cooldown_and_resets_state():
+    """The full-exit path must be unaffected: state goes to COOLDOWN,
+    trail_peak/atr_sl reset, capital pool slot released."""
+    from bot.strategy.threshold_strategy import Signal
+
+    pm = PositionManager()
+    pm.on_buy(80_000.0, 0.001)
+    sm = TradingStateMachine(cooldown_ticks=3)
+    sm.on_fill(Signal.BUY, 80_000.0)
+    executor = _FakeExecutorForResync(has_resting_stop=False)
+    ss = _ss(executor, pm, sm)
+    ss['trail_peak'] = 95_000.0
+    ss['atr_sl']     = 76_000.0
+    capital_pool = CapitalPool(total_capital=100.0, max_concurrent=1)
+    capital_pool.allocate("BTC/CAD")
+    risk = MagicMock()
+    alerter = MagicMock()
+    trade_log = MagicMock()
+
+    order = _fill_order(quantity=0.001, price=94_000.0)   # full close
+    bot_main._process_discovered_sell_fill(
+        "BTC/CAD", ss, order, "native_stop_discovered",
+        capital_pool=capital_pool, risk=risk, alerter=alerter, trade_log=trade_log,
+    )
+
+    assert not pm.has_position
+    assert sm.state.value == "COOLDOWN"
+    assert ss['trail_peak'] == 0.0
+    assert ss['atr_sl'] == 0.0
+    assert not capital_pool.is_allocated("BTC/CAD")
+
+
+def test_partial_discovered_exit_alerts_if_residual_left_unprotected():
+    """If the discovered fill somehow reached a CONFIRMED TERMINAL outcome
+    (stop fully gone) but a residual position remains — an unusual
+    under-sized-stop edge case — this must alert loudly rather than
+    silently leave the residual unprotected."""
+    from bot.strategy.threshold_strategy import Signal
+
+    pm = PositionManager()
+    pm.on_buy(80_000.0, 0.002)
+    sm = TradingStateMachine(cooldown_ticks=3)
+    sm.on_fill(Signal.BUY, 80_000.0)
+    executor = _FakeExecutorForResync(has_resting_stop=False)   # stop is GONE
+    ss = _ss(executor, pm, sm)
+    capital_pool = CapitalPool(total_capital=100.0, max_concurrent=1)
+    capital_pool.allocate("BTC/CAD")
+    risk = MagicMock()
+    alerter = MagicMock()
+    trade_log = MagicMock()
+
+    order = _fill_order(quantity=0.001, price=94_000.0)   # partial, but stop is gone
+    bot_main._process_discovered_sell_fill(
+        "BTC/CAD", ss, order, "native_stop_discovered",
+        capital_pool=capital_pool, risk=risk, alerter=alerter, trade_log=trade_log,
+    )
+
+    assert pm.quantity == pytest.approx(0.001)
+    alerter.error.assert_called_once()
+    assert "UNPROTECTED RESIDUAL" in alerter.error.call_args[0][0]

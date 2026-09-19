@@ -72,6 +72,20 @@ class _SubmissionOutcomeUnknown(Exception):
     response was merely lost, not refused."""
 
 
+class _SubmissionAborted(Exception):
+    """Raised internally when a durable pre-submission intent could not be
+    persisted (_save_state() failed) — the exchange was NEVER contacted for
+    this attempt. Distinct from _SubmissionOutcomeUnknown: there, the
+    exchange WAS contacted and the outcome is genuinely unclear; here we
+    know FOR CERTAIN nothing was submitted, so a caller can safely treat
+    this exactly like a confirmed non-event (e.g. safe to re-arm a SELL's
+    native stop, since the position provably didn't change — unlike the
+    unknown case, where doing so could be wrong). 2026-09-18 PASS-3 review
+    finding: the old code proceeded to submit anyway after a failed
+    pre-submit persistence, leaving no recovery record for an order that
+    might still be accepted."""
+
+
 def _raw_ordertype(order: dict) -> str:
     """Raw Kraken descr.ordertype string from a ccxt-parsed order dict
     (fetch_open_orders etc.) — see _is_native_stop_order for why the raw
@@ -219,22 +233,28 @@ class LiveExecutor:
         # OVERWROTE the first's still-pending recovery record. Now a list —
         # every unacked fill survives independently until its own ack.
         self._pending_journal_entries: list[dict] = []
-        # Monotonic per-executor counter — disambiguates multiple distinct
-        # fill events that can share the same order_id (a native stop's
-        # order_id is the SAME across each of its own partial-fill deltas;
-        # "an order ID alone is insufficient to distinguish separate
-        # execution deltas" — 2026-09-18 follow-up review finding). Not
-        # persisted: only needs to be unique among entries in THIS
-        # in-memory queue, which is always small and short-lived.
-        self._journal_seq: int = 0
-        # 2026-09-18 follow-up review finding (P0): an unresolved submission
-        # (_SubmissionOutcomeUnknown) previously left no trace at all — the
-        # NEXT execute() call (this tick or after a restart) generated a
-        # fresh client_order_id and submitted again, risking two live
-        # orders for one signal. Persisted so a same-side submission is
-        # never attempted while a prior one's outcome is still unknown —
-        # see _create_order_persisted().
-        self._pending_submission: dict | None = None
+        # 2026-09-18 PASS-3 review finding (P1): a monotonic in-memory
+        # counter here was NOT persisted, so it reset to 0 on every
+        # restart — a native stop's order_id is the SAME across each of
+        # its own partial-fill deltas, so a post-restart delta could reuse
+        # an exec_key already used (and acked) BEFORE the restart,
+        # silently discarding a genuinely new fill as "already recorded".
+        # Replaced entirely: exec_key now comes from Order.exec_key (a
+        # fresh UUID assigned once per Order at construction, requiring no
+        # persisted counter and no restart-collision risk — see
+        # bot/execution/executor.py's Order dataclass).
+        # 2026-09-18 PASS-3 review finding (P0): a single dict here meant an
+        # opposite-side submission (a SELL while a BUY was still pending)
+        # could silently overwrite the only tracked entry, and a
+        # successfully-ACKNOWLEDGED-but-not-yet-SETTLED order (accepted,
+        # still open) cleared this immediately — leaving nothing to stop a
+        # second execute() call from submitting again while the first was
+        # still genuinely unresolved. Now keyed by role ("buy"/"sell" for
+        # ordinary trade submissions, "protect" for native-stop placement)
+        # so each has its own independent slot, and only cleared once the
+        # caller (execute() / _place_native_stop) has confirmed a TERMINAL
+        # outcome — not merely that the initial network call didn't raise.
+        self._pending_submissions: dict[str, dict] = {}
         # 2026-09-18 follow-up review finding (P0): a native stop that is
         # PARTIALLY filled but still OPEN (resting for the remainder) was
         # being treated as fully resolved the instant any fill was seen,
@@ -244,6 +264,16 @@ class LiveExecutor:
         # each check and the id is retained until a genuinely terminal
         # status is observed. Reset to 0 whenever a fresh stop is placed.
         self._native_stop_last_recorded_filled: float = 0.0
+        # 2026-09-18 PASS-3 review finding (P1): the code above tracked
+        # cumulative QUANTITY to compute a fill delta, but then applied the
+        # order's CUMULATIVE average price and CUMULATIVE fee to that
+        # delta quantity — wrong proceeds when price moves between partial
+        # fills, and double-charged fees already deducted by a prior
+        # delta. These track cumulative cost (quote-currency) and fee so
+        # the delta's own price/fee can be derived by subtraction, exactly
+        # like the quantity delta already is.
+        self._native_stop_last_recorded_cost: float = 0.0
+        self._native_stop_last_recorded_fee:  float = 0.0
         # Set False if a fill's accounting update could not be durably
         # persisted (_save_state() raised) — execute() then refuses new
         # BUYs until a later save succeeds, rather than trading on top of
@@ -741,11 +771,22 @@ class LiveExecutor:
         self._native_stop_order_id    = order_id
         self._native_stop_price       = None if is_trailing else stop_price
         self._native_stop_is_trailing = is_trailing
-        # Seed from whatever this order already shows filled at adoption
-        # time — any fill that happened before we started tracking it this
-        # session is not ours to invent accounting for; only NEW fill
-        # observed from this point forward should ever be recorded.
-        self._native_stop_last_recorded_filled = float(order.get("filled") or 0.0)
+        # Seed from whatever this order already shows filled/cost/fee at
+        # adoption time — any fill that happened before we started
+        # tracking it this session is not ours to invent accounting for;
+        # only NEW fill observed from this point forward should ever be
+        # recorded (2026-09-18 PASS-3 review finding: cost/fee must be
+        # seeded together with quantity, or the first NEW delta recorded
+        # after adoption would wrongly treat this order's entire
+        # pre-adoption cumulative cost/fee as if it were that one delta's).
+        _seed_filled = float(order.get("filled") or 0.0)
+        _seed_cost   = float(order.get("cost") or 0.0)
+        if _seed_cost <= 0:
+            _seed_avg = float(order.get("average") or order.get("price") or 0.0)
+            _seed_cost = _seed_avg * _seed_filled
+        self._native_stop_last_recorded_filled = _seed_filled
+        self._native_stop_last_recorded_cost   = _seed_cost
+        self._native_stop_last_recorded_fee    = float((order.get("fee") or {}).get("cost") or 0.0)
         logger.warning(
             "NATIVE STOP ADOPTED [%s]: found untracked resting %s order %s "
             "— adopted instead of placing a duplicate.",
@@ -1011,15 +1052,45 @@ class LiveExecutor:
         # tracking the (still resting, now-reduced) stop.
         new_delta = max(0.0, cumulative_filled - self._native_stop_last_recorded_filled)
 
+        # 2026-09-18 PASS-3 review finding (P1): the delta QUANTITY was
+        # computed correctly, but the delta's PRICE and FEE were not — the
+        # order's CUMULATIVE average price and CUMULATIVE fee were applied
+        # to the new delta quantity wholesale. Reproduced exactly: fill 1
+        # (0.001 @ avg 90000, cumulative fee $0.36) then fill 2 (cumulative
+        # 0.002 @ avg 95000, cumulative fee $0.76) — correct total proceeds
+        # are $190 - $0.76 = $189.24 (fill 2's own price is actually
+        # $100,000: cumulative cost $190 minus fill 1's $90, over 0.001),
+        # but the old code produced $183.88 (used $95,000 for fill 2's
+        # price and re-charged the FULL $0.76 fee on top of fill 1's
+        # already-deducted $0.36). Fixed: track cumulative COST and FEE
+        # (not just quantity) so the delta's own price/fee are derived by
+        # subtraction, exactly like the quantity delta already is.
+        # `cost` (ccxt's own cumulative quote-currency total) is preferred
+        # over back-computing average*filled when the exchange provides it
+        # directly.
+        cumulative_cost = float(order.get("cost") or 0.0)
+        if cumulative_cost <= 0:
+            _avg = float(order.get("average") or order.get("price") or 0.0)
+            cumulative_cost = _avg * cumulative_filled
+        cumulative_fee = float((order.get("fee") or {}).get("cost") or 0.0)
+
         fill_order = None
         if new_delta > 0:
+            delta_cost = max(0.0, cumulative_cost - self._native_stop_last_recorded_cost)
+            delta_fee  = max(0.0, cumulative_fee - self._native_stop_last_recorded_fee)
+            delta_price = delta_cost / new_delta if new_delta > 0 else 0.0
             fill_info = {
                 "order_id": _order_id,
                 "filled":   new_delta,
-                "price":    float(order.get("average") or order.get("price") or 0.0),
-                "fee":      order.get("fee") or {},
+                "price":    delta_price,
+                "fee":      {
+                    "cost": delta_fee,
+                    "currency": (order.get("fee") or {}).get("currency", ""),
+                },
             }
             self._native_stop_last_recorded_filled = cumulative_filled
+            self._native_stop_last_recorded_cost   = cumulative_cost
+            self._native_stop_last_recorded_fee    = cumulative_fee
             fill_order = self._record_stop_triggered_fill(fill_info)
 
         if is_terminal:
@@ -1027,6 +1098,8 @@ class LiveExecutor:
             self._native_stop_price       = None
             self._native_stop_is_trailing = False
             self._native_stop_last_recorded_filled = 0.0
+            self._native_stop_last_recorded_cost   = 0.0
+            self._native_stop_last_recorded_fee    = 0.0
             self._save_state()
             return "filled" if fill_order is not None else "cancelled", fill_order
 
@@ -1080,29 +1153,65 @@ class LiveExecutor:
         self._place_native_stop(self._portfolio.position, _price)
 
     def _place_native_stop(self, quantity: float, stop_price: float) -> None:
-        # Deliberately NO retry on this create_order (unlike the read-path
-        # fetch_with_retry calls elsewhere in this file): if attempt 1 times
-        # out AFTER Kraken accepted the order, a retry would place a second
-        # stop — and only the second would be tracked, leaving the first as
-        # an untracked orphan that could fire later against a future
-        # position. A failed placement alerts below and the software SL/TP
-        # still fully protects the position while the bot is running.
+        # 2026-09-18 PASS-3 review finding (P0): this used to call
+        # create_order() directly, outside _create_order_persisted — a
+        # timeout gave no way to tell "definitely didn't place" from
+        # "maybe did, response lost", and the except-clause cleared
+        # tracking unconditionally either way. Reproduced: two
+        # sync_protective_stop() calls hitting a response timeout each
+        # placed a real stop — two live stops, second one untracked.
+        # Routed through the SAME persisted-submission mechanism ordinary
+        # trade orders use, under role="protect" — a distinct slot from
+        # "buy"/"sell" so a protective stop (ccxt side "sell") is never
+        # confused with an ordinary strategy SELL that happens to be
+        # pending at the same time.
         try:
             _price_str = self._exchange.price_to_precision(self.symbol, stop_price)
-            raw = self._exchange.create_order(
-                self.symbol, "market", "sell", quantity,
-                params={"stopLossPrice": _price_str},
+            raw = self._create_order_persisted(
+                "protect", "sell", quantity, stop_price,
+                lambda cid: self._exchange.create_order(
+                    self.symbol, "market", "sell", quantity,
+                    params={"stopLossPrice": _price_str, "clientOrderId": cid},
+                ),
+                label=f"native stop placement [{self.symbol}]",
             )
             self._native_stop_order_id    = str(raw.get("id", ""))
             self._native_stop_price       = stop_price
             self._native_stop_is_trailing = False
             self._native_stop_last_recorded_filled = 0.0
+            self._native_stop_last_recorded_cost   = 0.0
+            self._native_stop_last_recorded_fee    = 0.0
             logger.warning(
                 "Native stop placed [%s]: %.6f @ %.2f (order %s)",
                 self.symbol, quantity, stop_price, self._native_stop_order_id,
             )
             self._save_state()
+            # Confirmed placed/adopted and durably tracked (native_stop_
+            # order_id + saved state) — the submission concern is resolved
+            # regardless of which branch inside _create_order_persisted
+            # produced this order.
+            self._resolve_pending_submission("protect")
+        except _SubmissionOutcomeUnknown as exc:
+            # Outcome genuinely unresolved — do NOT clear tracked state
+            # (there may be a stop resting we can't yet confirm) and do
+            # NOT treat this as "failed" (the software SL/TP alert below
+            # implies nothing is protecting the position, which may be
+            # false). The pending-submission "protect" slot stays
+            # persisted; the next sync_protective_stop call retries
+            # reconciliation via the SAME client_order_id.
+            logger.error(
+                "NATIVE STOP PLACEMENT UNRESOLVED [%s]: %s — leaving "
+                "existing tracked state untouched.", self.symbol, exc,
+            )
+            self._alerter.error(
+                f"NATIVE STOP PLACEMENT UNRESOLVED [{self.symbol}]: {exc}. "
+                f"Could not confirm whether a protective stop is actually "
+                f"resting — will retry reconciliation on the next sync "
+                f"rather than assume success or failure."
+            )
         except Exception as exc:
+            # Confirmed failure (including _SubmissionAborted — a
+            # pre-submit persistence failure means nothing was ever sent).
             logger.error("Native stop placement FAILED [%s]: %s", self.symbol, exc)
             self._alerter.error(
                 f"NATIVE STOP FAILED [{self.symbol}]: could not place backstop "
@@ -1113,6 +1222,7 @@ class LiveExecutor:
             self._native_stop_order_id    = None
             self._native_stop_price       = None
             self._native_stop_is_trailing = False
+            self._resolve_pending_submission("protect")
 
     def _place_native_trailing_stop(self, quantity: float, trailing_pct: float) -> None:
         """
@@ -1175,21 +1285,42 @@ class LiveExecutor:
         sibling stopLossPrice param under the identical annotation is what
         the existing static backstop already places live on spot BTC/CAD.
         """
+        # 2026-09-18 PASS-3 review finding (P0): same fix as _place_native_stop
+        # — routed through _create_order_persisted under role="protect" so a
+        # response-lost timeout is reconciled (via client_order_id) instead
+        # of assumed failed and silently re-attempted.
         try:
             _pct_str = f"{trailing_pct * 100:.4f}"
-            raw = self._exchange.create_order(
-                self.symbol, "market", "sell", quantity,
-                params={"trailingPercent": _pct_str},
+            raw = self._create_order_persisted(
+                "protect", "sell", quantity, None,
+                lambda cid: self._exchange.create_order(
+                    self.symbol, "market", "sell", quantity,
+                    params={"trailingPercent": _pct_str, "clientOrderId": cid},
+                ),
+                label=f"native trailing stop placement [{self.symbol}]",
             )
             self._native_stop_order_id    = str(raw.get("id", ""))
             self._native_stop_price       = None
             self._native_stop_is_trailing = True
             self._native_stop_last_recorded_filled = 0.0
+            self._native_stop_last_recorded_cost   = 0.0
+            self._native_stop_last_recorded_fee    = 0.0
             logger.warning(
                 "Native TRAILING stop placed [%s]: %.6f trailing %.2f%% (order %s)",
                 self.symbol, quantity, trailing_pct * 100, self._native_stop_order_id,
             )
             self._save_state()
+            self._resolve_pending_submission("protect")
+        except _SubmissionOutcomeUnknown as exc:
+            logger.error(
+                "NATIVE TRAILING STOP PLACEMENT UNRESOLVED [%s]: %s — leaving "
+                "existing tracked state untouched.", self.symbol, exc,
+            )
+            self._alerter.error(
+                f"NATIVE TRAILING STOP PLACEMENT UNRESOLVED [{self.symbol}]: "
+                f"{exc}. Could not confirm whether a protective stop is "
+                f"actually resting — will retry reconciliation on the next sync."
+            )
         except Exception as exc:
             logger.error("Native trailing stop placement FAILED [%s]: %s", self.symbol, exc)
             self._alerter.error(
@@ -1202,6 +1333,7 @@ class LiveExecutor:
             self._native_stop_order_id    = None
             self._native_stop_price       = None
             self._native_stop_is_trailing = False
+            self._resolve_pending_submission("protect")
 
     @property
     def native_stop_is_trailing(self) -> bool:
@@ -1286,8 +1418,15 @@ class LiveExecutor:
 
     # ── State persistence ─────────────────────────────────────────────
 
-    def _save_state(self) -> None:
-        """Persist portfolio state to disk so restarts can reconcile."""
+    def _save_state(self) -> bool:
+        """Persist portfolio state to disk so restarts can reconcile.
+
+        Returns True on success, False on failure — 2026-09-18 PASS-3
+        review finding: callers that need a save to have actually
+        succeeded BEFORE proceeding (e.g. persisting a submission intent
+        before contacting the exchange) previously had no way to check;
+        this only ever set self._state_write_healthy, which nothing
+        consulted before deciding whether to go ahead."""
         state = {
             "symbol":       self.symbol,
             "cash":         self._portfolio.cash,
@@ -1300,8 +1439,10 @@ class LiveExecutor:
             "native_stop_price":       self._native_stop_price,
             "native_stop_is_trailing": self._native_stop_is_trailing,
             "pending_journal_entries": self._pending_journal_entries,
-            "pending_submission":      self._pending_submission,
+            "pending_submissions":     self._pending_submissions,
             "native_stop_last_recorded_filled": self._native_stop_last_recorded_filled,
+            "native_stop_last_recorded_cost":   self._native_stop_last_recorded_cost,
+            "native_stop_last_recorded_fee":    self._native_stop_last_recorded_fee,
             "saved_at":     datetime.now(timezone.utc).isoformat(),
         }
         try:
@@ -1311,6 +1452,7 @@ class LiveExecutor:
                 "State saved: cash=%.2f pos=%.6f", state["cash"], state["position"],
             )
             self._state_write_healthy = True
+            return True
         except Exception as exc:
             logger.error("Failed to save state: %s", exc)
             if self._state_write_healthy:
@@ -1321,6 +1463,7 @@ class LiveExecutor:
                     f"losing it on a crash/restart."
                 )
             self._state_write_healthy = False
+            return False
 
     def _record_pending_journal_entry(self, order: Order) -> None:
         """Capture everything bot/main.py needs to write this fill's
@@ -1332,17 +1475,18 @@ class LiveExecutor:
         Appends (never overwrites) — a second fill recorded before the
         first is acked must not lose the first's recovery record.
 
-        exec_key disambiguates entries that share the same order_id (a
-        native stop's order_id is identical across each of its own
-        partial-fill deltas) — TradeLog uses it for an idempotent insert,
-        so a replay that runs twice (e.g. the ack itself is what didn't
-        survive a second crash) writes the row at most once. pnl is
-        included so a replayed SELL carries real P&L instead of NULL —
-        2026-09-18 follow-up review findings."""
-        self._journal_seq += 1
+        exec_key comes straight from order.exec_key (2026-09-18 PASS-3
+        review finding — see Order.exec_key's own docstring for why this
+        replaced an order_id+counter scheme that could collide across a
+        restart) — TradeLog uses it for an idempotent insert, so a replay
+        that runs twice (e.g. the ack itself is what didn't survive a
+        second crash) writes the row at most once, AND a normal write
+        followed by a replay of the SAME fill (crash between them) is
+        equally deduplicated, since both use this identical key. pnl is
+        included so a replayed SELL carries real P&L instead of NULL."""
         self._pending_journal_entries.append({
             "order_id":     order.order_id,
-            "exec_key":     f"{order.order_id}#{self._journal_seq}",
+            "exec_key":     order.exec_key,
             "side":         order.side.value,
             "symbol":       self.symbol,
             "quantity":     order.quantity,
@@ -1385,14 +1529,20 @@ class LiveExecutor:
         return self._state_write_healthy
 
     @property
-    def pending_submission(self) -> dict | None:
-        """A submission whose outcome could not be confirmed (the
-        reconciliation lookup itself failed) — None means no submission is
-        currently unresolved. A new same-side submission refuses to
-        proceed while this is set, always trying to resolve THIS entry
-        (via its own client_order_id) first. Survives a restart via
-        _save_state()/_load_state()."""
-        return self._pending_submission
+    def pending_submissions(self) -> dict[str, dict]:
+        """Submissions whose outcome hasn't been CONFIRMED TERMINAL yet,
+        keyed by role ("buy"/"sell" for ordinary trade submissions,
+        "protect" for native-stop placement) — an empty dict means nothing
+        is currently unresolved. 2026-09-18 PASS-3 review finding: an
+        order the exchange ACKNOWLEDGED (accepted, still open/unsettled)
+        used to clear this immediately, which is not the same as a
+        confirmed terminal outcome — this now stays populated until the
+        caller (execute() / _place_native_stop) confirms one. A new
+        submission of the SAME role refuses to proceed while its slot is
+        occupied, always trying to resolve that entry (via its own
+        client_order_id) first; a different role's slot is untouched.
+        Survives a restart via _save_state()/_load_state()."""
+        return dict(self._pending_submissions)
 
     @property
     def startup_sync_healthy(self) -> bool:
@@ -1459,16 +1609,32 @@ class LiveExecutor:
         else:
             _legacy = state.get("pending_journal_entry")
             self._pending_journal_entries = [_legacy] if _legacy is not None else []
-        self._pending_submission      = state.get("pending_submission")
+        # Backward-compat migration: an older state file has the singular
+        # "pending_submission" key (a dict or None, keyed implicitly by
+        # whatever side it was) instead of today's role-keyed dict.
+        if "pending_submissions" in state:
+            self._pending_submissions = dict(state.get("pending_submissions") or {})
+        else:
+            _legacy_sub = state.get("pending_submission")
+            self._pending_submissions = (
+                {_legacy_sub["side"]: _legacy_sub}
+                if _legacy_sub and _legacy_sub.get("side") else {}
+            )
         self._native_stop_last_recorded_filled = float(
             state.get("native_stop_last_recorded_filled", 0.0) or 0.0
         )
-        if self._pending_submission is not None:
+        self._native_stop_last_recorded_cost = float(
+            state.get("native_stop_last_recorded_cost", 0.0) or 0.0
+        )
+        self._native_stop_last_recorded_fee = float(
+            state.get("native_stop_last_recorded_fee", 0.0) or 0.0
+        )
+        if self._pending_submissions:
             logger.error(
-                "UNRESOLVED SUBMISSION ON RESTART [%s]: %s — this process "
-                "will try to reconcile it (via its own client_order_id) "
-                "before attempting any new same-side submission.",
-                self.symbol, self._pending_submission,
+                "UNRESOLVED SUBMISSION(S) ON RESTART [%s]: %s — this process "
+                "will try to reconcile each (via its own client_order_id) "
+                "before attempting any new submission of the same role.",
+                self.symbol, self._pending_submissions,
             )
         logger.warning(
             "Accounting restored: cost_basis=%.2f pnl=%.2f fees=%.4f (saved %s)",
@@ -1629,6 +1795,7 @@ class LiveExecutor:
 
     def _create_order_persisted(
         self,
+        role: str,
         ccxt_side: str,
         quantity: float,
         price: "float | None",
@@ -1639,71 +1806,92 @@ class LiveExecutor:
         """
         THE single choke point for every live order submission this
         executor makes — the limit-chase primary attempt, every one of its
-        market fallbacks, the direct passive-limit BUY, and the direct
-        market order all route through this. `order_call(client_order_id)`
-        performs the actual self._exchange.create_order(...) call (each
-        call site has a different positional/keyword shape — this wrapper
-        doesn't try to unify that, only the submission bookkeeping around it).
+        market fallbacks, the direct passive-limit BUY, the direct market
+        order, and native-stop placement all route through this.
+        `order_call(client_order_id)` performs the actual
+        self._exchange.create_order(...) call (each call site has a
+        different positional/keyword shape — this wrapper doesn't try to
+        unify that, only the submission bookkeeping around it).
 
-        2026-09-18 follow-up review finding (P0): an unresolved submission
-        (_SubmissionOutcomeUnknown) previously left no trace — the next
-        execute() call, this tick or after a restart, generated a fresh
-        client_order_id and submitted again, reproduced as two live
-        create_order calls for two consecutive execute() calls with the
-        same unresolved failure. This wrapper persists the pending intent
-        (self._pending_submission) BEFORE calling create_order, and before
-        attempting ANY new same-side submission, first tries to resolve a
-        still-pending one using ITS OWN client_order_id — never starting a
-        fresh attempt blind to an unresolved prior one.
+        role: the pending-submission slot key — "buy"/"sell" for ordinary
+        trade entry/exit, "protect" for native-stop placement. Independent
+        slots (2026-09-18 PASS-3 review finding): an opposite-side or
+        different-purpose submission must never overwrite another still-
+        unresolved one just because they happen to share ccxt_side (a
+        protective stop and a strategy SELL are both ccxt side "sell" but
+        must never be confused with each other).
+
+        IMPORTANT — this only PERSISTS the submission intent and performs
+        the network call; it does NOT clear the pending-submission slot on
+        a successful/adopted response (2026-09-18 PASS-3 review finding:
+        the exchange ACKNOWLEDGING a request, e.g. status="open", is not
+        proof of terminal settlement — clearing here let a second
+        execute() call submit again while the first order was still
+        genuinely open). The caller MUST call _resolve_pending_submission()
+        once it has independently confirmed a terminal outcome (filled/
+        closed/rejected) — see execute()'s bottom success/reject paths and
+        _place_native_stop()/_place_native_trailing_stop().
 
         fast_reject_exceptions: exception types that are a definite,
         synchronous rejection from the exchange (e.g. ccxt.InvalidOrder —
         Kraken saying "no" is not an ambiguous lost response) — these skip
         the reconciliation round-trip entirely and re-raise immediately,
-        clearing the pending marker. Callers still handle these exceptions
-        themselves exactly as before this wrapper existed.
+        clearing the pending slot (a confirmed non-event, safe to clear
+        right away, unlike a merely-accepted order).
         """
-        if self._pending_submission and self._pending_submission.get("side") == ccxt_side:
-            _entry = self._pending_submission
-            _cid   = _entry.get("client_order_id")
+        _entry = self._pending_submissions.get(role)
+        if _entry is not None:
+            _cid = _entry.get("client_order_id")
             adopted, confirmed_empty = self._find_untracked_entry_order(ccxt_side, _cid)
             if adopted is not None:
                 logger.warning(
-                    "SUBMISSION RECOVERY [%s]: prior unresolved %s submission "
+                    "SUBMISSION RECOVERY [%s/%s]: prior unresolved submission "
                     "(client_order_id=%s) found resting/filled — adopting it "
                     "instead of placing a new order this cycle.",
-                    self.symbol, ccxt_side, _cid,
+                    self.symbol, role, _cid,
                 )
-                self._pending_submission = None
+                self._pending_submissions[role] = {**_entry, "order_id": adopted.get("id")}
                 self._save_state()
                 return adopted
             if confirmed_empty:
                 logger.warning(
-                    "SUBMISSION RECOVERY [%s]: prior unresolved %s submission "
+                    "SUBMISSION RECOVERY [%s/%s]: prior unresolved submission "
                     "(client_order_id=%s) confirmed never placed — clearing "
-                    "it and proceeding.", self.symbol, ccxt_side, _cid,
+                    "it and proceeding.", self.symbol, role, _cid,
                 )
-                self._pending_submission = None
+                del self._pending_submissions[role]
                 self._save_state()
             else:
                 raise _SubmissionOutcomeUnknown(
-                    f"a prior {ccxt_side} submission on {self.symbol} "
+                    f"a prior {role} submission on {self.symbol} "
                     f"(client_order_id={_cid}) is still unresolved — "
                     f"refusing a new submission until it resolves"
                 )
 
         client_order_id = str(uuid.uuid4())
-        self._pending_submission = {
+        self._pending_submissions[role] = {
             "side": ccxt_side, "client_order_id": client_order_id,
             "quantity": quantity, "price": price, "label": label,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
-        self._save_state()
+        if not self._save_state():
+            # 2026-09-18 PASS-3 review finding (P0): a failed pre-submit
+            # persistence used to be silently ignored (only
+            # _state_write_healthy flipped) — the exchange call proceeded
+            # anyway, so an order with no durable recovery record could go
+            # live. We know FOR CERTAIN nothing was submitted yet (the
+            # exchange was never contacted) — remove the entry that never
+            # actually persisted and abstain, rather than proceed blind.
+            del self._pending_submissions[role]
+            raise _SubmissionAborted(
+                f"could not durably persist {role} submission intent for "
+                f"{self.symbol} — refusing to submit without a recovery record"
+            )
 
         try:
             raw = order_call(client_order_id)
         except fast_reject_exceptions:
-            self._pending_submission = None
+            del self._pending_submissions[role]
             self._save_state()
             raise
         except Exception as exc:
@@ -1718,11 +1906,13 @@ class LiveExecutor:
                     "error — adopting it instead of assuming failure",
                     label, adopted.get("id"),
                 )
-                self._pending_submission = None
+                self._pending_submissions[role] = {
+                    **self._pending_submissions[role], "order_id": adopted.get("id"),
+                }
                 self._save_state()
                 return adopted
             if confirmed_empty:
-                self._pending_submission = None
+                del self._pending_submissions[role]
                 self._save_state()
                 raise
             raise _SubmissionOutcomeUnknown(
@@ -1730,9 +1920,21 @@ class LiveExecutor:
                 f"error on {self.symbol} ({type(exc).__name__})"
             ) from exc
 
-        self._pending_submission = None
+        self._pending_submissions[role] = {
+            **self._pending_submissions[role], "order_id": raw.get("id"),
+        }
         self._save_state()
         return raw
+
+    def _resolve_pending_submission(self, role: str) -> None:
+        """Called once the caller has independently confirmed a TERMINAL
+        outcome (filled/closed/rejected) for the submission in this role's
+        slot — clears it so a future submission of the same role doesn't
+        pointlessly try to reconcile an already-settled order. A no-op if
+        nothing is pending for this role (always safe to call)."""
+        if role in self._pending_submissions:
+            del self._pending_submissions[role]
+            self._save_state()
 
     def _place_limit_order(self, side: str, quantity: float, price: float) -> dict:
         """
@@ -1782,7 +1984,7 @@ class LiveExecutor:
                 )
                 self._maker_fallback_reason = f"orderbook fetch failed ({type(exc).__name__})"
                 return self._create_order_persisted(
-                    side, quantity, None,
+                    side, side, quantity, None,
                     lambda cid: self._exchange.create_order(
                         self.symbol, "market", side, quantity, None, {"clientOrderId": cid},
                     ),
@@ -1826,7 +2028,7 @@ class LiveExecutor:
                 # the reconciliation round-trip for it so the immediate
                 # tick_pct-halving retry below stays exactly as fast as before.
                 raw = self._create_order_persisted(
-                    side, quantity, limit_price,
+                    side, side, quantity, limit_price,
                     lambda cid: self._exchange.create_order(
                         self.symbol, "limit", side, quantity, limit_price,
                         {"postOnly": True, "clientOrderId": cid},
@@ -1847,19 +2049,21 @@ class LiveExecutor:
                     logger.warning("spread too tight for post-only, using market")
                     self._maker_fallback_reason = "spread too tight for post-only"
                     return self._create_order_persisted(
-                        side, quantity, None,
+                        side, side, quantity, None,
                         lambda cid: self._exchange.create_order(
                             self.symbol, "market", side, quantity, None, {"clientOrderId": cid},
                         ),
                         label=f"market fallback (spread too tight) [{self.symbol}]",
                     )
                 continue
-            except _SubmissionOutcomeUnknown:
-                # Outcome genuinely unresolved — do NOT fall back to
-                # market (that's exactly the duplicate-order risk this
-                # exception exists to prevent). Propagate up to execute(),
-                # which holds back entirely. _pending_submission stays
-                # persisted so the next attempt reconciles this one first.
+            except (_SubmissionOutcomeUnknown, _SubmissionAborted):
+                # Outcome genuinely unresolved (or the submission was never
+                # even attempted due to a persistence failure) — do NOT
+                # fall back to market (that's exactly the duplicate-order
+                # risk this exists to prevent). Propagate up to execute(),
+                # which holds back entirely. The pending-submission slot
+                # (if any) stays persisted so the next attempt reconciles
+                # this one first.
                 raise
             except Exception as exc:
                 # _create_order_persisted already tried reconciliation and
@@ -1869,7 +2073,7 @@ class LiveExecutor:
                 # as this method always has for a confirmed limit failure.
                 self._maker_fallback_reason = f"exchange rejected limit order ({type(exc).__name__})"
                 return self._create_order_persisted(
-                    side, quantity, None,
+                    side, side, quantity, None,
                     lambda cid: self._exchange.create_order(
                         self.symbol, "market", side, quantity, None, {"clientOrderId": cid},
                     ),
@@ -1957,7 +2161,7 @@ class LiveExecutor:
             f"limit chase timed out after {cfg.exchange.limit_chase_max_retries} retries"
         )
         return self._create_order_persisted(
-            side, quantity, None,
+            side, side, quantity, None,
             lambda cid: self._exchange.create_order(
                 self.symbol, "market", side, quantity, None, {"clientOrderId": cid},
             ),
@@ -2202,7 +2406,7 @@ class LiveExecutor:
                             quantity, self.symbol, limit_price, price,
                         )
                         raw = self._create_order_persisted(
-                            ccxt_side, quantity, limit_price,
+                            ccxt_side, ccxt_side, quantity, limit_price,
                             lambda cid: self._exchange.create_order(
                                 symbol=self.symbol, type="limit", side=ccxt_side,
                                 amount=quantity, price=limit_price,
@@ -2216,7 +2420,7 @@ class LiveExecutor:
                             side.value, quantity, self.symbol,
                         )
                         raw = self._create_order_persisted(
-                            ccxt_side, quantity, None,
+                            ccxt_side, ccxt_side, quantity, None,
                             lambda cid: self._exchange.create_order(
                                 symbol=self.symbol, type="market", side=ccxt_side,
                                 amount=quantity, params={"clientOrderId": cid},
@@ -2319,19 +2523,28 @@ class LiveExecutor:
                                 " — skipping fill record. Manual verification required.",
                                 _side_str, order_id_str,
                             )
+                            # Confirmed terminal (closed) with genuinely
+                            # nothing filled — safe to treat like any other
+                            # confirmed non-event.
                             if _native_stop_restore is not None:
                                 self._rearm_native_stop_after_failed_sell(_native_stop_restore)
+                            self._resolve_pending_submission(side.value.lower())
                             return None
                     else:
-                        # Limit order with filled=0, or order not yet closed — do not infer.
+                        # Limit order with filled=0, or order not yet closed —
+                        # do not infer, and — 2026-09-18 PASS-3 review finding
+                        # — do NOT re-arm protection either: the order may
+                        # still be genuinely resting and could fill later,
+                        # same "don't act on an unresolved outcome" reasoning
+                        # as the _SubmissionOutcomeUnknown handler above.
+                        # Deliberately leave the pending-submission slot
+                        # (if any) untouched too — still unresolved.
                         logger.error(
                             "%s qty=0 GUARD: order %s status=%s order_type=%s filled=0"
                             " — skipping fill record to prevent phantom row."
                             " Manual verification required.",
                             _side_str, order_id_str, _last_status, _actual_type,
                         )
-                        if _native_stop_restore is not None:
-                            self._rearm_native_stop_after_failed_sell(_native_stop_restore)
                         return None
 
                 # Shared fee extraction — works for both limit-chase and market paths.
@@ -2371,19 +2584,63 @@ class LiveExecutor:
                 # confirmed, safe-to-retry failure. 2026-09-18 review
                 # finding: the old code always guessed (REJECTED or a
                 # market fallback) here.
+                #
+                # 2026-09-18 PASS-3 review finding: do NOT re-arm the
+                # cancelled native stop here for a SELL — we do not know
+                # whether this SELL actually went through. If it did, the
+                # position is smaller (or flat) than self._portfolio still
+                # shows (accounting is untouched on this path), so a
+                # "restore the old level" re-arm could size a replacement
+                # stop against a position that's no longer accurate.
+                # Determining the SELL's real outcome first, before
+                # touching protection again, is the caller's job on the
+                # next cycle (sync_protective_stop will attempt the cancel/
+                # verify again and reconcile whatever is actually true).
                 logger.error("ORDER OUTCOME UNKNOWN [%s]: %s", self.symbol, exc)
                 self._alerter.error(
                     f"ORDER OUTCOME UNKNOWN [{self.symbol}]: {exc}. Not "
                     f"recording a fill or a rejection — verify on the "
                     f"exchange before the next signal."
+                    + (
+                        f" Native stop protection was cancelled before this "
+                        f"attempt and has NOT been restored, since the SELL's "
+                        f"own outcome is unresolved — check Kraken directly."
+                        if _native_stop_restore is not None else ""
+                    )
+                )
+                return None
+            except _SubmissionAborted as exc:
+                # The submission was never even attempted (a durable
+                # pre-submit persistence failure) — we know FOR CERTAIN
+                # nothing happened on the exchange, so it's safe to treat
+                # exactly like a confirmed rejection: re-arm a cancelled
+                # native stop (the position provably didn't change) and
+                # record a REJECTED order (safe to retry).
+                logger.error("SUBMISSION ABORTED [%s]: %s", self.symbol, exc)
+                self._alerter.error(
+                    f"SUBMISSION ABORTED [{self.symbol}]: {exc}. No order "
+                    f"was placed."
                 )
                 if _native_stop_restore is not None:
                     self._rearm_native_stop_after_failed_sell(_native_stop_restore)
-                return None
+                self._resolve_pending_submission(side.value.lower())
+                order = Order(
+                    order_id      = "rejected",
+                    symbol        = self.symbol,
+                    side          = side,
+                    quantity      = quantity,
+                    price         = price,
+                    status        = OrderStatus.REJECTED,
+                    created_at    = ts,
+                    reject_reason = f"Submission aborted: {exc}",
+                )
+                self._rejects.append(order)
+                return order
             except ccxt.InsufficientFunds as exc:
                 logger.error("Insufficient funds: %s", exc)
                 if _native_stop_restore is not None:
                     self._rearm_native_stop_after_failed_sell(_native_stop_restore)
+                self._resolve_pending_submission(side.value.lower())
                 order = Order(
                     order_id      = "rejected",
                     symbol        = self.symbol,
@@ -2400,6 +2657,7 @@ class LiveExecutor:
                 logger.error("ccxt order error: %s", exc)
                 if _native_stop_restore is not None:
                     self._rearm_native_stop_after_failed_sell(_native_stop_restore)
+                self._resolve_pending_submission(side.value.lower())
                 order = Order(
                     order_id      = "rejected",
                     symbol        = self.symbol,
@@ -2500,6 +2758,13 @@ class LiveExecutor:
         )
         self._fills.append(order)
         self._record_pending_journal_entry(order)
+        # 2026-09-18 PASS-3 review finding: this is the point execute() has
+        # independently confirmed a TERMINAL outcome for this submission
+        # (a real fill, whatever its quantity) — only now is it safe to
+        # clear the pending-submission slot. A no-op for dry-run (never
+        # populates one) or the qty=0 GUARD paths above that return
+        # None instead of reaching here (deliberately still unresolved).
+        self._resolve_pending_submission(side.value.lower())
         self._save_state()
         return order
 

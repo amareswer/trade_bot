@@ -182,3 +182,128 @@ def test_multiple_pending_entries_on_one_symbol_each_replayed_and_acked(tmp_path
     assert ex.ack_journal_entry.call_count == 2
     ex.ack_journal_entry.assert_any_call("o1")
     ex.ack_journal_entry.assert_any_call("o2")
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-18 PASS-3 review finding (P1): a NORMAL trade_log write and a
+# journal replay of the SAME fill must be mutually idempotent — not just
+# replay-to-replay. Integration tests using a REAL LiveExecutor and REAL
+# TradeLog (temporary SQLite), not mocks, per the review's own request.
+# ---------------------------------------------------------------------------
+
+def test_normal_write_then_crash_before_ack_then_replay_leaves_one_row(tmp_path):
+    """Reproduced by PASS-3 exactly: record a fill normally (as
+    bot/main.py's _execute_approved_signal does — trade_log.log_fill with
+    the order's own exec_key), leave its journal entry UNACKNOWLEDGED
+    (simulating a crash between the normal write and the ack), then run
+    replay. Must produce exactly ONE row, not two — normal-write-to-replay
+    idempotency, not just replay-to-replay."""
+    from unittest.mock import MagicMock, patch
+
+    import bot.execution.live_executor as le_mod
+    from bot.data.trade_log import TradeLog
+    from bot.execution.live_executor import LiveExecutor
+    from bot.main import _replay_pending_journal_entries
+    from bot.strategy.threshold_strategy import Signal
+
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = {
+        "BTC/CAD": {"limits": {"amount": {"min": 0.00005}, "cost": {"min": 5.0}}}
+    }
+    mock_ex.fetch_balance.return_value = {"free": {"CAD": 1000.0}}
+    mock_ex.fetch_open_orders.return_value = []
+    mock_ex.price_to_precision.return_value = "0.0"
+    raw = {
+        "id": "buy-1", "status": "closed", "filled": 0.001,
+        "average": 90_000.0, "fee": {"cost": 0.36, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = raw
+    mock_ex.fetch_order.return_value = raw
+
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls, patch("time.sleep"), \
+         patch("bot.execution.live_executor.cfg") as mock_cfg:
+        mock_cfg.exchange.limit_order_enabled = False
+        mock_cls.return_value = mock_ex
+        executor = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=1000.0, dry_run=False,
+            state_path=str(tmp_path / "state.json"),
+        )
+        order = executor.execute(Signal.BUY, 90_000.0, 0.001)
+
+    assert order is not None and order.status.value == "FILLED"
+    assert len(executor.pending_journal_entries) == 1   # not yet acked
+
+    tl = TradeLog(db_path=str(tmp_path / "trades.db"))
+    # The NORMAL write path (bot/main.py's _execute_approved_signal),
+    # using the order's own exec_key — deliberately NOT followed by
+    # ack_journal_entry(), simulating a crash right after this DB commit.
+    tl.log_fill(
+        side=order.side.value, symbol="BTC/CAD", quantity=order.quantity,
+        price=order.price, pnl=order.pnl, exchange="kraken",
+        fee_cost=order.fee_cost, fee_currency=order.fee_currency,
+        exec_key=order.exec_key,
+    )
+    assert len(tl.recent(limit=10)) == 1
+
+    # Restart-equivalent: replay runs against the (still-unacked) journal.
+    alerter = MagicMock()
+    _replay_pending_journal_entries({"BTC/CAD": executor}, tl, alerter)
+
+    rows = tl.recent(limit=10)
+    assert len(rows) == 1, f"expected exactly one row, got {len(rows)}"
+
+
+def test_restart_delta_does_not_collide_with_pre_restart_exec_key(tmp_path):
+    """Reproduced by PASS-3 exactly: a monotonic in-memory counter reset to
+    0 on restart, so a native stop's SECOND partial-fill delta (recorded
+    after a restart) could reuse the SAME exec_key ("order_id#1") as its
+    FIRST delta (recorded and acked before the restart) — a genuinely new
+    fill silently discarded as "already recorded". Fixed via Order.exec_key
+    (a fresh UUID per Order, not a counter) — verify two deltas of the same
+    native-stop order_id, separated by a restart, never share a key."""
+    import bot.execution.live_executor as le_mod
+    from bot.execution.executor import Order, OrderSide, OrderStatus
+    from datetime import datetime, timezone
+    from unittest.mock import MagicMock, patch
+
+    from bot.execution.live_executor import LiveExecutor
+
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = {
+        "BTC/CAD": {"limits": {"amount": {"min": 0.00005}, "cost": {"min": 5.0}}}
+    }
+    mock_ex.fetch_balance.return_value = {"free": {"CAD": 1000.0}}
+    state_path = str(tmp_path / "state.json")
+
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = mock_ex
+        ex = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=1000.0, dry_run=False, state_path=state_path,
+        )
+    shared_order_id = "native-stop:persisted-stop"
+    o1 = Order(order_id=shared_order_id, symbol="BTC/CAD", side=OrderSide.SELL,
+               quantity=0.001, price=78_000.0, status=OrderStatus.FILLED,
+               created_at=datetime.now(timezone.utc), filled_at=datetime.now(timezone.utc))
+    ex._record_pending_journal_entry(o1)
+    first_key = ex.pending_journal_entries[0]["exec_key"]
+    ex.ack_journal_entry(shared_order_id)   # acked BEFORE the restart
+
+    # Restart: a fresh LiveExecutor loads the SAME state file.
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls2:
+        mock_cls2.return_value = mock_ex
+        ex2 = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=1000.0, dry_run=False, state_path=state_path,
+        )
+    o2 = Order(order_id=shared_order_id, symbol="BTC/CAD", side=OrderSide.SELL,
+               quantity=0.001, price=77_500.0, status=OrderStatus.FILLED,
+               created_at=datetime.now(timezone.utc), filled_at=datetime.now(timezone.utc))
+    ex2._record_pending_journal_entry(o2)
+    second_key = ex2.pending_journal_entries[0]["exec_key"]
+
+    assert first_key != second_key, (
+        "a post-restart delta must never reuse a pre-restart exec_key for "
+        "the same order_id"
+    )
