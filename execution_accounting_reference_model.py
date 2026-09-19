@@ -1,0 +1,1044 @@
+"""
+Disposable, offline reference model for the execution-accounting design
+(CRYPTO_BOT_EXECUTION_ACCOUNTING_DESIGN_2026-09-19.md, and its two review
+rounds — CRYPTO_BOT_EXECUTION_ACCOUNTING_DESIGN_REVIEW_2026-09-19.md,
+CRYPTO_BOT_EXECUTION_ACCOUNTING_DESIGN_REVIEW_R2_2026-09-19.md).
+
+Proves — against a SYNTHETIC exchange and an ISOLATED temporary SQLite
+database, with no live exchange access and no import from the live trading
+path (bot/execution/live_executor.py, bot/main.py are never imported here)
+— three properties the R2 review insisted be checked SEPARATELY, never
+folded into one boolean:
+
+  1. HISTORY COVERAGE — the retrieved trade/ledger window is complete and
+     internally stable (fetched count == exchange-reported total count,
+     stable across every page of one retrieval attempt). Never inferred
+     from whether a balance identity happens to match — R2 review finding
+     1's counterexample (two offsetting unseen events, or an incomplete
+     page that coincidentally nets to the right total) is why: a balance
+     match proves nothing about completeness on its own.
+
+  2. BALANCE CONSISTENCY — given a COVERAGE-approved event set, the prior
+     checkpoint's balance plus every known delta in the window equals a
+     freshly read balance, using exact values from the synthetic exchange
+     (no assumed rounding tolerance — R2 finding 5).
+
+  3. LEDGER / DELIVERY CONSISTENCY — every covered, balance-consistent
+     trade is committed to exactly one ledger row, same-timestamp trades
+     are ordered by actual causal evidence (a spot book's running
+     position can never go negativer — not by an opaque id, which R2
+     finding 3 showed can misallocate a same-timestamp BUY/SELL pair's
+     entry fee), and the resulting position/cost-basis/fee-allocation
+     fold is checked against the real expected numbers.
+
+Readiness = all three, reported separately. This module is not wired into
+any live path and is not production code.
+"""
+from __future__ import annotations
+
+import itertools
+import json
+import sqlite3
+import uuid
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+# ============================================================================
+# Synthetic exchange
+# ============================================================================
+
+@dataclass
+class SynTrade:
+    trade_id: str
+    order_id: str
+    symbol: str
+    side: str            # "buy" / "sell"
+    price: float
+    amount: float
+    cost: float
+    fee_cost: float
+    fee_currency: str
+    timestamp_ms: int
+
+
+@dataclass
+class SynLedgerEntry:
+    entry_id: str
+    refid: str            # trade_id for type == "trade"; "" otherwise
+    type: str              # "trade" | "deposit" | "withdrawal"
+    asset: str
+    amount: float          # signed delta
+    after: float            # balance AFTER this entry (ccxt unified "after")
+    timestamp_ms: int
+
+
+@dataclass
+class TradePage:
+    """Mirrors what a real retrieval interface MUST expose to prove
+    completeness — ccxt's unified fetch_my_trades() discards the exchange's
+    own reported total-match count (R2 review finding 1); this dataclass
+    deliberately keeps it."""
+    trades: "list[SynTrade]"
+    reported_total: int    # exchange-side total matching records for the query window
+    next_offset: "int | None"
+
+
+class SyntheticExchange:
+    """A minimal, fully-controllable fake exchange. Every balance-affecting
+    event (trade, deposit, withdrawal) takes effect on the ACTUAL balance
+    the instant it is recorded — exactly like a real exchange, where the
+    balance endpoint is authoritative and immediate. Trade/ledger HISTORY
+    visibility is a SEPARATE, independently controlled flag, modeling real
+    propagation lag between "the fill executed" and "fetch_my_trades()
+    reports it" — this is what makes the checkpoint race reproducible on
+    purpose rather than by accident."""
+
+    def __init__(self) -> None:
+        self._balances: "dict[str, float]" = {}
+        self._trades: "list[tuple[SynTrade, bool]]" = []       # (trade, visible)
+        self._ledger: "list[tuple[SynLedgerEntry, bool]]" = []  # (entry, visible)
+        self._next_id = 1
+
+    # -- mutation (test-driver only) ----------------------------------------
+
+    def _new_id(self, prefix: str) -> str:
+        i = self._next_id
+        self._next_id += 1
+        return f"{prefix}{i}"
+
+    def _apply_balance(self, asset: str, delta: float) -> float:
+        self._balances[asset] = self._balances.get(asset, 0.0) + delta
+        return self._balances[asset]
+
+    def execute_trade(
+        self, *, symbol: str, side: str, price: float, amount: float,
+        fee_cost: float = 0.0, fee_currency: str = "", timestamp_ms: int,
+        order_id: "str | None" = None, visible: bool = True,
+        trade_id: "str | None" = None,
+    ) -> SynTrade:
+        base, quote = symbol.split("/")
+        cost = price * amount
+        oid = order_id or self._new_id("O")
+        tid = trade_id or self._new_id("T")
+        trade = SynTrade(tid, oid, symbol, side, price, amount, cost,
+                          fee_cost, fee_currency or quote, timestamp_ms)
+        self._trades.append((trade, visible))
+        if side == "buy":
+            self._apply_balance(quote, -cost - (fee_cost if fee_currency in ("", quote) else 0.0))
+            after = self._apply_balance(base, amount)
+        else:
+            after = self._apply_balance(quote, cost - (fee_cost if fee_currency in ("", quote) else 0.0))
+            self._apply_balance(base, -amount)
+        ledger_asset = quote  # cash-affecting side; base-asset ledger rows omitted, not needed by these tests
+        entry = SynLedgerEntry(
+            self._new_id("L"), tid, "trade", ledger_asset,
+            amount=(-cost if side == "buy" else cost), after=self._balances.get(ledger_asset, 0.0),
+            timestamp_ms=timestamp_ms,
+        )
+        self._ledger.append((entry, visible))
+        return trade
+
+    def deposit(self, asset: str, amount: float, *, timestamp_ms: int, visible: bool = True) -> str:
+        after = self._apply_balance(asset, amount)
+        eid = self._new_id("L")
+        self._ledger.append((SynLedgerEntry(eid, "", "deposit", asset, amount, after, timestamp_ms), visible))
+        return eid
+
+    def withdraw(self, asset: str, amount: float, *, timestamp_ms: int, visible: bool = True) -> str:
+        after = self._apply_balance(asset, -amount)
+        eid = self._new_id("L")
+        self._ledger.append((SynLedgerEntry(eid, "", "withdrawal", asset, -amount, after, timestamp_ms), visible))
+        return eid
+
+    def reveal_all(self) -> None:
+        """Simulate propagation catching up: every pending trade/ledger
+        event becomes visible to history reads."""
+        self._trades = [(t, True) for t, _ in self._trades]
+        self._ledger = [(e, True) for e, _ in self._ledger]
+
+    def revise_trade_fee(self, trade_id: str, new_fee: float, *, timestamp_ms: int = 0) -> float:
+        """Simulate the exchange settling a trade's fee to a different
+        final value after it was first observed. Unlike the first draft of
+        this method, this ALSO applies the real delta to the actual quote
+        balance (a fee revision is a genuine cash movement on a real
+        exchange, not just a stored-value edit — reference-model review
+        finding: "the fake exchange never adjusts cash for that revised
+        fee"). Returns the signed delta (new - old) for the caller."""
+        for i, (t, vis) in enumerate(self._trades):
+            if t.trade_id == trade_id:
+                old_fee = t.fee_cost
+                delta_fee = new_fee - old_fee
+                revised = SynTrade(t.trade_id, t.order_id, t.symbol, t.side, t.price,
+                                    t.amount, t.cost, new_fee, t.fee_currency, t.timestamp_ms)
+                self._trades[i] = (revised, vis)
+                if delta_fee != 0.0:
+                    after = self._apply_balance(t.fee_currency, -delta_fee)
+                    eid = self._new_id("L")
+                    self._ledger.append((
+                        SynLedgerEntry(eid, trade_id, "fee_correction", t.fee_currency,
+                                        -delta_fee, after, timestamp_ms or t.timestamp_ms),
+                        True,
+                    ))
+                return delta_fee
+        raise KeyError(trade_id)
+
+    # -- reads ----------------------------------------------------------------
+
+    def fetch_balance_total(self, asset: str) -> float:
+        return self._balances.get(asset, 0.0)
+
+    def fetch_my_trades_page(
+        self, symbol: str, *, since_ms: "int | None" = None,
+        offset: int = 0, limit: int = 50,
+    ) -> TradePage:
+        # since_ms is EXCLUSIVE, matching Kraken's own documented TradesHistory
+        # `start` semantics ("starting unix timestamp... (exclusive)") — a
+        # window's own `until` boundary must never be re-included by the
+        # next window's `since`.
+        matching = [t for t, vis in self._trades
+                    if vis and t.symbol == symbol and (since_ms is None or t.timestamp_ms > since_ms)]
+        matching.sort(key=lambda t: (t.timestamp_ms, t.trade_id))
+        total = len(matching)
+        page = matching[offset:offset + limit]
+        next_offset = offset + limit if offset + limit < total else None
+        return TradePage(page, total, next_offset)
+
+    def fetch_ledger_entries(
+        self, asset: str, *, since_ms: "int | None" = None,
+    ) -> "list[SynLedgerEntry]":
+        entries = [e for e, vis in self._ledger
+                   if vis and e.asset == asset and (since_ms is None or e.timestamp_ms > since_ms)]
+        entries.sort(key=lambda e: (e.timestamp_ms, e.entry_id))
+        return entries
+
+    def fetch_deposits(self, asset: str, *, since_ms: "int | None" = None) -> "list[SynLedgerEntry]":
+        return [e for e in self.fetch_ledger_entries(asset, since_ms=since_ms) if e.type == "deposit"]
+
+    def fetch_withdrawals(self, asset: str, *, since_ms: "int | None" = None) -> "list[SynLedgerEntry]":
+        return [e for e in self.fetch_ledger_entries(asset, since_ms=since_ms) if e.type == "withdrawal"]
+
+
+# ============================================================================
+# SQLite schema for the reference model — deliberately its own temp DB,
+# never trades.db.
+# ============================================================================
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS observed_trades (
+    trade_id              TEXT PRIMARY KEY,
+    order_id               TEXT NOT NULL,
+    symbol                  TEXT NOT NULL,
+    side                     TEXT NOT NULL,
+    price                    REAL NOT NULL,
+    amount                   REAL NOT NULL,
+    cost                     REAL NOT NULL,
+    fee_cost                 REAL NOT NULL,
+    fee_currency              TEXT NOT NULL,
+    exchange_timestamp_ms     INTEGER NOT NULL,
+    checkpoint_id             TEXT,
+    ledger_written_at         TEXT
+);
+CREATE TABLE IF NOT EXISTS checkpoints (
+    checkpoint_id      TEXT PRIMARY KEY,
+    currency_scope       TEXT NOT NULL,
+    window_since_ms       INTEGER,
+    window_until_ms       INTEGER NOT NULL,
+    balance_after         REAL NOT NULL,
+    covered_trade_ids     TEXT NOT NULL,
+    committed_at          TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fills (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    exec_key      TEXT UNIQUE,
+    timestamp_ms   INTEGER NOT NULL,
+    side            TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    quantity        REAL NOT NULL,
+    price           REAL NOT NULL,
+    fee_cost        REAL NOT NULL,
+    pnl             REAL,
+    source          TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fee_corrections (
+    trade_id     TEXT NOT NULL,
+    revision      INTEGER NOT NULL,
+    old_fee        REAL NOT NULL,
+    new_fee        REAL NOT NULL,
+    recorded_at    TEXT NOT NULL,
+    PRIMARY KEY (trade_id, revision)
+);
+CREATE TABLE IF NOT EXISTS legacy_links (
+    trade_id         TEXT NOT NULL,
+    legacy_fill_id     INTEGER NOT NULL,
+    PRIMARY KEY (trade_id, legacy_fill_id)
+);
+CREATE TABLE IF NOT EXISTS opening_snapshot (
+    id               INTEGER PRIMARY KEY CHECK (id = 1),
+    symbol            TEXT NOT NULL,
+    as_of_ms           INTEGER NOT NULL,
+    balance            REAL NOT NULL,
+    cost_basis         REAL NOT NULL,
+    established_at     TEXT NOT NULL
+);
+"""
+
+
+def init_db(path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(path)
+    conn.executescript(_SCHEMA)
+    conn.commit()
+    return conn
+
+
+# ============================================================================
+# 1. History coverage — proven by exchange-reported count, never by balance
+# ============================================================================
+
+@dataclass
+class CoverageResult:
+    complete: bool
+    trades: "list[SynTrade]"
+    reported_total: int
+    fetched_count: int
+    reason: str = ""
+
+
+def retrieve_with_coverage_proof(
+    exchange: SyntheticExchange, symbol: str, *, since_ms: "int | None" = None,
+    page_size: int = 50, page_limit_override: "int | None" = None,
+) -> CoverageResult:
+    """Pages fetch_my_trades_page until the accumulated record count equals
+    the FIRST page's reported total. If a later page reports a DIFFERENT
+    total (the window was not stable across the retrieval attempt — new
+    trades arrived mid-pagination), completeness is explicitly refused
+    rather than silently accepted with a moving target.
+
+    page_limit_override: caps how many records this attempt will fetch,
+    regardless of how many actually exist — models a retrieval bug (or a
+    deliberately truncated read) so the coverage check's independence from
+    the balance check can be demonstrated: a truncated fetch must be
+    flagged incomplete even when the truncated subset's cash effect
+    happens to net out correctly against a fresh balance read (R2 finding
+    1's core counterexample).
+    """
+    all_trades: "list[SynTrade]" = []
+    offset = 0
+    first_total: "int | None" = None
+    while True:
+        limit = page_size
+        if page_limit_override is not None:
+            remaining = page_limit_override - len(all_trades)
+            if remaining <= 0:
+                return CoverageResult(False, all_trades, first_total or 0, len(all_trades),
+                                       "retrieval attempt truncated by page_limit_override")
+            limit = min(limit, remaining)
+        page = exchange.fetch_my_trades_page(symbol, since_ms=since_ms, offset=offset, limit=limit)
+        if first_total is None:
+            first_total = page.reported_total
+        elif page.reported_total != first_total:
+            return CoverageResult(False, all_trades, first_total, len(all_trades),
+                                   f"reported total drifted mid-pagination "
+                                   f"({first_total} -> {page.reported_total}) — window unstable")
+        all_trades.extend(page.trades)
+        if page.next_offset is None:
+            break
+        offset = page.next_offset
+    complete = len(all_trades) == first_total
+    reason = "" if complete else f"fetched {len(all_trades)} of reported {first_total}"
+    return CoverageResult(complete, all_trades, first_total or 0, len(all_trades), reason)
+
+
+def compute_safe_watermark(
+    coverage: CoverageResult, *, now_ms: int, previous_watermark_ms: "int | None",
+    safety_margin_ms: int,
+) -> "int | None":
+    """The ONLY function allowed to advance a persisted retrieval cursor.
+
+    Reference-model review finding: `coverage.complete=True` proves the
+    exchange's queryable history was fully PAGED as of this read — it can
+    never prove no other execution exists that the exchange itself hasn't
+    surfaced yet (an inherent limit of polling any REST history endpoint;
+    reproduced concretely: a BUY and SELL both held invisible produce an
+    empty, "complete" page and a balance identity that happens to match,
+    which is exactly the false-readiness counterexample). Treating
+    page-exhaustion as license to advance the cursor to "the last thing we
+    saw" is what let a still-hidden trade fall permanently behind an
+    exclusive `since` boundary once revealed.
+
+    The watermark this function returns NEVER exceeds `now_ms -
+    safety_margin_ms`, monotonically, regardless of what coverage claims —
+    so a trade hidden at read time gets every subsequent read within the
+    margin to still be picked up (`since_ms` stays at or before its own
+    timestamp until the margin has genuinely elapsed). Re-observing an
+    already-known trade during that overlap is free (trade_id is the
+    primary key everywhere in this model).
+
+    If coverage was NOT page-exhausted (a truncated/unstable read), the
+    watermark does not advance at all this cycle, even within the margin —
+    an incomplete read proves nothing about the window regardless of how
+    much real time has passed.
+
+    Residual, inherent limitation (stated, not hidden): a trade whose
+    visibility is delayed LONGER than safety_margin_ms relative to its own
+    execution time can still be permanently missed — no finite margin can
+    defend against unbounded propagation delay. Choosing a margin
+    generous relative to real observed propagation lag is a deployment
+    decision, not something this function can prove correct in general.
+    """
+    if not coverage.complete:
+        return previous_watermark_ms
+    candidate = now_ms - safety_margin_ms
+    if previous_watermark_ms is not None:
+        candidate = max(candidate, previous_watermark_ms)
+    return candidate
+
+
+def is_watermark_confirmed(window_until_ms: int, *, now_ms: int, safety_margin_ms: int) -> bool:
+    """True once enough real time has passed since a window's own end for
+    any propagation-delayed execution to plausibly have surfaced. Because
+    compute_safe_watermark above already caps window_until_ms at `now_ms -
+    safety_margin_ms` at the moment a checkpoint is committed, a checkpoint
+    committed via that function is confirmed the instant it is written —
+    this function exists for the caller-facing readiness check (and for
+    inspecting an OLDER checkpoint's confirmation status later) rather
+    than being a second independent gate a correctly-built checkpoint
+    would ever actually fail."""
+    return now_ms - window_until_ms >= safety_margin_ms
+
+
+# ============================================================================
+# 2. Balance consistency — an accounting identity, run ONLY on a
+#    coverage-approved set, never used to infer coverage.
+# ============================================================================
+
+@dataclass
+class BalanceCheckResult:
+    consistent: bool
+    expected_balance: float
+    actual_balance: float
+    residual: float
+
+
+def check_balance_consistency(
+    prior_balance: float, trades: "list[SynTrade]", deposits: "list[SynLedgerEntry]",
+    withdrawals: "list[SynLedgerEntry]", fresh_balance: float, *, side_asset_is_quote: bool,
+    quote: str, fee_correction_deltas: "list[float]" = (),
+) -> BalanceCheckResult:
+    """side_asset_is_quote: whether the balance being checked is the quote
+    currency (cash) that trades move — base-asset checks would instead sum
+    signed trade `amount`.
+
+    fee_correction_deltas: signed (new_fee - old_fee) values from
+    record_fee_revision/revise_trade_fee that have been recorded since
+    `prior_balance` — a fee revision is a real cash movement (§ the
+    revised SyntheticExchange.revise_trade_fee), so checking consistency
+    using only a trade's ORIGINALLY observed fee_cost without also
+    including any later correction will show a genuine residual (this is
+    intentional and tested — see test_fee_revision_converges_with_real_
+    balance_after_being_included — the check must not silently ignore a
+    stale fee value).
+
+    The 1e-12 comparison below is a float64-representational-error guard
+    (this function performs the same additions any float64 arithmetic
+    would, so residual noise at that scale is unavoidable rounding, not a
+    business tolerance) — NOT a rounding allowance for real currency
+    precision. A caller reconciling actual money should compare in
+    integer minor-units (cents) or Decimal, not trust this function's
+    tolerance as a statement about acceptable business-level imprecision.
+    Also note: this model always treats a trade's fee as being paid in
+    the quote currency (matching this bot's actually-observed Kraken spot
+    fee behavior) — a fee paid in the BASE currency is not modeled here.
+    """
+    delta = 0.0
+    for t in trades:
+        if side_asset_is_quote:
+            trade_fee = t.fee_cost if t.fee_currency == quote else 0.0
+            delta += (-t.cost - trade_fee) if t.side == "buy" else (t.cost - trade_fee)
+        else:
+            delta += t.amount if t.side == "buy" else -t.amount
+    for d in deposits:
+        delta += d.amount
+    for w in withdrawals:
+        delta += w.amount  # already signed negative by SyntheticExchange.withdraw
+    if side_asset_is_quote:
+        for fd in fee_correction_deltas:
+            delta -= fd  # a fee INCREASE (positive fd) reduces quote cash further
+    expected = prior_balance + delta
+    residual = fresh_balance - expected
+    return BalanceCheckResult(abs(residual) < 1e-9, expected, fresh_balance, residual)
+
+
+# ============================================================================
+# 3. Ledger / delivery consistency
+# ============================================================================
+
+def causal_order(trades: "list[SynTrade]") -> "list[SynTrade] | None":
+    """Orders trades primarily by timestamp. Same-timestamp trades on the
+    SAME symbol are, where more than one ordering is possible, resolved by
+    the one domain invariant this spot bot can rely on: running position
+    must never go negative (this book never shorts) — a SELL cannot be
+    causally before the BUY quantity it draws down. This is real causal
+    evidence, unlike an opaque trade-id sort (R2 finding 3).
+
+    Returns None if NO ordering of a tied group satisfies the invariant
+    (a genuine data problem — never silently guessed), or if MULTIPLE
+    orderings satisfy it AND they produce different results (still
+    ambiguous — checked by the caller via fold comparison, not here).
+    """
+    by_symbol: "dict[str, list[SynTrade]]" = {}
+    for t in trades:
+        by_symbol.setdefault(t.symbol, []).append(t)
+
+    resolved_by_symbol: "dict[str, list[SynTrade]]" = {}
+    for symbol, group in by_symbol.items():
+        group.sort(key=lambda t: t.timestamp_ms)
+        i = 0
+        resolved: "list[SynTrade]" = []
+        running_qty = 0.0
+        while i < len(group):
+            j = i
+            while j + 1 < len(group) and group[j + 1].timestamp_ms == group[i].timestamp_ms:
+                j += 1
+            tied = group[i:j + 1]
+            if len(tied) == 1:
+                t = tied[0]
+                running_qty += t.amount if t.side == "buy" else -t.amount
+                if running_qty < -1e-9:
+                    return None
+                resolved.append(t)
+            else:
+                found = None
+                for perm in itertools.permutations(tied):
+                    q = running_qty
+                    ok = True
+                    for t in perm:
+                        q += t.amount if t.side == "buy" else -t.amount
+                        if q < -1e-9:
+                            ok = False
+                            break
+                    if ok:
+                        if found is not None and found != perm:
+                            # more than one valid ordering — genuinely
+                            # ambiguous, not this function's call to make.
+                            return None
+                        found = perm
+                if found is None:
+                    return None
+                resolved.extend(found)
+                running_qty += sum((t.amount if t.side == "buy" else -t.amount) for t in tied)
+            i = j + 1
+        resolved_by_symbol[symbol] = resolved
+
+    # Merge symbols' independently-resolved sequences into one global order:
+    # primarily by timestamp, with each symbol's own causal rank as the
+    # tiebreak — this preserves every per-symbol invariant proven above
+    # without ever re-deriving order from an opaque id. Cross-symbol ties
+    # are economically independent (different books), so any stable
+    # resolution between them is fine; only the intra-symbol relative order
+    # matters and is exactly what resolved_by_symbol already fixed.
+    rank: "dict[str, int]" = {
+        t.trade_id: i for group in resolved_by_symbol.values() for i, t in enumerate(group)
+    }
+    flat = [t for group in resolved_by_symbol.values() for t in group]
+    flat.sort(key=lambda t: (t.timestamp_ms, t.symbol, rank[t.trade_id]))
+    return flat
+
+
+@dataclass
+class FoldResult:
+    final_qty: float
+    avg_cost: float
+    realized_pnl: float
+    per_trade_pnl: "dict[str, float]"
+
+
+def fold_position(trades_in_order: "list[SynTrade]") -> FoldResult:
+    """Minimal FIFO-average-cost position fold — enough to prove that
+    causal ordering (not opaque-id ordering) produces the economically
+    correct entry-fee allocation and realized P&L for a same-timestamp
+    BUY/SELL pair (R2 finding 3's explicit demand: test the actual fee and
+    basis numbers, not just that a sort is stable)."""
+    qty = 0.0
+    avg_cost = 0.0
+    realized = 0.0
+    per_trade: "dict[str, float]" = {}
+    for t in trades_in_order:
+        if t.side == "buy":
+            new_qty = qty + t.amount
+            avg_cost = ((avg_cost * qty) + t.cost + t.fee_cost) / new_qty if new_qty > 0 else 0.0
+            qty = new_qty
+        else:
+            proceeds = t.cost - t.fee_cost
+            cost_of_sold = avg_cost * t.amount
+            pnl = proceeds - cost_of_sold
+            realized += pnl
+            per_trade[t.trade_id] = pnl
+            qty -= t.amount
+    return FoldResult(qty, avg_cost, realized, per_trade)
+
+
+class _InjectedTransactionFailure(Exception):
+    """Raised INSIDE a real `with conn:` transaction block by the
+    fail_after_n_trade_inserts injection point below, so sqlite3's own
+    rollback machinery runs against REAL prior writes in the same
+    transaction — proving true atomicity, not merely "the function
+    returned before touching SQL" (reference-model review finding 3)."""
+
+
+def commit_checkpoint(
+    conn: sqlite3.Connection, *, currency_scope: str, window_since_ms: "int | None",
+    window_until_ms: int, balance_after: float, trades: "list[SynTrade]",
+    fail_before_commit: bool = False, fail_after_n_trade_inserts: "int | None" = None,
+) -> "str | None":
+    """Atomically: insert the checkpoint row AND stamp every covered trade's
+    checkpoint_id, in ONE transaction.
+
+    fail_before_commit: simulates a crash before any SQL runs at all (the
+    weaker case — proves an early return makes no writes).
+
+    fail_after_n_trade_inserts: simulates a crash AFTER n real
+    observed_trades inserts (and the checkpoint row itself) have already
+    executed inside the transaction, by raising before `with conn:` exits
+    — sqlite3 then rolls back the ENTIRE transaction, including the
+    checkpoint row and every trade insert that already ran. Callers can
+    verify via a fresh query that NOTHING partially persisted.
+
+    Either way, the caller's retrieval cursor/watermark (tracked
+    separately — see compute_safe_watermark) must not have been advanced
+    on a failed commit, so a retry safely re-observes the same trades
+    (idempotent — trade_id is the primary key, and ON CONFLICT below makes
+    a retry after a PARTIAL prior success — impossible under real sqlite3
+    atomicity, but kept defensively — a no-op rather than a duplicate)."""
+    checkpoint_id = str(uuid.uuid4())
+    covered_ids = [t.trade_id for t in trades]
+    if fail_before_commit:
+        return None
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO checkpoints (checkpoint_id, currency_scope, window_since_ms, "
+                "window_until_ms, balance_after, covered_trade_ids, committed_at) "
+                "VALUES (?,?,?,?,?,?,datetime('now'))",
+                (checkpoint_id, currency_scope, window_since_ms, window_until_ms,
+                 balance_after, json.dumps(covered_ids)),
+            )
+            for i, t in enumerate(trades):
+                if fail_after_n_trade_inserts is not None and i == fail_after_n_trade_inserts:
+                    raise _InjectedTransactionFailure(
+                        f"injected failure after {i} of {len(trades)} trade inserts"
+                    )
+                conn.execute(
+                    "INSERT INTO observed_trades (trade_id, order_id, symbol, side, price, "
+                    "amount, cost, fee_cost, fee_currency, exchange_timestamp_ms, checkpoint_id) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(trade_id) DO UPDATE SET checkpoint_id=excluded.checkpoint_id",
+                    (t.trade_id, t.order_id, t.symbol, t.side, t.price, t.amount, t.cost,
+                     t.fee_cost, t.fee_currency, t.timestamp_ms, checkpoint_id),
+                )
+    except _InjectedTransactionFailure:
+        return None
+    return checkpoint_id
+
+
+def is_ledger_represented(conn: sqlite3.Connection, trade_id: str) -> bool:
+    """The single predicate BOTH normal replay (write_ledger_rows) and
+    migration must consult before writing anything for a trade id — either
+    a `fills` row keyed by it directly, or a legacy_links mapping to an
+    existing aggregate row, counts as "already represented." Without this
+    shared check, ordinary replay run after a migration re-inserted a
+    second `fills` row for an already-migrated trade (reference-model
+    review finding 2, reproduced exactly: migrating trade T into a legacy
+    row, then calling write_ledger_rows(T), produced two fills rows for
+    one execution)."""
+    if conn.execute("SELECT 1 FROM fills WHERE exec_key = ?", (trade_id,)).fetchone():
+        return True
+    if conn.execute("SELECT 1 FROM legacy_links WHERE trade_id = ?", (trade_id,)).fetchone():
+        return True
+    return False
+
+
+def write_ledger_rows(conn: sqlite3.Connection, trades_in_order: "list[SynTrade]",
+                       fold: FoldResult) -> None:
+    """Writes exactly one `fills` row per trade, keyed by trade_id, and
+    marks observed_trades.ledger_written_at — in the SAME transaction, so
+    the two obligations can never diverge. Skips any trade already
+    represented via EITHER a native fills row OR a legacy migration link
+    (is_ledger_represented) — this is what makes migration and ordinary
+    replay compose safely instead of double-writing the same execution."""
+    with conn:
+        for t in trades_in_order:
+            if is_ledger_represented(conn, t.trade_id):
+                continue
+            pnl = fold.per_trade_pnl.get(t.trade_id)
+            conn.execute(
+                "INSERT INTO fills (exec_key, timestamp_ms, side, symbol, quantity, "
+                "price, fee_cost, pnl, source) VALUES (?,?,?,?,?,?,?,?, 'live')",
+                (t.trade_id, t.timestamp_ms, t.side, t.symbol, t.amount, t.price, t.fee_cost, pnl),
+            )
+            conn.execute(
+                "UPDATE observed_trades SET ledger_written_at = datetime('now') WHERE trade_id = ?",
+                (t.trade_id,),
+            )
+
+
+def record_fee_revision(conn: sqlite3.Connection, trade_id: str, new_fee: float) -> bool:
+    """Idempotent: repeatedly observing the SAME revised fee value emits
+    exactly one correction row, not one per call (R2 finding 5's fee-
+    correction-counter demand)."""
+    row = conn.execute(
+        "SELECT new_fee, revision FROM fee_corrections WHERE trade_id = ? "
+        "ORDER BY revision DESC LIMIT 1", (trade_id,),
+    ).fetchone()
+    old_row = conn.execute(
+        "SELECT fee_cost FROM observed_trades WHERE trade_id = ?", (trade_id,),
+    ).fetchone()
+    last_known_fee = row[0] if row is not None else (old_row[0] if old_row else None)
+    if last_known_fee is not None and abs(last_known_fee - new_fee) < 1e-12:
+        return False  # no change since the last recorded value — not a new revision
+    next_revision = (row[1] + 1) if row is not None else 1
+    with conn:
+        conn.execute(
+            "INSERT INTO fee_corrections (trade_id, revision, old_fee, new_fee, recorded_at) "
+            "VALUES (?,?,?,?, datetime('now'))",
+            (trade_id, next_revision, last_known_fee if last_known_fee is not None else 0.0, new_fee),
+        )
+    return True
+
+
+# ============================================================================
+# Recovery — reconstructing state PURELY from persisted SQLite, after a
+# genuine close/reopen of the database. Reference-model review finding 3:
+# the original three-restart test kept the same connection and manually
+# carried Python variables (cursor values, computed positions) across
+# "restarts" — it tested SyntheticExchange's own bookkeeping, not real
+# recovery. The functions below are what an actually-restarted process
+# must call, and only ever read from `conn` — never from anything the
+# caller happens to still be holding in memory.
+# ============================================================================
+
+def recover_watermark(conn: sqlite3.Connection, currency_scope: str) -> "int | None":
+    """The retrieval cursor a restarted process must resume from — the
+    highest window_until_ms among COMMITTED checkpoints for this scope.
+    None means no checkpoint has ever committed (fetch from the
+    beginning)."""
+    row = conn.execute(
+        "SELECT MAX(window_until_ms) FROM checkpoints WHERE currency_scope = ?",
+        (currency_scope,),
+    ).fetchone()
+    return row[0] if row and row[0] is not None else None
+
+
+def load_observed_trades(conn: sqlite3.Connection, symbol: str) -> "list[SynTrade]":
+    rows = conn.execute(
+        "SELECT trade_id, order_id, symbol, side, price, amount, cost, fee_cost, "
+        "fee_currency, exchange_timestamp_ms FROM observed_trades WHERE symbol = ?",
+        (symbol,),
+    ).fetchall()
+    return [SynTrade(*row) for row in rows]
+
+
+def recover_position(conn: sqlite3.Connection, symbol: str) -> FoldResult:
+    """Rebuilds qty/avg_cost/realized-P&L PURELY from persisted
+    observed_trades rows, causally ordered — the actual recovery path a
+    restarted process uses, independent of any in-memory state that may
+    have existed before the crash."""
+    trades = load_observed_trades(conn, symbol)
+    ordered = causal_order(trades)
+    if ordered is None:
+        raise ValueError(
+            f"persisted observed_trades for {symbol} cannot be causally "
+            f"ordered — data integrity problem, not a recovery bug"
+        )
+    return fold_position(ordered)
+
+
+def verify_ledger_delivery_consistency(conn: sqlite3.Connection, symbol: str) -> bool:
+    """The actual implementation behind the third readiness leg
+    (reference-model review finding: "assess_readiness accepts
+    ledger_delivery_ok from its caller; there is no implemented joint
+    ledger/delivery verifier behind that argument yet"). Checks, for every
+    observed_trades row marked ledger_written_at:
+      - it is represented EXACTLY once (a native fills row XOR a
+        legacy_links mapping, never both, never neither);
+      - every observed trade for this symbol is represented (nothing
+        silently un-delivered);
+      - the causally-ordered fold of ALL observed trades succeeds (no
+        unresolvable same-timestamp ambiguity sitting in persisted data).
+    Returns False on ANY violation — callers should treat False as
+    'ledger/delivery not proven consistent', never attempt to guess why
+    without inspecting the specific tables."""
+    written = conn.execute(
+        "SELECT trade_id FROM observed_trades WHERE symbol = ? AND ledger_written_at IS NOT NULL",
+        (symbol,),
+    ).fetchall()
+    for (trade_id,) in written:
+        has_fill = conn.execute(
+            "SELECT 1 FROM fills WHERE exec_key = ?", (trade_id,)
+        ).fetchone() is not None
+        has_link = conn.execute(
+            "SELECT 1 FROM legacy_links WHERE trade_id = ?", (trade_id,)
+        ).fetchone() is not None
+        if has_fill == has_link:  # both True (double-represented) or both False (orphaned marker)
+            return False
+
+    all_ids = {r[0] for r in conn.execute(
+        "SELECT trade_id FROM observed_trades WHERE symbol = ?", (symbol,)
+    )}
+    written_ids = {r[0] for r in written}
+    if all_ids != written_ids:
+        return False  # some observed trade was never delivered to the ledger at all
+
+    trades = load_observed_trades(conn, symbol)
+    return causal_order(trades) is not None
+
+
+# ============================================================================
+# Legacy-row migration — conservation based, blocks on ambiguity, never
+# renames an existing fills.exec_key.
+# ============================================================================
+
+@dataclass
+class LegacyFillRow:
+    fill_id: int
+    symbol: str
+    side: str
+    quantity: float
+    cost: float
+    fee_cost: float
+    window_start_ms: int
+    window_end_ms: int
+
+
+@dataclass
+class MigrationResult:
+    fill_id: int
+    matched_trade_ids: "list[str]"
+    blocked: bool
+    reason: str = ""
+
+
+def migrate_legacy_row(row: LegacyFillRow, candidate_trades: "list[SynTrade]",
+                        tolerance: float = 1e-6,
+                        already_linked: "frozenset[str] | set[str]" = frozenset()) -> MigrationResult:
+    """Finds a SUBSET of candidate_trades (same symbol/side, within the
+    row's time window) whose summed quantity/cost/fee EXACTLY matches the
+    legacy row's own totals (within tolerance) — never a nearest-timestamp
+    proximity guess. A legacy row can represent several trades (many-to-
+    one); this returns every trade_id in the matched subset. No match, or
+    more than one disjoint subset matching equally well, blocks for manual
+    resolution rather than guessing (R2 finding 2).
+
+    already_linked: trade ids a PRIOR migration run already claimed for a
+    DIFFERENT legacy row — excluded from the candidate pool up front, so
+    two legacy rows can never both match against the same underlying
+    execution (reference-model review finding 2's "enforce global
+    uniqueness of trade allocation across different legacy rows"). Callers
+    should pass already_linked_trade_ids(conn) here across a batch of
+    migrations."""
+    pool = [
+        t for t in candidate_trades
+        if t.symbol == row.symbol and t.side == row.side and t.trade_id not in already_linked
+        and row.window_start_ms <= t.timestamp_ms <= row.window_end_ms
+    ]
+    if not pool:
+        return MigrationResult(row.fill_id, [], True, "no candidate trades in window")
+    matches: "list[tuple[str, ...]]" = []
+    # Bounded subset search — this bot's actual trade counts per window are
+    # tiny (single digits); a full subset enumeration is deliberately
+    # simple and correct rather than a general-purpose solver.
+    n = len(pool)
+    if n > 20:
+        return MigrationResult(row.fill_id, [], True,
+                                f"candidate pool too large ({n}) for the bounded matcher — manual resolution required")
+    for r in range(1, n + 1):
+        for combo in itertools.combinations(pool, r):
+            qty = sum(t.amount for t in combo)
+            cost = sum(t.cost for t in combo)
+            fee = sum(t.fee_cost for t in combo)
+            if (abs(qty - row.quantity) < tolerance and abs(cost - row.cost) < tolerance
+                    and abs(fee - row.fee_cost) < tolerance):
+                matches.append(tuple(sorted(t.trade_id for t in combo)))
+    unique_matches = {m for m in matches}
+    if len(unique_matches) == 0:
+        return MigrationResult(row.fill_id, [], True, "no subset conserves quantity/cost/fee exactly")
+    if len(unique_matches) > 1:
+        return MigrationResult(row.fill_id, [], True,
+                                f"{len(unique_matches)} disjoint subsets all conserve totals — ambiguous")
+    return MigrationResult(row.fill_id, list(next(iter(unique_matches))), False)
+
+
+def already_linked_trade_ids(conn: sqlite3.Connection) -> "set[str]":
+    """Every trade id already claimed by SOME legacy migration link —
+    pass this into migrate_legacy_row's already_linked param across a
+    batch of migration runs so a later row can never re-claim an earlier
+    row's already-matched trade."""
+    return {r[0] for r in conn.execute("SELECT trade_id FROM legacy_links")}
+
+
+def apply_migration_link(conn: sqlite3.Connection, result: MigrationResult,
+                          matched_trades: "list[SynTrade]") -> None:
+    """Links matched trade ids to the existing legacy fills row WITHOUT
+    renaming its exec_key — the post-migration invariant ("every
+    ledger-written observed trade has a fills row keyed by its own
+    trade_id") applies only to trades observed AFTER migration; legacy
+    trades are linked via legacy_links, a structurally separate mapping,
+    never forced to satisfy the same-key invariant retroactively (R2
+    finding 2's contradiction, resolved by not claiming the invariant
+    covers legacy data at all). matched_trades must be exactly the trades
+    result.matched_trade_ids identifies — their real payload is what gets
+    recorded in observed_trades, never fabricated placeholder values."""
+    if result.blocked:
+        raise ValueError(f"cannot apply a blocked migration result: {result.reason}")
+    by_id = {t.trade_id: t for t in matched_trades}
+    with conn:
+        for trade_id in result.matched_trade_ids:
+            t = by_id[trade_id]
+            existing_link = conn.execute(
+                "SELECT legacy_fill_id FROM legacy_links WHERE trade_id = ?", (trade_id,)
+            ).fetchone()
+            if existing_link is not None and existing_link[0] != result.fill_id:
+                raise ValueError(
+                    f"trade {trade_id} is already linked to legacy fill "
+                    f"{existing_link[0]} — refusing to also link it to {result.fill_id}"
+                )
+            if is_ledger_represented(conn, trade_id) and existing_link is None:
+                raise ValueError(
+                    f"trade {trade_id} is already represented by a native fills row — "
+                    f"refusing to also migration-link it"
+                )
+            conn.execute(
+                "INSERT OR IGNORE INTO legacy_links (trade_id, legacy_fill_id) VALUES (?, ?)",
+                (trade_id, result.fill_id),
+            )
+            conn.execute(
+                "INSERT INTO observed_trades (trade_id, order_id, symbol, side, price, amount, "
+                "cost, fee_cost, fee_currency, exchange_timestamp_ms, ledger_written_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?, datetime('now')) "
+                "ON CONFLICT(trade_id) DO NOTHING",
+                (t.trade_id, t.order_id, t.symbol, t.side, t.price, t.amount,
+                 t.cost, t.fee_cost, t.fee_currency, t.timestamp_ms),
+            )
+
+
+# ============================================================================
+# Cash budget (CapitalPool-alike) vs. actual exchange cash — kept as two
+# structurally separate accumulators so neither can be added on top of the
+# other (R2 finding 4).
+# ============================================================================
+
+class BudgetPool:
+    """Models ONLY what CapitalPool actually tracks: cash ALLOCATED to a
+    symbol's slot at BUY time (a decision figure), released on full exit.
+    Never mutated by trade fills — allocation and actual cash movement are
+    different events by design."""
+
+    def __init__(self, total_capital: float) -> None:
+        self.total_capital = total_capital
+        self._allocated: "dict[str, float]" = {}
+
+    def allocate(self, symbol: str, budget: float) -> None:
+        self._allocated[symbol] = budget
+
+    def release(self, symbol: str) -> None:
+        self._allocated.pop(symbol, None)
+
+    @property
+    def invested_budget(self) -> float:
+        return sum(self._allocated.values())
+
+    @property
+    def free_pool_cash(self) -> float:
+        return self.total_capital - self.invested_budget
+
+
+class ExchangeCashReconciler:
+    """Reconciles the exchange's OWN quote-currency balance against the sum
+    of real trade cash deltas from an explicit opening baseline — entirely
+    independent of BudgetPool. Proves the two can diverge (fees, slippage
+    between a budgeted BUY and its actual fill) without one leaking into
+    the other's arithmetic."""
+
+    def __init__(self, opening_balance: float, quote: str) -> None:
+        self.opening_balance = opening_balance
+        self.quote = quote
+        self._cumulative_delta = 0.0
+
+    def apply_trades(self, trades: "list[SynTrade]") -> None:
+        for t in trades:
+            fee = t.fee_cost if t.fee_currency == self.quote else 0.0
+            self._cumulative_delta += (-t.cost - fee) if t.side == "buy" else (t.cost - fee)
+
+    @property
+    def expected_balance(self) -> float:
+        return self.opening_balance + self._cumulative_delta
+
+
+# ============================================================================
+# Readiness = all three properties, reported separately — never merged into
+# one boolean (R2 review, "Bounded next step").
+# ============================================================================
+
+@dataclass
+class ReadinessReport:
+    coverage_complete: bool
+    watermark_confirmed: bool
+    balance_consistent: bool
+    ledger_delivery_ok: bool
+    coverage_reason: str = ""
+    balance_residual: "float | None" = None
+
+    @property
+    def ready(self) -> bool:
+        return (self.coverage_complete and self.watermark_confirmed
+                and self.balance_consistent and self.ledger_delivery_ok)
+
+    def explain(self) -> str:
+        if self.ready:
+            return ("ready: coverage complete, watermark confirmed, balance "
+                     "consistent, ledger/delivery consistent")
+        failing = []
+        if not self.coverage_complete:
+            failing.append(f"coverage ({self.coverage_reason})")
+        if self.coverage_complete and not self.watermark_confirmed:
+            failing.append(
+                "watermark (page-exhausted as of this read, but the window has "
+                "not yet aged past the safety margin — provisional, not proven)"
+            )
+        if not self.balance_consistent:
+            failing.append(f"balance (residual={self.balance_residual})")
+        if not self.ledger_delivery_ok:
+            failing.append("ledger/delivery")
+        return "not ready — failing: " + ", ".join(failing)
+
+
+def assess_readiness(coverage: CoverageResult, balance: "BalanceCheckResult | None",
+                      ledger_delivery_ok: bool, *, watermark_confirmed: bool) -> ReadinessReport:
+    """Deliberately takes FOUR independent inputs and never lets one
+    substitute for another: a caller cannot pass a good balance result to
+    paper over incomplete coverage, and an incomplete coverage result means
+    the balance check is not even meaningful yet (balance is None-able for
+    exactly that reason — see tests).
+
+    watermark_confirmed (reference-model review finding 1 — the explicit
+    evidence/unknown state): coverage.complete alone only proves the
+    exchange's queryable history was fully PAGED as of this read — it can
+    never prove nothing else happened that hasn't surfaced yet. This
+    caller-supplied flag is expected to come from comparing the window's
+    own end against `now_ms` and the chosen safety_margin_ms (see
+    compute_safe_watermark) — REQUIRED here, not optional, so a checkpoint
+    freshly computed this instant can never silently read as "ready" just
+    because its (vacuous) page happened to be empty or its balance
+    happened to net out. A page-exhausted-but-not-yet-confirmed window is
+    the explicit PROVISIONAL state — neither proven ready nor proven
+    wrong."""
+    balance_ok = bool(balance and balance.consistent)
+    residual = balance.residual if balance else None
+    return ReadinessReport(
+        coverage_complete=coverage.complete,
+        watermark_confirmed=watermark_confirmed,
+        balance_consistent=balance_ok,
+        ledger_delivery_ok=ledger_delivery_ok,
+        coverage_reason=coverage.reason,
+        balance_residual=residual,
+    )
