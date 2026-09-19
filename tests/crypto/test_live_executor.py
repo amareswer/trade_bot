@@ -3140,7 +3140,12 @@ def test_native_stop_startup_confirms_still_open_order(tmp_path):
 
 def test_native_stop_startup_detects_gap_when_order_gone(tmp_path):
     """Restart with a saved stop id that's no longer open (cancelled somehow while
-    the bot was down, position still held) — cleared so main.py's fallback can act."""
+    the bot was down, position still held) — cleared so main.py's fallback can act.
+
+    PASS-8 review finding (P1, finding 2): the gone-branch now classifies
+    the direct fetch's ACTUAL status before clearing tracking — a
+    CONFIRMED terminal status (as here) still clears it; an inconclusive/
+    still-open one must NOT (see the sibling test below)."""
     state_path = str(tmp_path / "state.json")
     json.dump({
         "symbol": "BTC/CAD", "cash": 89.88, "position": 0.001,
@@ -3155,6 +3160,11 @@ def test_native_stop_startup_detects_gap_when_order_gone(tmp_path):
         "free": {"CAD": 89.88, "BTC": 0.001}, "total": {"CAD": 89.88, "BTC": 0.001},
     }
     mock_ex.fetch_open_orders.return_value = []   # gone
+    # Confirmed terminal (canceled, no fill) via the direct fetch — a
+    # realistic "cancelled manually while the bot was down" outcome.
+    mock_ex.fetch_order.return_value = {
+        "id": "stop-001", "status": "canceled", "filled": 0.0,
+    }
 
     with patch.object(le_mod.ccxt, "kraken") as mock_cls:
         mock_cls.return_value = mock_ex
@@ -3164,7 +3174,44 @@ def test_native_stop_startup_detects_gap_when_order_gone(tmp_path):
             native_stop_loss_enabled=True,
         )
 
-    assert not ex.has_resting_stop   # cleared — main.py's startup loop will re-place
+    assert not ex.has_resting_stop   # confirmed terminal — cleared
+
+
+def test_native_stop_startup_gap_inconclusive_status_retains_tracking(tmp_path):
+    """PASS-8 review finding (P1, finding 2), exact reproduction: the
+    tracked stop is absent from fetch_open_orders()'s LIST, but a direct
+    fetch shows it's genuinely still "open" (eventual consistency, or a
+    race) — absence from a list is not proof of termination. Must NOT
+    abandon tracking; the identity stays owned so a later BUY's own
+    cancel-before-place path (or a later restart) resolves it properly."""
+    state_path = str(tmp_path / "state.json")
+    json.dump({
+        "symbol": "BTC/CAD", "cash": 89.88, "position": 0.001,
+        "cost_basis": 88_870.0, "realized_pnl": 0.0, "fees_paid": 0.0,
+        "native_stop_order_id": "stop-001", "native_stop_price": 88_000.0,
+        "saved_at": "2026-08-01T00:00:00+00:00",
+    }, open(state_path, "w"))
+
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = _DEFAULT_MARKETS
+    mock_ex.fetch_balance.return_value = {
+        "free": {"CAD": 89.88, "BTC": 0.001}, "total": {"CAD": 89.88, "BTC": 0.001},
+    }
+    mock_ex.fetch_open_orders.return_value = []   # absent from the LIST
+    mock_ex.fetch_order.return_value = {
+        "id": "stop-001", "status": "open", "filled": 0.0,   # but genuinely still open
+    }
+
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = mock_ex
+        ex = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=100.0, dry_run=False, state_path=state_path,
+            native_stop_loss_enabled=True,
+        )
+
+    assert ex.has_resting_stop   # retained — NOT abandoned
+    assert ex._native_stop_order_id == "stop-001"
 
 
 def test_native_stop_startup_position_closed_externally_clears_stale_id(tmp_path):

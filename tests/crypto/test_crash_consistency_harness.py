@@ -726,12 +726,215 @@ def test_transient_lookup_failure_preserves_recovery_identity_until_resolved(moc
 
     assert ex2.position == pytest.approx(0.001)          # position sync unaffected
     assert ex2._portfolio.realized_pnl == pytest.approx(0.0)   # not yet recovered
-    assert ex2._unresolved_stop_recovery is not None
-    assert ex2._unresolved_stop_recovery["order_id"] == raw["id"]
+    assert len(ex2._unresolved_stop_recoveries) == 1
+    assert ex2._unresolved_stop_recoveries[0]["order_id"] == raw["id"]
 
     # Restart #2: the lookup succeeds.
     ex3 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
 
     assert ex3._portfolio.realized_pnl == pytest.approx(-7.0)   # (78000-85000)*0.001
-    assert ex3._unresolved_stop_recovery is None
+    assert ex3._unresolved_stop_recoveries == []
     assert len(ex3.pending_journal_entries) >= 1
+
+
+# ---------------------------------------------------------------------------
+# PASS-8 review, finding 1 (P1): a pending PROTECTIVE PLACEMENT (identity
+# lives in pending_submissions['protect'], no _native_stop_order_id ever
+# committed) that fully fills offline must also recover using the
+# PRESERVED pre-sync cost basis — the same class of bug as PASS-7 finding
+# 1, at a separate entry point.
+# ---------------------------------------------------------------------------
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_pending_protect_placement_fully_filled_offline_uses_preserved_basis(mock_cfg, mock_sleep, tmp_path):
+    """PASS-8 review finding (P1, finding 1), exact reproduction: a
+    protective placement is accepted (persisted in
+    _pending_submissions['protect']) before tracking is ever committed —
+    no _native_stop_order_id set at all. It fully fills OFFLINE for 0.002
+    BTC at $78,000 with a $0.32 fee. The old pending-placement recovery
+    path called the cash-free journal helper WITHOUT the preserved basis
+    override, fabricating +$156 profit instead of the real -$14 loss
+    (cash was already correct)."""
+    state_path = str(tmp_path / "state.json")
+    fake = FakeExchange(cash=1000.0)
+    ex = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    ex._portfolio.position    = 0.002
+    ex._portfolio._cost_basis = 85_000.0
+    fake._balance[fake.base] = 0.002
+    raw = fake.create_order(
+        "BTC/CAD", "market", "sell", 0.002,
+        params={"stopLossPrice": "78000.00", "clientOrderId": "protect-cid-1"},
+    )
+    # Model "placement accepted before tracking was committed": the
+    # pending submission exists, but _native_stop_order_id was never set.
+    ex._pending_submissions["protect"] = {
+        "side": "sell", "client_order_id": "protect-cid-1",
+        "quantity": 0.002, "price": 78_000.0, "label": "native stop placement",
+        "created_at": "2026-09-19T00:00:00+00:00", "order_id": raw["id"],
+    }
+    ex._save_state()
+
+    # Offline: the placement fully fills.
+    fake.simulate_fill(raw["id"], 0.002, 78_000.0, 0.32, terminal=True)
+
+    ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+
+    assert ex2.cash == pytest.approx(1_155.68)
+    assert ex2.position == pytest.approx(0.0)
+    assert ex2._portfolio.realized_pnl == pytest.approx(-14.0)
+    assert "protect" not in ex2.pending_submissions
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_pending_protect_placement_crash_between_saves_still_converges(mock_cfg, mock_sleep, tmp_path):
+    """PASS-8 finding 1's own acceptance criterion: repeat with a crash
+    injected between _sync_position() and recovery finishing — the
+    preserved basis must survive to the NEXT restart even though the
+    outstanding identity lives in pending_submissions['protect'] rather
+    than _native_stop_order_id (the capture-guard fix must cover both)."""
+    state_path = str(tmp_path / "state.json")
+    fake = FakeExchange(cash=1000.0)
+    ex = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    ex._portfolio.position    = 0.002
+    ex._portfolio._cost_basis = 85_000.0
+    fake._balance[fake.base] = 0.002
+    raw = fake.create_order(
+        "BTC/CAD", "market", "sell", 0.002,
+        params={"stopLossPrice": "78000.00", "clientOrderId": "protect-cid-2"},
+    )
+    ex._pending_submissions["protect"] = {
+        "side": "sell", "client_order_id": "protect-cid-2",
+        "quantity": 0.002, "price": 78_000.0, "label": "native stop placement",
+        "created_at": "2026-09-19T00:00:00+00:00", "order_id": raw["id"],
+    }
+    ex._save_state()
+    fake.simulate_fill(raw["id"], 0.002, 78_000.0, 0.32, terminal=True)
+
+    with patch.object(LiveExecutor, "_resolve_pending_protect_submission_at_startup",
+                       side_effect=_InjectedCrash("crash after position sync, before recovery")):
+        with pytest.raises(_InjectedCrash):
+            _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+
+    ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+
+    assert ex2.cash == pytest.approx(1_155.68)
+    assert ex2._portfolio.realized_pnl == pytest.approx(-14.0)
+
+
+# ---------------------------------------------------------------------------
+# PASS-8 review, finding 2 (P1): a FLAT local position does not establish
+# that the stop's own, independent life on the exchange has terminated —
+# must never abandon ownership of a still-live order.
+# ---------------------------------------------------------------------------
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_flat_position_does_not_abandon_a_still_open_stop(mock_cfg, mock_sleep, tmp_path):
+    """PASS-8 review finding (P1, finding 2), exact reproduction: 0.002 BTC
+    and a tracked OPEN stop O1. The BTC balance is externally zeroed (a
+    transfer/close unrelated to the stop), leaving O1 genuinely still
+    resting on the exchange. The old code unconditionally cleared
+    tracking once the local position went flat — abandoning ownership of
+    a live order fetch_open_orders() still shows."""
+    state_path = str(tmp_path / "state.json")
+    fake = FakeExchange(cash=1000.0)
+    ex = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    ex._portfolio.position    = 0.002
+    ex._portfolio._cost_basis = 85_000.0
+    fake._balance[fake.base] = 0.002
+    raw = fake.create_order(
+        "BTC/CAD", "market", "sell", 0.002,
+        params={"stopLossPrice": "78000.00", "clientOrderId": "seed-stop"},
+    )
+    ex._native_stop_order_id    = raw["id"]
+    ex._native_stop_price       = 78_000.0
+    ex._native_stop_is_trailing = False
+    ex._save_state()
+
+    # External close/transfer: BTC balance zeroed, the stop order itself
+    # remains genuinely open (untouched).
+    fake._balance[fake.base] = 0.0
+
+    ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+
+    assert ex2.position == pytest.approx(0.0)
+    assert ex2.has_resting_stop            # NOT abandoned
+    assert ex2._native_stop_order_id == raw["id"]
+    open_orders = fake.fetch_open_orders()
+    assert any(o["id"] == raw["id"] for o in open_orders)   # still genuinely resting
+
+
+# ---------------------------------------------------------------------------
+# PASS-8 review, finding 3 (P1): a SECOND unresolved historical stop must
+# not overwrite the first — both must be tracked and recovered
+# independently.
+# ---------------------------------------------------------------------------
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_multiple_unresolved_stops_recovered_independently_not_overwritten(mock_cfg, mock_sleep, tmp_path):
+    """PASS-8 review finding (P1, finding 3), exact reproduction: O1 fills
+    0.001 BTC at $78,000 (fee $0.16) and becomes terminal while offline; a
+    transient lookup failure queues it unresolved, leaving 0.001 BTC
+    residual. A replacement O2 is placed for the residual, which ALSO
+    fills (0.0005 @ $78,000, fee $0.08) and becomes terminal while
+    offline, ALSO hitting a transient lookup failure. The old single-slot
+    design silently replaced O1's frozen entry with O2's — recovering
+    only -$3.50 instead of the correct -$10.50 across both executions."""
+    state_path = str(tmp_path / "state.json")
+    fake = FakeExchange(cash=1000.0)
+    ex = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    ex._portfolio.position    = 0.002
+    ex._portfolio._cost_basis = 85_000.0
+    fake._balance[fake.base] = 0.002
+    o1 = fake.create_order(
+        "BTC/CAD", "market", "sell", 0.002,
+        params={"stopLossPrice": "78000.00", "clientOrderId": "seed-o1"},
+    )
+    ex._native_stop_order_id    = o1["id"]
+    ex._native_stop_price       = 78_000.0
+    ex._native_stop_is_trailing = False
+    ex._save_state()
+
+    # Offline: O1 fills 0.001, becomes terminal, leaving 0.001 residual.
+    fake.simulate_fill(o1["id"], 0.001, 78_000.0, 0.16, terminal=True)
+    fake._orders[o1["id"]]["status"] = "canceled"
+
+    # Restart #1: O1's final-state lookup times out.
+    with patch.object(fake, "fetch_order", side_effect=ccxt.RequestTimeout("timeout")):
+        ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    assert len(ex2._unresolved_stop_recoveries) == 1
+    assert ex2._unresolved_stop_recoveries[0]["order_id"] == o1["id"]
+    assert ex2.position == pytest.approx(0.001)
+
+    # A replacement stop O2 is placed for the residual 0.001.
+    o2 = fake.create_order(
+        "BTC/CAD", "market", "sell", 0.001,
+        params={"stopLossPrice": "78000.00", "clientOrderId": "seed-o2"},
+    )
+    ex2._native_stop_order_id    = o2["id"]
+    ex2._native_stop_price       = 78_000.0
+    ex2._native_stop_is_trailing = False
+    ex2._save_state()
+
+    # Offline: O2 ALSO fills (0.0005 of the 0.001 residual) and becomes
+    # terminal.
+    fake.simulate_fill(o2["id"], 0.0005, 78_000.0, 0.08, terminal=True)
+    fake._orders[o2["id"]]["status"] = "canceled"
+
+    # Restart #2: BOTH O1's and O2's final-state lookups still fail.
+    with patch.object(fake, "fetch_order", side_effect=ccxt.RequestTimeout("timeout")):
+        ex3 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    assert len(ex3._unresolved_stop_recoveries) == 2   # BOTH retained, not overwritten
+    _order_ids = {e["order_id"] for e in ex3._unresolved_stop_recoveries}
+    assert _order_ids == {o1["id"], o2["id"]}
+
+    # Restart #3: lookups succeed for both.
+    ex4 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+
+    assert ex4._unresolved_stop_recoveries == []
+    assert ex4._portfolio.realized_pnl == pytest.approx(-10.50)
+    _recovered_qty = sum(e["quantity"] for e in ex4.pending_journal_entries)
+    assert _recovered_qty == pytest.approx(0.0015)
