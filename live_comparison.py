@@ -79,50 +79,111 @@ def _load_fills(db_path: str) -> list[dict]:
 
     conn = sqlite3.connect(db_path)
     rows = conn.execute(
-        "SELECT side, symbol, quantity, price, value, pnl, timestamp, exchange FROM fills ORDER BY id"
+        "SELECT side, symbol, quantity, price, value, pnl, timestamp, exchange, "
+        "fee_cost, fee_currency FROM fills ORDER BY id"
     ).fetchall()
     conn.close()
 
     return [
         {
-            "side":      r[0],
-            "symbol":    r[1],
-            "quantity":  r[2],
-            "price":     r[3],
-            "value":     r[4],
-            "pnl":       r[5],
-            "timestamp": r[6],
-            "exchange":  r[7],
+            "side":         r[0],
+            "symbol":       r[1],
+            "quantity":     r[2],
+            "price":        r[3],
+            "value":        r[4],
+            "pnl":          r[5],
+            "timestamp":    r[6],
+            "exchange":     r[7],
+            "fee_cost":     r[8] or 0.0,
+            "fee_currency": r[9] or "",
         }
         for r in rows
     ]
 
 
+def _quote_ccy(symbol: str) -> str:
+    parts = (symbol or "").split("/")
+    return parts[1].upper() if len(parts) == 2 else ""
+
+
 def _compute_live_metrics(fills: list[dict]) -> dict:
+    """
+    2026-09-18 review finding: this used to compute PF/win-rate/total P&L
+    entirely from the stored `pnl` column, which PositionManager.on_sell()
+    never subtracts fees from — a price-profitable trade that lost money
+    after real trading costs was counted as a win. Fixed to mirror the same
+    gross-vs-net convention bot/backtest/metrics.py adopted 2026-09-12
+    (CLAUDE.md: "PF/win-rate are NET of fees"): `pf`/`win_rate` below are
+    now NET (the trustworthy, primary figures); `gross_pf`/`gross_win_rate`
+    are kept alongside for comparison only, never for gating.
+
+    `net_pnl` is an EXACT identity — total realized gross P&L minus every
+    fee actually paid (BUY entry + SELL exit) across the whole loaded
+    fill set. Per-trade `pf`/`win_rate` are a documented APPROXIMATION —
+    each SELL's own exit fee is attributed to it, but the matching entry
+    BUY's fee is not (this flat fills table has no cost-basis linkage
+    between a BUY and the SELL(s) that later close it — a true per-trade
+    allocation is the "shared closed-position accounting component" the
+    review calls for as future work, matching the backtest engine's own
+    already-built position-tracking machinery). A fee whose currency
+    doesn't match its own fill's quote currency is excluded rather than
+    silently mixed into a differently-denominated total — counted in
+    `unmatched_fee_ct` so the report can say so.
+    """
     sells    = [f for f in fills if f["side"] == "SELL" and f["pnl"] is not None]
     n        = len(sells)
     if n == 0:
         return {}
 
+    total_fees       = 0.0
+    unmatched_fee_ct = 0
+    for f in fills:
+        fee = f.get("fee_cost") or 0.0
+        if fee <= 0:
+            continue
+        cur = (f.get("fee_currency") or "").upper()
+        if cur and cur != _quote_ccy(f["symbol"]):
+            unmatched_fee_ct += 1
+            continue
+        total_fees += fee
+
+    def _net_pnl(f: dict) -> float:
+        fee = f.get("fee_cost") or 0.0
+        cur = (f.get("fee_currency") or "").upper()
+        if cur and cur != _quote_ccy(f["symbol"]):
+            return f["pnl"]   # unknown basis for this trade — report gross rather than guess
+        return f["pnl"] - fee
+
     pnls     = [f["pnl"] for f in sells]
-    wins     = [p for p in pnls if p > 0]
-    losses   = [p for p in pnls if p < 0]
-    win_rate = len(wins) / n
+    net_pnls = [_net_pnl(f) for f in sells]
+
+    wins,     losses     = [p for p in pnls if p > 0],     [p for p in pnls if p < 0]
+    net_wins, net_losses = [p for p in net_pnls if p > 0], [p for p in net_pnls if p < 0]
+    gross_win_rate = len(wins) / n
+    net_win_rate   = len(net_wins) / n
 
     gross_profit = sum(wins)
     gross_loss   = abs(sum(losses)) if losses else 0.0
-    pf           = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+    gross_pf     = gross_profit / gross_loss if gross_loss > 0 else float("inf")
 
-    # Equity curve for Sharpe (cumulative PnL per trade)
+    net_profit = sum(net_wins)
+    net_loss   = abs(sum(net_losses)) if net_losses else 0.0
+    net_pf     = net_profit / net_loss if net_loss > 0 else float("inf")
+
+    # Equity curve for Sharpe (cumulative NET PnL per trade). This is a
+    # trade-level statistic, not a regularly sampled account-return series
+    # — it is NOT directly comparable to a backtest's own (per-period)
+    # Sharpe. 2026-09-18 review finding: labeled explicitly in the report
+    # rather than implying comparability.
     equity = [0.0]
-    for p in pnls:
+    for p in net_pnls:
         equity.append(equity[-1] + p)
     returns = [equity[i + 1] - equity[i] for i in range(len(equity) - 1)]
     mean_r = sum(returns) / len(returns)
     std_r  = math.sqrt(sum((r - mean_r) ** 2 for r in returns) / len(returns)) if len(returns) > 1 else 0.0
     sharpe = round((mean_r / std_r) * math.sqrt(n), 2) if std_r > 0 else 0.0
 
-    # Max drawdown from cumulative equity
+    # Max drawdown from cumulative (net) equity
     peak = 0.0
     max_dd = 0.0
     for e in equity:
@@ -130,18 +191,22 @@ def _compute_live_metrics(fills: list[dict]) -> dict:
         max_dd = min(max_dd, e - peak)
 
     return {
-        "n_trades":     n,
-        "win_rate":     win_rate,
-        "pf":           pf,
-        "total_pnl":    sum(pnls),
-        "avg_win":      gross_profit / len(wins) if wins else 0.0,
-        "avg_loss":     sum(losses) / len(losses) if losses else 0.0,
-        "sharpe":       sharpe,
-        "max_dd":       max_dd,
-        "first_trade":  sells[0]["timestamp"],
-        "last_trade":   sells[-1]["timestamp"],
-        "exchanges":    list({f["exchange"] for f in fills if f["exchange"]}),
-        "symbols":      list({f["symbol"] for f in fills if f["symbol"]}),
+        "n_trades":         n,
+        "win_rate":         net_win_rate,
+        "pf":               net_pf,
+        "gross_win_rate":   gross_win_rate,
+        "gross_pf":         gross_pf,
+        "total_pnl":        sum(pnls),
+        "net_pnl":          sum(pnls) - total_fees,
+        "unmatched_fee_ct": unmatched_fee_ct,
+        "avg_win":          net_profit / len(net_wins) if net_wins else 0.0,
+        "avg_loss":         sum(net_losses) / len(net_losses) if net_losses else 0.0,
+        "sharpe":           sharpe,
+        "max_dd":           max_dd,
+        "first_trade":      sells[0]["timestamp"],
+        "last_trade":       sells[-1]["timestamp"],
+        "exchanges":        list({f["exchange"] for f in fills if f["exchange"]}),
+        "symbols":          list({f["symbol"] for f in fills if f["symbol"]}),
     }
 
 
@@ -163,39 +228,58 @@ def _print_report(metrics: dict, min_trades: int) -> None:
     _row("Exchange", metrics.get("exchanges", ["—"])[0] if metrics.get("exchanges") else "—", "binance")
     print(f"  {'─'*20}")
 
+    print(f"\n  {_YL}⚠ Baseline predates the 2026-09-12 net-of-fee accounting fix — it is a{_R}")
+    print(f"  {_YL}  GROSS-only figure. Compare against gross_pf/gross_win_rate below, not{_R}")
+    print(f"  {_YL}  the primary (net) numbers, until the baseline is regenerated net of fees.{_R}")
+
     if n < min_trades:
         print(f"\n  {_YL}Only {n} live trade(s) — need {min_trades} for statistical relevance.{_R}")
-        print(f"  {_DIM}Baseline: {_BASELINE['trades']} trades, PF {_BASELINE['pf']}, "
+        print(f"  {_DIM}Baseline (gross): {_BASELINE['trades']} trades, PF {_BASELINE['pf']}, "
               f"win rate {_BASELINE['win_rate']*100:.1f}%{_R}")
         print(f"\n{'─' * w}\n")
         return
 
-    # ── Profit Factor ────────────────────────────────────────────────────
-    pf     = metrics["pf"]
-    pf_c   = _col(pf, 1.5, 1.0)
-    pf_b   = _BASELINE["pf"]
-    diff_c = _GR if pf >= pf_b * 0.8 else _YL if pf >= pf_b * 0.5 else _RD
-    _row("Profit factor",
+    # ── Profit Factor (NET of fees — 2026-09-18 fix; gross kept alongside) ─
+    pf      = metrics["pf"]
+    gpf     = metrics["gross_pf"]
+    pf_c    = _col(pf, 1.5, 1.0)
+    pf_b    = _BASELINE["pf"]   # gross baseline — see warning above
+    diff_c  = _GR if pf >= pf_b * 0.8 else _YL if pf >= pf_b * 0.5 else _RD
+    _row("Profit factor (net)",
          f"{pf_c}{pf:.2f}{_R}",
-         f"{pf_b:.2f}  {diff_c}{'▲' if pf >= pf_b else '▼'}{abs(pf-pf_b):.2f}{_R}")
+         f"{pf_b:.2f} (gross)  {diff_c}{'▲' if pf >= pf_b else '▼'}{abs(pf-pf_b):.2f}{_R}")
+    _row("  gross_pf",          f"{_DIM}{gpf:.2f}{_R}", "")
 
     # ── Win rate ─────────────────────────────────────────────────────────
     wr     = metrics["win_rate"] * 100
+    gwr    = metrics["gross_win_rate"] * 100
     wr_c   = _col(wr, 40, 30)
     wr_b   = _BASELINE["win_rate"] * 100
-    _row("Win rate",
+    _row("Win rate (net)",
          f"{wr_c}{wr:.1f}%{_R}",
-         f"{wr_b:.1f}%")
+         f"{wr_b:.1f}% (gross)")
+    _row("  gross_win_rate",    f"{_DIM}{gwr:.1f}%{_R}", "")
+
+    if metrics.get("unmatched_fee_ct"):
+        print(f"  {_YL}⚠ {metrics['unmatched_fee_ct']} fill(s) had a fee in a currency that "
+              f"didn't match the symbol's quote — excluded from net figures rather than "
+              f"mixed in; net numbers above may understate real cost.{_R}")
 
     # ── Sharpe ───────────────────────────────────────────────────────────
+    # Trade-level (cumulative per-trade P&L), NOT a regularly sampled
+    # account-return series — not directly comparable to a backtest's own
+    # per-period Sharpe. 2026-09-18 review finding: labeled explicitly.
     sh     = metrics["sharpe"]
     sh_c   = _col(sh, 1.0, 0.0)
-    _row("Sharpe (trade)",  f"{sh_c}{sh:.2f}{_R}", "—")
+    _row("Sharpe (trade, not comparable to backtest)",  f"{sh_c}{sh:.2f}{_R}", "—")
 
     # ── Total P&L ────────────────────────────────────────────────────────
     tp     = metrics["total_pnl"]
+    npl    = metrics["net_pnl"]
     tp_c   = _GR if tp > 0 else _RD
-    _row("Total P&L",       f"{tp_c}${tp:+.2f}{_R}", "—")
+    npl_c  = _GR if npl > 0 else _RD
+    _row("Total P&L (net, all fees)", f"{npl_c}${npl:+.2f}{_R}", "—")
+    _row("  gross (pre-fee)",         f"{_DIM}${tp:+.2f}{_R}",   "")
 
     # ── Avg win / loss ───────────────────────────────────────────────────
     aw = metrics["avg_win"]

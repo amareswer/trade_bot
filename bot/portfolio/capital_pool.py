@@ -149,11 +149,17 @@ class CapitalPool:
         anyone and stays idle in the pool (see available_cash) instead of
         being force-split across symbols the way equal division would.
         """
-        cap = self._slot_caps.get(symbol)
-        if cap is None:
-            return self.slot_cash
         already_committed = sum(v for k, v in self._slots.items() if k != symbol)
         remaining = max(0.0, self._total - already_committed)
+        cap = self._slot_caps.get(symbol)
+        if cap is None:
+            # 2026-09-18 review finding: this branch used to return
+            # self.slot_cash (an equal division of the FULL pool) with no
+            # bound against what other symbols already hold — reproduced:
+            # total=100, 2 slots, one symbol capped at 80 and allocated
+            # first, the other (uncapped) still got the full 50 equal-share
+            # via this branch, for a combined 130 out of a 100 pool.
+            return min(self.slot_cash, remaining)
         if cap <= 0:
             return remaining   # 0 = uncapped for this symbol — bounded only by what's left
         return min(cap, remaining)
@@ -164,11 +170,17 @@ class CapitalPool:
         """
         True if a BUY for symbol is allowed by the pool.
         A symbol that already holds a slot can always add to its position.
-        A new symbol needs a free slot.
+        A new symbol needs both a free slot AND actual remaining cash — a
+        free slot count alone (2026-09-18 review finding) let a fully
+        committed or zero-cash pool admit a new entry just because a
+        nominal slot was open, before slot_cash_for() would have handed it
+        $0 anyway.
         """
         if symbol in self._slots:
             return True
-        return len(self._slots) < self._max_conc
+        if len(self._slots) >= self._max_conc:
+            return False
+        return self.slot_cash_for(symbol) > 0
 
     def is_allocated(self, symbol: str) -> bool:
         return symbol in self._slots

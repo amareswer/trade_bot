@@ -94,35 +94,57 @@ class TradeLog:
                      side, symbol, quantity, price, pnl, fee_cost, fee_currency)
 
     def recent(self, limit: int = 20) -> list[dict]:
-        """Return the most recent fills as a list of dicts."""
+        """Return the most recent fills as a list of dicts.
+
+        2026-09-18 review finding: this used to zip a hardcoded 12-column
+        list against a `SELECT *` row that actually has 14 columns
+        (fee_cost/fee_currency were added later) — zip() silently truncates
+        to the shorter list, so every caller of recent() lost the fee
+        columns without any error. Columns are now read from the cursor's
+        own description, so this can never drift from the real schema
+        again, whatever columns get added next."""
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM fills ORDER BY id DESC LIMIT ?", (limit,)
-            ).fetchall()
-        cols = [
-            "id", "timestamp", "side", "symbol", "quantity", "price",
-            "value", "pnl", "exchange", "signal_reason", "risk_decision", "notes",
-        ]
+            cursor = conn.execute("SELECT * FROM fills ORDER BY id DESC LIMIT ?", (limit,))
+            rows = cursor.fetchall()
+            cols = [d[0] for d in cursor.description]
         return [dict(zip(cols, row)) for row in rows]
 
     def summary(self) -> dict:
         """
         Quick performance summary from logged fills.
-        Returns trade count, win rate, total realized P&L.
+        Returns trade count, win rate, and both gross and net-of-fee
+        realized P&L.
+
+        2026-09-18 review finding: this reported ONLY gross `pnl` (the
+        stored value never has fees subtracted — see
+        PositionManager.on_sell) with no fee awareness at all. `net_pnl`
+        here is an exact identity, not an approximation: total realized
+        gross P&L across every SELL, minus every fee (BUY entry + SELL
+        exit) actually paid across the whole logged history — a true
+        accounting total, even though no single trade's fee is currently
+        attributed as "this trade's entry fee" in this flat schema (that
+        finer per-trade allocation is a separate, larger effort — see
+        live_comparison.py's own per-trade net calculation and its
+        docstring for the same caveat).
         """
         with self._connect() as conn:
-            rows = conn.execute(
+            sell_rows = conn.execute(
                 "SELECT pnl FROM fills WHERE side='SELL' AND pnl IS NOT NULL"
             ).fetchall()
-        if not rows:
-            return {"trades": 0, "win_rate": 0.0, "total_pnl": 0.0}
-        pnls      = [r[0] for r in rows]
-        wins      = sum(1 for p in pnls if p > 0)
-        total_pnl = sum(pnls)
+            fee_row = conn.execute(
+                "SELECT COALESCE(SUM(fee_cost), 0.0) FROM fills"
+            ).fetchone()
+        if not sell_rows:
+            return {"trades": 0, "win_rate": 0.0, "total_pnl": 0.0, "net_pnl": 0.0}
+        pnls        = [r[0] for r in sell_rows]
+        wins        = sum(1 for p in pnls if p > 0)
+        total_pnl   = sum(pnls)
+        total_fees  = fee_row[0] if fee_row else 0.0
         return {
             "trades":    len(pnls),
             "win_rate":  round(wins / len(pnls), 4),
             "total_pnl": round(total_pnl, 4),
+            "net_pnl":   round(total_pnl - total_fees, 4),
         }
 
     # ------------------------------------------------------------------

@@ -17,6 +17,7 @@ import glob
 import json
 import logging
 import logging.handlers
+import math
 import os
 import signal as _signal_module
 import threading
@@ -549,6 +550,65 @@ def _check_orphaned_positions(
     return orphaned
 
 
+def _replay_pending_journal_entries(executors: dict, trade_log, alerter: "TelegramAlerter") -> list[str]:
+    """
+    2026-09-18 review finding (P1-3): LiveExecutor.execute() persists a
+    fill's accounting effect (cash/position/pnl) to its own state file
+    BEFORE the caller separately writes that fill to trade_log (SQLite) —
+    a crash between those two writes leaves the portfolio state correctly
+    updated but the fill invisible to trade_log/reporting forever.
+
+    Called once at startup, before any new trading: every executor exposing
+    a non-None pending_journal_entry recorded a fill whose accounting is
+    already real and persisted, but whose trade_log row may be missing.
+    Replays it into trade_log (tagged so it's distinguishable from a
+    normally-logged fill) and acks it so a later restart doesn't replay it
+    again. Never raises — a replay failure is alerted and left pending for
+    the next startup rather than silently dropped or crashing the boot.
+    Returns the list of symbols that had a pending entry (for tests/logs).
+    """
+    recovered: list[str] = []
+    for sym, executor in executors.items():
+        entry = getattr(executor, "pending_journal_entry", None)
+        if entry is None:
+            continue
+        try:
+            trade_log.log_fill(
+                side          = entry["side"],
+                symbol        = entry["symbol"],
+                quantity      = entry["quantity"],
+                price         = entry["price"],
+                exchange      = cfg.exchange.exchange,
+                signal_reason = "recovered_from_crash",
+                notes         = f"replayed from pending_journal_entry, filled_at={entry.get('filled_at')}",
+                fee_cost      = entry.get("fee_cost", 0.0),
+                fee_currency  = entry.get("fee_currency", ""),
+            )
+            executor.ack_journal_entry(entry["order_id"])
+            recovered.append(sym)
+            logger.warning(
+                "FILL JOURNAL RECOVERED [%s]: replayed missed trade_log row "
+                "for order %s (a crash previously interrupted logging it)",
+                sym, entry.get("order_id"),
+            )
+            alerter.message(
+                f"ℹ️ FILL JOURNAL RECOVERED [{sym}]: a fill from a prior crash "
+                f"({entry['side']} {entry['quantity']:.8f} @ {entry['price']:,.2f}) "
+                f"had its accounting already applied but was missing from "
+                f"trade_log — replayed now."
+            )
+        except Exception as exc:
+            logger.error(
+                "FILL JOURNAL REPLAY FAILED [%s]: %s — entry stays pending, "
+                "will retry on next startup", sym, exc,
+            )
+            alerter.error(
+                f"FILL JOURNAL REPLAY FAILED [{sym}]: {exc} — a crash-recovered "
+                f"fill could not be logged; will retry on the next restart."
+            )
+    return recovered
+
+
 # ---------------------------------------------------------------------------
 # Candle watchdog — circuit breaker (extracted for unit-testability)
 #
@@ -596,6 +656,44 @@ def _check_candle_watchdog(
         )
 
     return ss['candle_feed_stale']
+
+
+def _update_price_feed_staleness(
+    ss: dict, ok: bool, symbol: str, alerter: "TelegramAlerter", threshold: int = 5,
+) -> bool:
+    """
+    2026-09-18 review finding (P1-7): a ticker-fetch failure reused
+    ss['last_price'] (a stale value) and let the tick continue exactly as
+    if a fresh price had been read — including evaluating a brand-new BUY
+    signal against data that may no longer reflect the market. Mirrors
+    _check_candle_watchdog's edge-trigger pattern for a second, independent
+    freshness signal: the live intra-candle price tick, not the candle feed.
+
+    Call with ok=True on every successful price fetch, ok=False on every
+    failure (after ss['err_count'] has already been updated by the caller).
+    Alerts once per fresh<->stale transition, not every tick. SELL/exits
+    are never affected by this flag — same standing breaker rule as the
+    candle watchdog (a stale price must not block getting OUT of a
+    position, only entries into a new one).
+
+    Returns the resulting ss['price_feed_stale'] value.
+    """
+    _sym_label = f" [{symbol}]" if symbol else ""
+    if ok:
+        if ss['price_feed_stale']:
+            ss['price_feed_stale'] = False
+            alerter.message(
+                f"✅ Price feed{_sym_label}: fresh ticks resumed — new BUYs re-enabled."
+            )
+        return False
+    if ss['err_count'] >= threshold and not ss['price_feed_stale']:
+        ss['price_feed_stale'] = True
+        alerter.error(
+            f"Price feed{_sym_label}: {ss['err_count']} consecutive fetch "
+            f"failures — reusing a stale price. New BUYs blocked until a "
+            f"fresh tick arrives (SELL/exits unaffected)."
+        )
+    return ss['price_feed_stale']
 
 
 # ---------------------------------------------------------------------------
@@ -1102,6 +1200,13 @@ def _execute_approved_signal(
                 fee_cost      = order.fee_cost,
                 fee_currency  = order.fee_currency,
             )
+            # 2026-09-18 review finding (P1-3, durable fill journal): the
+            # trade_log write above and the accounting update inside
+            # execute() are two separate writes — ack once the trade_log
+            # row is actually written so a restart doesn't find this fill
+            # still "pending" and replay it a second time.
+            if hasattr(ss['executor'], 'ack_journal_entry'):
+                ss['executor'].ack_journal_entry(order.order_id)
             alerter.fill(
                 side        = order.side.value,
                 symbol      = sym,
@@ -1390,6 +1495,7 @@ def _new_symbol_state_dict(strategy, sm, pm, executor, last_ts_ms=None) -> dict:
         'native_stop_price': None,
         'native_stop_is_trailing': False,
         'candle_feed_stale': False,
+        'price_feed_stale':  False,   # 2026-09-18: live-tick fetch failing — blocks new BUYs
         'last_price':        0.0,
         'err_count':         0,
         'drift_count':       0,
@@ -1886,6 +1992,27 @@ def _maybe_send_health_digest(
                 attention.append(f"{_sym}: {_ss['exit_fail_count']} failed SL/TP exits")
             if _ss.get("candle_feed_stale"):
                 attention.append(f"{_sym}: candle feed stale")
+            # 2026-09-18 review finding (P2-10): surface the same execution-
+            # health signals the review calls for (quote freshness,
+            # protection state, unresolved-order/reconciliation age) in the
+            # one place a human already checks daily, rather than only in
+            # scattered per-event alerts.
+            if _ss.get("price_feed_stale"):
+                attention.append(f"{_sym}: live price feed stale")
+            _exc = _ss.get("executor")
+            if _exc is not None:
+                if not getattr(_exc, "state_write_healthy", True):
+                    attention.append(f"{_sym}: last state save failed — new BUYs blocked")
+                if not getattr(_exc, "startup_sync_healthy", True):
+                    attention.append(f"{_sym}: startup balance/position sync failed this run")
+                if getattr(_exc, "pending_journal_entry", None) is not None:
+                    attention.append(f"{_sym}: unacked fill journal entry — trade_log may be missing a fill")
+                if (
+                    getattr(_exc, "position", 0) > 0
+                    and cfg.exchange.native_stop_loss_enabled
+                    and not getattr(_exc, "has_resting_stop", True)
+                ):
+                    attention.append(f"{_sym}: holding a position with no resting native stop")
         if stuck_detector is not None:
             for _k, _n in stuck_detector.failing_keys().items():
                 attention.append(f"stuck loop: {_k} ({_n} consecutive failures)")
@@ -2261,6 +2388,12 @@ def run():
     _record_startup_and_check_crash_loop(alerter)
     _orphaned_symbols = _check_orphaned_positions(set(executors.keys()), alerter)
 
+    # ── Fill journal replay (2026-09-18 review finding, P1-3) ───────────
+    # Before any new trading this run: recover any fill whose accounting
+    # was already persisted by a prior process but never made it into
+    # trade_log because the process crashed between those two writes.
+    _replay_pending_journal_entries(executors, trade_log, alerter)
+
     # ── Derive live candle timeframe from CANDLE_MINUTES ─────────────────────
     # This is the timeframe used for ALL live candle operations:
     # warmup fetch, candle polling, and countdown display.
@@ -2329,6 +2462,7 @@ def run():
                 'native_stop_price': None,        # static native-stop backstop price for the current position
                 'native_stop_is_trailing': False, # has the backstop been swapped to a native Kraken trailing-stop this fill?
                 'candle_feed_stale': False,       # candle watchdog circuit-breaker state
+                'price_feed_stale': False,        # 2026-09-18: live-tick fetch failing — blocks new BUYs
                 'last_price':       0.0,
                 'err_count':        0,            # consecutive price-fetch failures
                 'drift_count':      0,            # consecutive drift detections
@@ -2386,6 +2520,7 @@ def run():
             'native_stop_price': None,        # static native-stop backstop price for the current position
             'native_stop_is_trailing': False, # has the backstop been swapped to a native Kraken trailing-stop this fill?
             'candle_feed_stale': False,       # candle watchdog circuit-breaker state
+            'price_feed_stale': False,        # 2026-09-18: live-tick fetch failing — blocks new BUYs
             'last_price':       0.0,
             'err_count':        0,
             'drift_count':      0,
@@ -2776,8 +2911,16 @@ def run():
                         lambda: live_exchange.fetch_ticker(sym)['last'],
                         label=f"price fetch [{sym}]",
                     ))
+                    # 2026-09-18 review finding (P1-7): a NaN/inf/non-positive
+                    # ticker value (a real, if rare, exchange/API glitch) used
+                    # to be accepted as a genuine fresh price — treat it as a
+                    # failed fetch instead, same as an exception, so the
+                    # staleness/err_count machinery below handles it.
+                    if not math.isfinite(price) or price <= 0:
+                        raise ValueError(f"invalid ticker price for {sym}: {price!r}")
                     ss['last_price'] = price
                     ss['err_count'] = 0
+                    _update_price_feed_staleness(ss, True, sym, alerter)
                 except Exception as exc:
                     ss['err_count'] += 1
                     if ss['err_count'] >= 5:
@@ -2786,13 +2929,17 @@ def run():
                         )
                     logger.warning("price fetch failed for %s: %s", sym, exc)
                     price = ss['last_price']
+                    _update_price_feed_staleness(ss, False, sym, alerter)
                     if not price:
                         continue
             else:
                 try:
                     price = feed.get_price()
+                    if not math.isfinite(price) or price <= 0:
+                        raise ValueError(f"invalid feed price for {sym}: {price!r}")
                     ss['last_price'] = price
                     ss['err_count'] = 0
+                    _update_price_feed_staleness(ss, True, sym, alerter)
                 except Exception as exc:
                     ss['err_count'] += 1
                     if ss['err_count'] >= 5:
@@ -2800,6 +2947,7 @@ def run():
                             f"Price feed down [{sym}] {ss['err_count']} consecutive ticks — {exc}"
                         )
                     print(f"  TICK {tick:04d} | price fetch failed: {exc}")
+                    _update_price_feed_staleness(ss, False, sym, alerter)
                     continue
 
             # ── 1b. Candle watchdog — circuit breaker (every symbol, live only) ──
@@ -2955,9 +3103,18 @@ def run():
                                     print(f"           📊 PARTIAL TP [{sym}]:  {_p_qty:.6f} @ {price:,.2f}  PnL={_p_pnl:+.2f}", flush=True)
                                     logger.warning("PARTIAL TP [%s]: sold %.6f @ %.2f  pnl=%.2f", sym, _p_qty, price, _p_pnl)
                                     trade_log.log_fill(
+                                        # 2026-09-18: log the ACTUAL filled
+                                        # quantity, not the request — now
+                                        # that LiveExecutor.execute() honors
+                                        # a partial SELL instead of silently
+                                        # liquidating the full position
+                                        # (finding #6), _p_order.quantity is
+                                        # trustworthy and should match the
+                                        # other two log_fill call sites'
+                                        # convention.
                                         side          = "SELL",
                                         symbol        = sym,
-                                        quantity      = _p_qty,
+                                        quantity      = _p_order.quantity,
                                         price         = _p_order.price,
                                         pnl           = _p_pnl,
                                         exchange      = cfg.exchange.exchange,
@@ -2965,6 +3122,8 @@ def run():
                                         fee_cost      = _p_order.fee_cost,
                                         fee_currency  = _p_order.fee_currency,
                                     )
+                                    if hasattr(ss['executor'], 'ack_journal_entry'):
+                                        ss['executor'].ack_journal_entry(_p_order.order_id)
                                     alerter.fill(
                                         side        = "SELL",
                                         symbol      = sym,
@@ -3075,6 +3234,8 @@ def run():
                                     fee_cost      = _ic_order.fee_cost,
                                     fee_currency  = _ic_order.fee_currency,
                                 )
+                                if hasattr(ss['executor'], 'ack_journal_entry'):
+                                    ss['executor'].ack_journal_entry(_ic_order.order_id)
                                 _ic_reason_label = {
                                     "trail_stop":  "trailing stop hit — protecting gained profit",
                                     "stop_loss":   "stop-loss hit — cutting the loss",
@@ -3371,6 +3532,19 @@ def run():
                 logger.warning("CANDLE WATCHDOG [%s]: BUY blocked — feed stale", sym)
             elif raw_signal == Signal.BUY:
                 logger.info("Candle watchdog [%s]: OK — feed fresh", sym)
+
+            # ── 2h. Price feed staleness gate (2026-09-18 review finding) ──
+            # Same standing breaker rule as the candle watchdog, for the
+            # independent live-tick price feed: a run of ticker-fetch
+            # failures means `price` this tick is reused from the last
+            # successful fetch, not fresh — do not authorize a new entry
+            # against it. SELL/exits are untouched.
+            if raw_signal == Signal.BUY and ss['price_feed_stale']:
+                raw_signal = Signal.HOLD
+                if not _buy_block_gate:
+                    _buy_block_gate = "price_feed_stale"
+                print(f"  [{sym}] PRICE FEED: BUY blocked — stale price", flush=True)
+                logger.warning("PRICE FEED [%s]: BUY blocked — stale price", sym)
 
             # ── 3. Warmup guard ───────────────────────────────────────
             if is_indicator and not ss['strategy'].is_warmed_up:

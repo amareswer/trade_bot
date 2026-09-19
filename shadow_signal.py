@@ -464,8 +464,21 @@ def build_report(
     mf(["- Live PF ≥ 1.2 over ≥15 completed round-trips"])
     mf(["- Shadow match rate ≥ 95% (confirms strategy is executing as backtested)"])
     mf(["- Fee and slippage within assumptions (fill price within 0.5% of signal close)"])
+    # 2026-09-18 review finding: the old text asserted a failing PF with
+    # clean signal fidelity means "variance, not strategy failure" —
+    # unjustified. Correct execution of a strategy proves the bot ran the
+    # backtested logic faithfully; it says nothing about whether that
+    # logic still has an economic edge (or ever did net of real costs —
+    # see CLAUDE.md's 2026-09-12 fee-accounting finding). Replaced with an
+    # inconclusive-result statement that doesn't pre-judge the cause.
     mf(["", "A failing PF with clean signal fidelity (≥95% match, slippage on-spec) means",
-        "**variance, not strategy failure** — extend the window rather than demoting.",
+        "the bot executed the backtested strategy faithfully — it does **not** by itself",
+        "establish why PF is failing. Clean fidelity rules out an execution bug as the",
+        "cause, but is equally consistent with normal small-sample variance OR a real,",
+        "already-present lack of economic edge (net of fees) that fidelity alone cannot",
+        "distinguish. Treat as **inconclusive**: extend the sample AND separately verify",
+        "the strategy's net-of-fee edge (see the canonical fingerprint's walk-forward",
+        "numbers) before drawing a conclusion either way.",
         "A failing PF with poor fidelity requires investigation before any decision."])
     mf([""])
 

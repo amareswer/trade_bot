@@ -4,6 +4,7 @@ All exchange interaction is against a hermetic FakeExchange (no network) —
 same pattern this repo already uses for FakeIB in the IBKR executor tests.
 """
 import json
+from unittest.mock import patch
 
 import pytest
 
@@ -92,6 +93,44 @@ def test_well_behaved_symbol_is_eligible(tmp_path):
     assert result.eligible_symbols == ["ETH/CAD"]
     assert result.rejected == []
     assert result.stale is False
+
+
+def test_successful_scan_appends_point_in_time_snapshot(tmp_path):
+    """2026-09-18 review finding: the JSON cache overwrites itself each
+    scan, so even the previous snapshot is lost — appended separately here
+    so a future analysis has real historical eligibility, not just today's."""
+    import json as _json
+
+    markets, tickers, books, ohlcv = _good_symbol_fixtures()
+    ex = FakeExchange(markets, tickers, books, ohlcv)
+    cache_path = str(tmp_path / "cache.json")
+    screener = DynamicUniverseScreener(_cfg(), cache_path=cache_path)
+
+    screener.discover(ex, slot_cash=100.0)
+    screener.discover(ex, slot_cash=100.0)   # a second scan must APPEND, not overwrite
+
+    snap_path = str(tmp_path / "dynamic_universe_snapshots.jsonl")
+    with open(snap_path) as f:
+        lines = [_json.loads(l) for l in f if l.strip()]
+
+    assert len(lines) == 2
+    assert lines[0]["eligible"] == ["ETH/CAD"]
+    assert "scanned_at" in lines[0]
+
+
+def test_snapshot_log_write_failure_does_not_break_discover(tmp_path, monkeypatch):
+    """A failure writing the snapshot log must never affect discover()'s
+    own return value — best-effort, not load-bearing."""
+    markets, tickers, books, ohlcv = _good_symbol_fixtures()
+    ex = FakeExchange(markets, tickers, books, ohlcv)
+    screener = DynamicUniverseScreener(_cfg(), cache_path=str(tmp_path / "cache.json"))
+
+    with patch("builtins.open", side_effect=OSError("disk full")):
+        result = screener.discover(ex, slot_cash=100.0)
+
+    # discover() itself uses open() for the cache too, which also "fails"
+    # under this patch — the real assertion is that it doesn't raise.
+    assert result is not None
 
 
 # ── Individual filters ──────────────────────────────────────────────────

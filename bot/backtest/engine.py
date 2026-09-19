@@ -276,6 +276,34 @@ def run(
             else:
                 _trail_peak = max(_trail_peak, candle.high)
 
+        # 2026-09-18 review finding: partial-TP used to fire purely off
+        # candle.high with no awareness of whether the SAME candle's low
+        # would also trigger the stop-loss. OHLC data alone cannot establish
+        # which happened first intra-candle — booking a favorable partial
+        # exit when the stop may actually have hit first overstates the
+        # trade's result. Conservative policy (matches this engine's own
+        # gap-through/same-candle-trailing-activation precedent): if the
+        # stop-loss would ALSO trigger this candle, assume it happened
+        # first and skip the partial TP entirely — the SL/TP block below
+        # then closes the full (undiminished) position at the stop level.
+        # Deliberately re-derives the SAME trail > ATR > flat priority the
+        # SL/TP block below applies, as a read-only check only (no exit
+        # applied here) — kept separate from that block's own well-tested
+        # exit-price logic (gap-aware min/max fills) rather than
+        # refactoring it, to avoid touching already-reviewed behavior.
+        _active_sl_level_for_partial_tp = None
+        if executor.position > 0 and entry_price > 0:
+            if trail_stop_pct > 0 and _trail_peak_for_sl_check > 0:
+                _active_sl_level_for_partial_tp = _trail_peak_for_sl_check * (1 - trail_stop_pct)
+            elif atr_sl_mult > 0 and _entry_atr > 0:
+                _active_sl_level_for_partial_tp = entry_price - _entry_atr * atr_sl_mult
+            elif stop_loss_pct > 0:
+                _active_sl_level_for_partial_tp = entry_price * (1 - stop_loss_pct)
+        _sl_would_also_trigger_this_candle = (
+            _active_sl_level_for_partial_tp is not None
+            and candle.low <= _active_sl_level_for_partial_tp
+        )
+
         # ── Partial TP: sell 50% at partial_tp_pct (only when explicitly set) ─
         if (
             executor.position > 0
@@ -283,6 +311,7 @@ def run(
             and partial_tp_pct > 0
             and not _partial_tp_done
             and candle.high >= entry_price * (1 + partial_tp_pct)
+            and not _sl_would_also_trigger_this_candle
         ):
             _p_qty = round(executor.position * partial_tp_size, 6)
             _p_price = entry_price * (1 + partial_tp_pct)

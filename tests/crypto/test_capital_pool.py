@@ -297,3 +297,71 @@ def test_portfolio_config_default_slot_caps_by_base_is_empty():
     kwarg at all) gets an empty dict, not None or a shared mutable default."""
     cfg = PortfolioConfig()
     assert cfg.max_slot_cash_cad_by_base == {}
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-18 review finding: mixed capped/uncapped slots could overcommit
+# the pool — the uncapped branch of slot_cash_for() ignored what other
+# symbols already held.
+# ---------------------------------------------------------------------------
+
+def test_mixed_capped_and_uncapped_allocation_never_overcommits():
+    """Reproduced by the review: total=100, 2 slots, BTC capped at 80 and
+    allocated first, SOL uncapped. Before the fix SOL still got the full
+    50 equal-share (self.slot_cash), for a combined 130 out of a 100 pool
+    and available_cash == -30."""
+    pool = CapitalPool(total_capital=100.0, max_concurrent=2, slot_caps={"BTC/CAD": 80.0})
+
+    btc_cash = pool.allocate("BTC/CAD")
+    sol_cash = pool.allocate("SOL/CAD")
+
+    assert btc_cash == 80.0
+    assert sol_cash == 20.0             # bounded by what's left, not an equal 50/50 split
+    assert btc_cash + sol_cash <= 100.0
+    assert pool.available_cash >= 0.0
+
+
+def test_mixed_capped_and_uncapped_allocation_order_reversed():
+    """Same pool, uncapped symbol allocated first — it still may not exceed
+    remaining capital once the capped symbol is later allocated."""
+    pool = CapitalPool(total_capital=100.0, max_concurrent=2, slot_caps={"BTC/CAD": 80.0})
+
+    sol_cash = pool.allocate("SOL/CAD")   # uncapped, allocated first
+    btc_cash = pool.allocate("BTC/CAD")   # capped at 80, allocated second
+
+    assert sol_cash == 50.0               # nothing committed yet — equal share is fine here
+    assert btc_cash == 50.0               # bounded by remaining (100-50), not its own 80 cap
+    assert sol_cash + btc_cash <= 100.0
+    assert pool.available_cash >= 0.0
+
+
+def test_uncapped_slot_cash_for_unaffected_when_nothing_else_allocated():
+    """Backward-compat check: with no other symbol holding a slot,
+    slot_cash_for() for an uncapped symbol is numerically identical to the
+    original self.slot_cash (equal division) — the fix only changes
+    behavior once something else is already committed."""
+    pool = CapitalPool(total_capital=200.0, max_concurrent=2)
+    assert pool.slot_cash_for("BTC/CAD") == pool.slot_cash == 100.0
+
+
+def test_can_open_position_false_when_pool_fully_committed_by_other_symbols():
+    """2026-09-18 review finding: a free slot count alone let a fully
+    committed pool admit a new entry even though slot_cash_for() would
+    have hand it $0. max_concurrent=3 so a nominal slot is free, but two
+    capped symbols already consume the entire pool."""
+    pool = CapitalPool(
+        total_capital=100.0, max_concurrent=3,
+        slot_caps={"BTC/CAD": 60.0, "SOL/CAD": 40.0},
+    )
+    pool.allocate("BTC/CAD")
+    pool.allocate("SOL/CAD")
+
+    assert pool.free_slots == 1                       # a nominal slot IS free
+    assert pool.can_open_position("ETH/CAD") is False  # but no cash remains
+    assert pool.allocate("ETH/CAD") == 0.0
+
+
+def test_can_open_position_true_with_remaining_cash_and_free_slot():
+    pool = CapitalPool(total_capital=100.0, max_concurrent=2, slot_caps={"BTC/CAD": 80.0})
+    pool.allocate("BTC/CAD")
+    assert pool.can_open_position("SOL/CAD") is True   # 20 remains, one slot free

@@ -140,6 +140,7 @@ class DynamicUniverseScreener:
         rejected = [c for c in deduped if not c.eligible]
         result = ScreenResult(eligible=eligible, rejected=rejected, scanned_at=time.time(), stale=False)
         self._save_cache(result)
+        self._append_snapshot_log(result)
         return result
 
     # ── Per-quote screening ──────────────────────────────────────────────
@@ -354,6 +355,36 @@ class DynamicUniverseScreener:
             "(block new entries; never falling back to an arbitrary symbol)"
         )
         return ScreenResult(eligible=[], rejected=[], scanned_at=time.time(), stale=True)
+
+    def _append_snapshot_log(self, result: ScreenResult) -> None:
+        """
+        2026-09-18 review finding (P1-8): a current eligibility list applied
+        retroactively across historical backtest windows cannot reconstruct
+        which pairs were actually liquid/eligible on any past date —
+        exchanges don't expose that after the fact. _save_cache() above only
+        ever keeps the LATEST scan (overwritten each call), so even that
+        single snapshot is lost once superseded.
+
+        This appends one line per successful scan to a separate,
+        never-overwritten JSONL log — every scan this screener ever runs
+        going forward is preserved with its own timestamp, so a future
+        analysis has REAL point-in-time eligibility to work from instead of
+        reconstructing the past from today's list (which the code comment
+        atop this module already calls out as impossible for prior dates).
+        Best-effort: a write failure here never affects discover()'s return
+        value or the fail-safe cache above.
+        """
+        try:
+            path = os.path.join(os.path.dirname(self._cache_path), "dynamic_universe_snapshots.jsonl")
+            line = json.dumps({
+                "scanned_at": result.scanned_at,
+                "eligible":   [c.symbol for c in result.eligible],
+                "rejected":   len(result.rejected),
+            })
+            with open(path, "a") as f:
+                f.write(line + "\n")
+        except Exception as exc:
+            logger.warning("dynamic universe: snapshot log append failed: %s", exc)
 
     def _save_cache(self, result: ScreenResult) -> None:
         try:

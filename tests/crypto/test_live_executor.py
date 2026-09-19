@@ -308,6 +308,64 @@ def test_live_sell_updates_portfolio(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 2026-09-18 review finding: a partial SELL request used to be silently
+# overwritten with a full-position SELL, unconditionally.
+# ---------------------------------------------------------------------------
+
+def test_partial_sell_honors_requested_quantity_leaves_residual(tmp_path):
+    """Reproduced by the review: buy 0.002 BTC, request SELL 0.001 BTC —
+    must fill 0.001 and leave 0.001 held, not liquidate the whole position."""
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+    buy_raw = {
+        "id": "order-buy", "status": "closed",
+        "filled": 0.002, "average": 90_000.0,
+        "fee": {"cost": 0.0, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = buy_raw
+    mock_ex.fetch_order.return_value  = buy_raw
+    ex.execute(Signal.BUY, 90_000.0, 0.002)
+    assert abs(ex.position - 0.002) < 1e-9
+
+    sell_raw = {
+        "id": "order-sell", "status": "closed",
+        "filled": 0.001, "average": 91_000.0,
+        "fee": {"cost": 0.0, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = sell_raw
+    mock_ex.fetch_order.return_value  = sell_raw
+    order = ex.execute(Signal.SELL, 91_000.0, quantity=0.001)
+
+    assert order is not None and order.status == OrderStatus.FILLED
+    assert abs(order.quantity - 0.001) < 1e-9
+    assert abs(ex.position - 0.001) < 1e-9          # residual half still held, not zero
+
+
+def test_sell_request_exceeding_position_is_capped_not_overselling(tmp_path):
+    """An overlarge (stale/buggy caller) SELL request must be capped at
+    what's actually held — never oversell."""
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+    ex._portfolio.position    = 0.001
+    ex._portfolio._cost_basis = 90_000.0
+
+    sell_raw = {
+        "id": "order-sell", "status": "closed",
+        "filled": 0.001, "average": 91_000.0,
+        "fee": {"cost": 0.0, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = sell_raw
+    mock_ex.fetch_order.return_value  = sell_raw
+
+    order = ex.execute(Signal.SELL, 91_000.0, quantity=0.01)   # 10x what's held
+
+    # The limit-chase path (default LIMIT_ORDER_ENABLED=true) calls
+    # create_order positionally: (symbol, "limit", side, quantity, price, params).
+    call = mock_ex.create_order.call_args
+    assert abs(call[0][3] - 0.001) < 1e-9   # capped, never asked the exchange for 0.01
+    assert order.quantity <= 0.001
+
+
+# ---------------------------------------------------------------------------
 # Test 6: fetch_order polling resolves when order reaches 'closed'
 # ---------------------------------------------------------------------------
 
@@ -481,6 +539,95 @@ def test_state_save_load_roundtrip():
 
 
 # ---------------------------------------------------------------------------
+# 2026-09-18 review finding (P1-3): durable fill journal — a fill's
+# accounting is persisted separately from (and before) the caller's own
+# trade_log write; pending_journal_entry / ack_journal_entry close that gap.
+# ---------------------------------------------------------------------------
+
+def test_fill_sets_pending_journal_entry(tmp_path):
+    ex, mock_ex = _make(dry_run=True, starting_cash=1000.0, tmp_path=tmp_path)
+    assert ex.pending_journal_entry is None
+
+    order = ex.execute(Signal.BUY, 90_000.0, 0.001)
+
+    entry = ex.pending_journal_entry
+    assert entry is not None
+    assert entry["order_id"] == order.order_id
+    assert entry["side"] == "BUY"
+    assert abs(entry["quantity"] - 0.001) < 1e-9
+    assert entry["price"] == 90_000.0
+
+
+def test_ack_journal_entry_clears_it(tmp_path):
+    ex, mock_ex = _make(dry_run=True, starting_cash=1000.0, tmp_path=tmp_path)
+    order = ex.execute(Signal.BUY, 90_000.0, 0.001)
+    assert ex.pending_journal_entry is not None
+
+    ex.ack_journal_entry(order.order_id)
+
+    assert ex.pending_journal_entry is None
+
+
+def test_ack_journal_entry_ignores_mismatched_order_id(tmp_path):
+    """Defensive: acking the WRONG order id must never clear a still-
+    genuinely-pending entry for a different fill."""
+    ex, mock_ex = _make(dry_run=True, starting_cash=1000.0, tmp_path=tmp_path)
+    ex.execute(Signal.BUY, 90_000.0, 0.001)
+    assert ex.pending_journal_entry is not None
+
+    ex.ack_journal_entry("some-other-order-id")
+
+    assert ex.pending_journal_entry is not None   # NOT cleared
+
+
+def test_pending_journal_entry_survives_restart(tmp_path):
+    """The exact crash scenario: a fill's accounting is persisted, but the
+    process dies before the caller (bot/main.py) gets to ack it. A restart
+    must still see the pending entry so it can be replayed into trade_log."""
+    state_path = str(tmp_path / "state.json")
+    ex, mock_ex = _make(dry_run=True, starting_cash=1000.0, state_path=state_path, tmp_path=tmp_path)
+    ex.execute(Signal.BUY, 90_000.0, 0.001)
+    assert ex.pending_journal_entry is not None
+
+    mock_ex.fetch_balance.return_value = {
+        "free":  {"CAD": ex.cash, "BTC": ex.position},
+        "total": {"CAD": ex.cash, "BTC": ex.position},
+    }
+    mock_ex.fetch_ticker.return_value = {"last": ex.avg_entry}
+
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls2:
+        mock_cls2.return_value = mock_ex
+        ex2 = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=1000.0, dry_run=False, state_path=state_path,
+        )
+
+    assert ex2.pending_journal_entry is not None
+    assert ex2.pending_journal_entry["order_id"] == ex.pending_journal_entry["order_id"]
+
+
+def test_state_save_failure_blocks_new_buys_not_sells(tmp_path):
+    """2026-09-18 review finding: opening a new position on top of
+    accounting that isn't confirmed durably persisted risks losing it on a
+    crash. SELL/exits must stay unblocked — reducing risk is always safe."""
+    ex, mock_ex = _make(dry_run=True, starting_cash=1000.0, tmp_path=tmp_path)
+    ex.execute(Signal.BUY, 90_000.0, 0.001)   # succeeds, establishes a position
+    assert ex.state_write_healthy is True
+
+    with patch("bot.atomic_json.atomic_write_json", side_effect=OSError("disk full")):
+        with patch.object(ex._alerter, "error"):
+            order = ex.execute(Signal.BUY, 90_000.0, 0.001)   # the save inside this fails
+
+    assert ex.state_write_healthy is False
+
+    blocked = ex.execute(Signal.BUY, 91_000.0, 0.001)
+    assert blocked is None   # new BUY refused while state writes are unhealthy
+
+    sell_order = ex.execute(Signal.SELL, 92_000.0, quantity=0.001)
+    assert sell_order is not None and sell_order.status == OrderStatus.FILLED   # SELL still works
+
+
+# ---------------------------------------------------------------------------
 # Test 10: _sync_cash returns exchange balance (live mode)
 # ---------------------------------------------------------------------------
 
@@ -515,6 +662,64 @@ def test_sync_cash_falls_back_on_error(caplog):
 
     assert abs(ex.cash - 100.0) < 0.01
     assert any("_sync_cash failed" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-18 review finding (P1-7): startup sync failure must expose a
+# persistent readiness flag and block new BUYs, not just fall back silently.
+# ---------------------------------------------------------------------------
+
+def test_startup_sync_healthy_true_on_clean_start(tmp_path):
+    ex, mock_ex = _make(dry_run=False, starting_cash=100.0, tmp_path=tmp_path)
+    assert ex.startup_sync_healthy is True
+
+
+def test_startup_cash_sync_failure_marks_unhealthy_and_blocks_buy(tmp_path):
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = _DEFAULT_MARKETS
+    mock_ex.fetch_balance.side_effect = Exception("API timeout")
+
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls, \
+         patch("bot.exchanges.retry.time.sleep"):
+        mock_cls.return_value = mock_ex
+        ex = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=100.0, dry_run=False,
+            state_path=str(tmp_path / "state.json"),
+        )
+
+    assert ex.startup_sync_healthy is False
+    order = ex.execute(Signal.BUY, 90_000.0, 0.001)
+    assert order is None   # BUY refused — never even attempted create_order
+    mock_ex.create_order.assert_not_called()
+
+
+def test_startup_sync_healthy_does_not_block_sell(tmp_path):
+    """A degraded startup sync must not also disable exits — a bot that
+    can't confirm its balance can still get OUT of a position it already
+    knows (from saved state) it holds."""
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = _DEFAULT_MARKETS
+    mock_ex.fetch_balance.side_effect = Exception("API timeout")
+
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls, \
+         patch("bot.exchanges.retry.time.sleep"):
+        mock_cls.return_value = mock_ex
+        ex = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=100.0, dry_run=False,
+            state_path=str(tmp_path / "state.json"),
+        )
+    assert ex.startup_sync_healthy is False
+    ex._portfolio.position    = 0.001
+    ex._portfolio._cost_basis = 90_000.0
+
+    sell_raw = {"id": "s1", "status": "closed", "filled": 0.001, "average": 91_000.0,
+                "fee": {"cost": 0.0, "currency": "CAD"}}
+    mock_ex.create_order.return_value = sell_raw
+    mock_ex.fetch_order.return_value  = sell_raw
+    order = ex.execute(Signal.SELL, 91_000.0, quantity=0.001, urgent=True)
+    assert order is not None and order.status == OrderStatus.FILLED
 
 
 # ---------------------------------------------------------------------------
@@ -1047,7 +1252,10 @@ def test_order_type_limit_buy_uses_post_only_and_bid_price(mock_cfg, mock_sleep,
     assert actual_price == fill_price, f"expected {fill_price}, got {actual_price}"
     # post-only param must be present — Kraken uses postOnly=True, not timeInForce=PO
     params = call[1].get("params") or (call[0][5] if len(call[0]) > 5 else {})
-    assert params == {"postOnly": True}, f"missing post-only: {params}"
+    # postOnly must be present; clientOrderId (2026-09-18 reconciliation
+    # fix) is also expected now — no longer asserting an exact dict.
+    assert params.get("postOnly") is True, f"missing post-only: {params}"
+    assert "clientOrderId" in params
 
 
 # ---------------------------------------------------------------------------
@@ -1128,6 +1336,102 @@ def test_urgent_sell_bypasses_limit_chase(mock_cfg, mock_sleep, tmp_path):
         f"urgent SELL should use market order, got '{order_type_used}'"
     )
     mock_ex.fetch_order_book.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-18 review finding: direct market/limit-BUY submission exceptions
+# must be reconciled, not assumed failed — same protection the limit-chase
+# path already had (2026-09-11), extended to the two paths that lacked it.
+# ---------------------------------------------------------------------------
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_direct_market_submission_exception_adopts_untracked_order(mock_cfg, mock_sleep, tmp_path):
+    """create_order raises on the direct/urgent market path, but the order
+    actually reached Kraken (found resting via client_order_id) — adopt it
+    instead of placing a second market order on top."""
+    mock_cfg.exchange.limit_order_enabled = False
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+    resting = {
+        "id": "mkt-001", "status": "closed", "filled": 0.001,
+        "average": 90_100.0, "clientOrderId": "will-be-overwritten",
+        "fee": {"cost": 0.5, "currency": "CAD"},
+    }
+
+    def _create_order_side_effect(**kwargs):
+        resting["clientOrderId"] = kwargs["params"]["clientOrderId"]
+        raise ccxt.RequestTimeout("response lost")
+
+    mock_ex.create_order.side_effect = _create_order_side_effect
+    mock_ex.fetch_open_orders.return_value = []
+    mock_ex.fetch_closed_orders.return_value = [resting]
+
+    order = ex.execute(Signal.BUY, 90_000.0, 0.001)
+
+    assert order is not None and order.status == OrderStatus.FILLED
+    assert order.order_id == "mkt-001"
+    assert mock_ex.create_order.call_count == 1   # never placed a second order
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_direct_market_submission_exception_confirmed_empty_is_rejected(mock_cfg, mock_sleep, tmp_path):
+    """create_order raises and reconciliation confirms (both open and
+    closed orders checked) that nothing was placed — a genuine, safe
+    rejection, same REJECTED order as before this fix."""
+    mock_cfg.exchange.limit_order_enabled = False
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+    mock_ex.create_order.side_effect = ccxt.ExchangeError("kraken rejected")
+    mock_ex.fetch_open_orders.return_value = []
+    mock_ex.fetch_closed_orders.return_value = []
+
+    order = ex.execute(Signal.BUY, 90_000.0, 0.001)
+
+    assert order is not None and order.status == OrderStatus.REJECTED
+    assert mock_ex.create_order.call_count == 1
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_direct_market_submission_exception_unconfirmed_holds_back(mock_cfg, mock_sleep, tmp_path):
+    """2026-09-18 review finding (the core P0): create_order raises AND the
+    reconciliation lookup itself fails — the outcome is genuinely unknown.
+    Must NOT fall back to a second market order, and must NOT record a
+    REJECTED order either (that would wrongly license a same-tick retry) —
+    execute() returns None and leaves it for manual/next-cycle resolution."""
+    mock_cfg.exchange.limit_order_enabled = False
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+    mock_ex.create_order.side_effect = ccxt.RequestTimeout("response lost")
+    mock_ex.fetch_open_orders.side_effect = ccxt.NetworkError("still unreachable")
+
+    with patch.object(ex._alerter, "error") as mock_alert:
+        order = ex.execute(Signal.BUY, 90_000.0, 0.001)
+
+    assert order is None
+    assert mock_ex.create_order.call_count == 1   # exactly one submission attempt, ever
+    assert ex.rejected_orders() == []              # not recorded as a confirmed rejection either
+    mock_alert.assert_called_once()
+    assert "OUTCOME UNKNOWN" in mock_alert.call_args[0][0]
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_direct_limit_buy_submission_exception_unconfirmed_holds_back(mock_cfg, mock_sleep, tmp_path):
+    """Same as above, for the direct passive-limit BUY path (ORDER_TYPE=limit,
+    LIMIT_ORDER_ENABLED=false — the non-chased limit path)."""
+    mock_cfg.exchange.limit_order_enabled = False
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, order_type="limit", tmp_path=tmp_path)
+
+    mock_ex.create_order.side_effect = ccxt.RequestTimeout("response lost")
+    mock_ex.fetch_open_orders.side_effect = ccxt.NetworkError("still unreachable")
+
+    order = ex.execute(Signal.BUY, 90_000.0, 0.001)
+
+    assert order is None
+    assert mock_ex.create_order.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1311,6 +1615,7 @@ def test_native_stop_cancelled_when_position_closes(tmp_path):
     assert ex.has_resting_stop
 
     ex._portfolio.position = 0.0   # position closed by the caller before this call
+    mock_ex.fetch_order.return_value = {"id": "stop-001", "status": "canceled", "filled": 0.0}
     ex.sync_protective_stop(None)
 
     mock_ex.cancel_order.assert_called_once_with("stop-001", "BTC/CAD")
@@ -1326,6 +1631,7 @@ def test_native_stop_resync_replaces_existing_order(tmp_path):
     ex.sync_protective_stop(88_000.0)
 
     ex._portfolio.position = 0.0005
+    mock_ex.fetch_order.return_value = {"id": "stop-001", "status": "canceled", "filled": 0.0}
     mock_ex.create_order.return_value = {"id": "stop-002"}
     ex.sync_protective_stop(88_000.0)
 
@@ -1333,19 +1639,81 @@ def test_native_stop_resync_replaces_existing_order(tmp_path):
     assert ex._native_stop_order_id == "stop-002"
 
 
-def test_native_stop_cancel_failure_is_swallowed(tmp_path):
-    """Cancelling an already-filled/gone order raises on Kraken — must not
-    propagate (the whole point: the position closed one way or another)."""
+def test_native_stop_cancel_failure_confirmed_gone_clears_tracking(tmp_path):
+    """Cancelling raises on Kraken (e.g. OrderNotFound), but the follow-up
+    verification confirms the order is genuinely canceled/gone with nothing
+    filled — tracked protection clears and a replacement may be placed."""
     ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True, tmp_path=tmp_path)
     ex._portfolio.position = 0.001
     mock_ex.create_order.return_value = {"id": "stop-001"}
     ex.sync_protective_stop(88_000.0)
 
     mock_ex.cancel_order.side_effect = ccxt.OrderNotFound("already filled")
+    mock_ex.fetch_order.return_value = {"id": "stop-001", "status": "canceled", "filled": 0.0}
     ex._portfolio.position = 0.0
     ex.sync_protective_stop(None)   # must not raise
 
     assert not ex.has_resting_stop
+
+
+def test_native_stop_cancel_unconfirmed_leaves_tracking_intact(tmp_path):
+    """2026-09-18 review finding: cancel_order raises AND the follow-up
+    verification also fails (or is itself unreachable) — the old code
+    cleared the tracked stop id anyway, which could leave the bot believing
+    a real resting stop was gone. The tracked id/price must survive
+    untouched so nothing downstream assumes protection was removed."""
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True, tmp_path=tmp_path)
+    ex._portfolio.position = 0.001
+    mock_ex.create_order.return_value = {"id": "stop-001"}
+    ex.sync_protective_stop(88_000.0)
+    assert ex.has_resting_stop
+
+    mock_ex.cancel_order.side_effect = ccxt.NetworkError("timeout")
+    mock_ex.fetch_order.side_effect = ccxt.NetworkError("timeout")
+
+    with patch.object(ex._alerter, "error") as mock_alert:
+        outcome, fill_order = ex._cancel_native_stop()
+
+    assert outcome == "unknown"
+    assert fill_order is None
+    assert ex.has_resting_stop                       # NOT cleared
+    assert ex._native_stop_order_id == "stop-001"
+    assert ex._native_stop_price == 88_000.0
+    mock_alert.assert_called_once()
+    assert "UNCONFIRMED" in mock_alert.call_args[0][0]
+
+
+def test_native_stop_cancel_race_fill_records_exit_once(tmp_path):
+    """2026-09-18 review finding: the stop fires (fills) in the race between
+    our cancel attempt and its own trigger. The old code discarded this
+    silently (no fill record, no P&L, no CSV row). Now it must be recorded
+    through the same accounting a normal SELL fill gets, exactly once."""
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True,
+                        starting_cash=2000.0, tmp_path=tmp_path)
+    ex._portfolio.position    = 0.01
+    ex._portfolio._cost_basis = 80_000.0
+    mock_ex.create_order.return_value = {"id": "stop-001"}
+    ex.sync_protective_stop(78_000.0)
+    assert ex.has_resting_stop
+
+    mock_ex.cancel_order.side_effect = ccxt.InvalidOrder("order already filled")
+    mock_ex.fetch_order.return_value = {
+        "id": "stop-001", "status": "closed", "filled": 0.01,
+        "average": 78_000.0, "fee": {"cost": 1.5, "currency": "CAD"},
+    }
+
+    outcome, fill_order = ex._cancel_native_stop()
+
+    assert outcome == "filled"
+    assert fill_order is not None
+    assert fill_order.status == OrderStatus.FILLED
+    assert abs(fill_order.quantity - 0.01) < 1e-9
+    assert fill_order.price == 78_000.0
+    assert ex._portfolio.position == 0.0              # position closed
+    assert abs(ex._portfolio.realized_pnl - (-20.0)) < 1e-6   # (78000-80000)*0.01
+    assert not ex.has_resting_stop                     # stop is genuinely gone
+    assert fill_order in ex.filled_orders()             # recorded exactly once
+    assert ex.filled_orders().count(fill_order) == 1
 
 
 def test_native_stop_placement_failure_alerts_and_stays_unprotected(tmp_path):
@@ -1587,6 +1955,10 @@ def _startup_with_tracked_stop(tmp_path, *, resting_order: dict, position: float
     }
     mock_ex.fetch_open_orders.return_value = [resting_order]
     mock_ex.price_to_precision.return_value = "87000.0"
+    # Only exercised by tests that reach the actual cancel (the under-sized
+    # resize path) — confirms a clean cancel with nothing filled so the
+    # resize proceeds exactly as before this method started verifying.
+    mock_ex.fetch_order.return_value = {"id": "stop-001", "status": "canceled", "filled": 0.0}
 
     with patch.object(le_mod.ccxt, "kraken") as mock_cls:
         mock_cls.return_value = mock_ex
@@ -1701,6 +2073,7 @@ def test_native_stop_startup_resizes_under_sized_trailing_stop(tmp_path):
         "id": "trail-001", "amount": 0.0005, "remaining": 0.0005,
         "info": {"descr": {"ordertype": "trailing-stop", "price": "+2.5000%"}},
     }]
+    mock_ex.fetch_order.return_value = {"id": "trail-001", "status": "canceled", "filled": 0.0}
 
     with patch.object(le_mod.ccxt, "kraken") as mock_cls:
         mock_cls.return_value = mock_ex
@@ -1924,6 +2297,7 @@ def test_native_trailing_stop_cancelled_when_position_closes(tmp_path):
     assert ex.has_resting_stop
 
     ex._portfolio.position = 0.0
+    mock_ex.fetch_order.return_value = {"id": "trail-001", "status": "canceled", "filled": 0.0}
     ex.sync_protective_stop(None)
 
     mock_ex.cancel_order.assert_called_once_with("trail-001", "BTC/CAD")
@@ -1942,6 +2316,7 @@ def test_native_trailing_stop_resync_on_quantity_change_replaces_order(tmp_path)
     ex.sync_protective_stop(None, trailing_pct=0.02)
 
     ex._portfolio.position = 0.0005
+    mock_ex.fetch_order.return_value = {"id": "trail-001", "status": "canceled", "filled": 0.0}
     mock_ex.create_order.return_value = {"id": "trail-002"}
     ex.sync_protective_stop(None, trailing_pct=0.02)
 
@@ -2036,11 +2411,19 @@ def test_sell_cancels_resting_native_stop_before_placing_order(mock_cfg, _s, tmp
     sell_raw = {"id": "sell-001", "status": "closed", "filled": 0.01,
                 "average": 88_000.0, "type": "market", "fee": {"cost": 3.5, "currency": "CAD"}}
     mock_ex.create_order.return_value = sell_raw
-    mock_ex.fetch_order.return_value  = sell_raw
+
+    def _fetch_order_side_effect(order_id, symbol):
+        if order_id == "stop-001":
+            # Cancellation of the native stop is confirmed clean — nothing
+            # filled — so execute() proceeds to place its own SELL below.
+            return {"id": "stop-001", "status": "canceled", "filled": 0.0}
+        return sell_raw
+    mock_ex.fetch_order.side_effect = _fetch_order_side_effect
 
     order = ex.execute(Signal.SELL, 88_000.0, 0.01, urgent=True)
 
     assert order is not None and order.status == OrderStatus.FILLED
+    assert order.order_id == "sell-001"       # the bot's own SELL, not the stop
     # The resting stop was cancelled...
     mock_ex.cancel_order.assert_called_once_with("stop-001", "BTC/CAD")
     # ...BEFORE the sell order was placed.
@@ -2057,6 +2440,10 @@ def test_rejected_sell_rearms_the_native_stop(mock_cfg, _s, tmp_path):
                         starting_cash=2000.0, tmp_path=tmp_path)
     _seed_position_and_stop(ex, mock_ex, stop=78_000.0)
 
+    # Native stop cancellation confirms clean (nothing filled) before the
+    # SELL attempt itself is rejected.
+    mock_ex.fetch_order.return_value = {"id": "stop-001", "status": "canceled", "filled": 0.0}
+
     # SELL create_order raises; the follow-up _place_native_stop create_order succeeds.
     mock_ex.create_order.side_effect = [
         ccxt.InsufficientFunds("kraken EOrder:Insufficient funds"),
@@ -2069,6 +2456,61 @@ def test_rejected_sell_rearms_the_native_stop(mock_cfg, _s, tmp_path):
     assert ex._native_stop_order_id == "stop-restored"   # put back
     assert ex._native_stop_price == 78_000.0             # at the prior level
     assert ex._portfolio.position == 0.01                # still held
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_sell_aborted_when_native_stop_cancellation_unconfirmed(mock_cfg, _s, tmp_path):
+    """2026-09-18 review finding: if the pre-SELL cancel of the native stop
+    can't be confirmed, execute() must refuse to place the SELL at all —
+    not fall back to a plain market order, which could double-sell against
+    a stop that's still resting, or against one that already filled."""
+    _limit_cfg(mock_cfg, enabled=True, timeout_s=30)
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True,
+                        starting_cash=2000.0, tmp_path=tmp_path)
+    _seed_position_and_stop(ex, mock_ex, stop=78_000.0)
+    mock_ex.reset_mock()   # drop the setup's place-stop create_order call
+
+    mock_ex.cancel_order.side_effect = ccxt.NetworkError("timeout")
+    mock_ex.fetch_order.side_effect = ccxt.NetworkError("timeout")
+
+    with patch.object(ex._alerter, "error") as mock_alert:
+        order = ex.execute(Signal.SELL, 88_000.0, 0.01, urgent=True)
+
+    assert order is None                       # no order placed, no phantom row
+    mock_ex.create_order.assert_not_called()    # never attempted a SELL
+    assert ex._native_stop_order_id == "stop-001"   # tracked protection untouched
+    assert ex._portfolio.position == 0.01
+    assert mock_alert.call_args[0][0].startswith("SELL HELD BACK")
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_sell_uses_stop_own_fill_when_it_wins_the_cancel_race(mock_cfg, _s, tmp_path):
+    """2026-09-18 review finding: the native stop fires during the cancel
+    attempt itself (wins the race). execute() must not also place its own
+    SELL on top — the stop's fill IS the exit, recorded exactly once."""
+    _limit_cfg(mock_cfg, enabled=True, timeout_s=30)
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True,
+                        starting_cash=2000.0, tmp_path=tmp_path)
+    _seed_position_and_stop(ex, mock_ex, stop=78_000.0)
+    mock_ex.reset_mock()   # drop the setup's place-stop create_order call
+
+    mock_ex.cancel_order.side_effect = ccxt.InvalidOrder("order already filled")
+    mock_ex.fetch_order.return_value = {
+        "id": "stop-001", "status": "closed", "filled": 0.01,
+        "average": 77_500.0, "fee": {"cost": 1.2, "currency": "CAD"},
+    }
+
+    order = ex.execute(Signal.SELL, 88_000.0, 0.01, urgent=True)
+
+    assert order is not None and order.status == OrderStatus.FILLED
+    assert order.order_id == "native-stop:stop-001"
+    assert order.price == 77_500.0                 # the stop's own fill price
+    mock_ex.create_order.assert_not_called()        # no second SELL placed
+    assert ex._portfolio.position == 0.0
+    assert not ex.has_resting_stop
+    assert ex.filled_orders().count(order) == 1
 
 
 @patch("time.sleep")

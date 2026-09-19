@@ -117,3 +117,40 @@ def test_trailing_stop_cannot_fire_on_the_same_candle_that_activates_it():
         f"candle 2's open ($105) is below the $108 trail level -> gap-aware "
         f"fill at the open, not the stale $108 level — got {sell.price}"
     )
+
+
+def test_partial_tp_deferred_when_same_candle_also_stops_out():
+    """2026-09-18 review finding: a single candle whose high touches the
+    partial-TP level AND whose low touches the stop-loss level used to bank
+    the partial profit first, then stop out the remainder — OHLC data alone
+    cannot establish that the TP genuinely happened before the SL within
+    that candle. Conservative fix: assume the SL happened first and skip
+    the partial TP entirely, closing the FULL (undiminished) position at
+    the stop level instead.
+
+    Entry $100, partial TP at +5% ($105), stop-loss at -2% ($98). The next
+    candle's high ($106) clears the TP level and its low ($95) clears the
+    SL level in the same bar."""
+    candles = [
+        _candle(0, 100.0, 101.0, 99.0, 100.0),   # closes at 100 -> BUY
+        _candle(1, 100.0, 106.0, 95.0, 100.0),   # both partial-TP ($105) and SL ($98) touched
+    ]
+    result = run(
+        candles, symbol="TEST/USD", timeframe="4h", strategy_mode="threshold",
+        buy_threshold=105.0, sell_threshold=999.0,
+        stop_loss_pct=0.02, take_profit_pct=0.0,
+        partial_tp_pct=0.05, partial_tp_size=0.5,
+    )
+    assert len(result.fills) == 2, (
+        f"expected exactly BUY + one full stop-loss SELL (no partial_tp "
+        f"fill), got {[(f.side, f.reason, f.price, f.quantity) for f in result.fills]}"
+    )
+    buy, sell = result.fills
+    assert buy.side == "BUY"
+    assert sell.side == "SELL"
+    assert sell.reason == "stop_loss"
+    assert sell.quantity == buy.quantity, (
+        "the FULL position must close at the stop — a partial_tp fill "
+        "before it would have left only half this quantity"
+    )
+    assert sell.price == 98.0   # theoretical level — candle's open (100) didn't gap through it

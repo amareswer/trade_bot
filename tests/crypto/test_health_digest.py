@@ -138,6 +138,85 @@ def test_digest_flags_stuck_loop(monkeypatch, tmp_path):
     assert "stuck loop: execute:BTC/CAD:SELL (3 consecutive failures)" in body
 
 
+def _fake_executor(**overrides):
+    """A minimal MagicMock with the specific attributes
+    _maybe_send_health_digest's new (2026-09-18) checks read, explicitly
+    set — avoids the classic MagicMock trap where an unset attribute reads
+    back as a truthy auto-created Mock instead of a real default."""
+    exc = MagicMock()
+    exc.state_write_healthy   = overrides.get("state_write_healthy", True)
+    exc.startup_sync_healthy  = overrides.get("startup_sync_healthy", True)
+    exc.pending_journal_entry = overrides.get("pending_journal_entry", None)
+    exc.position              = overrides.get("position", 0.0)
+    exc.has_resting_stop      = overrides.get("has_resting_stop", True)
+    return exc
+
+
+def test_digest_flags_price_feed_stale(monkeypatch, tmp_path):
+    risk, alerter, execs = _mk(monkeypatch, tmp_path)
+    ss = {"BTC/CAD": {"price_feed_stale": True, "executor": _fake_executor()}}
+    monkeypatch.setenv("HEALTH_DIGEST_TIME", "08:00")
+    bot_main._maybe_send_health_digest(
+        execs, ss, risk, alerter, True, False, datetime(2026, 8, 27, 9, 0),
+    )
+    body = alerter.message.call_args[0][0]
+    assert "NEEDS ATTENTION" in body
+    assert "BTC/CAD: live price feed stale" in body
+
+
+def test_digest_flags_state_write_and_startup_sync_unhealthy(monkeypatch, tmp_path):
+    risk, alerter, execs = _mk(monkeypatch, tmp_path)
+    ss = {
+        "BTC/CAD": {"executor": _fake_executor(
+            state_write_healthy=False, startup_sync_healthy=False,
+        )},
+    }
+    monkeypatch.setenv("HEALTH_DIGEST_TIME", "08:00")
+    bot_main._maybe_send_health_digest(
+        execs, ss, risk, alerter, True, False, datetime(2026, 8, 27, 9, 0),
+    )
+    body = alerter.message.call_args[0][0]
+    assert "BTC/CAD: last state save failed" in body
+    assert "BTC/CAD: startup balance/position sync failed" in body
+
+
+def test_digest_flags_unacked_journal_entry(monkeypatch, tmp_path):
+    risk, alerter, execs = _mk(monkeypatch, tmp_path)
+    ss = {"BTC/CAD": {"executor": _fake_executor(
+        pending_journal_entry={"order_id": "o1", "side": "BUY"},
+    )}}
+    monkeypatch.setenv("HEALTH_DIGEST_TIME", "08:00")
+    bot_main._maybe_send_health_digest(
+        execs, ss, risk, alerter, True, False, datetime(2026, 8, 27, 9, 0),
+    )
+    body = alerter.message.call_args[0][0]
+    assert "BTC/CAD: unacked fill journal entry" in body
+
+
+def test_digest_flags_unprotected_open_position(monkeypatch, tmp_path):
+    risk, alerter, execs = _mk(monkeypatch, tmp_path)
+    ss = {"BTC/CAD": {"executor": _fake_executor(position=0.001, has_resting_stop=False)}}
+    monkeypatch.setenv("HEALTH_DIGEST_TIME", "08:00")
+    monkeypatch.setattr(bot_main.cfg.exchange, "native_stop_loss_enabled", True)
+    bot_main._maybe_send_health_digest(
+        execs, ss, risk, alerter, True, False, datetime(2026, 8, 27, 9, 0),
+    )
+    body = alerter.message.call_args[0][0]
+    assert "BTC/CAD: holding a position with no resting native stop" in body
+
+
+def test_digest_healthy_executor_flags_nothing(monkeypatch, tmp_path):
+    """A fully healthy executor must not add any spurious attention items."""
+    risk, alerter, execs = _mk(monkeypatch, tmp_path)
+    ss = {"BTC/CAD": {"executor": _fake_executor()}}
+    monkeypatch.setenv("HEALTH_DIGEST_TIME", "08:00")
+    bot_main._maybe_send_health_digest(
+        execs, ss, risk, alerter, True, False, datetime(2026, 8, 27, 9, 0),
+    )
+    body = alerter.message.call_args[0][0]
+    assert "✅ all systems normal" in body
+
+
 def test_wired_into_run_loop():
     src = inspect.getsource(bot_main.run)
     assert "_maybe_send_health_digest(" in src
