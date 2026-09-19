@@ -1533,32 +1533,66 @@ def _process_discovered_buy_fill(
     # Do NOT delay the protective-stop sync itself to fix this — a real
     # position must still be protected as soon as possible; only the
     # DURABLE LEDGER write order needed to change.
-    display.fill(order.side.value, order.quantity, sym, order.price, order.total_value, None)
-    trade_log.log_fill(
-        side          = "BUY",
-        symbol        = sym,
-        quantity      = order.quantity,
-        price         = order.price,
-        pnl           = None,
-        exchange      = cfg.exchange.exchange,
-        signal_reason = reason,
-        fee_cost      = order.fee_cost,
-        fee_currency  = order.fee_currency,
-        exec_key      = order.exec_key,
-        order_id      = order.order_id,
-    )
-    if hasattr(ss['executor'], 'ack_journal_entry'):
-        ss['executor'].ack_journal_entry(order.order_id)
-    alerter.fill(
-        side        = "BUY",
-        symbol      = sym,
-        quantity    = order.quantity,
-        price       = order.price,
-        total_value = order.total_value,
-        pnl         = None,
-        exchange    = cfg.exchange.exchange,
-        reason      = reason,
-    )
+    #
+    # PASS-11 review finding (P1, finding 3): that reordering made a real
+    # ledger failure (disk full, a lock timeout) propagate straight out
+    # of this function, skipping protection ENTIRELY — PositionManager
+    # already shows the real, owned quantity at this point, so a raised
+    # exception here left an acquired position with no protection-sync
+    # attempt at all. Reproduced exactly: trade_log.log_fill() raising
+    # OSError left executor.sync_calls empty. Fixed: the ledger commit
+    # is best-effort and must NEVER be able to skip protection below —
+    # any failure here (the write, the ack, or even the failure alert
+    # itself) is caught and logged, never re-raised. This fill's OWN
+    # journal entry was already durably queued by the EXECUTOR itself
+    # (reconcile_pending_orders()'s own _record_pending_journal_entry
+    # call, entirely independent of this trade_log write) — leaving it
+    # un-acked here means the next restart's ordered replay
+    # (_replay_pending_journal_entries, which preserves append order)
+    # still logs it, still BUY-before-SELL, since the executor appends
+    # any SELL this same call later discovers strictly AFTER this BUY.
+    try:
+        display.fill(order.side.value, order.quantity, sym, order.price, order.total_value, None)
+        trade_log.log_fill(
+            side          = "BUY",
+            symbol        = sym,
+            quantity      = order.quantity,
+            price         = order.price,
+            pnl           = None,
+            exchange      = cfg.exchange.exchange,
+            signal_reason = reason,
+            fee_cost      = order.fee_cost,
+            fee_currency  = order.fee_currency,
+            exec_key      = order.exec_key,
+            order_id      = order.order_id,
+        )
+        if hasattr(ss['executor'], 'ack_journal_entry'):
+            ss['executor'].ack_journal_entry(order.order_id)
+        alerter.fill(
+            side        = "BUY",
+            symbol      = sym,
+            quantity    = order.quantity,
+            price       = order.price,
+            total_value = order.total_value,
+            pnl         = None,
+            exchange    = cfg.exchange.exchange,
+            reason      = reason,
+        )
+    except Exception as exc:
+        logger.error(
+            "RECOVERED BUY LEDGER WRITE FAILED [%s]: %s — proceeding to "
+            "protect the acquired position regardless; the fill's own "
+            "journal entry stays pending and will be replayed on the "
+            "next restart.", sym, exc,
+        )
+        try:
+            alerter.error(
+                f"RECOVERED BUY LEDGER WRITE FAILED [{sym}]: {exc} — the "
+                f"position is protected below regardless; trade_log will "
+                f"catch up via the next restart's journal replay."
+            )
+        except Exception:
+            pass
 
     if cfg.exchange.native_stop_loss_enabled and hasattr(ss['executor'], 'sync_protective_stop'):
         if ss.get('native_stop_price') or ss.get('native_stop_is_trailing'):

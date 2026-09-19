@@ -37,7 +37,7 @@ first, in both the baseline and the crashed run.
 """
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1345,3 +1345,186 @@ def test_unresolved_stop_delta_straddling_checkpoint_splits_correctly(mock_cfg, 
     assert len(discovered) == 1
     assert discovered[0].quantity == pytest.approx(0.0005)
     assert ex2._unresolved_stop_recoveries[0]["checkpoint_qty_cap"] == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# PASS-11 review, finding 1 (P0): a persisted checkpoint_qty_cap goes stale
+# the moment a SECOND restart's own fresh balance sync absorbs MORE offline
+# activity than the first restart's cap knew about — the stale cap then
+# lets that further fill be treated as live on top of an already-updated
+# checkpoint.
+# ---------------------------------------------------------------------------
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_stale_checkpoint_cap_is_refreshed_across_a_second_restart(mock_cfg, mock_sleep, tmp_path):
+    """PASS-11 review finding (P0, finding 1), exact reproduction: 0.003
+    BTC @ $85,000, tracked stop O1. Offline, O1 fills 0.001 BTC @ $78,000
+    (zero fee), stays open. Restart #1 (empty open-orders list + a timed-
+    out direct lookup) correctly syncs $1,078/0.002 and queues recovery
+    with cap 0.001. BEFORE a second restart, O1 fills FURTHER offline —
+    cumulative reaches 0.002 BTC @ $78,000, terminal; the exchange now
+    holds $1,156/0.001. Restart #2 (healthy lookups, no further
+    activity) must converge to the ALREADY-CORRECT $1,156/0.001 — not
+    apply the second 0.001 a second time on top of it ($1,234/0)."""
+    state_path = str(tmp_path / "state.json")
+    fake = FakeExchange(cash=1000.0)
+    ex = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    ex._portfolio.position    = 0.003
+    ex._portfolio._cost_basis = 85_000.0
+    fake._balance[fake.base] = 0.003
+    o1 = fake.create_order(
+        "BTC/CAD", "market", "sell", 0.003,
+        params={"stopLossPrice": "78000.00", "clientOrderId": "seed-o1"},
+    )
+    ex._native_stop_order_id    = o1["id"]
+    ex._native_stop_price       = 78_000.0
+    ex._native_stop_is_trailing = False
+    ex._save_state()
+
+    # Offline: O1 fills 0.001 BTC, stays open.
+    fake.simulate_fill(o1["id"], 0.001, 78_000.0, 0.0, terminal=False)
+
+    # Restart #1: open-order listing empty, direct lookup times out.
+    with patch.object(fake, "fetch_open_orders", return_value=[]), \
+         patch.object(fake, "fetch_order", side_effect=ccxt.RequestTimeout("timeout")):
+        ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    assert ex2.cash     == pytest.approx(1_078.0)
+    assert ex2.position == pytest.approx(0.002)
+    assert ex2._unresolved_stop_recoveries[0]["checkpoint_qty_cap"] == pytest.approx(0.001)
+
+    # BEFORE another restart, O1 fills FURTHER offline: cumulative 0.002
+    # @ $78,000, now terminal. Exchange truth: $1,156 / 0.001 BTC.
+    fake.simulate_fill(o1["id"], 0.002, 78_000.0, 0.0, terminal=True)
+    assert fake._balance[fake.quote] == pytest.approx(1_156.0)
+    assert fake._balance[fake.base]  == pytest.approx(0.001)
+
+    # Restart #2: healthy lookups, no further activity.
+    ex3 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+
+    assert ex3.cash     == pytest.approx(1_156.0)   # unchanged — not double-applied
+    assert ex3.position == pytest.approx(0.001)     # unchanged
+    assert ex3._unresolved_stop_recoveries == []      # terminal, resolved
+    assert len(ex3.pending_journal_entries) == 1
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_stale_checkpoint_cap_refreshed_across_restart_before_adoption(mock_cfg, mock_sleep, tmp_path):
+    """PASS-11 review finding (P0, finding 1) — the same staleness bug,
+    but reached through the ADOPTION merge path (Pass-10 finding 1's
+    reproduction B) instead of the plain retry loop: the order stays
+    OPEN across two restarts, with the queue's OWN direct lookup still
+    failing at restart #2 (forcing resolution through
+    _adopt_untracked_stop's merge), while MORE fills happen offline in
+    between. The refreshed cap must still be visible in time for the
+    merge to use it."""
+    state_path = str(tmp_path / "state.json")
+    fake = FakeExchange(cash=1000.0)
+    ex = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    ex._portfolio.position    = 0.003
+    ex._portfolio._cost_basis = 85_000.0
+    fake._balance[fake.base] = 0.003
+    o1 = fake.create_order(
+        "BTC/CAD", "market", "sell", 0.003,
+        params={"stopLossPrice": "78000.00", "clientOrderId": "seed-o1"},
+    )
+    ex._native_stop_order_id    = o1["id"]
+    ex._native_stop_price       = 78_000.0
+    ex._native_stop_is_trailing = False
+    ex._save_state()
+
+    # Offline: O1 fills 0.001 BTC, stays open.
+    fake.simulate_fill(o1["id"], 0.001, 78_000.0, 0.0, terminal=False)
+
+    with patch.object(fake, "fetch_open_orders", return_value=[]), \
+         patch.object(fake, "fetch_order", side_effect=ccxt.RequestTimeout("timeout")):
+        ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    assert ex2._unresolved_stop_recoveries[0]["checkpoint_qty_cap"] == pytest.approx(0.001)
+
+    # Further offline fill: cumulative 0.002 @ $78,000, STILL open (0.001
+    # of the original 0.003 remains unfilled). Exchange: $1,156 / 0.001.
+    fake.simulate_fill(o1["id"], 0.002, 78_000.0, 0.0, terminal=False)
+    assert fake._balance[fake.quote] == pytest.approx(1_156.0)
+    assert fake._balance[fake.base]  == pytest.approx(0.001)
+
+    # Restart #2: open-order discovery succeeds (O1 still genuinely
+    # resting) and adopts it, while the queue's OWN direct lookup (used
+    # by its retry) still times out — forcing resolution through adoption's
+    # merge path instead of the plain retry loop.
+    with patch.object(fake, "fetch_order", side_effect=ccxt.RequestTimeout("timeout")):
+        ex3 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+
+    assert ex3._native_stop_order_id == o1["id"]
+    assert ex3._unresolved_stop_recoveries == []
+    assert ex3.cash     == pytest.approx(1_156.0)   # unchanged — not double-applied
+    assert ex3.position == pytest.approx(0.001)
+
+
+# ---------------------------------------------------------------------------
+# PASS-11 review, finding 2 (P1): splitting a checkpoint-straddling delta
+# applies the SAME cumulative-average price to both the checkpoint-covered
+# and live portions — exact for quantity, an ESTIMATE for cash/fee when the
+# true per-segment execution prices actually differ. This asserts the
+# estimate itself converges to the KNOWN (documented) approximation and
+# that its use is loudly alerted, rather than silently trusted as exact.
+# ---------------------------------------------------------------------------
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_checkpoint_split_with_varying_prices_is_estimated_and_alerted(mock_cfg, mock_sleep, tmp_path):
+    """PASS-11 review finding (P1, finding 2), exact reproduction: the
+    first 0.001 BTC executes offline at $78,000 (checkpoint correctly
+    syncs $1,078); after startup, a second 0.001 executes live at
+    $82,000. A single read reports cumulative 0.002 @ average $80,000,
+    cost $160, zero fees. The exact quantity split (0.001 checkpoint-
+    covered / 0.001 live) is not in question — but crediting the live
+    portion at the blended $80,000 average (giving executor cash
+    $1,158) instead of its own true $82,000 (which would give $1,160)
+    is a real, bounded estimation error given ccxt exposes no per-fill
+    breakdown. This is expected, documented behavior — asserted here
+    specifically so a future change to the estimate's formula doesn't
+    silently drift — and must be loudly alerted, not silent."""
+    state_path = str(tmp_path / "state.json")
+    fake = FakeExchange(cash=1000.0)
+    ex = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    ex._portfolio.position    = 0.002
+    ex._portfolio._cost_basis = 85_000.0
+    fake._balance[fake.base] = 0.002
+    o1 = fake.create_order(
+        "BTC/CAD", "market", "sell", 0.002,
+        params={"stopLossPrice": "78000.00", "clientOrderId": "seed-o1"},
+    )
+    ex._native_stop_order_id    = o1["id"]
+    ex._native_stop_price       = 78_000.0
+    ex._native_stop_is_trailing = False
+    ex._save_state()
+
+    # Offline: 0.001 fills at $78,000, order stays open.
+    fake.simulate_fill(o1["id"], 0.001, 78_000.0, 0.0, terminal=False)
+
+    with patch.object(fake, "fetch_open_orders", return_value=[]), \
+         patch.object(fake, "fetch_order", side_effect=ccxt.RequestTimeout("timeout")):
+        ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    assert ex2.cash == pytest.approx(1_078.0)
+    assert ex2._unresolved_stop_recoveries[0]["checkpoint_qty_cap"] == pytest.approx(0.001)
+
+    # Live, a further 0.001 fills at a DIFFERENT price ($82,000) — the
+    # exchange now reports cumulative 0.002 @ average $80,000 (cost
+    # $160), exactly the review's own reproduction numbers.
+    fake.simulate_fill(o1["id"], 0.002, 80_000.0, 0.0, terminal=False)
+    mock_alerter = MagicMock()
+    ex2._alerter = mock_alerter
+    discovered = ex2.reconcile_pending_orders()
+
+    # The known, documented estimation result (blended $80,000 applied to
+    # the live 0.001) — NOT the true $1,160 a per-fill reconstruction
+    # would give. This pins the current approximation's exact behavior.
+    assert ex2.cash == pytest.approx(1_078.0 + 0.001 * 80_000.0)   # == 1,158.0
+    assert len(discovered) == 1
+    assert discovered[0].quantity == pytest.approx(0.001)
+    assert discovered[0].price    == pytest.approx(80_000.0)
+
+    # Loudly alerted as an estimate, not silently trusted as exact.
+    assert mock_alerter.error.called
+    assert "ESTIMATE" in mock_alerter.error.call_args[0][0]

@@ -734,3 +734,45 @@ def test_recovered_buy_with_immediate_full_exit_logs_buy_before_sell(mock_cfg, t
     assert metrics["net_pnl"]             == pytest.approx(-0.20)
     assert metrics["win_rate"]            == pytest.approx(0.0)
     assert metrics["unallocated_buy_fees"] == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# PASS-11 review, finding 3 (P1): a raised trade_log failure must never skip
+# the protective-stop sync for a real, already-owned position — logging is
+# best-effort; protection is not conditional on it succeeding.
+# ---------------------------------------------------------------------------
+
+@patch("bot.main.cfg")
+def test_recovered_buy_ledger_failure_does_not_skip_protection(mock_cfg):
+    """PASS-11 review finding (P1, finding 3), exact reproduction: a
+    recovered BUY (qty 1 @ $100) with no existing protection, native
+    protection enabled, STOP_LOSS_PCT 0.02, and trade_log.log_fill()
+    raising OSError('disk full'). The old (PASS-10) ordering let this
+    exception propagate straight out of the function, skipping the
+    protective-stop sync entirely — PositionManager already shows the
+    real, owned quantity at that point. Must not raise, and protection
+    MUST still be attempted."""
+    mock_cfg.exchange.native_stop_loss_enabled = True
+    mock_cfg.exchange.exchange                 = "kraken"
+    mock_cfg.backtest.stop_loss_pct            = 0.02
+
+    pm = PositionManager()   # flat — this IS the position-opening BUY
+    sm = TradingStateMachine(cooldown_ticks=3)
+    executor = _FakeExecutorForResync()
+    ss = _ss(executor, pm, sm)
+    capital_pool = CapitalPool(total_capital=1000.0, max_concurrent=1)
+    risk = MagicMock()
+    alerter = MagicMock()
+    trade_log = MagicMock()
+    trade_log.log_fill.side_effect = OSError("disk full")
+
+    order = _buy_fill_order(quantity=1.0, price=100.0, fee_cost=0.0, order_id="buy-1")
+    bot_main._process_discovered_buy_fill(   # must not raise
+        "BTC/CAD", ss, order, "pending_order_reconciled",
+        capital_pool=capital_pool, risk=risk, alerter=alerter, trade_log=trade_log,
+    )
+
+    assert pm.quantity == pytest.approx(1.0)     # the BUY's own economics still applied
+    assert len(executor.sync_calls) == 1          # protection WAS attempted
+    expected_fallback = 100.0 * (1 - 0.02)
+    assert executor.sync_calls[0] == (pytest.approx(expected_fallback), None)

@@ -1284,11 +1284,31 @@ class LiveExecutor:
         _queue_unresolved_stop_recovery's own docstring). None means
         unbounded (checkpoint-covered no matter what — the flat-position
         caller). Any new_delta beyond this cap is provably NEW,
-        post-checkpoint activity, regardless of apply_as_live_fill. A
-        SINGLE delta can straddle the boundary (part checkpoint-covered,
-        part new) — split proportionally by quantity share, matching this
-        file's existing partial-fill fee-allocation convention, so a
-        crash landing exactly mid-fill doesn't misattribute either half."""
+        post-checkpoint activity, regardless of apply_as_live_fill.
+
+        PASS-11 review finding (P1, finding 2) — read before trusting the
+        split below: a SINGLE delta can straddle the boundary (part
+        checkpoint-covered, part new). The cap makes the QUANTITY split
+        exact, but ccxt's order fields expose only ONE cumulative average
+        price/cost/fee for the WHOLE order — there is no per-fill
+        breakdown to recover the historical and live portions'
+        INDIVIDUAL prices from a plain fetch_order() response. This
+        applies the cumulative average to BOTH sides as the best
+        available estimate (proportional by quantity, same convention as
+        this file's existing partial-fill fee allocation) — NOT an exact
+        reconstruction. Reproduced exactly: 0.001 @ $78,000 historical +
+        0.001 @ $82,000 live (cumulative average $80,000) credited the
+        live portion $80 instead of the real $82 — executor cash $1,158
+        vs. correct $1,160. The error is bounded by how much the true
+        per-segment price actually varies, and only arises when a split
+        is genuinely needed (covered_qty and live_qty both positive) —
+        alerted below specifically so it's visible for manual
+        reconciliation rather than silently trusted as precise. A
+        genuinely exact fix needs per-fill execution data this file does
+        not currently fetch (e.g. fetchMyTrades) — deliberately deferred
+        as its own follow-up rather than bolted on here (a new exchange
+        call path is a materially bigger, riskier change than this
+        review round's other fixes)."""
         _bf   = self._native_stop_last_recorded_filled if baseline_filled is None else baseline_filled
         _bc   = self._native_stop_last_recorded_cost   if baseline_cost   is None else baseline_cost
         _bfee = self._native_stop_last_recorded_fee    if baseline_fee   is None else baseline_fee
@@ -1321,6 +1341,34 @@ class LiveExecutor:
             live_qty = new_delta - covered_qty
             covered_fee = delta_fee * (covered_qty / new_delta)
             live_fee    = delta_fee - covered_fee
+            if covered_qty > 0 and live_qty > 0:
+                # PASS-11 review finding (P1, finding 2): a genuine split
+                # — both sides of the checkpoint boundary have quantity —
+                # is where the constant cumulative-average-price
+                # assumption can actually misattribute cash (see this
+                # method's own docstring). Not silent: this is the one
+                # case the approximation is least trustworthy in.
+                logger.error(
+                    "NATIVE STOP CHECKPOINT SPLIT ESTIMATE [%s]: order %s "
+                    "delta %.8f straddles the balance checkpoint "
+                    "(%.8f checkpoint-covered / %.8f live) — both sides "
+                    "priced at the cumulative average %.2f since ccxt "
+                    "exposes no per-fill breakdown; if the true execution "
+                    "prices differed across the boundary, cash/fee "
+                    "attribution here is an ESTIMATE, not exact. Verify "
+                    "manually against Kraken's own trade history if "
+                    "precision matters for this fill.",
+                    self.symbol, order_id_str, new_delta, covered_qty,
+                    live_qty, delta_price,
+                )
+                self._alerter.error(
+                    f"NATIVE STOP CHECKPOINT SPLIT ESTIMATE [{self.symbol}]: "
+                    f"order {order_id_str} split {covered_qty:.8f} "
+                    f"checkpoint-covered / {live_qty:.8f} live at one "
+                    f"blended price ({delta_price:.2f}) — cash/fee for "
+                    f"this fill may be off if the real per-segment prices "
+                    f"differed; verify against Kraken's trade history."
+                )
             if covered_qty > 0:
                 self._journal_native_stop_execution_without_cash_effect(
                     order_id_str, covered_qty, delta_price, covered_fee, fee_currency,
@@ -1461,6 +1509,7 @@ class LiveExecutor:
         self, order_id: str, cost_basis: "float | None",
         baseline_filled: float, baseline_cost: float, baseline_fee: float,
         checkpoint_qty_cap: "float | None" = None,
+        origin_position: "float | None" = None,
     ) -> None:
         """PASS-8 review finding (P1, finding 3): add or UPDATE (never
         silently overwrite a DIFFERENT order's entry) a historical
@@ -1491,20 +1540,76 @@ class LiveExecutor:
         activity. See _recover_missed_native_stop_execution's own
         docstring for why a caller-mode boolean alone (PASS-9's
         apply_as_live_fill) cannot answer this for the QUANTITY
-        dimension — only an exact, provable bound can."""
+        dimension — only an exact, provable bound can.
+
+        origin_position (PASS-11 review finding, P0, finding 1): the
+        checkpoint_qty_cap above described the relationship to ONE
+        specific restart's balance checkpoint — but a LATER restart
+        re-synchronizes cash/position AGAIN, from scratch, and that
+        persisted cap never learns about it. A cap frozen at 0.001 stays
+        0.001 forever even after a SECOND restart's own fresh sync has
+        ALREADY absorbed a further 0.001 that happened in between — the
+        stale cap then lets that second fill's delta be treated as live
+        on top of a checkpoint that already paid for it. Reproduced
+        exactly: 0.003 BTC/$85,000, stop fills 0.001 offline (checkpoint
+        correctly reads $1,078/0.002, cap queued at 0.001), then a
+        FURTHER 0.001 fills offline before the NEXT restart (exchange now
+        $1,156/0.001) — the stale cap credited only the first 0.001,
+        applying the second live on top of the fresh sync: $1,234/0
+        instead of the correct, unchanged $1,156/0.001.
+
+        origin_position is the STABLE reference this recomputes from: the
+        position value as of THIS entry's OWN original queuing moment
+        (self._startup_recovery_position at that time) — never touched
+        again. _verify_resting_stop_on_startup() recomputes
+        checkpoint_qty_cap = origin_position - self._portfolio.position
+        fresh, from this fixed anchor, at the START of EVERY restart
+        (see _refresh_unresolved_recovery_caps) — always using the
+        LATEST ground-truth sync, so a second (or Nth) restart's own
+        fresh checkpoint is correctly reflected no matter how many
+        restarts occurred in between. This is safe even though the
+        recomputed cap can be more generous than what's LEFT to consume:
+        entries always gate on new_delta (cumulative_filled minus the
+        entry's OWN already-advanced baseline_filled), which already
+        excludes anything previously recovered — a generous cap can never
+        cause double-counting, only a too-small one could wrongly force a
+        real historical fill through the live path. None (the flat-
+        position caller) needs no recomputation — a flat position's proof
+        that the order's ENTIRE remaining size already executed doesn't
+        depend on any specific checkpoint and never goes stale."""
         for entry in self._unresolved_stop_recoveries:
             if entry.get("order_id") == order_id:
                 entry.update({
                     "cost_basis": cost_basis, "baseline_filled": baseline_filled,
                     "baseline_cost": baseline_cost, "baseline_fee": baseline_fee,
                     "checkpoint_qty_cap": checkpoint_qty_cap,
+                    "origin_position": origin_position,
                 })
                 return
         self._unresolved_stop_recoveries.append({
             "order_id": order_id, "cost_basis": cost_basis,
             "baseline_filled": baseline_filled, "baseline_cost": baseline_cost,
             "baseline_fee": baseline_fee, "checkpoint_qty_cap": checkpoint_qty_cap,
+            "origin_position": origin_position,
         })
+
+    def _refresh_unresolved_recovery_caps(self) -> None:
+        """PASS-11 review finding (P0, finding 1): called ONCE, at the
+        very start of _verify_resting_stop_on_startup() — i.e. exactly
+        once per restart, immediately after THIS instance's own
+        _sync_cash()/_sync_position() have already run — to re-anchor
+        every still-queued entry's checkpoint_qty_cap against the FRESH
+        ground truth this restart just confirmed, before either
+        _retry_unresolved_stop_recoveries() or _adopt_untracked_stop()
+        can use a now-stale value left over from an earlier restart. Must
+        NEVER run mid-tick (reconcile_pending_orders() does not call
+        this) — self._portfolio.position only means "the checkpoint"
+        immediately after a fresh sync; once a live fill mutates it
+        within this same running instance, it no longer is one."""
+        for entry in self._unresolved_stop_recoveries:
+            origin = entry.get("origin_position")
+            if origin is not None:
+                entry["checkpoint_qty_cap"] = max(0.0, origin - self._portfolio.position)
 
     def _reconcile_historical_stop_order(
         self, order: dict, *,
@@ -1801,7 +1906,14 @@ class LiveExecutor:
         PASS-7 review finding (P1, finding 4): also retries any
         previously-unresolved historical stop recovery FIRST, independent
         of the currently tracked slot or position state.
+
+        PASS-11 review finding (P0, finding 1): also re-anchors every
+        still-queued recovery entry's checkpoint_qty_cap against THIS
+        restart's own just-completed balance sync, before either the
+        retry loop or adoption below can use a cap left over from an
+        earlier restart — see _refresh_unresolved_recovery_caps.
         """
+        self._refresh_unresolved_recovery_caps()
         self._resolve_pending_protect_submission_at_startup()
         self._retry_unresolved_stop_recoveries()
 
@@ -1935,7 +2047,11 @@ class LiveExecutor:
                 # possible seller) can never be credited more than this
                 # as checkpoint-covered, no matter how many later ticks
                 # its own lookup keeps failing across before finally
-                # resolving.
+                # resolving. origin_position (PASS-11 finding 1): anchors
+                # this cap for re-derivation on every SUBSEQUENT restart
+                # too (see _refresh_unresolved_recovery_caps) — a cap
+                # frozen at THIS restart's own delta would go stale the
+                # moment a later restart's fresh sync absorbs still more.
                 self._queue_unresolved_stop_recovery(
                     _order_id, self._portfolio._cost_basis,
                     self._native_stop_last_recorded_filled,
@@ -1944,6 +2060,7 @@ class LiveExecutor:
                     checkpoint_qty_cap=max(
                         0.0, self._startup_recovery_position - self._portfolio.position,
                     ),
+                    origin_position=self._startup_recovery_position,
                 )
                 self._clear_native_stop_tracking_fields()
                 self._save_state()
