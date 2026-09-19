@@ -80,7 +80,7 @@ def _load_fills(db_path: str) -> list[dict]:
     conn = sqlite3.connect(db_path)
     rows = conn.execute(
         "SELECT side, symbol, quantity, price, value, pnl, timestamp, exchange, "
-        "fee_cost, fee_currency FROM fills ORDER BY id"
+        "fee_cost, fee_currency, order_id FROM fills ORDER BY id"
     ).fetchall()
     conn.close()
 
@@ -96,9 +96,37 @@ def _load_fills(db_path: str) -> list[dict]:
             "exchange":     r[7],
             "fee_cost":     r[8] or 0.0,
             "fee_currency": r[9] or "",
+            "order_id":     r[10] or "",
         }
         for r in rows
     ]
+
+
+def _load_fee_adjustments(db_path: str) -> "dict[str, float]":
+    """2026-09-19 PASS-6 review finding (P1): late fee corrections (native-
+    stop or ordinary order) now reach a durable `fee_adjustments` table,
+    but nothing in this report ever read it — a trade whose net result
+    flips from a win to a loss purely because of a stored correction still
+    reported the pre-correction (wrong) result. Returns order_id -> total
+    delta_fee (summed — normally one adjustment per order, but a second
+    correction on the same order is possible and should accumulate, not
+    overwrite). Missing table (an older DB, or none yet) returns {}
+    rather than raising — this report must degrade gracefully, not crash,
+    against a DB from before this feature existed."""
+    if not os.path.exists(db_path):
+        return {}
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT order_id, SUM(delta_fee) FROM fee_adjustments GROUP BY order_id"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Table doesn't exist yet (a DB from before this feature) — no
+        # adjustments to report, not an error.
+        rows = []
+    finally:
+        conn.close()
+    return {r[0]: float(r[1] or 0.0) for r in rows if r[0]}
 
 
 def _quote_ccy(symbol: str) -> str:
@@ -106,7 +134,7 @@ def _quote_ccy(symbol: str) -> str:
     return parts[1].upper() if len(parts) == 2 else ""
 
 
-def _compute_live_metrics(fills: list[dict]) -> dict:
+def _compute_live_metrics(fills: list[dict], fee_adjustments: "dict[str, float] | None" = None) -> dict:
     """
     2026-09-18 review finding: this used to compute PF/win-rate/total P&L
     entirely from the stored `pnl` column, which PositionManager.on_sell()
@@ -136,14 +164,39 @@ def _compute_live_metrics(fills: list[dict]) -> dict:
     still open at the end of the loaded window — a real cost already paid
     that isn't yet attributable to any closed trade (not silently dropped,
     not wrongly charged against a trade that hasn't closed).
+
+    2026-09-19 PASS-6 review finding (P1): fee_adjustments (late
+    corrections logged separately, after a fill's own row already exists)
+    were computed and stored but never consumed here — a trade whose net
+    result flipped from a win to a loss purely because of a stored
+    correction still reported the stale, pre-correction result.
+    Reproduced exactly: BUY $100 fee $0, SELL $101 fee $0 (gross win $1),
+    then a stored $2 SELL fee adjustment — correct net result is -$1, but
+    the un-fixed report said +$1 / 100% win rate. Fixed: each fill's OWN
+    fee_adjustment (matched by order_id, the same persistent linkage
+    TradeLog.log_fill()'s order_id column now provides) is added to that
+    fill's fee BEFORE the existing FIFO allocation runs — a BUY's
+    adjustment flows into the entry-fee pool exactly like its own
+    original fee would, and a SELL's adjustment is added to its own exit
+    fee, both using the SAME currency-mismatch and allocation logic
+    already in place. An adjustment whose order_id matches no loaded fill
+    is never silently dropped — it is summed into
+    `unattributed_fee_adjustments` for visibility.
     """
     sells_with_pnl = [f for f in fills if f["side"] == "SELL" and f["pnl"] is not None]
     n = len(sells_with_pnl)
     if n == 0:
         return {}
 
+    fee_adjustments = dict(fee_adjustments or {})
+    _matched_adjustment_order_ids: set = set()
+
     def _fee_or_zero(f: dict) -> "tuple[float, bool]":
         fee = f.get("fee_cost") or 0.0
+        oid = f.get("order_id") or ""
+        if oid and oid in fee_adjustments:
+            fee += fee_adjustments[oid]
+            _matched_adjustment_order_ids.add(oid)
         if fee <= 0:
             return 0.0, True
         cur = (f.get("fee_currency") or "").upper()
@@ -179,6 +232,9 @@ def _compute_live_metrics(fills: list[dict]) -> dict:
                 pending_buy_qty[sym] = 0.0
 
     unallocated_buy_fees = sum(pending_buy_fee.values())
+    unattributed_fee_adjustments = sum(
+        v for k, v in fee_adjustments.items() if k not in _matched_adjustment_order_ids
+    )
 
     wins,     losses     = [p for p in closed_gross if p > 0], [p for p in closed_gross if p < 0]
     net_wins, net_losses = [p for p in closed_net if p > 0],   [p for p in closed_net if p < 0]
@@ -222,6 +278,7 @@ def _compute_live_metrics(fills: list[dict]) -> dict:
         "total_pnl":           sum(closed_gross),
         "net_pnl":             sum(closed_net),
         "unallocated_buy_fees": unallocated_buy_fees,
+        "unattributed_fee_adjustments": unattributed_fee_adjustments,
         "unmatched_fee_ct":    unmatched_fee_ct,
         "avg_win":             net_profit / len(net_wins) if net_wins else 0.0,
         "avg_loss":            sum(net_losses) / len(net_losses) if net_losses else 0.0,
@@ -291,6 +348,10 @@ def _print_report(metrics: dict, min_trades: int) -> None:
     if metrics.get("unallocated_buy_fees"):
         print(f"  {_DIM}({metrics['unallocated_buy_fees']:.2f} in BUY fees not yet allocated — "
               f"open inventory, not attributable to a closed trade yet){_R}")
+    if metrics.get("unattributed_fee_adjustments"):
+        print(f"  {_YL}⚠ ${metrics['unattributed_fee_adjustments']:.2f} in stored fee "
+              f"adjustment(s) match no loaded fill's order_id — NOT included in the "
+              f"figures above (should not normally happen; check trades.db).{_R}")
 
     # ── Sharpe ───────────────────────────────────────────────────────────
     # Trade-level (cumulative per-trade P&L), NOT a regularly sampled
@@ -346,11 +407,12 @@ def main() -> None:
     args = parser.parse_args()
 
     all_fills = _load_fills(args.db)
+    all_adjustments = _load_fee_adjustments(args.db)
     base      = args.base.strip().upper()
     fills     = [f for f in all_fills
                  if (f["symbol"] or "").split("/")[0].upper() == base]
     excluded  = len(all_fills) - len(fills)
-    metrics   = _compute_live_metrics(fills)
+    metrics   = _compute_live_metrics(fills, all_adjustments)
 
     print(f"\n  Database:    {os.path.abspath(args.db)}")
     print(f"  Total fills: {len(all_fills)}  (BUY + SELL)")

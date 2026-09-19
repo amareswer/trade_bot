@@ -952,6 +952,172 @@ class LiveExecutor:
     def has_resting_stop(self) -> bool:
         return self._native_stop_order_id is not None
 
+    def _journal_native_stop_execution_without_cash_effect(
+        self, order_id: str, filled_qty: float, fill_price: float,
+        fee_cost: float, fee_currency: str,
+    ) -> Order:
+        """PASS-6 review finding (P1): the startup-safe counterpart to
+        _record_stop_triggered_fill. That method is for the LIVE, mid-run
+        case where NOTHING else has yet applied the fill's cash/position
+        effect. At startup, _sync_cash()/_sync_position() (which always
+        run before any native-stop startup reconciliation) ALREADY
+        reflect every execution that happened on the exchange, including
+        one this executor never got to record locally before a crash —
+        re-applying cash/position here would double-count it. But
+        realized P&L and fees_paid are NOT established by the exchange
+        sync (Kraken's free balance doesn't report "realized P&L"), and
+        the execution itself still needs a journal entry — skipping those
+        is exactly PASS-6 finding 1: a real fill and its loss disappearing
+        entirely from the recovery journal, even though cash converged."""
+        quote = self.symbol.split("/")[1]
+        pnl = (fill_price - self._portfolio._cost_basis) * filled_qty
+        self._portfolio.realized_pnl += pnl
+        if fee_cost > 0:
+            if fee_currency and fee_currency != quote:
+                logger.warning(
+                    "Native-stop startup-recovery fee currency mismatch "
+                    "[%s]: fee=%.6f %s but quote=%s — not counted (manual "
+                    "reconciliation needed)", self.symbol, fee_cost, fee_currency, quote,
+                )
+            else:
+                self._fees_paid += fee_cost
+        order = Order(
+            order_id     = f"native-stop:{order_id}",
+            symbol       = self.symbol,
+            side         = OrderSide.SELL,
+            quantity     = filled_qty,
+            price        = fill_price,
+            status       = OrderStatus.FILLED,
+            created_at   = datetime.now(timezone.utc),
+            filled_at    = datetime.now(timezone.utc),
+            fee_cost     = fee_cost,
+            fee_currency = fee_currency,
+            pnl          = pnl,
+        )
+        self._fills.append(order)
+        self._record_pending_journal_entry(order)
+        logger.warning(
+            "STARTUP RECONCILIATION [%s/protect]: recovered a stop-"
+            "triggered exit of %.8f @ %.2f (order %s) that happened "
+            "before this restart — journaled; cash/position already "
+            "reflected via the exchange sync.",
+            self.symbol, filled_qty, fill_price, order_id,
+        )
+        return order
+
+    def _recover_missed_native_stop_execution(self, order: dict) -> None:
+        """PASS-6 review finding (P1): compares the order's CURRENT
+        cumulative filled/cost/fee against the LAST PERSISTED
+        _native_stop_last_recorded_* baseline (loaded from disk, from
+        before whatever restart triggered this call) — any positive delta
+        is a real execution that happened but was never journaled (a
+        crash prevented the normal in-process accounting from recording
+        it). Journals it (P&L included) via the cash-free helper above,
+        THEN advances the baseline to the order's current state — the
+        exact same "commit progress and economics together" discipline
+        _record_order_delta's callers use, just anchored to the exchange's
+        already-synced truth instead of a fresh in-process fill.
+
+        On an ORDINARY (non-crash) restart this is a safe no-op: the last
+        successful save already advanced the baseline to match the
+        order's cumulative state, so the delta is exactly zero."""
+        cumulative_filled = float(order.get("filled") or 0.0)
+        new_delta = max(0.0, cumulative_filled - self._native_stop_last_recorded_filled)
+        cumulative_cost = float(order.get("cost") or 0.0)
+        if cumulative_cost <= 0:
+            _avg = float(order.get("average") or order.get("price") or 0.0)
+            cumulative_cost = _avg * cumulative_filled
+        cumulative_fee = float((order.get("fee") or {}).get("cost") or 0.0)
+        if new_delta > 0:
+            delta_cost = max(0.0, cumulative_cost - self._native_stop_last_recorded_cost)
+            delta_fee  = max(0.0, cumulative_fee  - self._native_stop_last_recorded_fee)
+            delta_price = delta_cost / new_delta if new_delta > 0 else 0.0
+            fee_currency = (order.get("fee") or {}).get("currency", "") or self.symbol.split("/")[1]
+            self._journal_native_stop_execution_without_cash_effect(
+                str(order.get("id", "")), new_delta, delta_price, delta_fee, fee_currency,
+            )
+        self._native_stop_last_recorded_filled = cumulative_filled
+        self._native_stop_last_recorded_cost   = cumulative_cost
+        self._native_stop_last_recorded_fee    = cumulative_fee
+
+    def _resolve_pending_protect_submission_at_startup(self) -> None:
+        """PASS-6 review finding (P1): ordinary buy/sell startup recovery
+        (_reconcile_pending_orders_at_startup) never covered the 'protect'
+        role — a native-stop PLACEMENT interrupted by a crash between
+        persisting the submission intent and confirming/tracking its
+        outcome sat unresolved indefinitely (nothing else re-checks a
+        pending 'protect' submission independently of a position-changing
+        event). Resolves it the same way _find_untracked_entry_order-based
+        reconciliation always does, but WITHOUT applying cash/position
+        (already reflected via the exchange sync that runs before this),
+        journaling any discovered fill through the cash-free helper above."""
+        entry = self._pending_submissions.get("protect")
+        if entry is None:
+            return
+        adopted, confirmed_empty = self._find_untracked_entry_order(
+            "sell", entry.get("client_order_id"), order_id=entry.get("order_id"),
+        )
+        if adopted is None:
+            if confirmed_empty:
+                logger.warning(
+                    "STARTUP RECONCILIATION [%s/protect]: prior unresolved "
+                    "placement confirmed never placed — clearing.", self.symbol,
+                )
+                del self._pending_submissions["protect"]
+                self._save_state()
+            return
+
+        order_id     = str(adopted.get("id", ""))
+        status       = str(adopted.get("status") or "").lower()
+        is_terminal  = status in _CANCELLED_TERMINAL_STATUSES
+        filled       = float(adopted.get("filled") or 0.0)
+        is_trailing  = _raw_ordertype(adopted) == "trailing-stop"
+        stop_price, _ = _extract_stop_trigger(adopted)
+
+        if filled <= 0:
+            if not is_terminal:
+                # Genuinely resting, unfilled — start tracking it; nothing
+                # to journal.
+                self._native_stop_order_id    = order_id
+                self._native_stop_price       = None if is_trailing else stop_price
+                self._native_stop_is_trailing = is_trailing
+                self._native_stop_last_recorded_filled = 0.0
+                self._native_stop_last_recorded_cost   = 0.0
+                self._native_stop_last_recorded_fee    = 0.0
+            self._resolve_pending_submission("protect")
+            self._save_state()
+            return
+
+        cumulative_cost = float(adopted.get("cost") or 0.0)
+        if cumulative_cost <= 0:
+            _avg = float(adopted.get("average") or adopted.get("price") or 0.0)
+            cumulative_cost = _avg * filled
+        fee_data     = adopted.get("fee") or {}
+        fee_cost     = float(fee_data.get("cost") or 0.0)
+        fee_currency = fee_data.get("currency") or self.symbol.split("/")[1]
+        fill_price   = cumulative_cost / filled if filled > 0 else 0.0
+
+        self._journal_native_stop_execution_without_cash_effect(
+            order_id, filled, fill_price, fee_cost, fee_currency,
+        )
+
+        if is_terminal:
+            self._native_stop_order_id    = None
+            self._native_stop_price       = None
+            self._native_stop_is_trailing = False
+            self._native_stop_last_recorded_filled = 0.0
+            self._native_stop_last_recorded_cost   = 0.0
+            self._native_stop_last_recorded_fee    = 0.0
+        else:
+            self._native_stop_order_id    = order_id
+            self._native_stop_price       = None if is_trailing else stop_price
+            self._native_stop_is_trailing = is_trailing
+            self._native_stop_last_recorded_filled = filled
+            self._native_stop_last_recorded_cost   = cumulative_cost
+            self._native_stop_last_recorded_fee    = fee_cost
+        self._resolve_pending_submission("protect")
+        self._save_state()
+
     def _verify_resting_stop_on_startup(self) -> None:
         """
         Called once from __init__ (live mode only) after _sync_position.
@@ -1004,7 +1170,15 @@ class LiveExecutor:
         adopt nothing (confirmed the pre-existing ambiguity alert did NOT
         cover this case: it only ever ran after the "no tracked id" early
         return, so a lost-id restart never reached it).
+
+        PASS-6 review finding (P1): also resolves any pending 'protect'
+        role submission FIRST — unconditionally, regardless of current
+        position — since a pending placement's own OUTCOME (did it fill?)
+        needs journaling as a historical fact even if the position it was
+        protecting has since changed by some other means.
         """
+        self._resolve_pending_protect_submission_at_startup()
+
         if self._portfolio.position <= 0:
             # No position to protect — any leftover id is stale by definition.
             if self._native_stop_order_id:
@@ -1070,36 +1244,47 @@ class LiveExecutor:
                 o for o in open_orders
                 if str(o.get("id", "")) == self._native_stop_order_id
             )
-            # PASS-5 review finding (P0), surfaced by the stateful crash-
-            # injection harness: this branch confirmed the tracked stop is
-            # still open but never re-seeded _native_stop_last_recorded_*
-            # from ITS CURRENT cumulative filled/cost/fee — unlike
-            # _adopt_untracked_stop's identical situation (an untracked
-            # order found resting), which already does this. Any fill this
-            # order shows RIGHT NOW is fill that happened before this
-            # startup and is ALREADY reflected in the cash/position
-            # _sync_cash()/_sync_position() just established moments ago
-            # (this method runs after both) — leaving the baseline at its
-            # stale pre-restart value (typically 0, or a crash-frozen
-            # partial) double-counted that same fee/quantity the next time
-            # a cancel-and-verify cycle computed a "new" delta against it.
-            # Reproduced exactly: a stop partially fills 0.001/$0.16 fee,
-            # a crash prevents the normal post-fill baseline advance,
-            # restart correctly syncs cash/position for that 0.001 but
-            # leaves the tracked baseline at 0 — the NEXT cancel then
-            # recomputed the fee delta as the FULL $0.32 (cumulative)
-            # instead of just the genuinely new $0.16, overcharging by the
-            # already-accounted-for $0.16. Seed exactly like adoption does.
-            self._native_stop_last_recorded_filled = float(matched.get("filled") or 0.0)
-            _seed_cost = float(matched.get("cost") or 0.0)
-            if _seed_cost <= 0:
-                _seed_avg = float(matched.get("average") or matched.get("price") or 0.0)
-                _seed_cost = _seed_avg * self._native_stop_last_recorded_filled
-            self._native_stop_last_recorded_cost = _seed_cost
-            self._native_stop_last_recorded_fee  = float((matched.get("fee") or {}).get("cost") or 0.0)
+            # PASS-5/PASS-6 review findings (P0/P1), surfaced by the
+            # stateful crash-injection harness: this branch confirmed the
+            # tracked stop is still open but neither re-seeded
+            # _native_stop_last_recorded_* from ITS CURRENT cumulative
+            # filled/cost/fee (PASS-5 — double-counted a fee/quantity on
+            # the next cancel cycle) NOR recovered the execution/P&L for
+            # whatever delta occurred before this restart (PASS-6 — a real
+            # fill and its realized loss silently disappeared, seeding the
+            # baseline as if that execution never happened). Cash/position
+            # for this delta are ALREADY reflected via _sync_cash()/
+            # _sync_position() (this method runs after both) — only the
+            # journal entry and realized P&L were missing.
+            self._recover_missed_native_stop_execution(matched)
             self._save_state()
             self._reconcile_resting_stop_quantity(matched)
         else:
+            # PASS-6 review finding (P1): the tracked order is gone from
+            # open orders — it either filled to completion or was
+            # cancelled while the bot was down. The old code assumed the
+            # worst (unprotected) and moved on without ever checking
+            # WHICH — a stop that fully executed offline had its final
+            # fill/P&L silently discarded, identical in spirit to the
+            # still-open case above. Query it directly; a genuine fill
+            # recovers through the same cash-free journal path.
+            _final_order = None
+            try:
+                _final_order = fetch_with_retry(
+                    lambda: self._exchange.fetch_order(
+                        self._native_stop_order_id, self.symbol,
+                    ),
+                    label=f"native stop final-state check [{self.symbol}]",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not verify final state of gone native stop %s "
+                    "on %s: %s — clearing tracking without recovering any "
+                    "missed execution (will not be retried).",
+                    self._native_stop_order_id, self.symbol, exc,
+                )
+            if _final_order is not None:
+                self._recover_missed_native_stop_execution(_final_order)
             logger.warning(
                 "NATIVE STOP GAP [%s]: tracked order %s is no longer open "
                 "(filled or cancelled while the bot was down) — position=%.6f "
@@ -1110,6 +1295,9 @@ class LiveExecutor:
             self._native_stop_order_id    = None
             self._native_stop_price       = None
             self._native_stop_is_trailing = False
+            self._native_stop_last_recorded_filled = 0.0
+            self._native_stop_last_recorded_cost   = 0.0
+            self._native_stop_last_recorded_fee    = 0.0
             self._save_state()
 
     def _alert_ambiguous_stops(self, stop_orders: list[dict]) -> None:
@@ -1380,7 +1568,14 @@ class LiveExecutor:
             "+%.6f (quantity/cost unchanged since the last check) — "
             "applied once.", self.symbol, order_id, delta_fee,
         )
-        self._record_fee_adjustment_journal_entry(order_id, delta_fee, fee_currency)
+        # 2026-09-19 PASS-6 review finding (P1): use the SAME "native-stop:"
+        # prefixed identity _record_stop_triggered_fill gives this order's
+        # own fill row (Order.order_id) — live_comparison.py's fee-
+        # adjustment attribution matches by this exact string, and a raw
+        # (unprefixed) id here would never match its own fill.
+        self._record_fee_adjustment_journal_entry(
+            f"native-stop:{order_id}", delta_fee, fee_currency,
+        )
 
     def _cancel_native_stop(self) -> "tuple[str, Order | None]":
         """Cancel the resting native stop, but only clear tracked protection

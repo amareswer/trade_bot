@@ -16,7 +16,7 @@ no network, no ccxt, no production file writes.
 """
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -45,6 +45,7 @@ class _FakeExecutorForResync:
         self._next_fill = None
         self.acked_order_ids = []
         self.has_resting_stop = has_resting_stop
+        self.sync_calls = []
 
     def queue_fill(self, order):
         self._next_fill = order
@@ -54,6 +55,7 @@ class _FakeExecutorForResync:
         # returns a list (possibly more than one discovered fill) — match
         # that contract so this fake exercises the SAME shape every real
         # call site actually receives.
+        self.sync_calls.append((stop_price, trailing_pct))
         fill = self._next_fill
         self._next_fill = None
         return [fill] if fill is not None else []
@@ -527,3 +529,150 @@ def test_process_discovered_buy_fill_ignores_non_buy_order():
 
     trade_log.log_fill.assert_not_called()
     risk.record_fill.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# PASS-6 review finding (P1): a BUY fill recovered independently of a fresh
+# signal must have native-stop protection reconciled to the NEW quantity
+# immediately — not left to a conditional trailing-activation swap that may
+# never fire for this exact situation.
+# ---------------------------------------------------------------------------
+
+@patch("bot.main.cfg")
+def test_recovered_buy_resizes_existing_static_stop(mock_cfg):
+    """A native stop is ALREADY established (static ATR level) covering
+    the OLD (smaller) quantity — the recovered delta must resize it to the
+    new total, via the same mechanism the partial-TP path already uses."""
+    mock_cfg.exchange.native_stop_loss_enabled = True
+    pm = PositionManager()
+    pm.on_buy(90_000.0, 0.001)   # existing 0.001 already protected
+    sm = TradingStateMachine(cooldown_ticks=3)
+    executor = _FakeExecutorForResync()
+    ss = _ss(executor, pm, sm)
+    ss['native_stop_price']       = 88_000.0   # already-established static level
+    ss['native_stop_is_trailing'] = False
+    capital_pool = CapitalPool(total_capital=100.0, max_concurrent=1)
+    risk = MagicMock()
+    alerter = MagicMock()
+    trade_log = MagicMock()
+
+    order = _buy_fill_order(quantity=0.001, price=90_000.0, order_id="buy-recovered")
+    bot_main._process_discovered_buy_fill(
+        "BTC/CAD", ss, order, "pending_order_reconciled",
+        capital_pool=capital_pool, risk=risk, alerter=alerter, trade_log=trade_log,
+    )
+
+    assert pm.quantity == pytest.approx(0.002)          # inventory grew
+    assert len(executor.sync_calls) == 1
+    assert executor.sync_calls[0] == (88_000.0, None)   # resized at the SAME level, not recomputed
+    alerter.error.assert_not_called()                   # no "unprotected" alert — it WAS resized
+
+
+@patch("bot.main.cfg")
+def test_recovered_buy_resizes_already_active_trailing_stop(mock_cfg):
+    """An already-ACTIVE trailing stop must stay trailing on resize — not
+    get silently converted to a static level."""
+    mock_cfg.exchange.native_stop_loss_enabled = True
+    mock_cfg.backtest.exit_params_for.return_value = {"trail_stop_pct": 0.03}
+    pm = PositionManager()
+    pm.on_buy(90_000.0, 0.001)
+    sm = TradingStateMachine(cooldown_ticks=3)
+    executor = _FakeExecutorForResync()
+    ss = _ss(executor, pm, sm)
+    ss['native_stop_is_trailing'] = True   # already trailing
+    capital_pool = CapitalPool(total_capital=100.0, max_concurrent=1)
+    risk = MagicMock()
+    alerter = MagicMock()
+    trade_log = MagicMock()
+
+    order = _buy_fill_order(quantity=0.001, price=90_000.0, order_id="buy-recovered")
+    bot_main._process_discovered_buy_fill(
+        "BTC/CAD", ss, order, "pending_order_reconciled",
+        capital_pool=capital_pool, risk=risk, alerter=alerter, trade_log=trade_log,
+    )
+
+    assert pm.quantity == pytest.approx(0.002)
+    assert len(executor.sync_calls) == 1
+    assert executor.sync_calls[0] == (None, 0.03)   # trailing dispatch, not static
+    assert ss['native_stop_is_trailing'] is True    # stays trailing
+
+
+@patch("bot.main.cfg")
+def test_recovered_buy_with_no_prior_protection_establishes_fallback(mock_cfg):
+    """First recovered fill for a symbol with NO protection at all yet
+    (position was flat) — must establish the configured flat-STOP_LOSS_PCT
+    fallback explicitly, not leave the position naked."""
+    mock_cfg.exchange.native_stop_loss_enabled = True
+    mock_cfg.backtest.stop_loss_pct = 0.015
+    pm = PositionManager()   # flat — first fill
+    sm = TradingStateMachine(cooldown_ticks=3)
+    executor = _FakeExecutorForResync()
+    ss = _ss(executor, pm, sm)
+    assert ss['native_stop_price'] is None
+    assert ss['native_stop_is_trailing'] is False
+    capital_pool = CapitalPool(total_capital=100.0, max_concurrent=1)
+    risk = MagicMock()
+    alerter = MagicMock()
+    trade_log = MagicMock()
+
+    order = _buy_fill_order(quantity=0.001, price=90_000.0, order_id="buy-first")
+    bot_main._process_discovered_buy_fill(
+        "BTC/CAD", ss, order, "pending_order_reconciled",
+        capital_pool=capital_pool, risk=risk, alerter=alerter, trade_log=trade_log,
+    )
+
+    expected_fallback = 90_000.0 * (1 - 0.015)
+    assert len(executor.sync_calls) == 1
+    assert executor.sync_calls[0] == (pytest.approx(expected_fallback), None)
+    assert ss['native_stop_price'] == pytest.approx(expected_fallback)
+    alerter.error.assert_not_called()
+
+
+@patch("bot.main.cfg")
+def test_recovered_buy_no_fallback_possible_alerts_unprotected(mock_cfg):
+    """STOP_LOSS_PCT=0 and no prior protection — cannot compute a
+    fallback; must alert loudly rather than silently leave it naked."""
+    mock_cfg.exchange.native_stop_loss_enabled = True
+    mock_cfg.backtest.stop_loss_pct = 0.0
+    pm = PositionManager()
+    sm = TradingStateMachine(cooldown_ticks=3)
+    executor = _FakeExecutorForResync()
+    ss = _ss(executor, pm, sm)
+    capital_pool = CapitalPool(total_capital=100.0, max_concurrent=1)
+    risk = MagicMock()
+    alerter = MagicMock()
+    trade_log = MagicMock()
+
+    order = _buy_fill_order(quantity=0.001, price=90_000.0, order_id="buy-first")
+    bot_main._process_discovered_buy_fill(
+        "BTC/CAD", ss, order, "pending_order_reconciled",
+        capital_pool=capital_pool, risk=risk, alerter=alerter, trade_log=trade_log,
+    )
+
+    assert executor.sync_calls == []
+    alerter.error.assert_called_once()
+    assert "UNPROTECTED" in alerter.error.call_args[0][0]
+
+
+@patch("bot.main.cfg")
+def test_recovered_buy_protection_disabled_skips_resize_entirely(mock_cfg):
+    """NATIVE_STOP_LOSS_ENABLED=false — must not touch protection at all,
+    matching fixed-mode/paper-trading behavior exactly as before."""
+    mock_cfg.exchange.native_stop_loss_enabled = False
+    pm = PositionManager()
+    sm = TradingStateMachine(cooldown_ticks=3)
+    executor = _FakeExecutorForResync()
+    ss = _ss(executor, pm, sm)
+    capital_pool = CapitalPool(total_capital=100.0, max_concurrent=1)
+    risk = MagicMock()
+    alerter = MagicMock()
+    trade_log = MagicMock()
+
+    order = _buy_fill_order(quantity=0.001, price=90_000.0, order_id="buy-first")
+    bot_main._process_discovered_buy_fill(
+        "BTC/CAD", ss, order, "pending_order_reconciled",
+        capital_pool=capital_pool, risk=risk, alerter=alerter, trade_log=trade_log,
+    )
+
+    assert executor.sync_calls == []
+    trade_log.log_fill.assert_called_once()   # bookkeeping still happened

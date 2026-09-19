@@ -633,6 +633,7 @@ def _replay_pending_journal_entries(executors: dict, trade_log, alerter: "Telegr
                     fee_currency  = entry.get("fee_currency", ""),
                     exec_key      = entry.get("exec_key", ""),
                     timestamp     = entry.get("filled_at"),
+                    order_id      = entry.get("order_id", ""),
                 )
                 executor.ack_journal_entry(entry["order_id"])
                 recovered.append(sym)
@@ -1280,6 +1281,7 @@ def _execute_approved_signal(
                 # between them) mutually idempotent instead of colliding
                 # only replay-to-replay.
                 exec_key      = order.exec_key,
+                order_id      = order.order_id,
             )
             # 2026-09-18 review finding (P1-3, durable fill journal): the
             # trade_log write above and the accounting update inside
@@ -1426,6 +1428,7 @@ def _process_discovered_sell_fill(
         fee_cost      = order.fee_cost,
         fee_currency  = order.fee_currency,
         exec_key      = order.exec_key,
+        order_id      = order.order_id,
     )
     if hasattr(ss['executor'], 'ack_journal_entry'):
         ss['executor'].ack_journal_entry(order.order_id)
@@ -1478,16 +1481,25 @@ def _process_discovered_buy_fill(
     SAME PositionManager / state machine / capital pool / risk / trade-log
     bookkeeping a strategy-driven BUY gets via _execute_approved_signal.
 
-    Deliberately narrower than _execute_approved_signal's own BUY path: it
-    does not recompute ATR SL / arm native-stop protection / activate
-    trailing state, since those depend on the CURRENT candle's indicators,
-    which this call site (running ahead of any signal evaluation) has no
-    fresh read of. This is not a lasting protection gap — every existing
-    per-tick SL/TP and _resync_native_stop machinery already re-derives
-    sizing off the now-correct position on every subsequent cycle
-    regardless; a discovered BUY delta here correctly updates core
-    holdings/fees/ledger/capital-allocation immediately, only deferring
-    the exit-level (re)computation by at most one tick.
+    2026-09-19 PASS-6 review finding (P1): this used to leave protection
+    resizing to "existing per-tick machinery" — but the loop's only
+    unconditional-looking hook is a CONDITIONAL trailing-ACTIVATION swap
+    (fires once, only when ATR protection is off, trailing hasn't armed
+    yet, and price has moved enough to activate it). A static ATR stop
+    already active, a trailing stop already active, or trailing not yet
+    configured at all each skip that swap entirely — inventory could grow
+    (e.g. 0.001 BTC to 0.002 BTC) while the resting native stop still only
+    covered the OLD, smaller quantity, for an indefinite number of ticks.
+    Fixed: reconcile protection quantity HERE, immediately, using
+    whatever exit policy (static level or trailing) is ALREADY
+    established for this symbol — no fresh indicators needed, since this
+    is a QUANTITY-only resize of an already-known level, the exact same
+    cancel+replace _resync_native_stop already does for the partial-TP
+    case. A first recovered fill with NO prior protection at all
+    (position was flat) establishes the configured flat-STOP_LOSS_PCT
+    fallback explicitly — the same fallback the startup-reconciliation
+    block already uses for an analogous gap — rather than leaving the
+    position naked until some unrelated later event happens to arm one.
 
     order.side must be BUY.
     """
@@ -1504,6 +1516,44 @@ def _process_discovered_buy_fill(
     ss['sm'].on_fill(Signal.BUY, order.price)
     capital_pool.allocate(sym)   # no-op if this symbol already holds a slot
 
+    if cfg.exchange.native_stop_loss_enabled and hasattr(ss['executor'], 'sync_protective_stop'):
+        if ss.get('native_stop_price') or ss.get('native_stop_is_trailing'):
+            # Protection already established at some level (static ATR or
+            # trailing) — resize it to the new total quantity. Reuses
+            # _resync_native_stop's own existing static-vs-trailing
+            # dispatch, so an already-active trailing stop stays trailing
+            # and a static one stays at its own already-computed level.
+            _bf_discovered = _resync_native_stop(ss)
+        else:
+            _bf_fallback_sl = (
+                ss['pm'].avg_entry * (1 - cfg.backtest.stop_loss_pct)
+                if cfg.backtest.stop_loss_pct > 0 and ss['pm'].avg_entry > 0
+                else None
+            )
+            if _bf_fallback_sl:
+                ss['native_stop_price']       = _bf_fallback_sl
+                ss['native_stop_is_trailing'] = False
+                _bf_discovered = ss['executor'].sync_protective_stop(_bf_fallback_sl)
+            else:
+                _bf_discovered = []
+                logger.error(
+                    "RECOVERED BUY UNPROTECTED [%s]: no prior protection "
+                    "and STOP_LOSS_PCT=0 — cannot compute a fallback "
+                    "level.", sym,
+                )
+                alerter.error(
+                    f"RECOVERED BUY UNPROTECTED [{sym}]: a BUY fill was "
+                    f"recovered independently of a new signal, but no "
+                    f"native stop is resting and STOP_LOSS_PCT=0 prevents "
+                    f"a fallback — position is UNPROTECTED until a manual "
+                    f"order or config fix."
+                )
+        _process_discovered_sell_fills(
+            sym, ss, _bf_discovered, "native_stop_discovered",
+            capital_pool=capital_pool, risk=risk,
+            alerter=alerter, trade_log=trade_log,
+        )
+
     display.fill(order.side.value, order.quantity, sym, order.price, order.total_value, None)
     trade_log.log_fill(
         side          = "BUY",
@@ -1516,6 +1566,7 @@ def _process_discovered_buy_fill(
         fee_cost      = order.fee_cost,
         fee_currency  = order.fee_currency,
         exec_key      = order.exec_key,
+        order_id      = order.order_id,
     )
     if hasattr(ss['executor'], 'ack_journal_entry'):
         ss['executor'].ack_journal_entry(order.order_id)
@@ -3460,6 +3511,7 @@ def run():
                                         fee_cost      = _p_order.fee_cost,
                                         fee_currency  = _p_order.fee_currency,
                                         exec_key      = _p_order.exec_key,
+                                        order_id      = _p_order.order_id,
                                     )
                                     if hasattr(ss['executor'], 'ack_journal_entry'):
                                         ss['executor'].ack_journal_entry(_p_order.order_id)
@@ -3583,6 +3635,7 @@ def run():
                                     fee_cost      = _ic_order.fee_cost,
                                     fee_currency  = _ic_order.fee_currency,
                                     exec_key      = _ic_order.exec_key,
+                                    order_id      = _ic_order.order_id,
                                 )
                                 if hasattr(ss['executor'], 'ack_journal_entry'):
                                     ss['executor'].ack_journal_entry(_ic_order.order_id)

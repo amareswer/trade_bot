@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS fills (
     notes         TEXT,
     fee_cost      REAL    DEFAULT 0.0,
     fee_currency  TEXT    DEFAULT '',
-    exec_key      TEXT
+    exec_key      TEXT,
+    order_id      TEXT
 )
 """
 # Partial unique index (SQLite): only enforces uniqueness among NON-NULL/
@@ -104,6 +105,7 @@ class TradeLog:
         source:        str             = "",
         exec_key:      str             = "",
         timestamp:     Optional[str]   = None,
+        order_id:      str             = "",
     ) -> None:
         """
         exec_key (2026-09-18 follow-up review finding): pass a stable,
@@ -114,6 +116,17 @@ class TradeLog:
         persisted must not duplicate the row on a retried replay); ordinary
         fills leave it empty and are unaffected (multiple empty-exec_key
         rows are explicitly allowed — see the partial unique index).
+
+        order_id (2026-09-19 PASS-6 review finding, P1): the exchange/
+        executor order_id this fill came from (LiveExecutor's Order.order_id
+        — "native-stop:<id>" for a stop-triggered exit, the raw exchange id
+        otherwise). This is the persistent linkage live_comparison.py needs
+        to attribute a LATE fee_adjustment (logged separately, against the
+        SAME order_id) to the specific trade/inventory it actually belongs
+        to, instead of only being able to subtract it from a report-wide
+        total. Optional/blank for older call sites — those fills simply
+        can't receive a fee_adjustment attribution (there's nothing to
+        attribute to).
 
         timestamp: override the row's timestamp with an ISO string instead
         of "now" — for replaying a fill whose ORIGINAL execution time is
@@ -148,12 +161,12 @@ class TradeLog:
                     INSERT INTO fills
                         (timestamp, side, symbol, quantity, price, value,
                          pnl, exchange, signal_reason, risk_decision, notes,
-                         fee_cost, fee_currency, exec_key)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         fee_cost, fee_currency, exec_key, order_id)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (ts, side.upper(), symbol, quantity, price, value,
                      pnl, exchange, signal_reason, risk_decision, notes,
-                     fee_cost, fee_currency, exec_key or None),
+                     fee_cost, fee_currency, exec_key or None, order_id or None),
                 )
         except sqlite3.IntegrityError:
             # A concurrent/retried call raced this exact exec_key between
@@ -311,6 +324,9 @@ class TradeLog:
             if "exec_key" not in existing:
                 conn.execute("ALTER TABLE fills ADD COLUMN exec_key TEXT")
                 logger.info("TradeLog: migrated — added exec_key column")
+            if "order_id" not in existing:
+                conn.execute("ALTER TABLE fills ADD COLUMN order_id TEXT")
+                logger.info("TradeLog: migrated — added order_id column")
             conn.execute(_CREATE_EXEC_KEY_INDEX)
             conn.execute(_CREATE_FEE_ADJUSTMENTS)
             conn.execute(_CREATE_FEE_ADJUSTMENTS_INDEX)

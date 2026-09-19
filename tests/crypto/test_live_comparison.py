@@ -22,9 +22,10 @@ def db(tmp_path):
     return str(tmp_path / "trades.db")
 
 
-def _fill(tl, side, qty, price, *, pnl=None, fee_cost=0.0, fee_currency="CAD", symbol="BTC/CAD"):
+def _fill(tl, side, qty, price, *, pnl=None, fee_cost=0.0, fee_currency="CAD",
+          symbol="BTC/CAD", order_id=""):
     tl.log_fill(side, symbol, qty, price, pnl=pnl, exchange="kraken",
-                fee_cost=fee_cost, fee_currency=fee_currency)
+                fee_cost=fee_cost, fee_currency=fee_currency, order_id=order_id)
 
 
 def test_quote_ccy_extracts_quote_from_symbol():
@@ -180,3 +181,115 @@ def test_print_report_does_not_raise_with_fee_data(db, capsys):
     out = capsys.readouterr().out
     assert "net" in out.lower()
     assert "GROSS-only" in out   # the stale-baseline warning fired
+
+
+# ---------------------------------------------------------------------------
+# PASS-6 review finding (P1): fee_adjustments (a late correction, logged
+# separately from the fill) were computed and stored but never consumed by
+# this report.
+# ---------------------------------------------------------------------------
+
+def test_load_fee_adjustments_empty_when_no_table(db):
+    """A DB predating this feature (schema never created) must return {}
+    rather than raise."""
+    import sqlite3
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE fills (id INTEGER PRIMARY KEY)")
+    conn.commit()
+    conn.close()
+    assert lc._load_fee_adjustments(db) == {}
+
+
+def test_load_fee_adjustments_sums_by_order_id(db):
+    tl = TradeLog(db_path=db)
+    tl.log_fee_adjustment("order-1", "BTC/CAD", 2.0, "CAD", adjustment_id="adj-1")
+    tl.log_fee_adjustment("order-1", "BTC/CAD", 0.5, "CAD", adjustment_id="adj-2")
+    tl.log_fee_adjustment("order-2", "BTC/CAD", 1.0, "CAD", adjustment_id="adj-3")
+
+    adjustments = lc._load_fee_adjustments(db)
+
+    assert adjustments == {"order-1": pytest.approx(2.5), "order-2": pytest.approx(1.0)}
+
+
+def test_stored_fee_adjustment_flips_a_reported_win_to_a_loss(db):
+    """PASS-6 review finding (P1), EXACT reproduction: BUY $100 fee $0,
+    SELL $101 fee $0 (gross win +$1), then a stored $2 SELL fee
+    adjustment. The correct net result is -$1 with a LOSS classification.
+    The un-fixed report returned net P&L +$1 and win rate 100%."""
+    tl = TradeLog(db_path=db)
+    _fill(tl, "BUY",  1.0, 100.0, order_id="buy-1")
+    _fill(tl, "SELL", 1.0, 101.0, pnl=1.0, order_id="sell-1")
+    tl.log_fee_adjustment("sell-1", "BTC/CAD", 2.0, "CAD", adjustment_id="adj-1")
+
+    fills       = lc._load_fills(db)
+    adjustments = lc._load_fee_adjustments(db)
+    metrics     = lc._compute_live_metrics(fills, adjustments)
+
+    assert metrics["net_pnl"] == pytest.approx(-1.0)
+    assert metrics["win_rate"] == 0.0   # the ONE trade is now a net LOSS
+    assert metrics["unattributed_fee_adjustments"] == pytest.approx(0.0)
+
+
+def test_fee_adjustment_on_buy_allocates_into_entry_fee_pool(db):
+    """A BUY-side fee adjustment must flow into the entry-fee pool exactly
+    like the BUY's own original fee would — reducing the net pnl of
+    whatever SELL(s) later close that inventory, via the SAME FIFO
+    allocation already used for ordinary entry fees."""
+    tl = TradeLog(db_path=db)
+    _fill(tl, "BUY",  1.0, 100.0, order_id="buy-1")
+    tl.log_fee_adjustment("buy-1", "BTC/CAD", 1.5, "CAD", adjustment_id="adj-1")
+    _fill(tl, "SELL", 1.0, 105.0, pnl=5.0, order_id="sell-1")
+
+    fills       = lc._load_fills(db)
+    adjustments = lc._load_fee_adjustments(db)
+    metrics     = lc._compute_live_metrics(fills, adjustments)
+
+    assert metrics["net_pnl"] == pytest.approx(5.0 - 1.5)
+
+
+def test_fee_adjustment_replay_idempotent_does_not_double_count(db):
+    """Reading the SAME adjustment_id twice (e.g. a replay after an
+    incomplete ack) must never double-count — log_fee_adjustment's own
+    idempotency, exercised end-to-end through this report."""
+    tl = TradeLog(db_path=db)
+    _fill(tl, "BUY",  1.0, 100.0, order_id="buy-1")
+    _fill(tl, "SELL", 1.0, 101.0, pnl=1.0, order_id="sell-1")
+    tl.log_fee_adjustment("sell-1", "BTC/CAD", 2.0, "CAD", adjustment_id="adj-1")
+    tl.log_fee_adjustment("sell-1", "BTC/CAD", 2.0, "CAD", adjustment_id="adj-1")   # replay
+
+    fills       = lc._load_fills(db)
+    adjustments = lc._load_fee_adjustments(db)
+    metrics     = lc._compute_live_metrics(fills, adjustments)
+
+    assert metrics["net_pnl"] == pytest.approx(-1.0)   # not -3.0
+
+
+def test_unattributed_fee_adjustment_reported_not_silently_dropped(db):
+    """An adjustment whose order_id matches no loaded fill (shouldn't
+    normally happen) must be surfaced, not silently discarded — a gap in
+    the figures above must be visible, not hidden."""
+    tl = TradeLog(db_path=db)
+    _fill(tl, "BUY",  1.0, 100.0, order_id="buy-1")
+    _fill(tl, "SELL", 1.0, 101.0, pnl=1.0, order_id="sell-1")
+    tl.log_fee_adjustment("orphan-order", "BTC/CAD", 3.0, "CAD", adjustment_id="adj-1")
+
+    fills       = lc._load_fills(db)
+    adjustments = lc._load_fee_adjustments(db)
+    metrics     = lc._compute_live_metrics(fills, adjustments)
+
+    assert metrics["net_pnl"] == pytest.approx(1.0)    # unaffected — nothing to attribute to
+    assert metrics["unattributed_fee_adjustments"] == pytest.approx(3.0)
+
+
+def test_main_wires_fee_adjustments_into_metrics(db, monkeypatch, capsys):
+    """End-to-end: main() must actually load and pass fee_adjustments
+    through — not just have the helper function exist unused."""
+    tl = TradeLog(db_path=db)
+    _fill(tl, "BUY",  1.0, 100.0, order_id="buy-1")
+    _fill(tl, "SELL", 1.0, 101.0, pnl=1.0, order_id="sell-1")
+    tl.log_fee_adjustment("sell-1", "BTC/CAD", 2.0, "CAD", adjustment_id="adj-1")
+
+    monkeypatch.setattr("sys.argv", ["live_comparison.py", "--db", db, "--min_trades", "1"])
+    lc.main()
+    out = capsys.readouterr().out
+    assert "-$1.00" in out or "-1.00" in out or "$-1.00" in out

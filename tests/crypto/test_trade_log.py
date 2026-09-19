@@ -51,10 +51,10 @@ def test_recent_column_count_matches_schema(tl):
     the table actually has — not a stale count."""
     tl.log_fill("BUY", "BTC/CAD", 0.001, 90_000.0, exchange="kraken")
     row = tl.recent()[0]
-    assert len(row) == 15   # id, timestamp, side, symbol, quantity, price,
+    assert len(row) == 16   # id, timestamp, side, symbol, quantity, price,
                              # value, pnl, exchange, signal_reason,
                              # risk_decision, notes, fee_cost, fee_currency,
-                             # exec_key
+                             # exec_key, order_id
 
 
 def test_recent_respects_limit_and_order(tl):
