@@ -1211,7 +1211,8 @@ class LiveExecutor:
         cost_basis_override: "float | None" = None,
         advance_tracked_baseline: bool = True,
         apply_as_live_fill: bool = False,
-    ) -> "Order | None":
+        checkpoint_qty_cap: "float | None" = None,
+    ) -> "tuple[Order | None, float | None]":
         """PASS-6/PASS-7 review findings (P1/P0): compares the order's
         CURRENT cumulative filled/cost/fee against a baseline — any
         positive delta is a real execution that happened but was never
@@ -1244,31 +1245,50 @@ class LiveExecutor:
         docstring — required whenever _sync_position() may already have
         zeroed self._portfolio._cost_basis before this runs.
 
-        apply_as_live_fill (PASS-9 review finding, P1, finding 1): the
-        cash-free journal path below is only correct for a delta the
-        executor's own startup balance sync (_sync_cash()/_sync_position(),
-        which run exactly once, in __init__) already reflects. A queued
-        historical order can keep executing WHILE THIS PROCESS RUNS —
-        every subsequent tick's reconcile_pending_orders() retries it, and
-        nothing re-syncs cash/position between ticks. A delta discovered
-        there is genuinely new and must be applied as a live fill (cash/
-        position mutated, an Order returned for the normal PositionManager/
-        state-machine/capital-pool consumer) instead of journaled cash-free
-        — otherwise it silently vanishes from executor cash/inventory even
-        though it's fully journaled. Reproduced exactly: a queued order
-        that later fills 0.001 more BTC while the bot keeps running left
-        executor cash at $1,000.00 and position at 0.002 instead of the
-        real $1,077.84 / 0.001, with zero discovered fills returned to the
-        caller. True at __init__ time (_verify_resting_stop_on_startup(),
-        apply_as_live_fill=False, the default): cash-free is correct,
-        exactly as before. During an ordinary tick's
-        reconcile_pending_orders() (apply_as_live_fill=True): both a new
-        quantity delta AND a fee-only delta must be applied live — a fee
-        that finalizes after the one-time startup sync is just as real and
-        just as unrecorded as a fresh fill quantity (reproduced separately:
-        a fee finalizing from $0 to $0.36 purely post-startup, with no new
-        quantity, left executor cash $0.36 too high with the fee correctly
-        journaled but never actually deducted)."""
+        apply_as_live_fill (PASS-9 review finding, P1, finding 1; scope
+        narrowed by PASS-10 finding 1 — see checkpoint_qty_cap below):
+        governs ONLY a FEE-ONLY correction (no accompanying new quantity)
+        now. True (an ordinary tick's reconcile_pending_orders()) applies
+        it as a live cash deduction — a fee finalizing after the one-time
+        startup sync is a real, not-yet-applied cash movement. False (the
+        default — a call happening as part of the executor's own one-time
+        startup sync window) keeps it cash-free, matching the exchange
+        balance the just-completed sync already read. A caller-mode
+        boolean CANNOT decide this for fee-only corrections either way
+        with certainty — it is a pragmatic default for a dimension this
+        file has no exact way to bound (see checkpoint_qty_cap for why
+        quantity, unlike fee, CAN be bounded exactly).
+
+        checkpoint_qty_cap (PASS-10 review finding, P0, finding 1): PASS-9
+        chose cash-free vs. live for a QUANTITY delta using the SAME
+        apply_as_live_fill caller-mode flag — wrong, because "which
+        method called this" says nothing about "did this specific
+        execution happen before or after the balance checkpoint". A fill
+        that happened OFFLINE, before this restart's own _sync_cash()/
+        _sync_position() ever ran, can still surface only on a LATER tick
+        (its own fetch_order kept failing at startup) — apply_as_live_fill
+        would then be True (a tick context) even though the checkpoint
+        ALREADY paid for it, double-applying $78 of already-synced
+        proceeds. Reproduced exactly: order fills 0.001 BTC @ $78,000
+        entirely offline; the checkpoint correctly reads $1,077.84/0.001;
+        a delayed successful lookup (via reconcile_pending_orders(), not
+        _verify_resting_stop_on_startup()) then re-applied that same
+        $77.84 net effect on top of the checkpoint, landing on
+        $1,155.68/0 instead of the unchanged, already-correct
+        $1,077.84/0.001.
+
+        Quantity CAN be bounded exactly, unlike fee: pass the precise
+        MAXIMUM quantity (beyond baseline_filled) that a checkpoint
+        already accounts for — computed by the caller as the actual
+        confirmed drop in position across _sync_position() (see
+        _queue_unresolved_stop_recovery's own docstring). None means
+        unbounded (checkpoint-covered no matter what — the flat-position
+        caller). Any new_delta beyond this cap is provably NEW,
+        post-checkpoint activity, regardless of apply_as_live_fill. A
+        SINGLE delta can straddle the boundary (part checkpoint-covered,
+        part new) — split proportionally by quantity share, matching this
+        file's existing partial-fill fee-allocation convention, so a
+        crash landing exactly mid-fill doesn't misattribute either half."""
         _bf   = self._native_stop_last_recorded_filled if baseline_filled is None else baseline_filled
         _bc   = self._native_stop_last_recorded_cost   if baseline_cost   is None else baseline_cost
         _bfee = self._native_stop_last_recorded_fee    if baseline_fee   is None else baseline_fee
@@ -1283,20 +1303,36 @@ class LiveExecutor:
         delta_cost = max(0.0, cumulative_cost - _bc)
         delta_fee  = max(0.0, cumulative_fee  - _bfee)
         fee_currency = (order.get("fee") or {}).get("currency", "") or self.symbol.split("/")[1]
+        order_id_str = str(order.get("id", ""))
 
         discovered_order: "Order | None" = None
+        remaining_cap = checkpoint_qty_cap
         if new_delta > 0:
             delta_price = delta_cost / new_delta if new_delta > 0 else 0.0
-            if apply_as_live_fill:
-                discovered_order = self._record_live_stop_execution_delta(
-                    str(order.get("id", "")), new_delta, delta_price, delta_fee, fee_currency,
-                    cost_basis=cost_basis_override,
-                )
+            if checkpoint_qty_cap is None:
+                # Unbounded — this order's ENTIRE remaining execution is
+                # provably checkpoint-covered (the flat-position caller:
+                # position hit exactly zero, which structurally cannot
+                # happen without this order's full remaining size already
+                # having executed before the checkpoint ran).
+                covered_qty = new_delta
             else:
+                covered_qty = min(new_delta, max(0.0, checkpoint_qty_cap))
+            live_qty = new_delta - covered_qty
+            covered_fee = delta_fee * (covered_qty / new_delta)
+            live_fee    = delta_fee - covered_fee
+            if covered_qty > 0:
                 self._journal_native_stop_execution_without_cash_effect(
-                    str(order.get("id", "")), new_delta, delta_price, delta_fee, fee_currency,
+                    order_id_str, covered_qty, delta_price, covered_fee, fee_currency,
                     cost_basis=cost_basis_override,
                 )
+            if live_qty > 0:
+                discovered_order = self._record_live_stop_execution_delta(
+                    order_id_str, live_qty, delta_price, live_fee, fee_currency,
+                    cost_basis=cost_basis_override,
+                )
+            if checkpoint_qty_cap is not None:
+                remaining_cap = max(0.0, checkpoint_qty_cap - covered_qty)
         elif delta_fee > 0:
             # PASS-7 review finding (P1, finding 3): a fee finalized while
             # offline, with the FILLED QUANTITY unchanged, used to just
@@ -1309,14 +1345,14 @@ class LiveExecutor:
             # DURING a live tick is a real, not-yet-applied cash movement.
             if apply_as_live_fill:
                 self._apply_native_stop_fee_only_adjustment(
-                    str(order.get("id", "")), delta_fee, fee_currency,
+                    order_id_str, delta_fee, fee_currency,
                 )
             else:
                 _quote = self.symbol.split("/")[1]
                 if fee_currency == _quote:
                     self._fees_paid += delta_fee
                 self._record_fee_adjustment_journal_entry(
-                    f"native-stop:{order.get('id', '')}", delta_fee, fee_currency,
+                    f"native-stop:{order_id_str}", delta_fee, fee_currency,
                 )
 
         if advance_tracked_baseline:
@@ -1324,7 +1360,7 @@ class LiveExecutor:
             self._native_stop_last_recorded_cost   = cumulative_cost
             self._native_stop_last_recorded_fee    = cumulative_fee
 
-        return discovered_order
+        return discovered_order, remaining_cap
 
     def _resolve_pending_protect_submission_at_startup(self) -> None:
         """PASS-6 review finding (P1): ordinary buy/sell startup recovery
@@ -1424,6 +1460,7 @@ class LiveExecutor:
     def _queue_unresolved_stop_recovery(
         self, order_id: str, cost_basis: "float | None",
         baseline_filled: float, baseline_cost: float, baseline_fee: float,
+        checkpoint_qty_cap: "float | None" = None,
     ) -> None:
         """PASS-8 review finding (P1, finding 3): add or UPDATE (never
         silently overwrite a DIFFERENT order's entry) a historical
@@ -1435,18 +1472,38 @@ class LiveExecutor:
         unresolved) — permanently losing the first one's recovery.
         Reproduced exactly: O1 (0.001 @ $78,000, -$7) queued unresolved,
         then O2 (0.0005 @ $78,000, -$3.50) ALSO queued — the single-slot
-        design retained only O2, permanently losing O1's $7 loss."""
+        design retained only O2, permanently losing O1's $7 loss.
+
+        checkpoint_qty_cap (PASS-10 review finding, P0, finding 1): how
+        much of this order's EVENTUAL cumulative filled quantity, beyond
+        baseline_filled, is PROVABLY already reflected in a balance
+        checkpoint (_sync_cash()/_sync_position()) — independent of
+        whether/when we ever successfully read the order's own state
+        again. None means unbounded (the flat-position caller: a position
+        that reached exactly zero PROVES the order's entire remaining
+        size already executed — it structurally cannot grow any further,
+        so every bit of it is checkpoint-covered forever, no matter how
+        long its own lookup keeps failing). A finite value (the
+        still-open/"gone" caller) is the exact quantity the position
+        dropped by, confirmed via _sync_position() — this order can never
+        be credited more than that as checkpoint-covered; any further
+        cumulative growth beyond it is provably NEW, post-checkpoint
+        activity. See _recover_missed_native_stop_execution's own
+        docstring for why a caller-mode boolean alone (PASS-9's
+        apply_as_live_fill) cannot answer this for the QUANTITY
+        dimension — only an exact, provable bound can."""
         for entry in self._unresolved_stop_recoveries:
             if entry.get("order_id") == order_id:
                 entry.update({
                     "cost_basis": cost_basis, "baseline_filled": baseline_filled,
                     "baseline_cost": baseline_cost, "baseline_fee": baseline_fee,
+                    "checkpoint_qty_cap": checkpoint_qty_cap,
                 })
                 return
         self._unresolved_stop_recoveries.append({
             "order_id": order_id, "cost_basis": cost_basis,
             "baseline_filled": baseline_filled, "baseline_cost": baseline_cost,
-            "baseline_fee": baseline_fee,
+            "baseline_fee": baseline_fee, "checkpoint_qty_cap": checkpoint_qty_cap,
         })
 
     def _reconcile_historical_stop_order(
@@ -1454,7 +1511,8 @@ class LiveExecutor:
         baseline_filled: float, baseline_cost: float, baseline_fee: float,
         cost_basis: "float | None",
         apply_as_live_fill: bool = False,
-    ) -> "tuple[str, Order | None]":
+        checkpoint_qty_cap: "float | None" = None,
+    ) -> "tuple[str, Order | None, float | None]":
         """PASS-8 review finding (P1, finding 2 — the shared classification
         every startup/retry entry point must agree on): recovers any
         missed fill/fee delta for a HISTORICAL order — one that is NOT
@@ -1462,7 +1520,7 @@ class LiveExecutor:
         GIVEN baseline/cost_basis (never the shared
         self._native_stop_last_recorded_*/self._portfolio._cost_basis,
         which may by now belong to an entirely different order). Returns
-        (classification, discovered_order):
+        (classification, discovered_order, remaining_checkpoint_qty_cap):
 
           "terminal"   — confirmed closed/canceled/rejected/expired. Fully
                          resolved; safe for the caller to stop tracking or
@@ -1474,29 +1532,32 @@ class LiveExecutor:
           "unknown"    — status couldn't be confidently classified. Same
                          "do not abandon" treatment as still_open.
 
-        apply_as_live_fill (PASS-9 review finding, P1, finding 1): False
-        (default) keeps the cash-free treatment appropriate for a call
-        happening as part of the executor's own one-time startup sync
-        window. True routes any discovered delta through the live,
-        cash-mutating path instead — pass this ONLY from a genuinely
-        post-startup context (an ordinary tick's
-        reconcile_pending_orders()), never from _verify_resting_stop_on_
-        startup() itself. discovered_order is the Order to route through
-        the normal bookkeeping consumer when apply_as_live_fill=True and
-        a quantity delta was found; None otherwise (a fee-only delta
-        never fabricates an Order, matching _apply_ordinary_order_fee_
-        only_adjustment's convention elsewhere in this file)."""
-        discovered_order = self._recover_missed_native_stop_execution(
+        apply_as_live_fill / checkpoint_qty_cap: see
+        _recover_missed_native_stop_execution's own docstring (PASS-9
+        finding 1, scope narrowed by PASS-10 finding 1) — apply_as_live_fill
+        now governs ONLY a fee-only correction; a quantity delta is
+        governed by checkpoint_qty_cap instead, an exact provable bound
+        rather than a caller-mode guess. discovered_order is the Order to
+        route through the normal bookkeeping consumer for whatever
+        portion of a quantity delta falls BEYOND the cap (or the entire
+        delta, if apply_as_live_fill applied a live fee-only correction —
+        that branch never fabricates an Order, matching
+        _apply_ordinary_order_fee_only_adjustment's convention elsewhere
+        in this file). remaining_checkpoint_qty_cap is the caller's
+        updated cap to persist back onto its own entry (unchanged/None
+        passthrough when no quantity delta was found this call)."""
+        discovered_order, remaining_cap = self._recover_missed_native_stop_execution(
             order, baseline_filled=baseline_filled, baseline_cost=baseline_cost,
             baseline_fee=baseline_fee, cost_basis_override=cost_basis,
             advance_tracked_baseline=False, apply_as_live_fill=apply_as_live_fill,
+            checkpoint_qty_cap=checkpoint_qty_cap,
         )
         status = str(order.get("status") or "").lower()
         if status in _CANCELLED_TERMINAL_STATUSES:
-            return "terminal", discovered_order
+            return "terminal", discovered_order, remaining_cap
         if status == "open":
-            return "still_open", discovered_order
-        return "unknown", discovered_order
+            return "still_open", discovered_order, remaining_cap
+        return "unknown", discovered_order, remaining_cap
 
     def _recover_flat_native_stop_at_startup(self) -> None:
         """PASS-7 review finding (P0): the position is ALREADY flat (0) by
@@ -1545,12 +1606,18 @@ class LiveExecutor:
                 self._native_stop_last_recorded_filled,
                 self._native_stop_last_recorded_cost,
                 self._native_stop_last_recorded_fee,
+                # Unbounded (PASS-10 finding 1): the position is ALREADY
+                # confirmed flat, which PROVES this order's entire
+                # remaining size executed before this checkpoint — it
+                # structurally cannot grow any further, so no future
+                # resolution of it (however delayed) can ever be "new".
+                checkpoint_qty_cap=None,
             )
             self._clear_native_stop_tracking_fields()
             self._save_state()
             return
 
-        classification, _ = self._reconcile_historical_stop_order(
+        classification, _, _ = self._reconcile_historical_stop_order(
             final_order,
             baseline_filled=self._native_stop_last_recorded_filled,
             baseline_cost=self._native_stop_last_recorded_cost,
@@ -1605,17 +1672,24 @@ class LiveExecutor:
         order's current cumulative state (so a later retry's delta isn't
         double-counted) and it stays queued.
 
-        live (PASS-9 review finding, P1, finding 1): False when called
-        from _verify_resting_stop_on_startup() (this executor's own
-        one-time balance sync just ran, so a recovered delta is correctly
-        cash-free) — True when called from reconcile_pending_orders()
-        during an ordinary tick, where nothing re-syncs cash/position, so
-        any delta discovered here is genuinely new and must be applied
-        live. Returns every discovered Order (empty list when live=False,
-        since a cash-free recovery never fabricates one to route
-        onward) — the caller must route each through the same
-        PositionManager/state-machine/capital-pool/risk/trade-log
-        consumer any other discovered fill gets."""
+        live (PASS-9 review finding, P1, finding 1; scope narrowed by
+        PASS-10 finding 1): now governs ONLY a fee-only correction (no
+        accompanying new quantity) — False when called from
+        _verify_resting_stop_on_startup() (this executor's own one-time
+        balance sync just ran, so a fee-only delta is presumed already
+        covered by it), True when called from reconcile_pending_orders()
+        during an ordinary tick (nothing re-syncs cash/position since
+        then, so a fee-only delta discovered here is presumed genuinely
+        new). A QUANTITY delta is decided by each entry's OWN
+        checkpoint_qty_cap instead (an exact, provable bound — see
+        _queue_unresolved_stop_recovery's docstring), independent of this
+        flag or of which call site is retrying it: a caller-mode boolean
+        alone cannot tell whether a specific execution happened before or
+        after the checkpoint, only how much of it provably did. Returns
+        every discovered Order (the portion of a quantity delta, if any,
+        that fell beyond its cap) — the caller must route each through
+        the same PositionManager/state-machine/capital-pool/risk/
+        trade-log consumer any other discovered fill gets."""
         discovered: "list[Order]" = []
         if not self._unresolved_stop_recoveries:
             return discovered
@@ -1635,13 +1709,14 @@ class LiveExecutor:
                 )
                 still_pending.append(entry)
                 continue
-            classification, discovered_order = self._reconcile_historical_stop_order(
+            classification, discovered_order, remaining_cap = self._reconcile_historical_stop_order(
                 final_order,
                 baseline_filled=entry.get("baseline_filled", 0.0),
                 baseline_cost=entry.get("baseline_cost", 0.0),
                 baseline_fee=entry.get("baseline_fee", 0.0),
                 cost_basis=entry.get("cost_basis"),
                 apply_as_live_fill=live,
+                checkpoint_qty_cap=entry.get("checkpoint_qty_cap"),
             )
             if discovered_order is not None:
                 discovered.append(discovered_order)
@@ -1656,8 +1731,9 @@ class LiveExecutor:
                 if _c <= 0:
                     _avg = float(final_order.get("average") or final_order.get("price") or 0.0)
                     _c = _avg * entry["baseline_filled"]
-                entry["baseline_cost"] = _c
-                entry["baseline_fee"]  = float((final_order.get("fee") or {}).get("cost") or 0.0)
+                entry["baseline_cost"]       = _c
+                entry["baseline_fee"]        = float((final_order.get("fee") or {}).get("cost") or 0.0)
+                entry["checkpoint_qty_cap"]  = remaining_cap
                 still_pending.append(entry)
         self._unresolved_stop_recoveries = still_pending
         self._save_state()
@@ -1852,17 +1928,28 @@ class LiveExecutor:
                 # self._portfolio._cost_basis has NOT been zeroed by
                 # _sync_position() — safe to capture directly, independent
                 # of the currently-tracked slot (cleared below regardless).
+                #
+                # checkpoint_qty_cap (PASS-10 finding 1): the exact
+                # quantity _sync_position() confirmed the position already
+                # dropped by, this restart — this order (the sole
+                # possible seller) can never be credited more than this
+                # as checkpoint-covered, no matter how many later ticks
+                # its own lookup keeps failing across before finally
+                # resolving.
                 self._queue_unresolved_stop_recovery(
                     _order_id, self._portfolio._cost_basis,
                     self._native_stop_last_recorded_filled,
                     self._native_stop_last_recorded_cost,
                     self._native_stop_last_recorded_fee,
+                    checkpoint_qty_cap=max(
+                        0.0, self._startup_recovery_position - self._portfolio.position,
+                    ),
                 )
                 self._clear_native_stop_tracking_fields()
                 self._save_state()
                 return
             if _final_order is not None:
-                classification, _ = self._reconcile_historical_stop_order(
+                classification, _, _ = self._reconcile_historical_stop_order(
                     _final_order,
                     baseline_filled=self._native_stop_last_recorded_filled,
                     baseline_cost=self._native_stop_last_recorded_cost,
@@ -1945,14 +2032,28 @@ class LiveExecutor:
         # the queue kept retrying it cash-free while active tracking
         # (_cancel_native_stop) ALSO independently discovered and booked
         # its own delta from a SEPARATE (zero) baseline — the same future
-        # fill got journaled twice. Reproduced exactly: a single 0.001 BTC
-        # partial fill produced two "native-stop:O1" journal entries and
-        # double-counted -$14 realized P&L instead of the true -$7.
-        # Fixed: transfer sole ownership to active tracking — seed THIS
-        # order's baseline from the recovery entry's own frozen progress
-        # (what's already been accounted for) instead of the order's raw
-        # current cumulative fields, and drop the queue entry so only one
-        # cursor ever tracks this order going forward.
+        # fill got journaled twice.
+        #
+        # PASS-10 review finding (P0, finding 1, reproduction B): the
+        # first fix (seed the new cursor from the queue entry's OWN
+        # frozen — usually zero — baseline) traded the double-booking bug
+        # for a double-APPLICATION bug: it treated the entry's already-
+        # checkpoint-covered fill as if none of it had ever been
+        # recovered, so a later _cancel_native_stop() delta computed
+        # against that stale zero baseline re-applied cash/position on
+        # top of what BOTH restarts' own _sync_cash()/_sync_position()
+        # calls had already correctly reflected — landing on $1,155.68/0
+        # instead of the correct, unchanged $1,077.84/0.001.
+        #
+        # Fixed: recover the entry's own pending delta HERE, through the
+        # exact same checkpoint-cap-aware split every other recovery path
+        # uses (cash-free up to what the entry's cap proves is already
+        # covered, live for anything beyond it — routed onward via the
+        # discovered-fills queue, since adoption has no direct return
+        # path of its own), THEN seed the new active cursor from the
+        # order's CURRENT actual state — never from the entry's stale
+        # baseline — so anything this order does from this point forward
+        # is unambiguously new to _cancel_native_stop().
         _merged_entry = None
         for _entry in list(self._unresolved_stop_recoveries):
             if _entry.get("order_id") == order_id:
@@ -1961,35 +2062,44 @@ class LiveExecutor:
                 break
 
         if _merged_entry is not None:
-            self._native_stop_last_recorded_filled = float(_merged_entry.get("baseline_filled", 0.0))
-            self._native_stop_last_recorded_cost   = float(_merged_entry.get("baseline_cost", 0.0))
-            self._native_stop_last_recorded_fee    = float(_merged_entry.get("baseline_fee", 0.0))
+            _discovered_order, _ = self._recover_missed_native_stop_execution(
+                order,
+                baseline_filled=_merged_entry.get("baseline_filled", 0.0),
+                baseline_cost=_merged_entry.get("baseline_cost", 0.0),
+                baseline_fee=_merged_entry.get("baseline_fee", 0.0),
+                cost_basis_override=_merged_entry.get("cost_basis"),
+                advance_tracked_baseline=False,
+                apply_as_live_fill=False,
+                checkpoint_qty_cap=_merged_entry.get("checkpoint_qty_cap"),
+            )
+            if _discovered_order is not None:
+                self._pending_discovered_fills.append(_discovered_order)
             logger.warning(
                 "NATIVE STOP RECOVERY MERGED [%s]: order %s was both "
                 "queued for historical recovery and independently "
-                "discovered resting on the exchange — merged into a "
-                "single tracking cursor (baseline filled=%.8f) instead "
-                "of letting both paths double-book any future fill.",
-                self.symbol, order_id, self._native_stop_last_recorded_filled,
+                "discovered resting on the exchange — recovered its "
+                "pending delta and merged into a single tracking cursor "
+                "instead of letting both paths double-book any future "
+                "fill.", self.symbol, order_id,
             )
-        else:
-            # Seed from whatever this order already shows filled/cost/fee
-            # at adoption time — any fill that happened before we started
-            # tracking it this session is not ours to invent accounting
-            # for; only NEW fill observed from this point forward should
-            # ever be recorded (2026-09-18 PASS-3 review finding: cost/fee
-            # must be seeded together with quantity, or the first NEW
-            # delta recorded after adoption would wrongly treat this
-            # order's entire pre-adoption cumulative cost/fee as if it
-            # were that one delta's).
-            _seed_filled = float(order.get("filled") or 0.0)
-            _seed_cost   = float(order.get("cost") or 0.0)
-            if _seed_cost <= 0:
-                _seed_avg = float(order.get("average") or order.get("price") or 0.0)
-                _seed_cost = _seed_avg * _seed_filled
-            self._native_stop_last_recorded_filled = _seed_filled
-            self._native_stop_last_recorded_cost   = _seed_cost
-            self._native_stop_last_recorded_fee    = float((order.get("fee") or {}).get("cost") or 0.0)
+
+        # Seed from whatever this order CURRENTLY shows filled/cost/fee —
+        # whether freshly adopted or just merged above, any fill up to
+        # and including right now is not ours to invent NEW accounting
+        # for a second time; only fill observed from this point forward
+        # should ever be recorded (2026-09-18 PASS-3 review finding:
+        # cost/fee must be seeded together with quantity, or the first
+        # NEW delta recorded after adoption would wrongly treat this
+        # order's entire pre-adoption cumulative cost/fee as if it were
+        # that one delta's).
+        _seed_filled = float(order.get("filled") or 0.0)
+        _seed_cost   = float(order.get("cost") or 0.0)
+        if _seed_cost <= 0:
+            _seed_avg = float(order.get("average") or order.get("price") or 0.0)
+            _seed_cost = _seed_avg * _seed_filled
+        self._native_stop_last_recorded_filled = _seed_filled
+        self._native_stop_last_recorded_cost   = _seed_cost
+        self._native_stop_last_recorded_fee    = float((order.get("fee") or {}).get("cost") or 0.0)
 
         logger.warning(
             "NATIVE STOP ADOPTED [%s]: found untracked resting %s order %s "

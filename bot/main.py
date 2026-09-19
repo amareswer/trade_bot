@@ -1516,6 +1516,50 @@ def _process_discovered_buy_fill(
     ss['sm'].on_fill(Signal.BUY, order.price)
     capital_pool.allocate(sym)   # no-op if this symbol already holds a slot
 
+    # PASS-10 review finding (P1): commit this BUY's own trade_log row
+    # BEFORE resyncing protection below can discover (and journal) an
+    # immediately-following SELL. trade_log rows are read back in
+    # INSERTION order (SELECT ... ORDER BY id), and live_comparison.py's
+    # entry-fee allocation walks that same order, treating each symbol's
+    # BUYs as a pending fee pool a LATER SELL draws from. Writing the
+    # derivative SELL first put its row ahead of the BUY that must
+    # economically precede it — the SELL's allocation then saw no pending
+    # BUY fee yet (permanently unallocated, reported as
+    # unallocated_buy_fees) and the round trip was scored as a pure win
+    # net of only its own exit fee. Reproduced exactly: BUY qty 1 @ $100
+    # fee $0.80, an immediate full protective SELL qty 1 @ $101 fee $0.40
+    # — correct round-trip net P&L is -$0.20 / 0% win rate; the old
+    # ordering reported +$0.60 / 100% win rate with $0.80 unallocated.
+    # Do NOT delay the protective-stop sync itself to fix this — a real
+    # position must still be protected as soon as possible; only the
+    # DURABLE LEDGER write order needed to change.
+    display.fill(order.side.value, order.quantity, sym, order.price, order.total_value, None)
+    trade_log.log_fill(
+        side          = "BUY",
+        symbol        = sym,
+        quantity      = order.quantity,
+        price         = order.price,
+        pnl           = None,
+        exchange      = cfg.exchange.exchange,
+        signal_reason = reason,
+        fee_cost      = order.fee_cost,
+        fee_currency  = order.fee_currency,
+        exec_key      = order.exec_key,
+        order_id      = order.order_id,
+    )
+    if hasattr(ss['executor'], 'ack_journal_entry'):
+        ss['executor'].ack_journal_entry(order.order_id)
+    alerter.fill(
+        side        = "BUY",
+        symbol      = sym,
+        quantity    = order.quantity,
+        price       = order.price,
+        total_value = order.total_value,
+        pnl         = None,
+        exchange    = cfg.exchange.exchange,
+        reason      = reason,
+    )
+
     if cfg.exchange.native_stop_loss_enabled and hasattr(ss['executor'], 'sync_protective_stop'):
         if ss.get('native_stop_price') or ss.get('native_stop_is_trailing'):
             # Protection already established at some level (static ATR or
@@ -1553,33 +1597,6 @@ def _process_discovered_buy_fill(
             capital_pool=capital_pool, risk=risk,
             alerter=alerter, trade_log=trade_log,
         )
-
-    display.fill(order.side.value, order.quantity, sym, order.price, order.total_value, None)
-    trade_log.log_fill(
-        side          = "BUY",
-        symbol        = sym,
-        quantity      = order.quantity,
-        price         = order.price,
-        pnl           = None,
-        exchange      = cfg.exchange.exchange,
-        signal_reason = reason,
-        fee_cost      = order.fee_cost,
-        fee_currency  = order.fee_currency,
-        exec_key      = order.exec_key,
-        order_id      = order.order_id,
-    )
-    if hasattr(ss['executor'], 'ack_journal_entry'):
-        ss['executor'].ack_journal_entry(order.order_id)
-    alerter.fill(
-        side        = "BUY",
-        symbol      = sym,
-        quantity    = order.quantity,
-        price       = order.price,
-        total_value = order.total_value,
-        pnl         = None,
-        exchange    = cfg.exchange.exchange,
-        reason      = reason,
-    )
 
 
 def _execute_ranked_dynamic_buys(

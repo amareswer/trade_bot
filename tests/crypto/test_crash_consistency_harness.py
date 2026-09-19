@@ -1155,3 +1155,193 @@ def test_adoption_merges_queued_recovery_instead_of_double_booking(mock_cfg, moc
         if e.get("order_id") == f"native-stop:{o1['id']}"
     ]
     assert len(_native_stop_entries) == 1   # exactly one journal entry, not two
+
+
+# ---------------------------------------------------------------------------
+# PASS-10 review, finding 1 (P0): discovery time is not execution time.
+# PASS-9's apply_as_live_fill flag decided cash-free-vs-live by WHICH
+# CALLER finally reads a queued order, not by whether the exchange
+# movement happened before or after the balance checkpoint — a fill that
+# executed entirely OFFLINE, but whose own lookup only starts succeeding
+# on a LATER TICK (not the same startup pass that queued it), was
+# double-applied on top of a checkpoint that already included it.
+# ---------------------------------------------------------------------------
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_delayed_lookup_of_offline_fill_does_not_double_apply_checkpoint(mock_cfg, mock_sleep, tmp_path):
+    """PASS-10 review finding (P0, finding 1), reproduction A, exact
+    reproduction: O1 fills 0.001 BTC @ $78,000 (fee $0.16) and becomes
+    terminal ENTIRELY WHILE OFFLINE — the checkpoint (_sync_cash()/
+    _sync_position() at restart) correctly reads $1,077.84 / 0.001
+    BEFORE O1's own lookup ever succeeds. O1's lookup then times out
+    during startup (queuing it) and only succeeds LATER, via
+    reconcile_pending_orders() on a live tick — with NO further exchange
+    activity in between. The old apply_as_live_fill=True (a tick-context
+    call) would re-apply this already-checkpointed fill on top of itself:
+    $1,155.68 cash / 0 BTC instead of the correct, UNCHANGED
+    $1,077.84 / 0.001."""
+    state_path = str(tmp_path / "state.json")
+    fake = FakeExchange(cash=1000.0)
+    ex = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    ex._portfolio.position    = 0.002
+    ex._portfolio._cost_basis = 85_000.0
+    fake._balance[fake.base] = 0.002
+    o1 = fake.create_order(
+        "BTC/CAD", "market", "sell", 0.002,
+        params={"stopLossPrice": "78000.00", "clientOrderId": "seed-o1"},
+    )
+    ex._native_stop_order_id    = o1["id"]
+    ex._native_stop_price       = 78_000.0
+    ex._native_stop_is_trailing = False
+    ex._save_state()
+
+    # Entirely offline: O1 fills 0.001 BTC and becomes terminal. The
+    # exchange now genuinely holds $1,077.84 / 0.001 BTC.
+    fake.simulate_fill(o1["id"], 0.001, 78_000.0, 0.16, terminal=True)
+    assert fake._balance[fake.quote] == pytest.approx(1_077.84)
+    assert fake._balance[fake.base]  == pytest.approx(0.001)
+
+    # Restart: the checkpoint correctly reads the ALREADY-updated exchange
+    # state, but O1's own final-state lookup times out — queued unresolved.
+    with patch.object(fake, "fetch_order", side_effect=ccxt.RequestTimeout("timeout")):
+        ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    assert ex2.cash     == pytest.approx(1_077.84)   # checkpoint already correct
+    assert ex2.position == pytest.approx(0.001)
+    assert len(ex2._unresolved_stop_recoveries) == 1
+
+    # Healthy lookup restored. No further exchange activity occurs — this
+    # is the SAME historical fill the checkpoint above already reflects.
+    discovered = ex2.reconcile_pending_orders()
+
+    assert discovered == []                          # not a new live execution
+    assert ex2.cash     == pytest.approx(1_077.84)    # unchanged — not double-applied
+    assert ex2.position == pytest.approx(0.001)       # unchanged
+    assert ex2._unresolved_stop_recoveries == []       # terminal, resolved
+    assert len(ex2.pending_journal_entries) == 1       # still journaled, exactly once
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_adoption_merge_does_not_double_apply_checkpoint_covered_fill(mock_cfg, mock_sleep, tmp_path):
+    """PASS-10 review finding (P0, finding 1), reproduction B, exact
+    reproduction: same offline partial fill as the test above, but O1
+    stays OPEN (not flat). Restart #1 queues it unresolved (empty
+    open-orders list + a timed-out direct lookup). Restart #2's
+    open-orders discovery succeeds and adopts the same still-resting O1
+    while its OWN direct lookup still fails — the PASS-9 fix (seed the
+    new cursor from the queue entry's frozen ZERO baseline) consumed the
+    entry without recognizing its checkpoint_qty_cap, so a later
+    _cancel_native_stop() re-applied the SAME already-checkpointed fill:
+    $1,155.68 / 0 BTC instead of the correct, unchanged
+    $1,077.84 / 0.001."""
+    state_path = str(tmp_path / "state.json")
+    fake = FakeExchange(cash=1000.0)
+    ex = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    ex._portfolio.position    = 0.002
+    ex._portfolio._cost_basis = 85_000.0
+    fake._balance[fake.base] = 0.002
+    o1 = fake.create_order(
+        "BTC/CAD", "market", "sell", 0.002,
+        params={"stopLossPrice": "78000.00", "clientOrderId": "seed-o1"},
+    )
+    ex._native_stop_order_id    = o1["id"]
+    ex._native_stop_price       = 78_000.0
+    ex._native_stop_is_trailing = False
+    ex._save_state()
+
+    # Entirely offline: O1 partially fills 0.001 BTC and stays OPEN (the
+    # remaining 0.001 of its original 0.002 size is still unfilled).
+    fake.simulate_fill(o1["id"], 0.001, 78_000.0, 0.16, terminal=False)
+    assert fake._balance[fake.quote] == pytest.approx(1_077.84)
+    assert fake._balance[fake.base]  == pytest.approx(0.001)
+
+    # Restart #1: open-order listing empty, direct lookup times out -> O1
+    # queued unresolved, active tracking cleared. The checkpoint already
+    # correctly reads the post-fill exchange state.
+    with patch.object(fake, "fetch_open_orders", return_value=[]), \
+         patch.object(fake, "fetch_order", side_effect=ccxt.RequestTimeout("timeout")):
+        ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    assert ex2.cash     == pytest.approx(1_077.84)
+    assert ex2.position == pytest.approx(0.001)
+    assert len(ex2._unresolved_stop_recoveries) == 1
+
+    # Restart #2: open-order discovery succeeds (O1 still genuinely
+    # resting for its unfilled remainder) and adopts it, while O1's own
+    # direct lookup (used by the queue's own retry) still times out.
+    with patch.object(fake, "fetch_order", side_effect=ccxt.RequestTimeout("timeout")):
+        ex3 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    assert ex3._native_stop_order_id == o1["id"]
+    assert ex3._unresolved_stop_recoveries == []   # merged, not left dangling
+    assert ex3.cash     == pytest.approx(1_077.84)    # unchanged by the merge itself
+    assert ex3.position == pytest.approx(0.001)
+
+    # No further exchange activity. A later cancel attempt must NOT
+    # re-discover and re-apply the SAME already-checkpointed 0.001 fill.
+    fake.queue_cancel_failure()
+    outcome, fill_order = ex3._cancel_native_stop()
+
+    assert fill_order is None          # nothing NEW to report — already accounted for
+    assert ex3.cash     == pytest.approx(1_077.84)     # still unchanged
+    assert ex3.position == pytest.approx(0.001)        # still unchanged
+    assert len(ex3.pending_journal_entries) == 1        # journaled once, by the merge
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_unresolved_stop_delta_straddling_checkpoint_splits_correctly(mock_cfg, mock_sleep, tmp_path):
+    """PASS-10 review finding (P0, finding 1), acceptance criterion "one
+    order contains both pre-startup and post-startup deltas": O1 fills
+    0.001 BTC OFFLINE (checkpoint-covered) and stays open; after being
+    queued (lookup times out at startup), it fills a FURTHER 0.0005 BTC
+    purely during this live run before its lookup finally succeeds. A
+    single reconcile_pending_orders() call must split the combined
+    0.0015 delta: 0.001 checkpoint-covered (cash-free) and 0.0005
+    genuinely new (live, returned to the caller)."""
+    state_path = str(tmp_path / "state.json")
+    fake = FakeExchange(cash=1000.0)
+    ex = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    ex._portfolio.position    = 0.002
+    ex._portfolio._cost_basis = 85_000.0
+    fake._balance[fake.base] = 0.002
+    o1 = fake.create_order(
+        "BTC/CAD", "market", "sell", 0.002,
+        params={"stopLossPrice": "78000.00", "clientOrderId": "seed-o1"},
+    )
+    ex._native_stop_order_id    = o1["id"]
+    ex._native_stop_price       = 78_000.0
+    ex._native_stop_is_trailing = False
+    ex._save_state()
+
+    # Offline: 0.001 fills, order stays open (0.001 of 0.002 remains).
+    fake.simulate_fill(o1["id"], 0.001, 78_000.0, 0.16, terminal=False)
+
+    with patch.object(fake, "fetch_open_orders", return_value=[]), \
+         patch.object(fake, "fetch_order", side_effect=ccxt.RequestTimeout("timeout")):
+        ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    assert ex2.cash     == pytest.approx(1_077.84)
+    assert ex2.position == pytest.approx(0.001)
+    assert ex2._unresolved_stop_recoveries[0]["checkpoint_qty_cap"] == pytest.approx(0.001)
+
+    # Purely live, a FURTHER 0.0005 fills (cumulative 0.0015 of 0.002),
+    # order stays open. The queued entry's own lookup now succeeds for
+    # the FIRST time, seeing the COMBINED delta in one read.
+    fake.simulate_fill(o1["id"], 0.0015, 78_000.0, 0.24, terminal=False)
+    discovered = ex2.reconcile_pending_orders()
+
+    # The entry's OWN baseline never separately captured the offline
+    # $0.16 (it was queued with baseline_fee=0.0 — nothing had been
+    # locally recorded before the crash) — so the combined $0.24 fee
+    # this single read observes is split proportionally by quantity
+    # share (0.0005/0.0015), matching this file's existing partial-fill
+    # fee-allocation convention (there is no finer-grained, per-event fee
+    # to attribute directly from cumulative-only exchange data). Only
+    # that live share is actually deducted from cash; the rest is
+    # checkpoint-covered, cash-free.
+    _combined_fee    = 0.24
+    _live_fee_share  = _combined_fee * (0.0005 / 0.0015)
+    assert ex2.cash     == pytest.approx(1_077.84 + 0.0005 * 78_000.0 - _live_fee_share)
+    assert ex2.position == pytest.approx(0.0005)
+    assert len(discovered) == 1
+    assert discovered[0].quantity == pytest.approx(0.0005)
+    assert ex2._unresolved_stop_recoveries[0]["checkpoint_qty_cap"] == pytest.approx(0.0)

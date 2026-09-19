@@ -16,11 +16,14 @@ no network, no ccxt, no production file writes.
 """
 from __future__ import annotations
 
+import sqlite3
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 import bot.main as bot_main
+import live_comparison as lc
+from bot.data.trade_log import TradeLog
 from bot.execution.executor import Order, OrderSide, OrderStatus
 from bot.portfolio.capital_pool import CapitalPool
 from bot.portfolio.position_manager import PositionManager
@@ -676,3 +679,58 @@ def test_recovered_buy_protection_disabled_skips_resize_entirely(mock_cfg):
 
     assert executor.sync_calls == []
     trade_log.log_fill.assert_called_once()   # bookkeeping still happened
+
+
+# ---------------------------------------------------------------------------
+# PASS-10 review, finding 2 (P1): a recovered BUY whose immediate protective
+# resize discovers a full SELL must write its OWN trade_log row FIRST — the
+# durable ledger's insertion order (and live_comparison.py's entry-fee
+# allocation, which walks fills in that same order) must agree with the
+# real causal order (BUY opened the position the SELL then closed), not
+# whichever order the in-process consumer happened to write rows in.
+# ---------------------------------------------------------------------------
+
+@patch("bot.main.cfg")
+def test_recovered_buy_with_immediate_full_exit_logs_buy_before_sell(mock_cfg, tmp_path):
+    """PASS-10 review finding (P1, finding 2), exact reproduction: a
+    recovered BUY (qty 1 @ $100, fee $0.80) whose fallback protective stop
+    immediately discovers a full SELL (qty 1 @ $101, fee $0.40). Using a
+    REAL temporary SQLite TradeLog and live_comparison.py's actual
+    _load_fills/_compute_live_metrics — not a mock — proves the durable
+    row order agrees with reality: the BUY row must have a lower id than
+    the derivative SELL row, the round trip's net P&L must be the real
+    -$0.20 (not +$0.60), win rate 0% (not 100%), and the BUY's entry fee
+    must be fully allocated (not left as $0.80 unallocated)."""
+    mock_cfg.exchange.native_stop_loss_enabled = True
+    mock_cfg.exchange.exchange                 = "kraken"
+    mock_cfg.backtest.stop_loss_pct            = 0.015
+
+    pm = PositionManager()   # flat — this IS the position-opening BUY
+    sm = TradingStateMachine(cooldown_ticks=3)
+    executor = _FakeExecutorForResync()
+    # The fallback protective stop, once placed, discovers it was already
+    # filled — a full, immediate exit at $101.
+    executor.queue_fill(_fill_order(quantity=1.0, price=101.0, fee_cost=0.40, order_id="native-stop:stop-1"))
+    ss = _ss(executor, pm, sm)
+    capital_pool = CapitalPool(total_capital=1000.0, max_concurrent=1)
+    risk = MagicMock()
+    alerter = MagicMock()
+    trade_log = TradeLog(db_path=str(tmp_path / "trades.db"))
+
+    order = _buy_fill_order(quantity=1.0, price=100.0, fee_cost=0.80, order_id="buy-1")
+    bot_main._process_discovered_buy_fill(
+        "BTC/CAD", ss, order, "pending_order_reconciled",
+        capital_pool=capital_pool, risk=risk, alerter=alerter, trade_log=trade_log,
+    )
+
+    conn = sqlite3.connect(str(tmp_path / "trades.db"))
+    rows = conn.execute("SELECT id, side FROM fills ORDER BY id").fetchall()
+    conn.close()
+    assert [r[1] for r in rows] == ["BUY", "SELL"]   # BUY committed first
+
+    fills   = lc._load_fills(str(tmp_path / "trades.db"))
+    metrics = lc._compute_live_metrics(fills)
+
+    assert metrics["net_pnl"]             == pytest.approx(-0.20)
+    assert metrics["win_rate"]            == pytest.approx(0.0)
+    assert metrics["unallocated_buy_fees"] == pytest.approx(0.0)
