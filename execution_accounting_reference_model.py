@@ -395,16 +395,69 @@ def compute_safe_watermark(
 
 
 def is_watermark_confirmed(window_until_ms: int, *, now_ms: int, safety_margin_ms: int) -> bool:
-    """True once enough real time has passed since a window's own end for
-    any propagation-delayed execution to plausibly have surfaced. Because
-    compute_safe_watermark above already caps window_until_ms at `now_ms -
-    safety_margin_ms` at the moment a checkpoint is committed, a checkpoint
-    committed via that function is confirmed the instant it is written —
-    this function exists for the caller-facing readiness check (and for
-    inspecting an OLDER checkpoint's confirmation status later) rather
-    than being a second independent gate a correctly-built checkpoint
-    would ever actually fail."""
+    """True once enough real time has passed since a window's own end that
+    ANY execution delayed by no more than safety_margin_ms would plausibly
+    have surfaced by now.
+
+    Reference-model review R2 finding 1: this is a TIME check against an
+    ASSUMED visibility bound — nothing more. Reproduced exactly: a BUY and
+    SELL hidden at ms 1000/1001, watermark advances to 5000 at now=10000
+    with a 5000ms margin, and this function returns True — yet the two
+    trades are STILL hidden at this instant and, once the watermark has
+    advanced past their timestamps, an exclusive `since` query can never
+    find them again even after they are revealed. A trade hidden LONGER
+    than safety_margin_ms is not detected or prevented by this function —
+    that is an explicit, acknowledged residual limitation of any
+    finite-margin protocol, not something "confirmed" proves away. Because
+    compute_safe_watermark caps window_until_ms at `now_ms -
+    safety_margin_ms` at commit time, a checkpoint built that way passes
+    this check THE INSTANT it is written — this is a definitional
+    consequence of how the watermark was computed, not independent
+    evidence that nothing was actually missed. Treat a True result as
+    "the assumed bound was not violated in an observable way," never as
+    "proven complete." audit_historical_window below is the mechanism that
+    can actually DETECT a violation after the fact, when one has
+    occurred — this function cannot."""
     return now_ms - window_until_ms >= safety_margin_ms
+
+
+@dataclass
+class AuditResult:
+    violated: bool
+    newly_discovered_trade_ids: "list[str]"
+    audited_since_ms: "int | None"
+    audited_until_ms: int
+
+
+def audit_historical_window(
+    exchange: SyntheticExchange, conn: sqlite3.Connection, symbol: str, *,
+    audit_since_ms: "int | None", audit_until_ms: int,
+) -> AuditResult:
+    """Re-queries an ALREADY-watermarked (believed-closed) window directly
+    against the exchange and checks whether it now reports any trade that
+    persisted observed_trades does not already have. This is the genuine,
+    independent confirmation is_watermark_confirmed cannot provide on its
+    own — that function only checks elapsed time against an assumed bound;
+    this function actually looks for evidence the bound was violated.
+
+    A clean audit (violated=False) is evidence the bounded-delay
+    assumption held FOR THIS WINDOW, checked now — it does not prove no
+    delay could ever exceed the margin in general, only that this
+    particular re-check found nothing amiss. A violation
+    (violated=True) means the assumption failed for real: the trades are
+    reported here so a human/operator can decide how to reconcile an
+    already-closed window's accounting — this function deliberately does
+    NOT retroactively rewrite anything itself (reopening closed books is a
+    decision, not something to do silently inside an audit read)."""
+    coverage = retrieve_with_coverage_proof(exchange, symbol, since_ms=audit_since_ms)
+    known = {r[0] for r in conn.execute(
+        "SELECT trade_id FROM observed_trades WHERE symbol = ?", (symbol,)
+    )}
+    newly_discovered = [
+        t.trade_id for t in coverage.trades
+        if t.trade_id not in known and t.timestamp_ms <= audit_until_ms
+    ]
+    return AuditResult(len(newly_discovered) > 0, newly_discovered, audit_since_ms, audit_until_ms)
 
 
 # ============================================================================
@@ -730,12 +783,41 @@ def recover_watermark(conn: sqlite3.Connection, currency_scope: str) -> "int | N
 
 
 def load_observed_trades(conn: sqlite3.Connection, symbol: str) -> "list[SynTrade]":
+    """Reconstruction-facing read: for each trade, applies the LATEST
+    recorded fee_corrections revision in place of the originally observed
+    fee_cost, if one exists.
+
+    Reference-model review R2 finding 2, reproduced exactly: making
+    revise_trade_fee move real exchange cash did nothing for
+    reconstruction, because this function used to return each trade's
+    frozen original fee_cost regardless of any later correction —
+    recover_position (BUY 1@100 + SELL 1@101, both zero fee, then a SELL
+    fee correction to $2, then a real close/reopen) reported +$1 instead
+    of the correct −$1. `observed_trades.fee_cost` remains the untouched
+    ORIGINAL-observation audit record (never overwritten in place — the
+    correction stays a separate, traceable event in fee_corrections); this
+    function is what makes every RECONSTRUCTION-consuming caller
+    (recover_position, verify_ledger_delivery_consistency, this file's own
+    causal_order/fold_position pipeline) correction-aware without having
+    to duplicate the join. A trade with no correction row is returned
+    completely unchanged."""
     rows = conn.execute(
         "SELECT trade_id, order_id, symbol, side, price, amount, cost, fee_cost, "
         "fee_currency, exchange_timestamp_ms FROM observed_trades WHERE symbol = ?",
         (symbol,),
     ).fetchall()
-    return [SynTrade(*row) for row in rows]
+    trades = []
+    for row in rows:
+        trade_id, fee_cost = row[0], row[7]
+        correction = conn.execute(
+            "SELECT new_fee FROM fee_corrections WHERE trade_id = ? "
+            "ORDER BY revision DESC LIMIT 1", (trade_id,),
+        ).fetchone()
+        if correction is not None:
+            fee_cost = correction[0]
+        trades.append(SynTrade(row[0], row[1], row[2], row[3], row[4], row[5], row[6],
+                                fee_cost, row[8], row[9]))
+    return trades
 
 
 def recover_position(conn: sqlite3.Connection, symbol: str) -> FoldResult:
@@ -753,21 +835,33 @@ def recover_position(conn: sqlite3.Connection, symbol: str) -> FoldResult:
     return fold_position(ordered)
 
 
-def verify_ledger_delivery_consistency(conn: sqlite3.Connection, symbol: str) -> bool:
-    """The actual implementation behind the third readiness leg
-    (reference-model review finding: "assess_readiness accepts
-    ledger_delivery_ok from its caller; there is no implemented joint
-    ledger/delivery verifier behind that argument yet"). Checks, for every
-    observed_trades row marked ledger_written_at:
-      - it is represented EXACTLY once (a native fills row XOR a
-        legacy_links mapping, never both, never neither);
-      - every observed trade for this symbol is represented (nothing
-        silently un-delivered);
-      - the causally-ordered fold of ALL observed trades succeeds (no
-        unresolvable same-timestamp ambiguity sitting in persisted data).
-    Returns False on ANY violation — callers should treat False as
-    'ledger/delivery not proven consistent', never attempt to guess why
-    without inspecting the specific tables."""
+def verify_ledger_delivery_consistency(conn: sqlite3.Connection, symbol: str,
+                                        tolerance: float = 1e-9) -> bool:
+    """The actual implementation behind the third readiness leg.
+
+    Reference-model review R2 finding 3, reproduced exactly: the first
+    version of this function checked only identity PRESENCE (a native
+    fills row XOR a legacy_links mapping) — rewriting an already-correct
+    SELL fills row's stored quantity to 99 and pnl to 999, while leaving
+    its exec_key untouched, still returned True, because nothing here ever
+    compared a stored VALUE against anything. This version additionally:
+      - recomputes the correction-aware fold (via load_observed_trades,
+        so a fee correction is included — same fix as recover_position)
+        and compares every NATIVE fills row's quantity/price/fee_cost/pnl
+        against the trade's true observed payload and recomputed P&L;
+      - validates conservation for every LEGACY-linked group: the sum of
+        every trade linked to one legacy fills row must still match that
+        row's own stored quantity/fee_cost exactly (a legacy row or its
+        links being altered after migration is now caught, not just
+        native-row corruption);
+      - retains the representation-presence and full-delivery checks from
+        the previous version.
+    Returns False on ANY violation. Note (named honestly, not hidden):
+    this checks agreement between STORED ledger rows and the RECOMPUTED
+    fold from observed_trades — it does not independently re-verify
+    observed_trades itself against the exchange (that is coverage/balance
+    consistency's job, checked separately, never folded into this
+    function)."""
     written = conn.execute(
         "SELECT trade_id FROM observed_trades WHERE symbol = ? AND ledger_written_at IS NOT NULL",
         (symbol,),
@@ -789,8 +883,63 @@ def verify_ledger_delivery_consistency(conn: sqlite3.Connection, symbol: str) ->
     if all_ids != written_ids:
         return False  # some observed trade was never delivered to the ledger at all
 
-    trades = load_observed_trades(conn, symbol)
-    return causal_order(trades) is not None
+    trades = load_observed_trades(conn, symbol)  # correction-aware
+    ordered = causal_order(trades)
+    if ordered is None:
+        return False
+    fold = fold_position(ordered)
+    by_id = {t.trade_id: t for t in trades}
+
+    for (trade_id,) in written:
+        is_legacy = conn.execute(
+            "SELECT 1 FROM legacy_links WHERE trade_id = ?", (trade_id,)
+        ).fetchone() is not None
+        if is_legacy:
+            continue  # conservation-checked as a group below
+        row = conn.execute(
+            "SELECT quantity, price, fee_cost, pnl FROM fills WHERE exec_key = ?", (trade_id,)
+        ).fetchone()
+        qty, price, fee_cost, stored_pnl = row
+        t = by_id[trade_id]
+        if abs(qty - t.amount) > tolerance or abs(price - t.price) > tolerance:
+            return False
+        if abs(fee_cost - t.fee_cost) > tolerance:
+            return False
+        expected_pnl = fold.per_trade_pnl.get(trade_id)
+        if (expected_pnl is None) != (stored_pnl is None):
+            return False
+        if expected_pnl is not None and abs(stored_pnl - expected_pnl) > tolerance:
+            return False
+
+    legacy_group_ids = {
+        r[0] for r in conn.execute(
+            "SELECT DISTINCT legacy_fill_id FROM legacy_links WHERE trade_id IN "
+            "(SELECT trade_id FROM observed_trades WHERE symbol = ?)", (symbol,),
+        )
+    }
+    for legacy_fill_id in legacy_group_ids:
+        linked_ids = [r[0] for r in conn.execute(
+            "SELECT trade_id FROM legacy_links WHERE legacy_fill_id = ?", (legacy_fill_id,)
+        )]
+        linked_trades = [by_id[tid] for tid in linked_ids if tid in by_id]
+        legacy_row = conn.execute(
+            "SELECT quantity, fee_cost FROM fills WHERE id = ?", (legacy_fill_id,)
+        ).fetchone()
+        if legacy_row is None:
+            return False
+        legacy_qty, legacy_fee = legacy_row
+        if abs(sum(t.amount for t in linked_trades) - legacy_qty) > tolerance:
+            return False
+        # Note: this compares against each linked trade's CURRENT
+        # (correction-aware) fee — a fee corrected after migration will
+        # legitimately break exact conservation against the frozen legacy
+        # total unless that correction is separately reconciled into the
+        # legacy row; surfaced here as a real mismatch, not silently
+        # tolerated.
+        if abs(sum(t.fee_cost for t in linked_trades) - legacy_fee) > tolerance:
+            return False
+
+    return True
 
 
 # ============================================================================
@@ -987,16 +1136,29 @@ class ReadinessReport:
     ledger_delivery_ok: bool
     coverage_reason: str = ""
     balance_residual: "float | None" = None
+    historical_audit_clean: "bool | None" = None  # None = no audit was run this cycle
 
     @property
     def ready(self) -> bool:
+        if self.historical_audit_clean is False:
+            return False  # an audit that found a violation overrides everything else
         return (self.coverage_complete and self.watermark_confirmed
                 and self.balance_consistent and self.ledger_delivery_ok)
 
     def explain(self) -> str:
+        if self.historical_audit_clean is False:
+            return ("not ready — audit found trade(s) the persisted watermark had "
+                     "already passed: the bounded-delay assumption was violated for "
+                     "this window; reconciliation is a human decision, not automatic")
         if self.ready:
-            return ("ready: coverage complete, watermark confirmed, balance "
-                     "consistent, ledger/delivery consistent")
+            if self.historical_audit_clean is True:
+                return ("ready: coverage complete, balance consistent, ledger/delivery "
+                         "consistent, AND an audit re-check of the historical window "
+                         "found nothing new — the strongest evidence this model produces")
+            return ("ready (conditional on the assumed visibility bound — coverage "
+                     "complete, watermark aged past the safety margin, balance and "
+                     "ledger/delivery consistent, but NOT independently audited; a "
+                     "trade hidden longer than the margin could still have been missed)")
         failing = []
         if not self.coverage_complete:
             failing.append(f"coverage ({self.coverage_reason})")
@@ -1013,25 +1175,36 @@ class ReadinessReport:
 
 
 def assess_readiness(coverage: CoverageResult, balance: "BalanceCheckResult | None",
-                      ledger_delivery_ok: bool, *, watermark_confirmed: bool) -> ReadinessReport:
-    """Deliberately takes FOUR independent inputs and never lets one
-    substitute for another: a caller cannot pass a good balance result to
-    paper over incomplete coverage, and an incomplete coverage result means
-    the balance check is not even meaningful yet (balance is None-able for
+                      ledger_delivery_ok: bool, *, watermark_confirmed: bool,
+                      historical_audit_clean: "bool | None" = None) -> ReadinessReport:
+    """Deliberately takes independent inputs and never lets one substitute
+    for another: a caller cannot pass a good balance result to paper over
+    incomplete coverage, and an incomplete coverage result means the
+    balance check is not even meaningful yet (balance is None-able for
     exactly that reason — see tests).
 
     watermark_confirmed (reference-model review finding 1 — the explicit
     evidence/unknown state): coverage.complete alone only proves the
     exchange's queryable history was fully PAGED as of this read — it can
-    never prove nothing else happened that hasn't surfaced yet. This
-    caller-supplied flag is expected to come from comparing the window's
-    own end against `now_ms` and the chosen safety_margin_ms (see
-    compute_safe_watermark) — REQUIRED here, not optional, so a checkpoint
-    freshly computed this instant can never silently read as "ready" just
-    because its (vacuous) page happened to be empty or its balance
-    happened to net out. A page-exhausted-but-not-yet-confirmed window is
-    the explicit PROVISIONAL state — neither proven ready nor proven
-    wrong."""
+    never prove nothing else happened that hasn't surfaced yet.
+    watermark_confirmed itself is ALSO only a time-elapsed check against an
+    ASSUMED visibility bound (see is_watermark_confirmed's own docstring)
+    — a trade hidden longer than the configured safety margin can still be
+    permanently missed while this reports ready=True. That is an
+    acknowledged, still-open residual limitation of any finite-margin
+    protocol, not something this function claims to close.
+
+    historical_audit_clean (R2 review: "make the watermark's explicit
+    assumption a visible part of readiness evidence rather than an
+    automatically satisfied confirmation flag"): pass the result of
+    audit_historical_window's `not violated` when an audit was actually
+    run this cycle. None (the default) means no audit ran — explain()
+    then reports readiness as explicitly CONDITIONAL, not proven. True
+    means an audit ran and found nothing amiss — the strongest evidence
+    this model can produce, though still not a mathematical proof no
+    delay could ever exceed the margin. False means an audit found a
+    genuine violation and forces ready=False regardless of every other
+    input."""
     balance_ok = bool(balance and balance.consistent)
     residual = balance.residual if balance else None
     return ReadinessReport(
@@ -1040,5 +1213,6 @@ def assess_readiness(coverage: CoverageResult, balance: "BalanceCheckResult | No
         balance_consistent=balance_ok,
         ledger_delivery_ok=ledger_delivery_ok,
         coverage_reason=coverage.reason,
+        historical_audit_clean=historical_audit_clean,
         balance_residual=residual,
     )

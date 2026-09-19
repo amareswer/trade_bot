@@ -21,6 +21,7 @@ from execution_accounting_reference_model import (
     already_linked_trade_ids,
     apply_migration_link,
     assess_readiness,
+    audit_historical_window,
     causal_order,
     check_balance_consistency,
     commit_checkpoint,
@@ -189,7 +190,110 @@ def test_hidden_buy_and_sell_do_not_produce_false_readiness_and_are_not_permanen
                                 watermark_confirmed=confirmed2)
     assert report2.ready is True
     # Neither hidden trade was ever lost — both were eventually observed
-    # and correctly folded into a genuinely-confirmed checkpoint.
+    # and correctly folded into a genuinely-confirmed checkpoint. This
+    # relied on revealing them WITHIN the safety margin — see the next
+    # test for the explicit, still-open limitation when that assumption
+    # doesn't hold.
+
+
+def test_watermark_confirmed_is_conditional_not_proof_and_audit_detects_a_real_violation(db):
+    """Reference-model review R2 finding 1, reproduced exactly: this test
+    proves the ACKNOWLEDGED LIMITATION exists — it is not a claim the
+    limitation is solved. A BUY and SELL hidden longer than the safety
+    margin get permanently skipped by the normal watermark path, and
+    is_watermark_confirmed (a pure elapsed-time check against an ASSUMED
+    bound) reports True regardless, because by construction a checkpoint
+    built via compute_safe_watermark satisfies it the instant it's
+    written. audit_historical_window is the separate mechanism that CAN
+    detect the violation after the fact by re-querying the exchange
+    directly — proven here to catch exactly what the normal path misses,
+    and to force readiness back to False when wired into assess_readiness
+    via historical_audit_clean."""
+    ex = SyntheticExchange()
+    ex.deposit("CAD", 1000.0, timestamp_ms=0, visible=True)
+    ex.execute_trade(symbol="BTC/CAD", side="buy", price=100.0, amount=1.0,
+                      timestamp_ms=1_000, trade_id="H_buy", visible=False)
+    ex.execute_trade(symbol="BTC/CAD", side="sell", price=100.0, amount=1.0,
+                      timestamp_ms=1_001, trade_id="H_sell", visible=False)
+
+    margin = 5_000
+    now = 10_000  # far beyond the margin relative to the hidden trades' own timestamps
+
+    coverage = retrieve_with_coverage_proof(ex, "BTC/CAD", since_ms=None)
+    assert coverage.complete and coverage.fetched_count == 0  # still hidden
+
+    watermark = compute_safe_watermark(coverage, now_ms=now, previous_watermark_ms=None,
+                                        safety_margin_ms=margin)
+    assert watermark == 5_000  # past BOTH hidden trades' own timestamps already
+
+    balance = check_balance_consistency(
+        prior_balance=1000.0, trades=coverage.trades, deposits=[], withdrawals=[],
+        fresh_balance=ex.fetch_balance_total("CAD"), side_asset_is_quote=True, quote="CAD",
+    )
+    assert balance.consistent  # trivially, as before
+
+    confirmed = is_watermark_confirmed(watermark, now_ms=now, safety_margin_ms=margin)
+    assert confirmed is True  # a pure elapsed-time check — proves nothing about coverage
+
+    commit_checkpoint(db, currency_scope="CAD", window_since_ms=None, window_until_ms=watermark,
+                       balance_after=ex.fetch_balance_total("CAD"), trades=coverage.trades)
+
+    # Without an audit, the pipeline reports ready — this IS the
+    # acknowledged limitation, not a fixed claim about it.
+    unaudited = assess_readiness(coverage, balance, ledger_delivery_ok=True,
+                                  watermark_confirmed=confirmed)
+    assert unaudited.ready is True
+    assert "conditional" in unaudited.explain()
+
+    ex.reveal_all()
+    # An exclusive since=5000 query permanently misses both — they
+    # executed at 1000/1001, strictly before the watermark.
+    post_reveal = retrieve_with_coverage_proof(ex, "BTC/CAD", since_ms=watermark)
+    assert post_reveal.fetched_count == 0  # the real, still-open gap
+
+    # audit_historical_window re-queries the ALREADY-watermarked window
+    # directly and finds what the normal path will never see again.
+    audit = audit_historical_window(ex, db, "BTC/CAD", audit_since_ms=None,
+                                     audit_until_ms=watermark)
+    assert audit.violated is True
+    assert sorted(audit.newly_discovered_trade_ids) == ["H_buy", "H_sell"]
+
+    audited_report = assess_readiness(coverage, balance, ledger_delivery_ok=True,
+                                       watermark_confirmed=confirmed,
+                                       historical_audit_clean=not audit.violated)
+    assert audited_report.ready is False
+    assert "audit" in audited_report.explain().lower()
+
+
+def test_audit_of_a_genuinely_clean_window_confirms_nothing_was_missed(db):
+    """The complementary, non-violation case: a window with no hidden
+    trades produces a clean audit, and readiness reports the STRONGEST
+    evidence tier this model can produce (explicitly distinguished in
+    explain() from the merely-elapsed-time, unaudited case above)."""
+    ex = SyntheticExchange()
+    ex.deposit("CAD", 1000.0, timestamp_ms=0, visible=True)
+    ex.execute_trade(symbol="BTC/CAD", side="buy", price=100.0, amount=1.0,
+                      timestamp_ms=1_000, trade_id="A")  # visible from the start
+
+    coverage = retrieve_with_coverage_proof(ex, "BTC/CAD", since_ms=None)
+    watermark = compute_safe_watermark(coverage, now_ms=10_000, previous_watermark_ms=None,
+                                        safety_margin_ms=5_000)
+    commit_checkpoint(db, currency_scope="CAD", window_since_ms=None, window_until_ms=watermark,
+                       balance_after=ex.fetch_balance_total("CAD"), trades=coverage.trades)
+    balance = check_balance_consistency(
+        prior_balance=1000.0, trades=coverage.trades, deposits=[], withdrawals=[],
+        fresh_balance=ex.fetch_balance_total("CAD"), side_asset_is_quote=True, quote="CAD",
+    )
+    confirmed = is_watermark_confirmed(watermark, now_ms=10_000, safety_margin_ms=5_000)
+
+    audit = audit_historical_window(ex, db, "BTC/CAD", audit_since_ms=None, audit_until_ms=watermark)
+    assert audit.violated is False
+    assert audit.newly_discovered_trade_ids == []
+
+    report = assess_readiness(coverage, balance, ledger_delivery_ok=True,
+                               watermark_confirmed=confirmed, historical_audit_clean=True)
+    assert report.ready is True
+    assert "audit" in report.explain() and "strongest" in report.explain()
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +652,117 @@ def test_fee_revision_converges_with_real_balance_only_once_correction_is_includ
         fee_correction_deltas=[delta],
     )
     assert balance2.consistent  # genuine economic convergence, not just a dedup row
+
+
+def test_recovered_position_applies_fee_corrections_after_a_real_restart(tmp_path):
+    """Reference-model review R2 finding 2, reproduced exactly: BUY 1@100
+    and SELL 1@101, both originally zero fee, ledger-written normally.
+    Recording a fee revision setting the SELL's fee to $2 and then doing a
+    REAL close/reopen used to still report +$1 realized P&L (the correct
+    answer is -$1) — recover_position's underlying load_observed_trades
+    read only each trade's frozen ORIGINAL fee_cost, never joining against
+    fee_corrections. Fixed at the read layer, so every reconstruction
+    consumer (recover_position, verify_ledger_delivery_consistency, this
+    file's own fold pipeline) is correction-aware without duplicating the
+    join."""
+    from execution_accounting_reference_model import SynTrade
+    db_path = str(tmp_path / "fee_correction_restart.db")
+    conn1 = init_db(db_path)
+    buy = SynTrade("BUY1", "O1", "BTC/CAD", "buy", 100.0, 1.0, 100.0, 0.0, "CAD", 1_000)
+    sell = SynTrade("SELL1", "O2", "BTC/CAD", "sell", 101.0, 1.0, 101.0, 0.0, "CAD", 2_000)
+    commit_checkpoint(conn1, currency_scope="CAD", window_since_ms=None, window_until_ms=2_000,
+                       balance_after=1001.0, trades=[buy, sell])
+    write_ledger_rows(conn1, [buy, sell], fold_position(causal_order([buy, sell])))
+
+    pre = recover_position(conn1, "BTC/CAD")
+    assert abs(pre.realized_pnl - 1.0) < 1e-9   # 101 - 100, both fees still zero
+
+    assert record_fee_revision(conn1, "SELL1", 2.0) is True
+    conn1.close()
+
+    conn2 = init_db(db_path)
+    post = recover_position(conn2, "BTC/CAD")
+    assert abs(post.realized_pnl - (-1.0)) < 1e-9   # 101 - 2 - 100 = -1, corrected
+    conn2.close()
+
+
+def test_fee_correction_on_entry_updates_remaining_basis_and_already_closed_pnl(tmp_path):
+    """Review R2 finding 2's specific further demand: 'Entry-fee revisions
+    must update remaining basis and realized P&L for already-closed
+    portions.' fold_position is always a full recompute over ALL observed
+    trades (never incremental), so a corrected BUY fee automatically flows
+    into both the REMAINING position's avg_cost and an ALREADY-recorded
+    partial SELL's own realized P&L the next time reconstruction runs —
+    proven here with a partial holding, not just a fully-closed round
+    trip, across a real close/reopen."""
+    from execution_accounting_reference_model import SynTrade
+    db_path = str(tmp_path / "entry_fee_correction.db")
+    conn1 = init_db(db_path)
+    buy = SynTrade("BUY1", "O1", "BTC/CAD", "buy", 100.0, 1.0, 100.0, 0.0, "CAD", 1_000)
+    partial_sell = SynTrade("SELL1", "O2", "BTC/CAD", "sell", 110.0, 0.4, 44.0, 0.0, "CAD", 2_000)
+    commit_checkpoint(conn1, currency_scope="CAD", window_since_ms=None, window_until_ms=2_000,
+                       balance_after=1044.0, trades=[buy, partial_sell])
+    write_ledger_rows(conn1, [buy, partial_sell], fold_position(causal_order([buy, partial_sell])))
+
+    pre = recover_position(conn1, "BTC/CAD")
+    assert abs(pre.avg_cost - 100.0) < 1e-9
+    assert abs(pre.realized_pnl - 4.0) < 1e-9    # 0.4*110 - 100*0.4 = 44-40
+    assert abs(pre.final_qty - 0.6) < 1e-9
+
+    assert record_fee_revision(conn1, "BUY1", 1.0) is True  # entry fee settles to $1
+    conn1.close()
+
+    conn2 = init_db(db_path)
+    post = recover_position(conn2, "BTC/CAD")
+    assert abs(post.avg_cost - 101.0) < 1e-9          # (100+1)/1 — corrected entry basis
+    assert abs(post.realized_pnl - 3.6) < 1e-9         # 44 - 101*0.4 = 44-40.4 — the ALREADY-
+                                                         # closed portion's pnl updates too
+    conn2.close()
+
+
+def test_ledger_verification_detects_economic_corruption_not_just_representation(db):
+    """Reference-model review R2 finding 3, reproduced exactly: rewriting
+    an already-correct SELL fills row's stored quantity to 99 and pnl to
+    999, while leaving its exec_key untouched, used to still pass
+    verify_ledger_delivery_consistency — the checker only looked at
+    identity presence, never at stored values. Now compares stored
+    quantity/price/fee/pnl against the trade's true (correction-aware)
+    observed payload and recomputed fold."""
+    from execution_accounting_reference_model import SynTrade
+    buy = SynTrade("BUY1", "O1", "BTC/CAD", "buy", 100.0, 1.0, 100.0, 0.0, "CAD", 1_000)
+    sell = SynTrade("SELL1", "O2", "BTC/CAD", "sell", 101.0, 1.0, 101.0, 0.0, "CAD", 2_000)
+    commit_checkpoint(db, currency_scope="CAD", window_since_ms=None, window_until_ms=2_000,
+                       balance_after=1001.0, trades=[buy, sell])
+    write_ledger_rows(db, [buy, sell], fold_position(causal_order([buy, sell])))
+    assert verify_ledger_delivery_consistency(db, "BTC/CAD") is True
+
+    with db:
+        db.execute("UPDATE fills SET quantity = 99, pnl = 999 WHERE exec_key = 'SELL1'")
+
+    assert verify_ledger_delivery_consistency(db, "BTC/CAD") is False
+
+
+def test_ledger_verification_detects_broken_legacy_conservation(db):
+    """Review R2 finding 3's further demand: validate conserved legacy
+    totals here too, not just native-row values."""
+    with db:
+        db.execute(
+            "INSERT INTO fills (id, exec_key, timestamp_ms, side, symbol, quantity, "
+            "price, fee_cost, source) VALUES (1, 'legacy-uuid-1', 900, 'buy', 'BTC/CAD', "
+            "0.02, 50000.0, 1.0, 'legacy_migration')"
+        )
+    from execution_accounting_reference_model import SynTrade
+    legacy = LegacyFillRow(fill_id=1, symbol="BTC/CAD", side="buy", quantity=0.02,
+                            cost=1000.0, fee_cost=1.0, window_start_ms=0, window_end_ms=10_000)
+    t1 = SynTrade("T1", "O1", "BTC/CAD", "buy", 50_000.0, 0.01, 500.0, 0.5, "CAD", 1_000)
+    t2 = SynTrade("T2", "O1", "BTC/CAD", "buy", 50_000.0, 0.01, 500.0, 0.5, "CAD", 1_050)
+    result = migrate_legacy_row(legacy, [t1, t2])
+    apply_migration_link(db, result, [t1, t2])
+    assert verify_ledger_delivery_consistency(db, "BTC/CAD") is True
+
+    with db:
+        db.execute("UPDATE fills SET fee_cost = 999 WHERE id = 1")
+    assert verify_ledger_delivery_consistency(db, "BTC/CAD") is False
 
 
 # ---------------------------------------------------------------------------
