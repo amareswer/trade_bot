@@ -938,3 +938,220 @@ def test_multiple_unresolved_stops_recovered_independently_not_overwritten(mock_
     assert ex4._portfolio.realized_pnl == pytest.approx(-10.50)
     _recovered_qty = sum(e["quantity"] for e in ex4.pending_journal_entries)
     assert _recovered_qty == pytest.approx(0.0015)
+
+
+# ---------------------------------------------------------------------------
+# PASS-9 review, finding 1 (P1): a queued historical stop that stays open
+# PAST startup must have any FURTHER execution applied as a live,
+# cash-mutating fill and returned to the caller — the executor's own
+# startup balance sync ran exactly once and does not cover anything that
+# happens while the process keeps running.
+# ---------------------------------------------------------------------------
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_unresolved_stop_new_fill_after_startup_applies_live_and_is_returned(mock_cfg, mock_sleep, tmp_path):
+    """PASS-9 review finding (P1, finding 1), reproduction A: O1 is still
+    completely unfilled at restart — the open-order listing comes back
+    empty and the direct final-state lookup times out, so O1 is queued
+    unresolved with balances still showing the pre-fill state. A first
+    reconcile_pending_orders() call while O1 remains open/unfilled changes
+    nothing. O1 THEN fills 0.001 BTC purely during this live run (nothing
+    else re-syncs cash/position) — a second reconcile_pending_orders()
+    must apply that delta to cash/position and return it as a discovered
+    SELL fill for the normal bookkeeping consumer, instead of silently
+    consuming it cash-free as the old code did (leaving cash at $1,000.00
+    and position at 0.002 instead of the real $1,077.84 / 0.001, with an
+    empty discovered list)."""
+    state_path = str(tmp_path / "state.json")
+    fake = FakeExchange(cash=1000.0)
+    ex = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    ex._portfolio.position    = 0.002
+    ex._portfolio._cost_basis = 85_000.0
+    fake._balance[fake.base] = 0.002
+    o1 = fake.create_order(
+        "BTC/CAD", "market", "sell", 0.002,
+        params={"stopLossPrice": "78000.00", "clientOrderId": "seed-o1"},
+    )
+    ex._native_stop_order_id    = o1["id"]
+    ex._native_stop_price       = 78_000.0
+    ex._native_stop_is_trailing = False
+    ex._save_state()
+
+    # Restart: the open-order listing comes back empty (a transient gap)
+    # and the direct final-state lookup also times out -> O1 is queued
+    # unresolved. Balances still correctly show the pre-fill state.
+    with patch.object(fake, "fetch_open_orders", return_value=[]), \
+         patch.object(fake, "fetch_order", side_effect=ccxt.RequestTimeout("timeout")):
+        ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    assert len(ex2._unresolved_stop_recoveries) == 1
+    assert ex2._unresolved_stop_recoveries[0]["order_id"] == o1["id"]
+    assert ex2.cash == pytest.approx(1000.0)
+    assert ex2.position == pytest.approx(0.002)
+
+    # Healthy queries restored. First live tick: O1 remains open, unfilled
+    # -> no delta, nothing changes.
+    discovered_1 = ex2.reconcile_pending_orders()
+    assert discovered_1 == []
+    assert ex2.cash == pytest.approx(1000.0)
+    assert ex2.position == pytest.approx(0.002)
+    assert len(ex2._unresolved_stop_recoveries) == 1
+
+    # O1 fills 0.001 more, purely during this live run — no restart, no
+    # fresh balance sync.
+    fake.simulate_fill(o1["id"], 0.001, 78_000.0, 0.16, terminal=False)
+    discovered_2 = ex2.reconcile_pending_orders()
+
+    assert ex2.cash     == pytest.approx(1_077.84)
+    assert ex2.position == pytest.approx(0.001)
+    assert len(discovered_2) == 1
+    assert discovered_2[0].side     == OrderSide.SELL
+    assert discovered_2[0].quantity == pytest.approx(0.001)
+    assert discovered_2[0].pnl      == pytest.approx(-7.0)
+    # The order remains genuinely open (0.001 of 0.002 still unfilled) —
+    # still queued for its eventual terminal resolution.
+    assert len(ex2._unresolved_stop_recoveries) == 1
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_unresolved_stop_fee_finalized_after_startup_deducts_cash(mock_cfg, mock_sleep, tmp_path):
+    """PASS-9 review finding (P1, finding 1), reproduction B: O1's full
+    0.002 BTC quantity was ALREADY recorded locally before the crash (no
+    new quantity ever appears from the recovery queue's point of view) —
+    only its FEE was still provisional ($0) at the time of the crash and
+    the startup balance sync. The startup sync therefore already reflects
+    the quantity's cash effect but NOT the fee, which only finalizes to
+    $0.36 strictly AFTER that sync, purely during this live run. The old
+    code's cash-free fee-only branch tracked and journaled the correction
+    but never actually deducted it from cash — this asserts executor cash
+    converges EXACTLY to the real exchange free balance after the fee
+    finalizes and is retried live."""
+    state_path = str(tmp_path / "state.json")
+    fake = FakeExchange(cash=1000.0)
+    ex = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    ex._portfolio.position    = 0.002
+    ex._portfolio._cost_basis = 85_000.0
+    fake._balance[fake.base] = 0.002
+    o1 = fake.create_order(
+        "BTC/CAD", "market", "sell", 0.002,
+        params={"stopLossPrice": "78000.00", "clientOrderId": "seed-o1"},
+    )
+    ex._native_stop_order_id    = o1["id"]
+    ex._native_stop_price       = 78_000.0
+    ex._native_stop_is_trailing = False
+
+    # The fill happened BEFORE the crash, with fee still provisional at
+    # $0 — and was already recorded locally (this executor's own state
+    # already reflects the quantity/cost), but the process died before
+    # _cancel_native_stop()'s own terminal-clearing logic ever ran, so
+    # the tracked id is still set — exactly the scenario
+    # _recover_flat_native_stop_at_startup() exists to handle (position
+    # already flat, tracked id still present).
+    fake.simulate_fill(o1["id"], 0.002, 78_000.0, 0.0, terminal=True)
+    ex._native_stop_last_recorded_filled = 0.002
+    ex._native_stop_last_recorded_cost   = 0.002 * 78_000.0
+    ex._native_stop_last_recorded_fee    = 0.0
+    ex._portfolio.position     = 0.0
+    ex._portfolio._cost_basis  = 0.0
+    ex._portfolio.realized_pnl = (78_000.0 - 85_000.0) * 0.002
+    ex._portfolio.cash         = fake._balance[fake.quote]   # 1156.0
+    ex._save_state()
+
+    # Restart: the final-state lookup times out during startup — O1 is
+    # queued unresolved. The startup sync reads the exchange's CURRENT
+    # free balance, which does not yet reflect the fee (it hasn't
+    # finalized on the exchange either, at this point).
+    with patch.object(fake, "fetch_order", side_effect=ccxt.RequestTimeout("timeout")):
+        ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    assert len(ex2._unresolved_stop_recoveries) == 1
+    _synced_cash = ex2.cash
+    assert _synced_cash == pytest.approx(1156.0)
+
+    # AFTER startup, purely during this live run, the exchange finalizes
+    # the fee — a real, not-yet-applied cash movement.
+    fake.simulate_fill(o1["id"], 0.002, 78_000.0, 0.36, terminal=True)
+    _real_exchange_cash = fake._balance[fake.quote]
+    assert _real_exchange_cash == pytest.approx(_synced_cash - 0.36)
+
+    discovered = ex2.reconcile_pending_orders()
+
+    assert discovered == []   # fee-only — never fabricates a fill Order
+    assert ex2.cash == pytest.approx(_real_exchange_cash)   # exactly converges
+    assert ex2._unresolved_stop_recoveries == []             # terminal, resolved
+    kinds = [e.get("kind", "fill") for e in ex2.pending_journal_entries]
+    assert "fee_adjustment" in kinds
+
+
+# ---------------------------------------------------------------------------
+# PASS-9 review, finding 2 (P1): an order queued for historical recovery
+# that is LATER independently adopted into active tracking (Gap B) must
+# have its recovery entry merged into — not left alongside — the newly
+# adopted cursor, or both paths independently discover and journal the
+# same future fill.
+# ---------------------------------------------------------------------------
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_adoption_merges_queued_recovery_instead_of_double_booking(mock_cfg, mock_sleep, tmp_path):
+    """PASS-9 review finding (P1, finding 2), exact reproduction: O1 is
+    queued for historical recovery after a failed lookup (which also
+    clears active tracking). A LATER restart's open-orders scan
+    independently discovers the same still-resting, still-unfilled O1 and
+    adopts it into active tracking. Before this fix, adoption never
+    checked the recovery queue: both a queued entry and a freshly adopted
+    cursor existed for the same order simultaneously, and when O1 later
+    partially filled, BOTH reconcile_pending_orders() (retrying the
+    queue) and _cancel_native_stop() (using active tracking) discovered
+    and journaled the SAME fill — realized P&L became -$14 for a single
+    0.001 BTC execution whose true loss is -$7."""
+    state_path = str(tmp_path / "state.json")
+    fake = FakeExchange(cash=1000.0)
+    ex = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    ex._portfolio.position    = 0.002
+    ex._portfolio._cost_basis = 85_000.0
+    fake._balance[fake.base] = 0.002
+    o1 = fake.create_order(
+        "BTC/CAD", "market", "sell", 0.002,
+        params={"stopLossPrice": "78000.00", "clientOrderId": "seed-o1"},
+    )
+    ex._native_stop_order_id    = o1["id"]
+    ex._native_stop_price       = 78_000.0
+    ex._native_stop_is_trailing = False
+    ex._save_state()
+
+    # Restart #1: open-order listing empty, direct lookup times out -> O1
+    # queued unresolved, active tracking cleared.
+    with patch.object(fake, "fetch_open_orders", return_value=[]), \
+         patch.object(fake, "fetch_order", side_effect=ccxt.RequestTimeout("timeout")):
+        ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    assert ex2._native_stop_order_id is None
+    assert len(ex2._unresolved_stop_recoveries) == 1
+    assert ex2._unresolved_stop_recoveries[0]["order_id"] == o1["id"]
+
+    # Restart #2: healthy queries restored. O1 is still genuinely resting,
+    # unfilled — the open-orders scan finds it untracked and adopts it.
+    ex3 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    assert ex3._native_stop_order_id == o1["id"]
+    # Fixed: adoption merges/removes the queued recovery entry so only
+    # ONE cursor survives, instead of both existing side by side.
+    assert ex3._unresolved_stop_recoveries == []
+
+    # O1 partially fills 0.001 BTC @ $78,000, fee $0.16 — still open.
+    fake.simulate_fill(o1["id"], 0.001, 78_000.0, 0.16, terminal=False)
+
+    # Both consumers run, in the order the review's own reproduction uses.
+    discovered = ex3.reconcile_pending_orders()
+    assert discovered == []   # the recovery queue is empty — nothing to retry there
+    fake.queue_cancel_failure()
+    outcome, fill_order = ex3._cancel_native_stop()
+
+    assert outcome == "partial"
+    assert fill_order is not None
+    assert fill_order.quantity == pytest.approx(0.001)
+    assert ex3._portfolio.realized_pnl == pytest.approx(-7.0)   # not -14.0
+    _native_stop_entries = [
+        e for e in ex3.pending_journal_entries
+        if e.get("order_id") == f"native-stop:{o1['id']}"
+    ]
+    assert len(_native_stop_entries) == 1   # exactly one journal entry, not two
