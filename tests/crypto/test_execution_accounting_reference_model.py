@@ -34,6 +34,7 @@ from execution_accounting_reference_model import (
     recover_position,
     recover_watermark,
     record_fee_revision,
+    refresh_ledger_projection_for_corrections,
     retrieve_with_coverage_proof,
     verify_ledger_delivery_consistency,
     write_ledger_rows,
@@ -256,11 +257,12 @@ def test_watermark_confirmed_is_conditional_not_proof_and_audit_detects_a_real_v
     audit = audit_historical_window(ex, db, "BTC/CAD", audit_since_ms=None,
                                      audit_until_ms=watermark)
     assert audit.violated is True
+    assert audit.status == "violated"
     assert sorted(audit.newly_discovered_trade_ids) == ["H_buy", "H_sell"]
 
     audited_report = assess_readiness(coverage, balance, ledger_delivery_ok=True,
                                        watermark_confirmed=confirmed,
-                                       historical_audit_clean=not audit.violated)
+                                       historical_audit_clean=audit.to_readiness_flag())
     assert audited_report.ready is False
     assert "audit" in audited_report.explain().lower()
 
@@ -288,12 +290,140 @@ def test_audit_of_a_genuinely_clean_window_confirms_nothing_was_missed(db):
 
     audit = audit_historical_window(ex, db, "BTC/CAD", audit_since_ms=None, audit_until_ms=watermark)
     assert audit.violated is False
+    assert audit.clean is True
     assert audit.newly_discovered_trade_ids == []
 
     report = assess_readiness(coverage, balance, ledger_delivery_ok=True,
-                               watermark_confirmed=confirmed, historical_audit_clean=True)
+                               watermark_confirmed=confirmed,
+                               historical_audit_clean=audit.to_readiness_flag())
     assert report.ready is True
     assert "audit" in report.explain() and "strongest" in report.explain()
+
+
+def test_incomplete_audit_is_inconclusive_not_silently_clean():
+    """Reference-model review R3 finding 1, reproduced exactly: an
+    unstable/truncated retrieval (coverage.complete=False) used to fall
+    through the same "no new ids found" path as a genuine clean read,
+    reporting violated=False — which readiness's documented
+    `historical_audit_clean=not audit.violated` conversion then silently
+    upgraded to CLEAN evidence. Injecting a drifting/truncated source
+    (mirroring test_reported_total_drift_mid_pagination_is_refused_not_
+    silently_accepted's own pattern) now returns status="inconclusive",
+    and to_readiness_flag() maps that to None — readiness is never
+    strengthened by a read that couldn't actually complete."""
+    from execution_accounting_reference_model import CoverageResult
+
+    class _AlwaysIncompleteSource:
+        def fetch_my_trades_page(self, symbol, since_ms=None, offset=0, limit=50):
+            from execution_accounting_reference_model import TradePage
+            # Reports a total that its own single page never reaches —
+            # the exact CoverageResult(False, [], 2, 0, ...) shape R3 named.
+            return TradePage([], reported_total=2, next_offset=None)
+
+    conn = init_db(":memory:")
+    audit = audit_historical_window(_AlwaysIncompleteSource(), conn, "BTC/CAD",
+                                     audit_since_ms=None, audit_until_ms=10_000)
+    assert audit.status == "inconclusive"
+    assert audit.violated is False       # NOT a violation...
+    assert audit.clean is False          # ...but explicitly not clean either
+    assert audit.inconclusive is True
+    assert audit.to_readiness_flag() is None
+
+    report = assess_readiness(
+        CoverageResult(True, [], 0, 0),  # some unrelated, otherwise-fine coverage read
+        check_balance_consistency(prior_balance=1000.0, trades=[], deposits=[], withdrawals=[],
+                                   fresh_balance=1000.0, side_asset_is_quote=True, quote="CAD"),
+        ledger_delivery_ok=True, watermark_confirmed=True,
+        historical_audit_clean=audit.to_readiness_flag(),
+    )
+    # Falls back to the conditional (unaudited) tier, exactly as if no
+    # audit had been attempted at all — never silently promoted to clean.
+    assert report.ready is True
+    assert "conditional" in report.explain()
+    assert "strongest" not in report.explain()
+
+
+def test_audit_retrieval_exception_is_inconclusive_not_propagated():
+    """Acceptance criterion from R3: a transient exchange failure during
+    the audit's own retrieval must not crash the caller or be silently
+    treated as clean — it's diagnostic, not a trading action."""
+    class _RaisingSource:
+        def fetch_my_trades_page(self, symbol, since_ms=None, offset=0, limit=50):
+            raise ConnectionError("simulated transient exchange failure")
+
+    conn = init_db(":memory:")
+    audit = audit_historical_window(_RaisingSource(), conn, "BTC/CAD",
+                                     audit_since_ms=None, audit_until_ms=10_000)
+    assert audit.status == "inconclusive"
+    assert "raised" in audit.reason
+    assert audit.to_readiness_flag() is None
+
+
+def test_audit_with_truncated_read_containing_only_already_known_ids_is_still_inconclusive():
+    """The specific edge R3 called out: a truncated page that happens to
+    contain only trade ids already in observed_trades must still be
+    inconclusive, not clean — coverage.complete is what decides this, not
+    whether the (incomplete) result happens to contain anything new. A
+    source that reports a total of 2 but a single page (with no further
+    pages) containing only the one already-known trade — the second,
+    genuinely new trade is simply never reached by this retrieval."""
+    from execution_accounting_reference_model import SynTrade, TradePage
+
+    conn = init_db(":memory:")
+    with conn:
+        conn.execute(
+            "INSERT INTO observed_trades (trade_id, order_id, symbol, side, price, amount, "
+            "cost, fee_cost, fee_currency, exchange_timestamp_ms) VALUES "
+            "('KNOWN', 'O1', 'BTC/CAD', 'buy', 100.0, 1.0, 100.0, 0.0, 'CAD', 1000)"
+        )
+
+    class _TruncatingSource:
+        def fetch_my_trades_page(self, symbol, since_ms=None, offset=0, limit=50):
+            known = SynTrade("KNOWN", "O1", "BTC/CAD", "buy", 100.0, 1.0, 100.0, 0.0, "CAD", 1_000)
+            # Reports 2 total but returns only the already-known one, with
+            # no further page offered — a truncated single-shot response.
+            return TradePage([known], reported_total=2, next_offset=None)
+
+    audit = audit_historical_window(_TruncatingSource(), conn, "BTC/CAD",
+                                     audit_since_ms=None, audit_until_ms=10_000)
+    assert audit.status == "inconclusive"
+    assert audit.to_readiness_flag() is None
+
+
+def test_audit_preserves_positive_evidence_from_a_partial_but_violating_read():
+    """Reference-model review R4 finding 1, reproduced exactly: a drifted/
+    incomplete retrieval whose FIRST page already contains a genuinely
+    unknown trade inside the audited window must report violated, not
+    inconclusive — the prior version discarded every partial trade before
+    comparing ids, so positive evidence of an omission was silently lost
+    the instant the retrieval also happened to be incomplete. Reproduces
+    the exact shape named in the review: CoverageResult(False, [Z], 2, 1,
+    ...) — one already-accumulated unknown trade, reported total 2,
+    fetched count 1."""
+    from execution_accounting_reference_model import SynTrade, TradePage
+
+    class _PartialButViolatingSource:
+        def __init__(self):
+            self._call = 0
+
+        def fetch_my_trades_page(self, symbol, since_ms=None, offset=0, limit=50):
+            self._call += 1
+            if self._call == 1:
+                z = SynTrade("Z", "O1", "BTC/CAD", "buy", 100.0, 1.0, 100.0, 0.0, "CAD", 2_000)
+                return TradePage([z], reported_total=2, next_offset=1)
+            # Second page drifts the reported total — retrieve_with_
+            # coverage_proof aborts as incomplete, but page 1's [Z] is
+            # already in the accumulated (partial) result set.
+            w = SynTrade("W", "O2", "BTC/CAD", "buy", 100.0, 1.0, 100.0, 0.0, "CAD", 2_500)
+            return TradePage([w], reported_total=3, next_offset=None)
+
+    conn = init_db(":memory:")  # nothing recorded — Z is genuinely unknown
+    audit = audit_historical_window(_PartialButViolatingSource(), conn, "BTC/CAD",
+                                     audit_since_ms=None, audit_until_ms=3_000)
+    assert audit.status == "violated"
+    assert audit.newly_discovered_trade_ids == ["Z"]
+    assert audit.to_readiness_flag() is False
+    assert "incomplete" in audit.reason  # incompleteness noted, not hidden, alongside the finding
 
 
 # ---------------------------------------------------------------------------
@@ -720,6 +850,95 @@ def test_fee_correction_on_entry_updates_remaining_basis_and_already_closed_pnl(
     conn2.close()
 
 
+def test_fee_correction_reaches_ledger_verification_via_projection_refresh(tmp_path):
+    """Reference-model review R3 finding 2, reproduced exactly: BUY 1@100
+    / SELL 1@101, both zero fee, written normally — verification starts
+    True. Recording a valid $2 SELL-fee correction makes reconstruction
+    correctly report -$1, but the STORED fills row stays at fee=0/pnl=+1
+    forever (ordinary replay skips an already-represented trade_id), so
+    verification correctly goes False with previously no way to close the
+    gap. refresh_ledger_projection_for_corrections is that repair path:
+    transactional, survives a real close/reopen, and is idempotent on
+    repeat."""
+    from execution_accounting_reference_model import SynTrade
+    db_path = str(tmp_path / "fee_correction_verification.db")
+    conn1 = init_db(db_path)
+    buy = SynTrade("BUY1", "O1", "BTC/CAD", "buy", 100.0, 1.0, 100.0, 0.0, "CAD", 1_000)
+    sell = SynTrade("SELL1", "O2", "BTC/CAD", "sell", 101.0, 1.0, 101.0, 0.0, "CAD", 2_000)
+    commit_checkpoint(conn1, currency_scope="CAD", window_since_ms=None, window_until_ms=2_000,
+                       balance_after=1001.0, trades=[buy, sell])
+    write_ledger_rows(conn1, [buy, sell], fold_position(causal_order([buy, sell])))
+    assert verify_ledger_delivery_consistency(conn1, "BTC/CAD") is True  # baseline
+
+    assert record_fee_revision(conn1, "SELL1", 2.0) is True
+    # Correction recorded, NOT yet materialized — verification correctly
+    # (fail-closed) reports False, not a silent pass.
+    assert verify_ledger_delivery_consistency(conn1, "BTC/CAD") is False
+
+    updated = refresh_ledger_projection_for_corrections(conn1, "BTC/CAD")
+    assert updated == ["SELL1"]
+    assert verify_ledger_delivery_consistency(conn1, "BTC/CAD") is True
+
+    row = conn1.execute("SELECT fee_cost, pnl FROM fills WHERE exec_key='SELL1'").fetchone()
+    assert abs(row[0] - 2.0) < 1e-9
+    assert abs(row[1] - (-1.0)) < 1e-9
+
+    # Repeating the refresh with nothing new to apply is a genuine no-op.
+    assert refresh_ledger_projection_for_corrections(conn1, "BTC/CAD") == []
+    conn1.close()
+
+    # Survives a REAL close/reopen: both verification and reconstruction
+    # agree from disk alone.
+    conn2 = init_db(db_path)
+    assert verify_ledger_delivery_consistency(conn2, "BTC/CAD") is True
+    post = recover_position(conn2, "BTC/CAD")
+    assert abs(post.realized_pnl - (-1.0)) < 1e-9
+    conn2.close()
+
+    # Genuine unrelated corruption must continue to fail — refresh only
+    # ever moves a row TOWARD the fold, and nothing here creates a
+    # fee_corrections entry for a corrupted quantity, so verification
+    # still catches it independent of any correction workflow.
+    conn3 = init_db(db_path)
+    with conn3:
+        conn3.execute("UPDATE fills SET quantity = 99 WHERE exec_key = 'SELL1'")
+    assert verify_ledger_delivery_consistency(conn3, "BTC/CAD") is False
+    conn3.close()
+
+
+def test_projection_refresh_mid_transaction_failure_rolls_back_every_update(db):
+    """Acceptance criterion from R3: inject a crash during materialization
+    and confirm true atomicity — with two trades both needing a refresh, a
+    failure injected after the first real UPDATE must undo THAT update
+    too, not just skip the second."""
+    from execution_accounting_reference_model import SynTrade
+    buy = SynTrade("BUY1", "O1", "BTC/CAD", "buy", 100.0, 2.0, 200.0, 0.0, "CAD", 1_000)
+    sell1 = SynTrade("SELL1", "O2", "BTC/CAD", "sell", 101.0, 1.0, 101.0, 0.0, "CAD", 2_000)
+    sell2 = SynTrade("SELL2", "O3", "BTC/CAD", "sell", 102.0, 1.0, 102.0, 0.0, "CAD", 3_000)
+    commit_checkpoint(db, currency_scope="CAD", window_since_ms=None, window_until_ms=3_000,
+                       balance_after=203.0, trades=[buy, sell1, sell2])
+    write_ledger_rows(db, [buy, sell1, sell2], fold_position(causal_order([buy, sell1, sell2])))
+
+    assert record_fee_revision(db, "SELL1", 1.0) is True
+    assert record_fee_revision(db, "SELL2", 1.5) is True
+
+    result = refresh_ledger_projection_for_corrections(db, "BTC/CAD", fail_after_n_updates=1)
+    assert result == []  # the whole call reports nothing applied
+
+    # BOTH rows must be untouched — including SELL1, whose UPDATE ran
+    # before the injected failure but inside the SAME transaction.
+    row1 = db.execute("SELECT fee_cost, pnl FROM fills WHERE exec_key='SELL1'").fetchone()
+    row2 = db.execute("SELECT fee_cost, pnl FROM fills WHERE exec_key='SELL2'").fetchone()
+    assert abs(row1[0] - 0.0) < 1e-9  # still stale
+    assert abs(row2[0] - 0.0) < 1e-9  # still stale
+    assert verify_ledger_delivery_consistency(db, "BTC/CAD") is False
+
+    # A clean retry applies both.
+    retried = refresh_ledger_projection_for_corrections(db, "BTC/CAD")
+    assert sorted(retried) == ["SELL1", "SELL2"]
+    assert verify_ledger_delivery_consistency(db, "BTC/CAD") is True
+
+
 def test_ledger_verification_detects_economic_corruption_not_just_representation(db):
     """Reference-model review R2 finding 3, reproduced exactly: rewriting
     an already-correct SELL fills row's stored quantity to 99 and pnl to
@@ -762,6 +981,53 @@ def test_ledger_verification_detects_broken_legacy_conservation(db):
 
     with db:
         db.execute("UPDATE fills SET fee_cost = 999 WHERE id = 1")
+    assert verify_ledger_delivery_consistency(db, "BTC/CAD") is False
+
+
+def test_legacy_pnl_blocks_verification_when_a_fee_correction_leaves_it_stale(db):
+    """Reference-model review R4 finding 2, reproduced exactly: a native
+    BUY funds a migrated legacy SELL whose originally stored P&L (+1) is
+    correct at baseline. Recording a SELL fee correction to $2 and running
+    the (fee-only, by declared design) projection refresh makes
+    correction-aware reconstruction correctly report -$1, but
+    refresh_ledger_projection_for_corrections deliberately never touches a
+    legacy row's stored pnl — a real, currently-unimplemented dimension.
+    Verification must FAIL, not silently pass on fee-conservation alone,
+    because the group's true combined P&L (sum over its linked trades'
+    correction-aware fold pnl) no longer matches what's stored."""
+    from execution_accounting_reference_model import SynTrade
+    buy = SynTrade("BUY1", "O1", "BTC/CAD", "buy", 100.0, 1.0, 100.0, 0.0, "CAD", 1_000)
+    commit_checkpoint(db, currency_scope="CAD", window_since_ms=None, window_until_ms=1_000,
+                       balance_after=900.0, trades=[buy])
+    write_ledger_rows(db, [buy], fold_position(causal_order([buy])))
+
+    sell = SynTrade("SELL1", "O2", "BTC/CAD", "sell", 101.0, 1.0, 101.0, 0.0, "CAD", 2_000)
+    with db:
+        db.execute(
+            "INSERT INTO fills (id, exec_key, timestamp_ms, side, symbol, quantity, "
+            "price, fee_cost, pnl, source) VALUES (2, 'legacy-sell-uuid', 2000, 'sell', "
+            "'BTC/CAD', 1.0, 101.0, 0.0, 1.0, 'legacy_migration')"
+        )
+    legacy = LegacyFillRow(fill_id=2, symbol="BTC/CAD", side="sell", quantity=1.0,
+                            cost=101.0, fee_cost=0.0, window_start_ms=1_500, window_end_ms=2_500)
+    result = migrate_legacy_row(legacy, [sell])
+    assert result.blocked is False
+    apply_migration_link(db, result, [sell])
+
+    # Baseline: the legacy row's stored +1 already matches the fold's own
+    # +1 (101 - 0 fee - 100 cost basis) exactly — nothing to flag yet.
+    assert verify_ledger_delivery_consistency(db, "BTC/CAD") is True
+
+    assert record_fee_revision(db, "SELL1", 2.0) is True
+    refresh_ledger_projection_for_corrections(db, "BTC/CAD")  # fee-only, by declared scope
+
+    row = db.execute("SELECT fee_cost, pnl FROM fills WHERE id = 2").fetchone()
+    assert abs(row[0] - 2.0) < 1e-9   # fee conservation WAS refreshed
+    assert abs(row[1] - 1.0) < 1e-9    # pnl was NOT — still the stale, pre-correction +1
+
+    post = recover_position(db, "BTC/CAD")
+    assert abs(post.realized_pnl - (-1.0)) < 1e-9  # reconstruction itself is correct
+
     assert verify_ledger_delivery_consistency(db, "BTC/CAD") is False
 
 

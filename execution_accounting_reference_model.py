@@ -423,10 +423,46 @@ def is_watermark_confirmed(window_until_ms: int, *, now_ms: int, safety_margin_m
 
 @dataclass
 class AuditResult:
-    violated: bool
+    """status is one of "clean" / "violated" / "inconclusive" — three
+    distinct outcomes, not a boolean. Reference-model review R3 finding 1:
+    the original boolean-only version conflated "we looked and found
+    nothing" with "we couldn't actually look" — an incomplete/truncated
+    retrieval (retrieve_with_coverage_proof's own coverage.complete=False)
+    used to fall straight through the same "no new ids found -> clean"
+    path as a genuine, fully-paged clean read, silently upgrading a
+    non-observation into positive evidence."""
+    status: str
     newly_discovered_trade_ids: "list[str]"
     audited_since_ms: "int | None"
     audited_until_ms: int
+    reason: str = ""
+
+    @property
+    def violated(self) -> bool:
+        return self.status == "violated"
+
+    @property
+    def clean(self) -> bool:
+        return self.status == "clean"
+
+    @property
+    def inconclusive(self) -> bool:
+        return self.status == "inconclusive"
+
+    def to_readiness_flag(self) -> "bool | None":
+        """The ONLY sanctioned way to feed an AuditResult into
+        assess_readiness's historical_audit_clean parameter: True only for
+        a genuinely clean audit, False for a real violation, and — this is
+        the fix — None (readiness must not be strengthened) for an
+        inconclusive one. Review R3's flagged bug was exactly the informal
+        `historical_audit_clean=not audit.violated` pattern silently
+        mapping inconclusive to True; this method makes that mapping
+        impossible to get wrong."""
+        if self.status == "violated":
+            return False
+        if self.status == "clean":
+            return True
+        return None
 
 
 def audit_historical_window(
@@ -440,16 +476,35 @@ def audit_historical_window(
     own — that function only checks elapsed time against an assumed bound;
     this function actually looks for evidence the bound was violated.
 
-    A clean audit (violated=False) is evidence the bounded-delay
-    assumption held FOR THIS WINDOW, checked now — it does not prove no
-    delay could ever exceed the margin in general, only that this
-    particular re-check found nothing amiss. A violation
-    (violated=True) means the assumption failed for real: the trades are
-    reported here so a human/operator can decide how to reconcile an
-    already-closed window's accounting — this function deliberately does
-    NOT retroactively rewrite anything itself (reopening closed books is a
-    decision, not something to do silently inside an audit read)."""
-    coverage = retrieve_with_coverage_proof(exchange, symbol, since_ms=audit_since_ms)
+    Returns "violated" whenever ANY successfully retrieved record —
+    whether or not the overall retrieval was page-exhausted — is a trade
+    inside the audited window that persisted state doesn't have.
+    Reference-model review R4 finding 1: a partial/incomplete read still
+    carries whatever records it DID manage to return, and an unknown trade
+    among them is real, positive evidence of a violation regardless of
+    what the untried remainder of the window might also contain — the
+    prior version discarded every partial trade before even looking,
+    silently downgrading concrete contrary evidence to "inconclusive."
+
+    Returns "inconclusive" (never silently "clean", and never silently
+    discarding a violation already found) if, with NO violation found in
+    whatever was retrieved:
+      - the retrieval itself was not page-exhausted (coverage.complete is
+        False — a truncated read containing only already-known ids used
+        to be indistinguishable from a genuine clean result); or
+      - the retrieval call raised (a transient exchange failure) — caught
+        here rather than propagated, since an audit is diagnostic, not a
+        trading action, and a caller should get a reportable result
+        either way.
+    Returns "clean" only when retrieval was genuinely complete AND no new
+    trade ids were found anywhere — evidence the bounded-delay assumption
+    held FOR THIS WINDOW, checked now (still not proof no delay could
+    ever exceed the margin in general)."""
+    try:
+        coverage = retrieve_with_coverage_proof(exchange, symbol, since_ms=audit_since_ms)
+    except Exception as exc:
+        return AuditResult("inconclusive", [], audit_since_ms, audit_until_ms,
+                            reason=f"audit retrieval raised: {exc}")
     known = {r[0] for r in conn.execute(
         "SELECT trade_id FROM observed_trades WHERE symbol = ?", (symbol,)
     )}
@@ -457,7 +512,15 @@ def audit_historical_window(
         t.trade_id for t in coverage.trades
         if t.trade_id not in known and t.timestamp_ms <= audit_until_ms
     ]
-    return AuditResult(len(newly_discovered) > 0, newly_discovered, audit_since_ms, audit_until_ms)
+    if newly_discovered:
+        # Positive evidence survives an incomplete retrieval — reported as
+        # violated either way, with the incompleteness noted for context.
+        reason = "" if coverage.complete else f"retrieval was also incomplete: {coverage.reason}"
+        return AuditResult("violated", newly_discovered, audit_since_ms, audit_until_ms, reason=reason)
+    if not coverage.complete:
+        return AuditResult("inconclusive", [], audit_since_ms, audit_until_ms,
+                            reason=f"audit retrieval itself was incomplete: {coverage.reason}")
+    return AuditResult("clean", [], audit_since_ms, audit_until_ms)
 
 
 # ============================================================================
@@ -759,6 +822,129 @@ def record_fee_revision(conn: sqlite3.Connection, trade_id: str, new_fee: float)
     return True
 
 
+class _InjectedProjectionFailure(Exception):
+    """Raised inside refresh_ledger_projection_for_corrections' real
+    transaction to prove a mid-refresh crash rolls back every UPDATE in
+    that call, not just the one it was about to make."""
+
+
+def refresh_ledger_projection_for_corrections(
+    conn: sqlite3.Connection, symbol: str, *, fail_after_n_updates: "int | None" = None,
+) -> "list[str]":
+    """Materializes the LATEST fee_corrections revision into the `fills`
+    table's fee_cost/pnl columns for every native (non-legacy) trade whose
+    stored row has drifted from the correction-aware fold.
+
+    Reference-model review R3 finding 2: recover_position/load_observed_
+    trades became correction-aware, but the DURABLE `fills` row a
+    correction lands on stayed frozen at its original value forever —
+    ordinary replay (write_ledger_rows) skips it because its identity is
+    already represented, so nothing could ever close the gap between
+    "reconstruction says -$1" and "the stored ledger row still says +$1".
+    verify_ledger_delivery_consistency stayed correctly False with no
+    repair path.
+
+    Chosen policy (stated explicitly, per the review's own framing):
+    `fee_corrections` is the immutable, append-only correction LOG —
+    never rewritten. `fills.fee_cost`/`fills.pnl` is a refreshable CURRENT
+    -value PROJECTION over `observed_trades` + `fee_corrections` — an
+    event-sourcing materialized view, not a second independent source of
+    truth. This function is that refresh step: transactional (one `with
+    conn:` — either every row needing an update gets it, or none do, on a
+    single call), idempotent (a trade already matching the fold is left
+    untouched and not returned), and safe to retry after an injected
+    failure (each row's own UPDATE is complete and correct on its own; a
+    retry simply reaches whatever the failed call didn't).
+
+    Scope, stated honestly: only NATIVE fills rows (one trade, one row)
+    are refreshed here. A legacy-linked aggregate row represents SEVERAL
+    trades summed together and was never modeled with a per-trade P&L
+    attribution to begin with (see LegacyFillRow/migrate_legacy_row) — a
+    correction affecting a migrated trade's fee is a real, currently
+    UNRESOLVED case for the aggregate row's own pnl; only its fee-
+    conservation total is refreshed (see the loop below), which
+    verify_ledger_delivery_consistency's legacy conservation check reads.
+    Refreshing a legacy row's pnl is out of scope for this pass.
+
+    Returns the trade_ids actually updated this call (empty if nothing
+    needed refreshing — the idempotent-repeat case)."""
+    trades = load_observed_trades(conn, symbol)  # correction-aware
+    ordered = causal_order(trades)
+    if ordered is None:
+        raise ValueError(
+            f"cannot refresh the ledger projection for {symbol}: persisted "
+            f"observed_trades cannot be causally ordered"
+        )
+    fold = fold_position(ordered)
+    by_id = {t.trade_id: t for t in trades}
+
+    updated: "list[str]" = []
+    try:
+        with conn:
+            for t in trades:
+                is_legacy = conn.execute(
+                    "SELECT 1 FROM legacy_links WHERE trade_id = ?", (t.trade_id,)
+                ).fetchone() is not None
+                if is_legacy:
+                    continue  # handled in the aggregate pass below
+                row = conn.execute(
+                    "SELECT fee_cost, pnl FROM fills WHERE exec_key = ?", (t.trade_id,)
+                ).fetchone()
+                if row is None:
+                    continue  # not a native fills row at all — nothing to refresh
+                stored_fee, stored_pnl = row
+                expected_pnl = fold.per_trade_pnl.get(t.trade_id)
+                fee_drifted = abs(stored_fee - t.fee_cost) > 1e-9
+                pnl_drifted = (
+                    (expected_pnl is None) != (stored_pnl is None)
+                    or (expected_pnl is not None
+                        and abs((stored_pnl or 0.0) - expected_pnl) > 1e-9)
+                )
+                if not (fee_drifted or pnl_drifted):
+                    continue
+                if fail_after_n_updates is not None and len(updated) == fail_after_n_updates:
+                    raise _InjectedProjectionFailure(
+                        f"injected failure after {len(updated)} projection updates"
+                    )
+                conn.execute(
+                    "UPDATE fills SET fee_cost = ?, pnl = ? WHERE exec_key = ?",
+                    (t.fee_cost, expected_pnl, t.trade_id),
+                )
+                updated.append(t.trade_id)
+
+            # Legacy aggregate fee-conservation refresh: sum of each
+            # linked group's CURRENT (correction-aware) trade fees.
+            legacy_group_ids = {
+                r[0] for r in conn.execute(
+                    "SELECT DISTINCT legacy_fill_id FROM legacy_links WHERE trade_id IN "
+                    "(SELECT trade_id FROM observed_trades WHERE symbol = ?)", (symbol,),
+                )
+            }
+            for legacy_fill_id in legacy_group_ids:
+                linked_ids = [r[0] for r in conn.execute(
+                    "SELECT trade_id FROM legacy_links WHERE legacy_fill_id = ?", (legacy_fill_id,)
+                )]
+                linked_trades = [by_id[tid] for tid in linked_ids if tid in by_id]
+                current_total_fee = sum(t.fee_cost for t in linked_trades)
+                stored = conn.execute(
+                    "SELECT fee_cost FROM fills WHERE id = ?", (legacy_fill_id,)
+                ).fetchone()
+                if stored is None or abs(stored[0] - current_total_fee) <= 1e-9:
+                    continue
+                if fail_after_n_updates is not None and len(updated) == fail_after_n_updates:
+                    raise _InjectedProjectionFailure(
+                        f"injected failure after {len(updated)} projection updates"
+                    )
+                conn.execute(
+                    "UPDATE fills SET fee_cost = ? WHERE id = ?",
+                    (current_total_fee, legacy_fill_id),
+                )
+                updated.append(f"legacy:{legacy_fill_id}")
+    except _InjectedProjectionFailure:
+        return []  # real rollback via `with conn:` — nothing in this call was applied
+    return updated
+
+
 # ============================================================================
 # Recovery — reconstructing state PURELY from persisted SQLite, after a
 # genuine close/reopen of the database. Reference-model review finding 3:
@@ -923,11 +1109,11 @@ def verify_ledger_delivery_consistency(conn: sqlite3.Connection, symbol: str,
         )]
         linked_trades = [by_id[tid] for tid in linked_ids if tid in by_id]
         legacy_row = conn.execute(
-            "SELECT quantity, fee_cost FROM fills WHERE id = ?", (legacy_fill_id,)
+            "SELECT quantity, fee_cost, pnl FROM fills WHERE id = ?", (legacy_fill_id,)
         ).fetchone()
         if legacy_row is None:
             return False
-        legacy_qty, legacy_fee = legacy_row
+        legacy_qty, legacy_fee, legacy_pnl = legacy_row
         if abs(sum(t.amount for t in linked_trades) - legacy_qty) > tolerance:
             return False
         # Note: this compares against each linked trade's CURRENT
@@ -938,6 +1124,30 @@ def verify_ledger_delivery_consistency(conn: sqlite3.Connection, symbol: str,
         # tolerated.
         if abs(sum(t.fee_cost for t in linked_trades) - legacy_fee) > tolerance:
             return False
+
+        # Legacy P&L, reference-model review R4 finding 2:
+        # refresh_ledger_projection_for_corrections deliberately never
+        # touches a legacy row's stored pnl (see its own docstring — legacy
+        # P&L refresh is an explicitly declared, deferred limitation, not
+        # silently forgotten). That deferral is only honest if verification
+        # actually checks it rather than passing on fee/quantity
+        # conservation alone. The natural aggregation policy for pnl is a
+        # plain sum across the linked group (pnl is additive, unlike
+        # price/fee); any linked trade with a non-None realized pnl in the
+        # correction-aware fold means the group's TRUE combined pnl is
+        # compared against the legacy row's stored value — matching (a
+        # correction already reconciled, or none ever affected it) passes;
+        # any drift (exactly the reproduced case: a fee correction to an
+        # underlying SELL leaves the legacy row's original pnl stale) fails
+        # closed here, whether or not that drift came from a correction
+        # directly on this group's own trades.
+        group_pnls = [fold.per_trade_pnl.get(t.trade_id) for t in linked_trades]
+        if any(p is not None for p in group_pnls):
+            expected_group_pnl = sum(p for p in group_pnls if p is not None)
+            if legacy_pnl is None or abs(legacy_pnl - expected_group_pnl) > tolerance:
+                return False
+        elif legacy_pnl is not None:
+            return False  # a pnl is stored but nothing in the group can justify one
 
     return True
 
