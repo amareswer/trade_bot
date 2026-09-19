@@ -191,11 +191,47 @@ def _compute_live_metrics(fills: list[dict], fee_adjustments: "dict[str, float] 
     fee_adjustments = dict(fee_adjustments or {})
     _matched_adjustment_order_ids: set = set()
 
+    # 2026-09-19 PASS-7 review finding (P1, finding 2): a correction is
+    # stored ONCE per order_id, but an order can have MULTIPLE fill rows
+    # (partial-fill deltas, after the earlier partial-fill fixes) sharing
+    # that SAME order_id — the old code added the FULL stored correction
+    # to EVERY matching row, charging it once per row instead of once per
+    # order. Reproduced exactly: two SELL rows sharing order_id "O1"
+    # (qty 0.5 each, gross pnl $0.50 each), correction {"O1": 1.20} —
+    # correct net P&L is $1.00 - $1.20 = -$0.20; the old code produced
+    # $1.00 - 2*$1.20 = -$1.40. Fixed: allocate the total correction
+    # across its rows proportional to quantity (the SAME convention
+    # already used for BUY-fee-to-SELL allocation below), with the LAST
+    # row sharing an order_id absorbing any floating-point remainder so
+    # the allocated total is EXACTLY the stored correction, never more.
+    _rows_per_order: dict[str, int] = {}
+    _order_total_qty: dict[str, float] = {}
+    for f in fills:
+        oid = f.get("order_id") or ""
+        if oid and oid in fee_adjustments:
+            _rows_per_order[oid]  = _rows_per_order.get(oid, 0) + 1
+            _order_total_qty[oid] = _order_total_qty.get(oid, 0.0) + (f.get("quantity") or 0.0)
+    _rows_seen:      dict[str, int]   = {}
+    _allocated_so_far: dict[str, float] = {}
+
     def _fee_or_zero(f: dict) -> "tuple[float, bool]":
         fee = f.get("fee_cost") or 0.0
         oid = f.get("order_id") or ""
         if oid and oid in fee_adjustments:
-            fee += fee_adjustments[oid]
+            _rows_seen[oid] = _rows_seen.get(oid, 0) + 1
+            total_adj = fee_adjustments[oid]
+            total_qty = _order_total_qty.get(oid, 0.0)
+            if _rows_seen[oid] >= _rows_per_order.get(oid, 1):
+                # Last (or only) row sharing this order_id — take whatever
+                # remains, guaranteeing the allocated sum is EXACTLY the
+                # stored total regardless of rounding.
+                share = total_adj - _allocated_so_far.get(oid, 0.0)
+            elif total_qty > 0:
+                share = total_adj * ((f.get("quantity") or 0.0) / total_qty)
+            else:
+                share = 0.0
+            _allocated_so_far[oid] = _allocated_so_far.get(oid, 0.0) + share
+            fee += share
             _matched_adjustment_order_ids.add(oid)
         if fee <= 0:
             return 0.0, True

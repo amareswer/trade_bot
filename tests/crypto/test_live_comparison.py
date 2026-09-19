@@ -293,3 +293,69 @@ def test_main_wires_fee_adjustments_into_metrics(db, monkeypatch, capsys):
     lc.main()
     out = capsys.readouterr().out
     assert "-$1.00" in out or "-1.00" in out or "$-1.00" in out
+
+
+# ---------------------------------------------------------------------------
+# PASS-7 review finding (P1, finding 2): a correction stored ONCE per
+# order_id must be allocated ONCE across ALL fill rows sharing that
+# order_id — not charged in full to every one of them.
+# ---------------------------------------------------------------------------
+
+def test_fee_adjustment_split_across_two_partial_fills_sharing_one_order_id():
+    """Exact reviewer reproduction: two SELL fill dicts, both
+    order_id="O1", quantity 0.5 each, gross pnl $0.50 each (gross profit
+    $1.00 total), zero original fees. Correction {"O1": 1.20}. Correct net
+    P&L is $1.00 - $1.20 = -$0.20. The un-fixed code produced -$1.40
+    (the $1.20 correction applied to BOTH rows)."""
+    fills = [
+        {"side": "SELL", "symbol": "BTC/CAD", "quantity": 0.5, "price": 100.0,
+         "pnl": 0.50, "fee_cost": 0.0, "fee_currency": "CAD", "order_id": "O1",
+         "timestamp": "t1", "exchange": "kraken"},
+        {"side": "SELL", "symbol": "BTC/CAD", "quantity": 0.5, "price": 100.0,
+         "pnl": 0.50, "fee_cost": 0.0, "fee_currency": "CAD", "order_id": "O1",
+         "timestamp": "t2", "exchange": "kraken"},
+    ]
+    metrics = lc._compute_live_metrics(fills, {"O1": 1.20})
+
+    assert metrics["net_pnl"] == pytest.approx(-0.20)
+    assert metrics["unattributed_fee_adjustments"] == pytest.approx(0.0)
+
+
+def test_fee_adjustment_split_proportionally_by_quantity_across_uneven_fills():
+    """Uneven quantities: the split must be proportional, not equal —
+    a 0.75/0.25 quantity split of a $4.00 correction allocates $3.00 and
+    $1.00 respectively, summing to exactly $4.00."""
+    fills = [
+        {"side": "SELL", "symbol": "BTC/CAD", "quantity": 0.75, "price": 100.0,
+         "pnl": 1.0, "fee_cost": 0.0, "fee_currency": "CAD", "order_id": "O2",
+         "timestamp": "t1", "exchange": "kraken"},
+        {"side": "SELL", "symbol": "BTC/CAD", "quantity": 0.25, "price": 100.0,
+         "pnl": 1.0, "fee_cost": 0.0, "fee_currency": "CAD", "order_id": "O2",
+         "timestamp": "t2", "exchange": "kraken"},
+    ]
+    metrics = lc._compute_live_metrics(fills, {"O2": 4.0})
+
+    # Gross pnl total $2.00, minus the full $4.00 correction (split
+    # 3.00/1.00 but summing to exactly 4.00 regardless) = -$2.00.
+    assert metrics["net_pnl"] == pytest.approx(-2.0)
+
+
+def test_fee_adjustment_allocation_end_to_end_with_real_sqlite(db):
+    """Real SQLite fixture: BUY split into two partial fills sharing an
+    order_id, closed by a SELL — a BUY-side correction must also be
+    allocated once across its own rows before flowing into the entry-fee
+    pool, per the SAME quantity-proportional convention."""
+    tl = TradeLog(db_path=db)
+    _fill(tl, "BUY", 0.5, 100.0, order_id="buy-1")
+    _fill(tl, "BUY", 0.5, 100.0, order_id="buy-1")   # second partial, SAME order_id
+    tl.log_fee_adjustment("buy-1", "BTC/CAD", 2.0, "CAD", adjustment_id="adj-1")
+    _fill(tl, "SELL", 1.0, 105.0, pnl=5.0, order_id="sell-1")
+
+    fills       = lc._load_fills(db)
+    adjustments = lc._load_fee_adjustments(db)
+    metrics     = lc._compute_live_metrics(fills, adjustments)
+
+    # Entry fee pool receives the FULL $2.00 correction exactly once
+    # (split 1.00/1.00 across the two BUY rows, but summing to 2.00 either
+    # way) — net pnl = 5.00 - 2.00 = 3.00, not 5.00 - 4.00 = 1.00.
+    assert metrics["net_pnl"] == pytest.approx(3.0)

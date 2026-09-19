@@ -559,3 +559,179 @@ def test_sell_crash_with_varying_fill_price_matches_uninterrupted(mock_cfg, mock
 
     assert crashed_final == baseline_final
     assert ex2.position == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# PASS-7 review, finding 1 (P0): a native stop that fully fills OFFLINE must
+# not have its proceeds credited twice, nor invent profit from a cost basis
+# _sync_position() already zeroed before recovery gets a chance to use it.
+# ---------------------------------------------------------------------------
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_stop_fully_fills_offline_does_not_double_credit_or_invent_profit(mock_cfg, mock_sleep, tmp_path):
+    """PASS-7 review finding (P0), exact reproduction: 0.002 BTC at an
+    $85,000 basis, $1,000 cash, a tracked stop at $78,000. The stop fully
+    fills OFFLINE for 0.002 BTC at $78,000 with a $0.32 fee. The old code's
+    flat-position startup branch called the LIVE _cancel_native_stop(),
+    which re-applied the already-synced proceeds (cash $1,311.36 instead
+    of $1,155.68) and computed P&L against the by-then-zeroed cost basis
+    (fabricating +$156 "profit" instead of the real -$14 loss)."""
+    state_path = str(tmp_path / "state.json")
+    fake = FakeExchange(cash=1000.0)
+    ex = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    ex._portfolio.position    = 0.002
+    ex._portfolio._cost_basis = 85_000.0
+    fake._balance[fake.base] = 0.002
+    raw = fake.create_order(
+        "BTC/CAD", "market", "sell", 0.002,
+        params={"stopLossPrice": "78000.00", "clientOrderId": "seed-stop"},
+    )
+    ex._native_stop_order_id    = raw["id"]
+    ex._native_stop_price       = 78_000.0
+    ex._native_stop_is_trailing = False
+    ex._save_state()
+
+    # Offline: the stop fully fills.
+    fake.simulate_fill(raw["id"], 0.002, 78_000.0, 0.32, terminal=True)
+
+    ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+
+    assert ex2.cash == pytest.approx(1_155.68)
+    assert ex2.position == pytest.approx(0.0)
+    assert ex2._portfolio.realized_pnl == pytest.approx(-14.0)
+    assert len(ex2.pending_journal_entries) == 1
+    assert ex2.pending_journal_entries[0]["pnl"] == pytest.approx(-14.0)
+    assert not ex2.has_resting_stop
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_stop_fully_fills_offline_crash_between_saves_still_converges(mock_cfg, mock_sleep, tmp_path):
+    """PASS-7 finding 1's own acceptance criterion: repeat with a crash
+    injected between _sync_position() (which zeros cost_basis) and stop
+    recovery finishing — the preserved pre-sync basis must survive to the
+    NEXT restart, not just the first one."""
+    state_path = str(tmp_path / "state.json")
+    fake = FakeExchange(cash=1000.0)
+    ex = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    ex._portfolio.position    = 0.002
+    ex._portfolio._cost_basis = 85_000.0
+    fake._balance[fake.base] = 0.002
+    raw = fake.create_order(
+        "BTC/CAD", "market", "sell", 0.002,
+        params={"stopLossPrice": "78000.00", "clientOrderId": "seed-stop"},
+    )
+    ex._native_stop_order_id    = raw["id"]
+    ex._native_stop_price       = 78_000.0
+    ex._native_stop_is_trailing = False
+    ex._save_state()
+    fake.simulate_fill(raw["id"], 0.002, 78_000.0, 0.32, terminal=True)
+
+    with patch.object(LiveExecutor, "_recover_flat_native_stop_at_startup",
+                       side_effect=_InjectedCrash("crash after position sync, before recovery")):
+        with pytest.raises(_InjectedCrash):
+            _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+
+    # Next restart, uninterrupted this time.
+    ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+
+    assert ex2.cash == pytest.approx(1_155.68)
+    assert ex2._portfolio.realized_pnl == pytest.approx(-14.0)
+
+
+# ---------------------------------------------------------------------------
+# PASS-7 review, finding 3 (P1): a fee finalized during downtime with NO
+# change in filled quantity must still reach the reporting journal, not
+# just get silently "consumed" by advancing the tracked baseline.
+# ---------------------------------------------------------------------------
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_fee_only_correction_during_downtime_reaches_journal(mock_cfg, mock_sleep, tmp_path):
+    """PASS-7 review finding (P1, finding 3), exact reproduction: 0.002 BTC
+    position, stop fills 0.001 at $78,000 with a PROVISIONAL zero fee
+    (recorded live). While offline, the fee finalizes to $0.36 with NO
+    change in filled quantity, remainder stays open. Restart. The old code
+    advanced the fee baseline (silently "consuming" the correction)
+    without ever journaling it."""
+    state_path = str(tmp_path / "state.json")
+    fake = FakeExchange(cash=1000.0)
+    ex = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    ex._portfolio.position    = 0.002
+    ex._portfolio._cost_basis = 80_000.0
+    fake._balance[fake.base] = 0.002
+    raw = fake.create_order(
+        "BTC/CAD", "market", "sell", 0.002,
+        params={"stopLossPrice": "78000.00", "clientOrderId": "seed-stop"},
+    )
+    ex._native_stop_order_id    = raw["id"]
+    ex._native_stop_price       = 78_000.0
+    ex._native_stop_is_trailing = False
+    ex._save_state()
+
+    fake.simulate_fill(raw["id"], 0.001, 78_000.0, 0.0, terminal=False)
+    fake.queue_cancel_failure()
+    outcome, fill_order = ex._cancel_native_stop()
+    assert outcome == "partial"
+    assert fill_order.fee_cost == pytest.approx(0.0)
+
+    # Offline: fee finalizes to $0.36, filled quantity UNCHANGED.
+    fake.simulate_fill(raw["id"], 0.001, 78_000.0, 0.36, terminal=False)
+
+    ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+
+    assert ex2._fees_paid == pytest.approx(0.36)
+    kinds = [e.get("kind", "fill") for e in ex2.pending_journal_entries]
+    assert "fee_adjustment" in kinds
+
+
+# ---------------------------------------------------------------------------
+# PASS-7 review, finding 4 (P1): a transient final-order lookup failure must
+# not permanently discard the stop's recovery identity — a later tick or
+# restart must still recover it.
+# ---------------------------------------------------------------------------
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_transient_lookup_failure_preserves_recovery_identity_until_resolved(mock_cfg, mock_sleep, tmp_path):
+    """PASS-7 review finding (P1, finding 4), exact reproduction: 0.002 BTC
+    at $85,000 basis, a tracked stop. Offline, the stop fills 0.001 BTC at
+    $78,000 with a $0.16 fee and becomes TERMINAL (e.g. cancelled with a
+    partial fill), leaving 0.001 BTC still held. A transient timeout on
+    the final-state lookup during restart must not permanently discard
+    the $7 loss — a later restart must still recover it."""
+    state_path = str(tmp_path / "state.json")
+    fake = FakeExchange(cash=1000.0)
+    ex = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+    ex._portfolio.position    = 0.002
+    ex._portfolio._cost_basis = 85_000.0
+    fake._balance[fake.base] = 0.002
+    raw = fake.create_order(
+        "BTC/CAD", "market", "sell", 0.002,
+        params={"stopLossPrice": "78000.00", "clientOrderId": "seed-stop"},
+    )
+    ex._native_stop_order_id    = raw["id"]
+    ex._native_stop_price       = 78_000.0
+    ex._native_stop_is_trailing = False
+    ex._save_state()
+
+    # Offline: partial fill, then terminal (cancelled), leaving 0.001 BTC.
+    fake.simulate_fill(raw["id"], 0.001, 78_000.0, 0.16, terminal=True)
+    fake._orders[raw["id"]]["status"] = "canceled"
+
+    # Restart #1: the final-state lookup times out transiently.
+    with patch.object(fake, "fetch_order", side_effect=ccxt.RequestTimeout("timeout")):
+        ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+
+    assert ex2.position == pytest.approx(0.001)          # position sync unaffected
+    assert ex2._portfolio.realized_pnl == pytest.approx(0.0)   # not yet recovered
+    assert ex2._unresolved_stop_recovery is not None
+    assert ex2._unresolved_stop_recovery["order_id"] == raw["id"]
+
+    # Restart #2: the lookup succeeds.
+    ex3 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
+
+    assert ex3._portfolio.realized_pnl == pytest.approx(-7.0)   # (78000-85000)*0.001
+    assert ex3._unresolved_stop_recovery is None
+    assert len(ex3.pending_journal_entries) >= 1

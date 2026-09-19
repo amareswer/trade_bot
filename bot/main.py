@@ -3335,6 +3335,32 @@ def run():
                             alerter=alerter, trade_log=trade_log,
                         )
 
+            # 2026-09-19 PASS-7 review — carried-over correctness gap, now
+            # closed: _rearm_native_stop_after_failed_sell() (a rejected
+            # SELL's stop re-placement turning out to already be filled)
+            # has no return-value path back here — execute()'s own return
+            # for that call is the REJECTED Order for the SELL itself, not
+            # this unrelated discovery. Drained every tick, alongside
+            # reconcile_pending_orders() above, and routed through the
+            # SAME bookkeeping consumer.
+            if (
+                cfg.exchange.live_trading and not cfg.exchange.dry_run
+                and hasattr(ss['executor'], 'drain_discovered_fills')
+            ):
+                for _rf_order in ss['executor'].drain_discovered_fills():
+                    if _rf_order.side == OrderSide.SELL:
+                        _process_discovered_sell_fill(
+                            sym, ss, _rf_order, "native_stop_discovered",
+                            capital_pool=capital_pool, risk=risk,
+                            alerter=alerter, trade_log=trade_log,
+                        )
+                    else:
+                        _process_discovered_buy_fill(
+                            sym, ss, _rf_order, "native_stop_discovered",
+                            capital_pool=capital_pool, risk=risk,
+                            alerter=alerter, trade_log=trade_log,
+                        )
+
             # ── 1c. Position drift reconciliation (every symbol, every 120 ticks, live) ──
             if cfg.exchange.live_trading and not cfg.exchange.dry_run and tick % 120 == 0:
                 _drift_delays = [5, 15, 30]

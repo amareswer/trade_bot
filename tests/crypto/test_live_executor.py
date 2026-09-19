@@ -2825,7 +2825,18 @@ def test_native_stop_fee_only_update_restart_between_fill_and_settlement(tmp_pat
     quantity fill and the fee settlement must still apply the fee
     adjustment exactly once — the tracked baseline is itself the
     idempotency record, and it is persisted the same way the quantity/cost
-    baseline already is."""
+    baseline already is.
+
+    PASS-7 review finding (P0/finding 3): with the flat-position startup
+    fix, the position (fully sold by the SAME order) goes to 0 as of the
+    first cancel call, so the NEXT restart's flat-position branch
+    (_recover_flat_native_stop_at_startup) is what discovers the
+    fee-only correction — not a later manual _cancel_native_stop() call,
+    which never runs against a tracked id that's already been cleared at
+    construction time. The exchange (fetch_order) already reflects the
+    FINAL, fee-settled state by the time this restart happens — exactly
+    as it would in reality (the correction finalizes on Kraken's side
+    independent of when the bot happens to next observe it)."""
     state_path = str(tmp_path / "state.json")
     ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True,
                         starting_cash=1000.0, state_path=state_path, tmp_path=tmp_path)
@@ -2841,10 +2852,25 @@ def test_native_stop_fee_only_update_restart_between_fill_and_settlement(tmp_pat
         "fee": {"cost": 0.0, "currency": "CAD"},
     }
     ex._cancel_native_stop()
+    assert ex.position == pytest.approx(0.0)
 
     # Restart — a fresh executor instance loading the SAME persisted state.
+    # The exchange now shows the SAME order fully settled with its final
+    # fee ($0.36) — this is what a real restart would observe. Kraken's
+    # own reported balance ALREADY reflects every fee at all times, so
+    # the fake exchange's free CAD here is exactly ex.cash minus the
+    # newly-finalized fee, even though the bot's own local cash hasn't
+    # caught up to it yet — that gap is exactly what _sync_cash() (the
+    # sole source of truth for cash, per the finding-1 fix) exists to close.
+    cash_before_restart = ex.cash
     mock_ex.fetch_balance.return_value = {
-        "free": {"CAD": ex.cash, "BTC": ex.position}, "total": {"CAD": ex.cash, "BTC": ex.position},
+        "free": {"CAD": ex.cash - 0.36, "BTC": ex.position},
+        "total": {"CAD": ex.cash - 0.36, "BTC": ex.position},
+    }
+    mock_ex.fetch_order.return_value = {
+        "id": "stop-001", "status": "canceled", "filled": 0.001,
+        "average": 90_000.0, "cost": 90.0,
+        "fee": {"cost": 0.36, "currency": "CAD"},
     }
     with patch.object(le_mod.ccxt, "kraken") as mock_cls2:
         mock_cls2.return_value = mock_ex
@@ -2853,19 +2879,10 @@ def test_native_stop_fee_only_update_restart_between_fill_and_settlement(tmp_pat
             starting_cash=1000.0, dry_run=False, state_path=state_path,
             native_stop_loss_enabled=True,
         )
-    cash_after_restart = ex2.cash
 
-    mock_ex.fetch_order.return_value = {
-        "id": "stop-001", "status": "canceled", "filled": 0.001,
-        "average": 90_000.0, "cost": 90.0,
-        "fee": {"cost": 0.36, "currency": "CAD"},
-    }
-    outcome, fill_order = ex2._cancel_native_stop()
-
-    assert outcome == "cancelled"
-    assert fill_order is None
     assert ex2._fees_paid == pytest.approx(0.36)
-    assert (cash_after_restart - ex2.cash) == pytest.approx(0.36)
+    assert (cash_before_restart - ex2.cash) == pytest.approx(0.36)   # applied exactly once
+    assert not ex2.has_resting_stop
 
 
 def test_sync_protective_stop_does_not_replace_when_partial_fill_still_open(tmp_path):
@@ -3153,7 +3170,15 @@ def test_native_stop_startup_detects_gap_when_order_gone(tmp_path):
 def test_native_stop_startup_position_closed_externally_clears_stale_id(tmp_path):
     """Position closed while the bot was down (the native stop's whole job) —
     exchange shows 0, saved stop id is stale and gets cleared. No re-placement:
-    there's no position left to protect."""
+    there's no position left to protect.
+
+    PASS-7 review finding (P0): the flat-position startup branch no longer
+    calls the LIVE _cancel_native_stop() (which would re-apply the fill's
+    cash effect on top of the already-synced exchange balance and compute
+    P&L against the by-then-zeroed cost_basis) — it recovers cash-free via
+    _recover_flat_native_stop_at_startup(), using the PRESERVED pre-sync
+    cost basis. An already-CLOSED order has nothing left to cancel, so
+    cancel_order is correctly never called at all."""
     state_path = str(tmp_path / "state.json")
     json.dump({
         "symbol": "BTC/CAD", "cash": 89.88, "position": 0.001,
@@ -3185,7 +3210,13 @@ def test_native_stop_startup_position_closed_externally_clears_stale_id(tmp_path
 
     assert ex.position == 0.0
     assert not ex.has_resting_stop
-    mock_ex.cancel_order.assert_called_once_with("stop-001", "BTC/CAD")
+    mock_ex.cancel_order.assert_not_called()   # already closed — nothing to cancel
+    assert ex.cash == pytest.approx(89.88)     # exchange-authoritative, not double-applied
+    # The missed execution's P&L is still recovered and journaled:
+    # (88,000 - 88,870) * 0.001 = -0.87
+    assert ex._portfolio.realized_pnl == pytest.approx(-0.87)
+    assert len(ex.pending_journal_entries) == 1
+    assert ex.pending_journal_entries[0]["quantity"] == pytest.approx(0.001)
 
 
 def test_native_stop_startup_detects_multiple_stop_orders_and_alerts(tmp_path):
@@ -3805,6 +3836,45 @@ def test_rejected_sell_rearms_the_native_stop(mock_cfg, _s, tmp_path):
     assert ex._native_stop_order_id == "stop-restored"   # put back
     assert ex._native_stop_price == 78_000.0             # at the prior level
     assert ex._portfolio.position == 0.01                # still held
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_rearm_discovering_an_already_filled_replacement_queues_it_for_drain(mock_cfg, _s, tmp_path):
+    """PASS-6/PASS-7 review — carried-over correctness gap, now closed:
+    the rejected SELL's stop re-placement discovers the replacement was
+    ALREADY filled (e.g. an adopted historical order). execute()'s own
+    return for this call is the REJECTED Order for the SELL itself — the
+    discovered fill must instead be queued for drain_discovered_fills(),
+    not silently dropped."""
+    _limit_cfg(mock_cfg, enabled=True, timeout_s=30)
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True,
+                        starting_cash=2000.0, tmp_path=tmp_path)
+    _seed_position_and_stop(ex, mock_ex, qty=0.01, entry=80_000.0, stop=78_000.0)
+
+    mock_ex.fetch_order.return_value = {"id": "stop-001", "status": "canceled", "filled": 0.0}
+    mock_ex.create_order.side_effect = [
+        ccxt.InsufficientFunds("kraken EOrder:Insufficient funds"),
+        # The replacement stop's OWN placement response shows it already
+        # executed (e.g. adopted via reconciliation after an earlier
+        # ambiguous outcome resolved on the exchange in the meantime).
+        {"id": "stop-already-filled", "status": "closed", "filled": 0.01,
+         "average": 78_000.0, "fee": {"cost": 0.16, "currency": "CAD"}},
+    ]
+
+    assert ex.drain_discovered_fills() == []   # nothing queued yet
+
+    order = ex.execute(Signal.SELL, 88_000.0, 0.01, urgent=True)
+
+    assert order is not None and order.status == OrderStatus.REJECTED
+    assert not ex.has_resting_stop   # already-filled response — nothing left resting
+
+    drained = ex.drain_discovered_fills()
+    assert len(drained) == 1
+    assert drained[0].side == OrderSide.SELL
+    assert drained[0].quantity == pytest.approx(0.01)
+    assert drained[0].price == pytest.approx(78_000.0)
+    assert ex.drain_discovered_fills() == []   # drained exactly once
 
 
 @patch("time.sleep")

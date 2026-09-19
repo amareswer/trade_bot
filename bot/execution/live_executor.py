@@ -301,6 +301,41 @@ class LiveExecutor:
         self._native_stop_order_id:    str | None   = None
         self._native_stop_price:       float | None = None
         self._native_stop_is_trailing: bool         = False
+        # PASS-7 review finding (P1, finding 4): a transient failure
+        # verifying a native stop's FINAL state (it's absent from open
+        # orders, or the position went flat) used to permanently discard
+        # the ability to recover that order's execution/P&L — a NEXT,
+        # healthy restart had nothing left telling it which historical
+        # order to check. This holds the reference (plus the baseline it
+        # must be compared against, captured at the moment it was lost —
+        # NOT the currently-tracked stop's baseline, which may by then
+        # belong to an entirely different replacement order) durably,
+        # independent of _native_stop_order_id (which is always cleared
+        # immediately — we DO know the order is no longer live/tracked,
+        # we just don't yet know its outcome). Retried every tick (see
+        # reconcile_pending_orders) and at every subsequent startup until
+        # it resolves.
+        self._unresolved_stop_recovery: dict | None = None
+        # PASS-7 review finding (P0): captured ONCE, immediately after
+        # _load_state() and BEFORE _sync_cash()/_sync_position() can
+        # zero cost_basis/position for a fully-offline-filled stop —
+        # startup recovery of that stop's P&L must use THIS preserved
+        # basis, never the (by-then-zeroed) live self._portfolio._cost_basis.
+        self._startup_recovery_cost_basis: float = 0.0
+        self._startup_recovery_position:   float = 0.0
+        # PASS-7 review — carried-over correctness gap, now closed: a fill
+        # discovered deep inside _rearm_native_stop_after_failed_sell()
+        # (a rejected SELL's stop re-placement turning out to already be
+        # filled) has nowhere to go via execute()'s own single-Order
+        # return contract. Queued here instead — drained by bot/main.py
+        # every tick via drain_discovered_fills(), alongside
+        # reconcile_pending_orders(), and routed through the SAME
+        # PositionManager/state-machine/capital-pool/risk/trade-log
+        # consumer any other discovered fill gets. Deliberately NOT
+        # persisted: see _rearm_native_stop_after_failed_sell's own
+        # docstring for why a crash before the next drain is not a
+        # correctness gap either.
+        self._pending_discovered_fills: list = []
         # Set by _place_limit_order when a post-only limit silently degrades to
         # a market (taker) order; read + cleared once per fill in execute().
         self._maker_fallback_reason:   str | None   = None
@@ -336,6 +371,28 @@ class LiveExecutor:
         # with the actual exchange balance to detect restart drift.
         # In dry-run: load saved state only (no API call for balance).
         self._load_state()
+        # PASS-7 review finding (P0): capture the JUST-LOADED cost basis/
+        # position BEFORE _sync_cash()/_sync_position() get any chance to
+        # zero/overwrite them (which _sync_position() does the moment the
+        # exchange shows the position fully closed — exactly the case
+        # where a native stop that fully executed offline needs ITS
+        # original basis to compute real P&L, not the post-sync zero).
+        #
+        # Only (re-)capture when the JUST-LOADED position is still > 0, or
+        # nothing is even tracked to protect. If position is ALREADY 0 as
+        # loaded from disk while a stop is STILL tracked, a PRIOR startup
+        # attempt already zeroed the live portfolio fields and crashed
+        # before finishing recovery — _load_state() just restored the
+        # CORRECT preserved snapshot from THAT attempt's own save into
+        # these same fields; re-deriving from the now-zeroed live
+        # cost_basis here would clobber it with 0, permanently losing the
+        # original basis on this second attempt. Reproduced exactly by
+        # injecting a crash between _sync_position() and recovery
+        # finishing, then retrying: without this guard the retry computed
+        # +$156 fabricated profit again instead of the real -$14 loss.
+        if self._portfolio.position > 0 or not self._native_stop_order_id:
+            self._startup_recovery_cost_basis = self._portfolio._cost_basis
+            self._startup_recovery_position   = self._portfolio.position
         # 2026-09-18 review finding (P1-7): a startup cash/position sync
         # failure fell back to configured starting_cash / the last saved
         # position (fictional/stale numbers, not the real exchange state)
@@ -348,6 +405,16 @@ class LiveExecutor:
         if not dry_run:
             base  = symbol.split("/")[0]
             quote = symbol.split("/")[1]
+            # PASS-7 review finding (P0): persist the preserved basis NOW,
+            # in its own dedicated (already-part-of-_save_state) fields —
+            # before _sync_position() can save the portfolio's own
+            # cost_basis/position as zero. A crash between here and
+            # finishing native-stop startup recovery still leaves this
+            # snapshot durable for the NEXT restart to recover from,
+            # rather than re-deriving it from what would by then be an
+            # already-zeroed on-disk _portfolio._cost_basis.
+            if self._native_stop_order_id:
+                self._save_state()
             # 2026-09-19 PASS-5 review finding (P1, carried over from
             # PASS-4 finding 3): must run BEFORE _sync_cash()/_sync_position()
             # — see _reconcile_pending_orders_at_startup()'s own docstring
@@ -601,7 +668,13 @@ class LiveExecutor:
         discovered native-stop fill already is via
         _process_discovered_sell_fill / _process_discovered_buy_fill.
         Never raises — same "must never crash the trading loop" contract
-        as sync_protective_stop()."""
+        as sync_protective_stop().
+
+        PASS-7 review finding (P1, finding 4): also retries any
+        previously-unresolved historical native-stop recovery every tick
+        (not just at the next restart) — a transient final-state lookup
+        failure must not have to wait for a restart to resolve."""
+        self._retry_unresolved_stop_recovery()
         discovered: list[Order] = []
         quote = self.symbol.split("/")[1]
         for role in ("buy", "sell"):
@@ -732,6 +805,22 @@ class LiveExecutor:
                     self.symbol, role, exc,
                 )
         return discovered
+
+    def drain_discovered_fills(self) -> "list[Order]":
+        """PASS-6/PASS-7 review — carried-over correctness gap, now
+        closed: returns and clears every fill queued by
+        _rearm_native_stop_after_failed_sell() (a rejected SELL's
+        stop-replacement turning out to already be filled — the one
+        remaining case where a discovered fill has no return-value path
+        back to bot/main.py's bookkeeping consumer, since it happens deep
+        inside execute()'s own reject-handling, which must still return
+        that call's own REJECTED Order). Call this once per tick, exactly
+        like reconcile_pending_orders() — every entry must be routed
+        through the SAME PositionManager/state-machine/capital-pool/risk/
+        trade-log consumer any other discovered fill gets."""
+        drained = self._pending_discovered_fills
+        self._pending_discovered_fills = []
+        return drained
 
     def _sync_cash(self) -> tuple[float, str | None]:
         """
@@ -954,7 +1043,7 @@ class LiveExecutor:
 
     def _journal_native_stop_execution_without_cash_effect(
         self, order_id: str, filled_qty: float, fill_price: float,
-        fee_cost: float, fee_currency: str,
+        fee_cost: float, fee_currency: str, cost_basis: "float | None" = None,
     ) -> Order:
         """PASS-6 review finding (P1): the startup-safe counterpart to
         _record_stop_triggered_fill. That method is for the LIVE, mid-run
@@ -968,9 +1057,20 @@ class LiveExecutor:
         sync (Kraken's free balance doesn't report "realized P&L"), and
         the execution itself still needs a journal entry — skipping those
         is exactly PASS-6 finding 1: a real fill and its loss disappearing
-        entirely from the recovery journal, even though cash converged."""
+        entirely from the recovery journal, even though cash converged.
+
+        cost_basis (PASS-7 review finding, P0): defaults to the CURRENT
+        self._portfolio._cost_basis, but the caller may pass the
+        PRESERVED pre-sync basis explicitly — when a stop fully executes
+        offline, _sync_position() zeroes cost_basis (position is now 0)
+        BEFORE this ever runs, so reading the current value here would
+        compute P&L against a basis that no longer reflects what was
+        actually paid for the position being closed (reproduced exactly:
+        cost basis $85,000 -> zeroed -> P&L computed against $0 fabricated
+        +$156 "profit" on a real $14 loss)."""
         quote = self.symbol.split("/")[1]
-        pnl = (fill_price - self._portfolio._cost_basis) * filled_qty
+        _cost_basis = self._portfolio._cost_basis if cost_basis is None else cost_basis
+        pnl = (fill_price - _cost_basis) * filled_qty
         self._portfolio.realized_pnl += pnl
         if fee_cost > 0:
             if fee_currency and fee_currency != quote:
@@ -1005,40 +1105,85 @@ class LiveExecutor:
         )
         return order
 
-    def _recover_missed_native_stop_execution(self, order: dict) -> None:
-        """PASS-6 review finding (P1): compares the order's CURRENT
-        cumulative filled/cost/fee against the LAST PERSISTED
-        _native_stop_last_recorded_* baseline (loaded from disk, from
-        before whatever restart triggered this call) — any positive delta
-        is a real execution that happened but was never journaled (a
-        crash prevented the normal in-process accounting from recording
-        it). Journals it (P&L included) via the cash-free helper above,
-        THEN advances the baseline to the order's current state — the
+    def _recover_missed_native_stop_execution(
+        self, order: dict, *,
+        baseline_filled: "float | None" = None,
+        baseline_cost:   "float | None" = None,
+        baseline_fee:    "float | None" = None,
+        cost_basis_override: "float | None" = None,
+        advance_tracked_baseline: bool = True,
+    ) -> None:
+        """PASS-6/PASS-7 review findings (P1/P0): compares the order's
+        CURRENT cumulative filled/cost/fee against a baseline — any
+        positive delta is a real execution that happened but was never
+        journaled (a crash prevented the normal in-process accounting
+        from recording it). Journals it (P&L included) via the cash-free
+        helper above, THEN advances the SHARED _native_stop_last_recorded_*
+        baseline (unless advance_tracked_baseline=False — see below) — the
         exact same "commit progress and economics together" discipline
         _record_order_delta's callers use, just anchored to the exchange's
         already-synced truth instead of a fresh in-process fill.
 
         On an ORDINARY (non-crash) restart this is a safe no-op: the last
         successful save already advanced the baseline to match the
-        order's cumulative state, so the delta is exactly zero."""
+        order's cumulative state, so the delta is exactly zero.
+
+        baseline_filled/cost/fee (PASS-7 review finding, P1, finding 4):
+        default to reading the SHARED self._native_stop_last_recorded_*
+        fields (the normal "this IS the currently tracked stop" case).
+        Pass explicit values when recovering a HISTORICAL order that is
+        NOT the currently tracked one (e.g. a retried _unresolved_stop_
+        recovery entry) — the shared fields may by then belong to an
+        entirely different (replacement) stop, and comparing against them
+        would silently corrupt an unrelated order's own delta tracking.
+        advance_tracked_baseline=False in that same situation: no
+        currently-tracked stop should have ITS baseline touched by
+        recovering a DIFFERENT, already-detached historical order.
+
+        cost_basis_override (PASS-7 review finding, P0): see
+        _journal_native_stop_execution_without_cash_effect's own
+        docstring — required whenever _sync_position() may already have
+        zeroed self._portfolio._cost_basis before this runs."""
+        _bf   = self._native_stop_last_recorded_filled if baseline_filled is None else baseline_filled
+        _bc   = self._native_stop_last_recorded_cost   if baseline_cost   is None else baseline_cost
+        _bfee = self._native_stop_last_recorded_fee    if baseline_fee   is None else baseline_fee
+
         cumulative_filled = float(order.get("filled") or 0.0)
-        new_delta = max(0.0, cumulative_filled - self._native_stop_last_recorded_filled)
+        new_delta = max(0.0, cumulative_filled - _bf)
         cumulative_cost = float(order.get("cost") or 0.0)
         if cumulative_cost <= 0:
             _avg = float(order.get("average") or order.get("price") or 0.0)
             cumulative_cost = _avg * cumulative_filled
         cumulative_fee = float((order.get("fee") or {}).get("cost") or 0.0)
+        delta_cost = max(0.0, cumulative_cost - _bc)
+        delta_fee  = max(0.0, cumulative_fee  - _bfee)
+        fee_currency = (order.get("fee") or {}).get("currency", "") or self.symbol.split("/")[1]
+
         if new_delta > 0:
-            delta_cost = max(0.0, cumulative_cost - self._native_stop_last_recorded_cost)
-            delta_fee  = max(0.0, cumulative_fee  - self._native_stop_last_recorded_fee)
             delta_price = delta_cost / new_delta if new_delta > 0 else 0.0
-            fee_currency = (order.get("fee") or {}).get("currency", "") or self.symbol.split("/")[1]
             self._journal_native_stop_execution_without_cash_effect(
                 str(order.get("id", "")), new_delta, delta_price, delta_fee, fee_currency,
+                cost_basis=cost_basis_override,
             )
-        self._native_stop_last_recorded_filled = cumulative_filled
-        self._native_stop_last_recorded_cost   = cumulative_cost
-        self._native_stop_last_recorded_fee    = cumulative_fee
+        elif delta_fee > 0:
+            # PASS-7 review finding (P1, finding 3): a fee finalized while
+            # offline, with the FILLED QUANTITY unchanged, used to just
+            # advance the baseline below with no journal entry at all —
+            # the correction was silently "consumed" (the baseline now
+            # matches it) without ever reaching TradeLog. Cash-free, same
+            # discipline as the quantity-delta branch above — never
+            # fabricates a zero-quantity execution row.
+            _quote = self.symbol.split("/")[1]
+            if fee_currency == _quote:
+                self._fees_paid += delta_fee
+            self._record_fee_adjustment_journal_entry(
+                f"native-stop:{order.get('id', '')}", delta_fee, fee_currency,
+            )
+
+        if advance_tracked_baseline:
+            self._native_stop_last_recorded_filled = cumulative_filled
+            self._native_stop_last_recorded_cost   = cumulative_cost
+            self._native_stop_last_recorded_fee    = cumulative_fee
 
     def _resolve_pending_protect_submission_at_startup(self) -> None:
         """PASS-6 review finding (P1): ordinary buy/sell startup recovery
@@ -1118,6 +1263,103 @@ class LiveExecutor:
         self._resolve_pending_submission("protect")
         self._save_state()
 
+    def _recover_flat_native_stop_at_startup(self) -> None:
+        """PASS-7 review finding (P0): the position is ALREADY flat (0) by
+        the time this runs — _sync_position() zeroed cost_basis for
+        exactly this reason (a native stop fully executed offline). The
+        OLD code called the LIVE _cancel_native_stop() here, which applies
+        the fill's cash effect a SECOND time (cash already reflects it via
+        _sync_cash()) and computes P&L against the now-zero cost_basis,
+        fabricating profit out of nothing. Reproduced exactly: cash
+        $1,311.36 instead of $1,155.68, reported profit +$156 instead of
+        the real -$14.
+
+        Fixed: query the tracked order directly and recover any missed
+        delta cash-free, using self._startup_recovery_cost_basis (captured
+        immediately after _load_state(), before any sync could zero it) —
+        never the LIVE _cancel_native_stop() path, and never the current
+        (by now zeroed) self._portfolio._cost_basis."""
+        order_id = self._native_stop_order_id
+        try:
+            final_order = fetch_with_retry(
+                lambda: self._exchange.fetch_order(order_id, self.symbol),
+                label=f"native stop final-state check (flat) [{self.symbol}]",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not verify final state of native stop %s (position "
+                "already flat) on %s: %s — preserving its historical "
+                "reference for a later retry instead of discarding it.",
+                order_id, self.symbol, exc,
+            )
+            self._unresolved_stop_recovery = {
+                "order_id": order_id,
+                "cost_basis": self._startup_recovery_cost_basis,
+                "baseline_filled": self._native_stop_last_recorded_filled,
+                "baseline_cost": self._native_stop_last_recorded_cost,
+                "baseline_fee": self._native_stop_last_recorded_fee,
+            }
+            self._native_stop_order_id    = None
+            self._native_stop_price       = None
+            self._native_stop_is_trailing = False
+            self._native_stop_last_recorded_filled = 0.0
+            self._native_stop_last_recorded_cost   = 0.0
+            self._native_stop_last_recorded_fee    = 0.0
+            self._save_state()
+            return
+
+        self._recover_missed_native_stop_execution(
+            final_order, cost_basis_override=self._startup_recovery_cost_basis,
+        )
+        self._native_stop_order_id    = None
+        self._native_stop_price       = None
+        self._native_stop_is_trailing = False
+        self._native_stop_last_recorded_filled = 0.0
+        self._native_stop_last_recorded_cost   = 0.0
+        self._native_stop_last_recorded_fee    = 0.0
+        self._save_state()
+
+    def _retry_unresolved_stop_recovery(self) -> None:
+        """PASS-7 review finding (P1, finding 4): retries a previously-
+        failed final-state lookup for a historical (no longer tracked)
+        native stop — called at startup and every tick (via
+        reconcile_pending_orders) until it resolves. Uses the baseline/
+        cost-basis frozen at the moment the reference was preserved, NOT
+        whatever the SHARED _native_stop_last_recorded_*/_portfolio.
+        _cost_basis fields currently hold (which may by now belong to an
+        entirely different replacement stop) — see
+        _recover_missed_native_stop_execution's own docstring."""
+        pending = self._unresolved_stop_recovery
+        if pending is None:
+            return
+        order_id = pending.get("order_id")
+        try:
+            final_order = fetch_with_retry(
+                lambda: self._exchange.fetch_order(order_id, self.symbol),
+                label=f"unresolved native-stop history retry [{self.symbol}]",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Unresolved native-stop history for %s on %s still "
+                "unavailable: %s — will retry again later.",
+                order_id, self.symbol, exc,
+            )
+            return
+        self._recover_missed_native_stop_execution(
+            final_order,
+            baseline_filled=pending.get("baseline_filled", 0.0),
+            baseline_cost=pending.get("baseline_cost", 0.0),
+            baseline_fee=pending.get("baseline_fee", 0.0),
+            cost_basis_override=pending.get("cost_basis"),
+            advance_tracked_baseline=False,
+        )
+        self._unresolved_stop_recovery = None
+        self._save_state()
+        logger.warning(
+            "UNRESOLVED NATIVE-STOP HISTORY RECOVERED [%s]: order %s "
+            "finally confirmed and journaled.", self.symbol, order_id,
+        )
+
     def _verify_resting_stop_on_startup(self) -> None:
         """
         Called once from __init__ (live mode only) after _sync_position.
@@ -1176,13 +1418,30 @@ class LiveExecutor:
         position — since a pending placement's own OUTCOME (did it fill?)
         needs journaling as a historical fact even if the position it was
         protecting has since changed by some other means.
+
+        PASS-7 review finding (P1, finding 4): also retries any
+        previously-unresolved historical stop recovery FIRST, independent
+        of the currently tracked slot or position state.
         """
         self._resolve_pending_protect_submission_at_startup()
+        self._retry_unresolved_stop_recovery()
 
         if self._portfolio.position <= 0:
-            # No position to protect — any leftover id is stale by definition.
+            # No position to protect — any leftover id is stale by
+            # definition, but PASS-7 review finding (P0): it may have
+            # FULLY EXECUTED OFFLINE before going stale, not just been
+            # cancelled — _sync_position() zeroing position/cost_basis
+            # reflects the cash effect of exactly that execution, but its
+            # P&L/journal are still missing. The OLD code called the LIVE
+            # _cancel_native_stop() here, which re-applies the fill's cash
+            # effect a SECOND time (already reflected via sync) and
+            # computes P&L against the NOW-ZERO cost_basis, fabricating
+            # profit out of nothing. Reproduced exactly: cash $1,311.36
+            # instead of $1,155.68, reported profit +$156 instead of the
+            # real -$14. Fixed: recover cash-free, using the basis
+            # preserved BEFORE the sync could zero it.
             if self._native_stop_order_id:
-                self._cancel_native_stop()
+                self._recover_flat_native_stop_at_startup()
             return
 
         try:
@@ -1269,6 +1528,7 @@ class LiveExecutor:
             # still-open case above. Query it directly; a genuine fill
             # recovers through the same cash-free journal path.
             _final_order = None
+            _lookup_failed = False
             try:
                 _final_order = fetch_with_retry(
                     lambda: self._exchange.fetch_order(
@@ -1277,14 +1537,29 @@ class LiveExecutor:
                     label=f"native stop final-state check [{self.symbol}]",
                 )
             except Exception as exc:
+                _lookup_failed = True
                 logger.warning(
                     "Could not verify final state of gone native stop %s "
-                    "on %s: %s — clearing tracking without recovering any "
-                    "missed execution (will not be retried).",
+                    "on %s: %s — PASS-7 fix: preserving its historical "
+                    "reference for a later retry instead of discarding it.",
                     self._native_stop_order_id, self.symbol, exc,
                 )
             if _final_order is not None:
                 self._recover_missed_native_stop_execution(_final_order)
+            elif _lookup_failed:
+                # PASS-7 review finding (P1, finding 4): position is still
+                # > 0 here (the early return above already handled the
+                # flat case), so self._portfolio._cost_basis has NOT been
+                # zeroed by _sync_position() — safe to capture directly,
+                # independent of the currently-tracked slot (which is
+                # about to be cleared below regardless of this outcome).
+                self._unresolved_stop_recovery = {
+                    "order_id": self._native_stop_order_id,
+                    "cost_basis": self._portfolio._cost_basis,
+                    "baseline_filled": self._native_stop_last_recorded_filled,
+                    "baseline_cost": self._native_stop_last_recorded_cost,
+                    "baseline_fee": self._native_stop_last_recorded_fee,
+                }
             logger.warning(
                 "NATIVE STOP GAP [%s]: tracked order %s is no longer open "
                 "(filled or cancelled while the bot was down) — position=%.6f "
@@ -1794,7 +2069,30 @@ class LiveExecutor:
         position is now naked. Put the stop back at its previous level so it
         isn't unprotected until the caller retries. Static stops re-place
         cleanly; a trailing stop can't (its % isn't recoverable here) so it
-        alerts loudly instead."""
+        alerts loudly instead.
+
+        PASS-6/PASS-7 review — carried-over correctness gap, now closed:
+        _place_native_stop() can itself discover the replacement was
+        ALREADY filled (an adopted historical order via
+        _create_order_persisted's reconciliation) and returns that fill.
+        This call site used to discard it entirely — the executor's own
+        cash/position updated correctly, but PositionManager/state
+        machine/capital pool/risk/trade log never learned about it.
+        execute()'s own return contract (a single Order for the CURRENT
+        call's own outcome) can't ALSO carry an unrelated fill discovered
+        deep inside its own reject-handling — instead of changing that
+        contract, this queues the discovery onto a durable, exactly-once
+        side channel (drain_discovered_fills()) that bot/main.py's per-
+        tick loop drains alongside reconcile_pending_orders(), routing it
+        through the SAME PositionManager/state-machine/capital-pool/risk/
+        trade-log consumer any other discovered fill gets. Not persisted
+        to disk: a crash before the next tick drains it is not a
+        correctness gap either — the executor's own accounting is already
+        fully caught up (this fill's delta has already been applied), so
+        bot/main.py's existing restart-recovery path re-seeds
+        PositionManager/state-machine/capital-pool fresh from the
+        executor's already-correct position rather than needing to replay
+        this specific event."""
         _price, _was_trailing = restore
         if self._portfolio.position <= 0:
             return
@@ -1808,7 +2106,9 @@ class LiveExecutor:
         logger.warning(
             "Re-arming native stop [%s] @ %.2f after a rejected SELL", self.symbol, _price,
         )
-        self._place_native_stop(self._portfolio.position, _price)
+        _discovered = self._place_native_stop(self._portfolio.position, _price)
+        if _discovered is not None:
+            self._pending_discovered_fills.append(_discovered)
 
     def _handle_protective_placement_result(
         self, raw: dict, quantity: float, is_trailing: bool,
@@ -2229,6 +2529,9 @@ class LiveExecutor:
             "native_stop_last_recorded_cost":   self._native_stop_last_recorded_cost,
             "native_stop_last_recorded_fee":    self._native_stop_last_recorded_fee,
             "order_progress": self._order_progress,
+            "unresolved_stop_recovery": self._unresolved_stop_recovery,
+            "startup_recovery_cost_basis": self._startup_recovery_cost_basis,
+            "startup_recovery_position":   self._startup_recovery_position,
             "saved_at":     datetime.now(timezone.utc).isoformat(),
         }
         try:
@@ -2466,6 +2769,15 @@ class LiveExecutor:
             state.get("native_stop_last_recorded_fee", 0.0) or 0.0
         )
         self._order_progress = dict(state.get("order_progress") or {})
+        self._unresolved_stop_recovery = state.get("unresolved_stop_recovery")
+        self._startup_recovery_cost_basis = float(state.get("startup_recovery_cost_basis", 0.0) or 0.0)
+        self._startup_recovery_position   = float(state.get("startup_recovery_position", 0.0) or 0.0)
+        if self._unresolved_stop_recovery:
+            logger.error(
+                "UNRESOLVED NATIVE-STOP HISTORY ON RESTART [%s]: %s — a "
+                "prior final-state lookup failed; will retry.",
+                self.symbol, self._unresolved_stop_recovery,
+            )
         if self._pending_submissions:
             logger.error(
                 "UNRESOLVED SUBMISSION(S) ON RESTART [%s]: %s — this process "
