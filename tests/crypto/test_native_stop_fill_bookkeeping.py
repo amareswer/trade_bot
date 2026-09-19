@@ -50,9 +50,13 @@ class _FakeExecutorForResync:
         self._next_fill = order
 
     def sync_protective_stop(self, stop_price, trailing_pct=None):
+        # 2026-09-19 PASS-5: real LiveExecutor.sync_protective_stop() now
+        # returns a list (possibly more than one discovered fill) — match
+        # that contract so this fake exercises the SAME shape every real
+        # call site actually receives.
         fill = self._next_fill
         self._next_fill = None
-        return fill
+        return [fill] if fill is not None else []
 
     def ack_journal_entry(self, order_id):
         self.acked_order_ids.append(order_id)
@@ -212,9 +216,9 @@ def test_process_discovered_sell_fill_ignores_non_sell_order():
 
 def test_resync_native_stop_return_value_flows_into_bookkeeping():
     """Proves the actual wiring: _resync_native_stop returns whatever
-    sync_protective_stop discovered, and that value is exactly what
-    _process_discovered_sell_fill needs — the full chain a real call site
-    in run() exercises, minus run()'s own loop scaffolding."""
+    sync_protective_stop discovered (a list), and that value is exactly
+    what _process_discovered_sell_fills needs — the full chain a real call
+    site in run() exercises, minus run()'s own loop scaffolding."""
     pm = PositionManager()
     pm.on_buy(80_000.0, 0.01)
     sm = TradingStateMachine(cooldown_ticks=3)
@@ -231,9 +235,9 @@ def test_resync_native_stop_return_value_flows_into_bookkeeping():
     executor.queue_fill(_fill_order(quantity=0.01, price=78_000.0))
 
     discovered = bot_main._resync_native_stop(ss)
-    assert discovered is not None
+    assert discovered == [discovered[0]]   # a one-element list, not a bare Order
 
-    bot_main._process_discovered_sell_fill(
+    bot_main._process_discovered_sell_fills(
         "BTC/CAD", ss, discovered, "native_stop_discovered",
         capital_pool=capital_pool, risk=risk, alerter=alerter, trade_log=trade_log,
     )
@@ -242,6 +246,58 @@ def test_resync_native_stop_return_value_flows_into_bookkeeping():
     assert not capital_pool.is_allocated("BTC/CAD")
     trade_log.log_fill.assert_called_once()
     risk.record_fill.assert_called_once_with("BTC/CAD")
+
+
+def test_sync_protective_stop_can_discover_two_fills_in_one_call():
+    """PASS-5 review finding (P1), exact reproduction: a cancel-side fill
+    from the OLD stop and a placement-side fill from the immediately-
+    following replacement are BOTH real execution events from a single
+    sync_protective_stop() call. Both must reach bookkeeping, in order —
+    not just whichever one the old single-Order return contract kept."""
+    pm = PositionManager()
+    pm.on_buy(80_000.0, 0.002)
+    sm = TradingStateMachine(cooldown_ticks=3)
+
+    class _TwoFillExecutor:
+        symbol = "BTC/CAD"
+        cash = 50.0
+        has_resting_stop = True
+
+        def __init__(self):
+            self.acked_order_ids = []
+
+        def sync_protective_stop(self, stop_price, trailing_pct=None):
+            return [
+                _fill_order(quantity=0.001, price=78_000.0, order_id="native-stop:old-001"),
+                _fill_order(quantity=0.001, price=78_500.0, order_id="native-stop:new-001"),
+            ]
+
+        def ack_journal_entry(self, order_id):
+            self.acked_order_ids.append(order_id)
+
+    executor = _TwoFillExecutor()
+    ss = _ss(executor, pm, sm)
+    ss['native_stop_is_trailing'] = False
+    ss['native_stop_price'] = 78_000.0
+    capital_pool = CapitalPool(total_capital=100.0, max_concurrent=1)
+    capital_pool.allocate("BTC/CAD")
+    risk = MagicMock()
+    alerter = MagicMock()
+    trade_log = MagicMock()
+
+    discovered = bot_main._resync_native_stop(ss)
+    assert len(discovered) == 2
+
+    bot_main._process_discovered_sell_fills(
+        "BTC/CAD", ss, discovered, "native_stop_discovered",
+        capital_pool=capital_pool, risk=risk, alerter=alerter, trade_log=trade_log,
+    )
+
+    assert not pm.has_position                     # both 0.001s applied — 0.002 fully closed
+    assert not capital_pool.is_allocated("BTC/CAD")
+    assert trade_log.log_fill.call_count == 2       # both fills reached TradeLog
+    assert risk.record_fill.call_count == 2
+    assert executor.acked_order_ids == ["native-stop:old-001", "native-stop:new-001"]
 
 
 # ---------------------------------------------------------------------------
@@ -349,3 +405,125 @@ def test_partial_discovered_exit_alerts_if_residual_left_unprotected():
     assert pm.quantity == pytest.approx(0.001)
     alerter.error.assert_called_once()
     assert "UNPROTECTED RESIDUAL" in alerter.error.call_args[0][0]
+
+
+# ---------------------------------------------------------------------------
+# PASS-5 review finding (P1): _process_discovered_buy_fill — a pending BUY
+# reconciled independently of a fresh signal (via
+# LiveExecutor.reconcile_pending_orders()) must reach the SAME bookkeeping
+# a strategy-driven BUY gets.
+# ---------------------------------------------------------------------------
+
+def _buy_fill_order(quantity, price, fee_cost=0.36, order_id="stuck-buy"):
+    return Order(
+        order_id=order_id, symbol="BTC/CAD", side=OrderSide.BUY,
+        quantity=quantity, price=price, status=OrderStatus.FILLED,
+        created_at=None, filled_at=None, fee_cost=fee_cost, fee_currency="CAD",
+    )
+
+
+def test_process_discovered_buy_fill_updates_position_manager():
+    pm = PositionManager()
+    sm = TradingStateMachine(cooldown_ticks=3)
+    executor = _FakeExecutorForResync()
+    ss = _ss(executor, pm, sm)
+    capital_pool = CapitalPool(total_capital=100.0, max_concurrent=1)
+    risk = MagicMock()
+    alerter = MagicMock()
+    trade_log = MagicMock()
+
+    order = _buy_fill_order(quantity=0.001, price=90_000.0)
+    bot_main._process_discovered_buy_fill(
+        "BTC/CAD", ss, order, "pending_order_reconciled",
+        capital_pool=capital_pool, risk=risk, alerter=alerter, trade_log=trade_log,
+    )
+
+    assert pm.has_position
+    assert pm.quantity == pytest.approx(0.001)
+
+
+def test_process_discovered_buy_fill_allocates_capital_pool_slot():
+    pm = PositionManager()
+    sm = TradingStateMachine(cooldown_ticks=3)
+    executor = _FakeExecutorForResync()
+    ss = _ss(executor, pm, sm)
+    capital_pool = CapitalPool(total_capital=100.0, max_concurrent=1)
+    assert not capital_pool.is_allocated("BTC/CAD")
+    risk = MagicMock()
+    alerter = MagicMock()
+    trade_log = MagicMock()
+
+    order = _buy_fill_order(quantity=0.001, price=90_000.0)
+    bot_main._process_discovered_buy_fill(
+        "BTC/CAD", ss, order, "pending_order_reconciled",
+        capital_pool=capital_pool, risk=risk, alerter=alerter, trade_log=trade_log,
+    )
+
+    assert capital_pool.is_allocated("BTC/CAD")
+
+
+def test_process_discovered_buy_fill_calls_risk_and_state_machine():
+    from bot.strategy.threshold_strategy import Signal
+
+    pm = PositionManager()
+    sm = TradingStateMachine(cooldown_ticks=3)
+    executor = _FakeExecutorForResync()
+    ss = _ss(executor, pm, sm)
+    capital_pool = CapitalPool(total_capital=100.0, max_concurrent=1)
+    risk = MagicMock()
+    alerter = MagicMock()
+    trade_log = MagicMock()
+
+    order = _buy_fill_order(quantity=0.001, price=90_000.0)
+    bot_main._process_discovered_buy_fill(
+        "BTC/CAD", ss, order, "pending_order_reconciled",
+        capital_pool=capital_pool, risk=risk, alerter=alerter, trade_log=trade_log,
+    )
+
+    risk.record_fill.assert_called_once_with("BTC/CAD")
+    assert sm.state.value == "LONG"
+
+
+def test_process_discovered_buy_fill_writes_trade_log_and_acks_journal():
+    pm = PositionManager()
+    sm = TradingStateMachine(cooldown_ticks=3)
+    executor = _FakeExecutorForResync()
+    ss = _ss(executor, pm, sm)
+    capital_pool = CapitalPool(total_capital=100.0, max_concurrent=1)
+    risk = MagicMock()
+    alerter = MagicMock()
+    trade_log = MagicMock()
+
+    order = _buy_fill_order(quantity=0.001, price=90_000.0, order_id="stuck-buy-1")
+    bot_main._process_discovered_buy_fill(
+        "BTC/CAD", ss, order, "pending_order_reconciled",
+        capital_pool=capital_pool, risk=risk, alerter=alerter, trade_log=trade_log,
+    )
+
+    trade_log.log_fill.assert_called_once()
+    _, kwargs = trade_log.log_fill.call_args
+    assert kwargs["side"] == "BUY"
+    assert kwargs["symbol"] == "BTC/CAD"
+    assert kwargs["quantity"] == pytest.approx(0.001)
+    assert executor.acked_order_ids == ["stuck-buy-1"]
+
+
+def test_process_discovered_buy_fill_ignores_non_buy_order():
+    pm = PositionManager()
+    sm = TradingStateMachine(cooldown_ticks=3)
+    pm.on_buy(80_000.0, 0.01)
+    executor = _FakeExecutorForResync()
+    ss = _ss(executor, pm, sm)
+    capital_pool = CapitalPool(total_capital=100.0, max_concurrent=1)
+    risk = MagicMock()
+    alerter = MagicMock()
+    trade_log = MagicMock()
+
+    sell_order = _fill_order(quantity=0.01, price=78_000.0)   # SELL
+    bot_main._process_discovered_buy_fill(
+        "BTC/CAD", ss, sell_order, "pending_order_reconciled",
+        capital_pool=capital_pool, risk=risk, alerter=alerter, trade_log=trade_log,
+    )
+
+    trade_log.log_fill.assert_not_called()
+    risk.record_fill.assert_not_called()

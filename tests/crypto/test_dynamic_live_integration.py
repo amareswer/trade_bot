@@ -96,8 +96,13 @@ class FakeExecutor:
         return order
 
     def sync_protective_stop(self, price, trailing_pct=None):
+        # Real LiveExecutor.sync_protective_stop() returns a list (possibly
+        # more than one discovered fill) — 2026-09-19 PASS-5. This fake
+        # never discovers one, but must match that contract shape so
+        # callers exercising the SAME code path as production don't crash.
         self.sync_calls.append((price, trailing_pct))
         self.has_resting_stop = price is not None or trailing_pct is not None
+        return []
 
     def _save_state(self):
         self.save_state_calls += 1

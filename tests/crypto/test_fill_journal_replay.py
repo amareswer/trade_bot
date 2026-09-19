@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from bot.data.trade_log import TradeLog
 from bot.main import _replay_pending_journal_entries
 
@@ -307,3 +309,105 @@ def test_restart_delta_does_not_collide_with_pre_restart_exec_key(tmp_path):
         "a post-restart delta must never reuse a pre-restart exec_key for "
         "the same order_id"
     )
+
+
+# ---------------------------------------------------------------------------
+# PASS-5 review finding (P1): fee-only corrections are queued on the SAME
+# pending-journal mechanism (kind="fee_adjustment") and must route to a
+# separate TradeLog table/consumer, never to log_fill.
+# ---------------------------------------------------------------------------
+
+def _fake_executor_fee_adjustment(entries: "list[dict] | None"):
+    ex = MagicMock()
+    ex.pending_journal_entries = entries or []
+    return ex
+
+
+def test_fee_adjustment_entry_reaches_trade_log_and_is_acked(tmp_path):
+    tl = TradeLog(db_path=str(tmp_path / "trades.db"))
+    alerter = MagicMock()
+    entry = {
+        "kind": "fee_adjustment", "adjustment_id": "adj-001",
+        "order_id": "native-stop:stop-001", "symbol": "BTC/CAD",
+        "delta_fee": 0.36, "fee_currency": "CAD",
+        "recorded_at": "2026-09-19T00:00:00+00:00",
+    }
+    ex = _fake_executor_fee_adjustment([entry])
+    executors = {"BTC/CAD": ex}
+
+    recovered = _replay_pending_journal_entries(executors, tl, alerter)
+
+    assert recovered == ["BTC/CAD"]
+    ex.ack_fee_adjustment.assert_called_once_with("adj-001")
+    ex.ack_journal_entry.assert_not_called()   # must not be treated as a fill
+    assert tl.total_fee_adjustments("BTC/CAD") == pytest.approx(0.36)
+
+
+def test_fee_adjustment_replay_idempotent_across_two_calls(tmp_path):
+    """Simulates the ack itself not surviving a second crash — the SAME
+    adjustment_id must never be double-counted."""
+    tl = TradeLog(db_path=str(tmp_path / "trades.db"))
+    alerter = MagicMock()
+    entry = {
+        "kind": "fee_adjustment", "adjustment_id": "adj-002",
+        "order_id": "order-002", "symbol": "BTC/CAD",
+        "delta_fee": 0.18, "fee_currency": "CAD",
+        "recorded_at": "2026-09-19T00:00:00+00:00",
+    }
+    executors = {"BTC/CAD": _fake_executor_fee_adjustment([entry])}
+
+    _replay_pending_journal_entries(executors, tl, alerter)
+    _replay_pending_journal_entries(executors, tl, alerter)   # ack "didn't survive"
+
+    assert tl.total_fee_adjustments("BTC/CAD") == pytest.approx(0.18)
+
+
+def test_fee_adjustment_replay_failure_alerts_and_does_not_ack(tmp_path):
+    tl = MagicMock()
+    tl.log_fee_adjustment.side_effect = Exception("disk full")
+    alerter = MagicMock()
+    entry = {
+        "kind": "fee_adjustment", "adjustment_id": "adj-003",
+        "order_id": "order-003", "symbol": "BTC/CAD",
+        "delta_fee": 0.5, "fee_currency": "CAD",
+        "recorded_at": "2026-09-19T00:00:00+00:00",
+    }
+    ex = _fake_executor_fee_adjustment([entry])
+    executors = {"BTC/CAD": ex}
+
+    recovered = _replay_pending_journal_entries(executors, tl, alerter)
+
+    assert recovered == []
+    ex.ack_fee_adjustment.assert_not_called()
+    alerter.error.assert_called_once()
+
+
+def test_fill_and_fee_adjustment_entries_both_replayed_independently(tmp_path):
+    """A fill (kind="fill") and a fee_adjustment for a DIFFERENT order both
+    pending at once — each must reach its own consumer without either
+    interfering with the other."""
+    tl = TradeLog(db_path=str(tmp_path / "trades.db"))
+    alerter = MagicMock()
+    fill_entry = {
+        "kind": "fill", "order_id": "order-fill-1", "exec_key": "order-fill-1#1",
+        "side": "BUY", "symbol": "BTC/CAD",
+        "quantity": 0.001, "price": 90_000.0, "pnl": None,
+        "fee_cost": 0.36, "fee_currency": "CAD",
+        "filled_at": "2026-09-19T00:00:00+00:00",
+    }
+    fee_entry = {
+        "kind": "fee_adjustment", "adjustment_id": "adj-004",
+        "order_id": "native-stop:stop-004", "symbol": "BTC/CAD",
+        "delta_fee": 0.10, "fee_currency": "CAD",
+        "recorded_at": "2026-09-19T00:00:00+00:00",
+    }
+    ex = _fake_executor_fee_adjustment([fill_entry, fee_entry])
+    executors = {"BTC/CAD": ex}
+
+    recovered = _replay_pending_journal_entries(executors, tl, alerter)
+
+    assert recovered == ["BTC/CAD", "BTC/CAD"]
+    ex.ack_journal_entry.assert_called_once_with("order-fill-1")
+    ex.ack_fee_adjustment.assert_called_once_with("adj-004")
+    assert len(tl.recent(limit=10)) == 1              # only the fill is a `fills` row
+    assert tl.total_fee_adjustments("BTC/CAD") == pytest.approx(0.10)

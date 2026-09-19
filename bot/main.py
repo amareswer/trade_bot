@@ -583,6 +583,42 @@ def _replay_pending_journal_entries(executors: dict, trade_log, alerter: "Telegr
     for sym, executor in executors.items():
         entries = list(getattr(executor, "pending_journal_entries", []) or [])
         for entry in entries:
+            # 2026-09-19 PASS-5 review finding (P1): a fee-only correction
+            # (native-stop or ordinary order) is queued on this SAME journal
+            # with kind="fee_adjustment" — it must route to its own
+            # TradeLog table/ack method, never to log_fill (which refuses
+            # quantity<=0 and would misrepresent a fee correction as a
+            # trade). Missing "kind" means an entry queued before this
+            # field existed — treat as "fill", the only kind that existed then.
+            if entry.get("kind") == "fee_adjustment":
+                try:
+                    trade_log.log_fee_adjustment(
+                        order_id      = entry["order_id"],
+                        symbol        = entry["symbol"],
+                        delta_fee     = entry["delta_fee"],
+                        fee_currency  = entry.get("fee_currency", ""),
+                        adjustment_id = entry.get("adjustment_id", ""),
+                        timestamp     = entry.get("recorded_at"),
+                    )
+                    executor.ack_fee_adjustment(entry["adjustment_id"])
+                    recovered.append(sym)
+                    logger.warning(
+                        "FEE ADJUSTMENT RECOVERED [%s]: replayed missed "
+                        "correction for order %s (+%.6f %s)",
+                        sym, entry.get("order_id"), entry["delta_fee"],
+                        entry.get("fee_currency", ""),
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "FEE ADJUSTMENT REPLAY FAILED [%s]: %s — entry stays "
+                        "pending, will retry on next startup", sym, exc,
+                    )
+                    alerter.error(
+                        f"FEE ADJUSTMENT REPLAY FAILED [{sym}]: {exc} — a "
+                        f"crash-recovered fee correction could not be logged; "
+                        f"will retry on the next restart."
+                    )
+                continue
             try:
                 trade_log.log_fill(
                     side          = entry["side"],
@@ -991,7 +1027,7 @@ def _seed_native_stop_state(executor) -> tuple[float | None, bool]:
     return executor.native_stop_price, executor.native_stop_is_trailing
 
 
-def _resync_native_stop(ss: dict) -> "Order | None":
+def _resync_native_stop(ss: dict) -> "list[Order]":
     """
     Re-place the native backstop sized to the position AFTER a quantity-
     changing event that doesn't close it (partial TP, a partial fill on
@@ -1013,14 +1049,16 @@ def _resync_native_stop(ss: dict) -> "Order | None":
     module-level definition instead of the nested one, and it's directly
     unit-testable without invoking run().
 
-    Returns whatever LiveExecutor.sync_protective_stop() returns — non-None
-    when a native stop was discovered to have filled (fully or partially)
+    Returns whatever LiveExecutor.sync_protective_stop() returns — a
+    (possibly empty) list of every fill discovered (fully or partially)
     during the cancel-and-verify cycle this triggers. 2026-09-18 follow-up
-    review finding (P1): every call site used to discard this return value
-    entirely — callers must now route a non-None result through
+    review finding (P1), sharpened 2026-09-19 PASS-5 (a cancel-side AND a
+    replacement-placement-side fill can both occur in the SAME call —
+    a single Optional return silently dropped one of them): every call
+    site must route EVERY entry in this list, in order, through
     _process_discovered_sell_fill so PositionManager/state machine/capital
-    pool/risk/trade log all learn about it, not just the executor's own
-    internal accounting.
+    pool/risk/trade log all learn about each one, not just the executor's
+    own internal accounting.
     """
     if not ss['pm'].has_position:
         _fo = ss['executor'].sync_protective_stop(None)
@@ -1191,12 +1229,11 @@ def _execute_approved_signal(
                 )
                 ss['native_stop_is_trailing'] = False
                 _discovered = ss['executor'].sync_protective_stop(ss['native_stop_price'])
-                if _discovered is not None:
-                    _process_discovered_sell_fill(
-                        sym, ss, _discovered, "native_stop_discovered",
-                        capital_pool=capital_pool, risk=risk,
-                        alerter=alerter, trade_log=trade_log,
-                    )
+                _process_discovered_sell_fills(
+                    sym, ss, _discovered, "native_stop_discovered",
+                    capital_pool=capital_pool, risk=risk,
+                    alerter=alerter, trade_log=trade_log,
+                )
             else:
                 pnl = ss['pm'].on_sell(order.price, order.quantity)
                 ss['trail_peak'] = 0.0
@@ -1206,24 +1243,22 @@ def _execute_approved_signal(
                     capital_pool.release(sym, ss['executor'].cash)
                     _discovered = ss['executor'].sync_protective_stop(None)
                     ss['native_stop_is_trailing'] = False
-                    if _discovered is not None:
-                        _process_discovered_sell_fill(
-                            sym, ss, _discovered, "native_stop_discovered",
-                            capital_pool=capital_pool, risk=risk,
-                            alerter=alerter, trade_log=trade_log,
-                        )
+                    _process_discovered_sell_fills(
+                        sym, ss, _discovered, "native_stop_discovered",
+                        capital_pool=capital_pool, risk=risk,
+                        alerter=alerter, trade_log=trade_log,
+                    )
                 else:
                     # Partial fill leaving a residual position (not
                     # currently reachable with strategy SELLs, which
                     # always close in full — defensive parity with
                     # the partial-TP path below).
                     _discovered = _resync_native_stop(ss)
-                    if _discovered is not None:
-                        _process_discovered_sell_fill(
-                            sym, ss, _discovered, "native_stop_discovered",
-                            capital_pool=capital_pool, risk=risk,
-                            alerter=alerter, trade_log=trade_log,
-                        )
+                    _process_discovered_sell_fills(
+                        sym, ss, _discovered, "native_stop_discovered",
+                        capital_pool=capital_pool, risk=risk,
+                        alerter=alerter, trade_log=trade_log,
+                    )
 
             display.fill(
                 order.side.value, order.quantity,
@@ -1401,6 +1436,96 @@ def _process_discovered_sell_fill(
         price       = order.price,
         total_value = order.total_value,
         pnl         = pnl,
+        exchange    = cfg.exchange.exchange,
+        reason      = reason,
+    )
+
+
+def _process_discovered_sell_fills(
+    sym: str, ss: dict, orders: "list[Order]", reason: str,
+    *, capital_pool: CapitalPool, risk: RiskManager, alerter, trade_log,
+) -> None:
+    """Plural wrapper around _process_discovered_sell_fill (2026-09-19
+    PASS-5 review finding, P1): sync_protective_stop()/_resync_native_stop()
+    can now discover MORE THAN ONE fill in a single call (a cancel-side
+    fill from the old stop AND a placement-side fill from the immediately-
+    following replacement, both real execution events) — every entry must
+    be processed, in order, through the SAME consumer, not just the first
+    or last one. Each call re-reads ss['pm'].has_position fresh, so
+    processing sequentially against the SAME position is already correct
+    for a partial-then-full (or full-then-nothing-left) sequence. Tolerates
+    a bare None (a non-conforming executor, e.g. a test double) the same
+    way this whole path must never be able to crash the trading loop."""
+    for order in (orders or []):
+        _process_discovered_sell_fill(
+            sym, ss, order, reason,
+            capital_pool=capital_pool, risk=risk, alerter=alerter, trade_log=trade_log,
+        )
+
+
+def _process_discovered_buy_fill(
+    sym: str, ss: dict, order: Order, reason: str,
+    *, capital_pool: CapitalPool, risk: RiskManager, alerter, trade_log,
+) -> None:
+    """Route a BUY fill DISCOVERED outside the normal execute() call path —
+    specifically, LiveExecutor.reconcile_pending_orders() resolving a
+    pending BUY submission independently of a fresh strategy signal
+    (2026-09-19 PASS-5 review finding, P1: the state machine suppresses
+    further BUY signals once LONG, so a partially-filled BUY's remaining
+    quantity could otherwise sit completely unresolved — no accounting
+    update, no fee/ledger entry, no capital-pool allocation — until some
+    unrelated event happened to touch the "buy" role again) — through the
+    SAME PositionManager / state machine / capital pool / risk / trade-log
+    bookkeeping a strategy-driven BUY gets via _execute_approved_signal.
+
+    Deliberately narrower than _execute_approved_signal's own BUY path: it
+    does not recompute ATR SL / arm native-stop protection / activate
+    trailing state, since those depend on the CURRENT candle's indicators,
+    which this call site (running ahead of any signal evaluation) has no
+    fresh read of. This is not a lasting protection gap — every existing
+    per-tick SL/TP and _resync_native_stop machinery already re-derives
+    sizing off the now-correct position on every subsequent cycle
+    regardless; a discovered BUY delta here correctly updates core
+    holdings/fees/ledger/capital-allocation immediately, only deferring
+    the exit-level (re)computation by at most one tick.
+
+    order.side must be BUY.
+    """
+    if order.side != OrderSide.BUY:
+        logger.error(
+            "_process_discovered_buy_fill called with a non-BUY order for "
+            "%s (%s) — ignoring, this should never happen.",
+            sym, order.side,
+        )
+        return
+
+    ss['pm'].on_buy(order.price, order.quantity)
+    risk.record_fill(sym)
+    ss['sm'].on_fill(Signal.BUY, order.price)
+    capital_pool.allocate(sym)   # no-op if this symbol already holds a slot
+
+    display.fill(order.side.value, order.quantity, sym, order.price, order.total_value, None)
+    trade_log.log_fill(
+        side          = "BUY",
+        symbol        = sym,
+        quantity      = order.quantity,
+        price         = order.price,
+        pnl           = None,
+        exchange      = cfg.exchange.exchange,
+        signal_reason = reason,
+        fee_cost      = order.fee_cost,
+        fee_currency  = order.fee_currency,
+        exec_key      = order.exec_key,
+    )
+    if hasattr(ss['executor'], 'ack_journal_entry'):
+        ss['executor'].ack_journal_entry(order.order_id)
+    alerter.fill(
+        side        = "BUY",
+        symbol      = sym,
+        quantity    = order.quantity,
+        price       = order.price,
+        total_value = order.total_value,
+        pnl         = None,
         exchange    = cfg.exchange.exchange,
         reason      = reason,
     )
@@ -2468,6 +2593,17 @@ def run():
                         _nsl_sym, _fallback_sl, cfg.backtest.stop_loss_pct * 100,
                         _nsl_exc.avg_entry,
                     )
+                    # Return value (now a list — 2026-09-19 PASS-5) deliberately
+                    # discarded here, same documented reasoning as
+                    # _reconcile_resting_stop_quantity/_rearm_native_stop_after_
+                    # failed_sell: this runs before symbol_state/risk/trade_log
+                    # exist for this symbol, so there is no live bookkeeping
+                    # consumer to route a discovered fill to yet. Placing a
+                    # BRAND NEW fallback stop discovering itself already filled
+                    # at this exact instant is an unreachable edge case in
+                    # practice (unlike the reconciliation-adopts-a-historical-
+                    # order case elsewhere) — left as an acknowledged, not a
+                    # newly-introduced, gap.
                     _nsl_exc.sync_protective_stop(_fallback_sl)
                 else:
                     logger.warning(
@@ -3119,6 +3255,35 @@ def run():
                     ss, cfg.exchange.candle_minutes, time.time(), alerter, symbol=sym,
                 )
 
+            # ── 1b-2. Pending-order reconciliation (every symbol, every tick, live) ──
+            # 2026-09-19 PASS-5 review finding (P1): a pending BUY/SELL
+            # submission was only ever reconciled as a SIDE EFFECT of a
+            # fresh signal for the SAME role — but the state machine
+            # suppresses further BUY signals once LONG, so a partially-
+            # filled BUY's remaining quantity (and a pending SELL that
+            # finishes independently of any new signal) could otherwise sit
+            # unresolved indefinitely: no accounting update, no fee/ledger
+            # entry. Runs BEFORE any new-signal evaluation below, every
+            # tick — never requires a fresh trade decision merely to finish
+            # accounting for an order the exchange already resolved.
+            if (
+                cfg.exchange.live_trading and not cfg.exchange.dry_run
+                and hasattr(ss['executor'], 'reconcile_pending_orders')
+            ):
+                for _pr_order in ss['executor'].reconcile_pending_orders():
+                    if _pr_order.side == OrderSide.SELL:
+                        _process_discovered_sell_fill(
+                            sym, ss, _pr_order, "pending_order_reconciled",
+                            capital_pool=capital_pool, risk=risk,
+                            alerter=alerter, trade_log=trade_log,
+                        )
+                    else:
+                        _process_discovered_buy_fill(
+                            sym, ss, _pr_order, "pending_order_reconciled",
+                            capital_pool=capital_pool, risk=risk,
+                            alerter=alerter, trade_log=trade_log,
+                        )
+
             # ── 1c. Position drift reconciliation (every symbol, every 120 ticks, live) ──
             if cfg.exchange.live_trading and not cfg.exchange.dry_run and tick % 120 == 0:
                 _drift_delays = [5, 15, 30]
@@ -3213,12 +3378,11 @@ def run():
                             None, trailing_pct=_trail_stop_pct,
                         )
                         ss['native_stop_is_trailing'] = True
-                        if _tr_discovered is not None:
-                            _process_discovered_sell_fill(
-                                sym, ss, _tr_discovered, "native_stop_discovered",
-                                capital_pool=capital_pool, risk=risk,
-                                alerter=alerter, trade_log=trade_log,
-                            )
+                        _process_discovered_sell_fills(
+                            sym, ss, _tr_discovered, "native_stop_discovered",
+                            capital_pool=capital_pool, risk=risk,
+                            alerter=alerter, trade_log=trade_log,
+                        )
 
                     _partial_tp_level = (
                         _ic_entry * (1 + cfg.backtest.partial_tp_pct)
@@ -3269,12 +3433,11 @@ def run():
                                     # same trailing % — partial TP changes
                                     # quantity, not level).
                                     _pt_discovered = _resync_native_stop(ss)
-                                    if _pt_discovered is not None:
-                                        _process_discovered_sell_fill(
-                                            sym, ss, _pt_discovered, "native_stop_discovered",
-                                            capital_pool=capital_pool, risk=risk,
-                                            alerter=alerter, trade_log=trade_log,
-                                        )
+                                    _process_discovered_sell_fills(
+                                        sym, ss, _pt_discovered, "native_stop_discovered",
+                                        capital_pool=capital_pool, risk=risk,
+                                        alerter=alerter, trade_log=trade_log,
+                                    )
                                     print(f"           📊 PARTIAL TP [{sym}]:  {_p_qty:.6f} @ {price:,.2f}  PnL={_p_pnl:+.2f}", flush=True)
                                     logger.warning("PARTIAL TP [%s]: sold %.6f @ %.2f  pnl=%.2f", sym, _p_qty, price, _p_pnl)
                                     trade_log.log_fill(
@@ -3381,12 +3544,11 @@ def run():
                                     # the executor-side cancel still clears it.
                                     _ic_discovered = ss['executor'].sync_protective_stop(None)
                                     ss['native_stop_is_trailing'] = False
-                                    if _ic_discovered is not None:
-                                        _process_discovered_sell_fill(
-                                            sym, ss, _ic_discovered, "native_stop_discovered",
-                                            capital_pool=capital_pool, risk=risk,
-                                            alerter=alerter, trade_log=trade_log,
-                                        )
+                                    _process_discovered_sell_fills(
+                                        sym, ss, _ic_discovered, "native_stop_discovered",
+                                        capital_pool=capital_pool, risk=risk,
+                                        alerter=alerter, trade_log=trade_log,
+                                    )
                                 else:
                                     # Urgent market SELL only partially filled — a
                                     # residual position remains. execute() cancelled
@@ -3395,12 +3557,11 @@ def run():
                                     # still held. Same resize the partial-TP and
                                     # strategy-SELL paths already do.
                                     _ic_discovered = _resync_native_stop(ss)
-                                    if _ic_discovered is not None:
-                                        _process_discovered_sell_fill(
-                                            sym, ss, _ic_discovered, "native_stop_discovered",
-                                            capital_pool=capital_pool, risk=risk,
-                                            alerter=alerter, trade_log=trade_log,
-                                        )
+                                    _process_discovered_sell_fills(
+                                        sym, ss, _ic_discovered, "native_stop_discovered",
+                                        capital_pool=capital_pool, risk=risk,
+                                        alerter=alerter, trade_log=trade_log,
+                                    )
                                 _ic_reason = (
                                     "trail_stop" if (_trail_sl_level > 0 and price <= _trail_sl_level)
                                     else "stop_loss" if _ic_sl
@@ -4108,6 +4269,16 @@ def run():
                     ),
                     trade_count  = risk.fills_today_for(_dp_sym),
                 )
+
+        # 2026-09-19 PASS-5 review finding (P1): fee-only corrections are
+        # queued on the pending-journal mechanism (kind="fee_adjustment")
+        # but nothing in the live per-tick path flushes them to TradeLog —
+        # only the ONE-TIME startup replay did, so a correction discovered
+        # mid-run sat unreported until the NEXT restart. Cheap and
+        # idempotent to call every tick (usually a no-op — empty lists);
+        # piggybacks on this existing per-tick maintenance point rather
+        # than adding a new one.
+        _replay_pending_journal_entries(executors, trade_log, alerter)
 
         # Daily both-bots health digest (local-time scheduled, once/day).
         _maybe_send_health_digest(

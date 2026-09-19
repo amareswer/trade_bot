@@ -50,6 +50,30 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_exec_key
 ON fills(exec_key) WHERE exec_key IS NOT NULL AND exec_key != ''
 """
 
+# 2026-09-19 PASS-5 review finding (P1): a late fee correction (native-stop
+# or ordinary order) updates the executor's own cash/fees_paid, but had
+# nothing durable for TradeLog/reporting — once the fill's own row was
+# already logged and acknowledged, the correction never reached net-of-fee
+# reports. A SEPARATE table, not a zero-quantity row in `fills` (log_fill
+# itself refuses quantity<=0 — this is deliberately never a fabricated
+# trade). adjustment_id is the idempotency key, same discipline as
+# fills.exec_key.
+_CREATE_FEE_ADJUSTMENTS = """
+CREATE TABLE IF NOT EXISTS fee_adjustments (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp     TEXT    NOT NULL,
+    order_id      TEXT    NOT NULL,
+    symbol        TEXT    NOT NULL,
+    delta_fee     REAL    NOT NULL,
+    fee_currency  TEXT    DEFAULT '',
+    adjustment_id TEXT
+)
+"""
+_CREATE_FEE_ADJUSTMENTS_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fee_adjustments_adjustment_id
+ON fee_adjustments(adjustment_id) WHERE adjustment_id IS NOT NULL AND adjustment_id != ''
+"""
+
 
 class TradeLog:
     """Thread-safe (write-serialized) SQLite trade log."""
@@ -144,6 +168,72 @@ class TradeLog:
         logger.debug("TradeLog: %s %s qty=%.6f @ %.2f pnl=%s fee=%.6f %s",
                      side, symbol, quantity, price, pnl, fee_cost, fee_currency)
 
+    def log_fee_adjustment(
+        self,
+        order_id:      str,
+        symbol:        str,
+        delta_fee:     float,
+        fee_currency:  str           = "",
+        adjustment_id: str           = "",
+        timestamp:     Optional[str] = None,
+    ) -> None:
+        """Records a late fee correction (a native-stop or ordinary order
+        whose fee was updated/finalized AFTER its original quantity fill
+        was already logged) as its own event — never a fabricated zero-
+        quantity row in `fills` (log_fill refuses quantity<=0 for exactly
+        this reason). adjustment_id makes this idempotent, identical
+        discipline to log_fill's exec_key: a second call with the same
+        adjustment_id is a confirmed no-op, not a duplicate row."""
+        if adjustment_id:
+            with self._connect() as conn:
+                existing = conn.execute(
+                    "SELECT id FROM fee_adjustments WHERE adjustment_id = ?",
+                    (adjustment_id,),
+                ).fetchone()
+            if existing is not None:
+                logger.info(
+                    "TradeLog: fee adjustment_id=%s already recorded (row "
+                    "id=%s) — skipping duplicate insert", adjustment_id, existing[0],
+                )
+                return
+        ts = timestamp or datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO fee_adjustments
+                        (timestamp, order_id, symbol, delta_fee, fee_currency, adjustment_id)
+                    VALUES (?,?,?,?,?,?)
+                    """,
+                    (ts, order_id, symbol, delta_fee, fee_currency, adjustment_id or None),
+                )
+        except sqlite3.IntegrityError:
+            logger.info(
+                "TradeLog: fee adjustment_id=%s inserted concurrently — "
+                "skipping duplicate", adjustment_id,
+            )
+            return
+        logger.debug(
+            "TradeLog: fee adjustment order=%s symbol=%s delta=%.6f %s",
+            order_id, symbol, delta_fee, fee_currency,
+        )
+
+    def total_fee_adjustments(self, symbol: Optional[str] = None) -> float:
+        """Sum of every logged fee adjustment (optionally scoped to one
+        symbol) — the correction live_comparison.py's net-of-fee math must
+        add on top of `fills.fee_cost` to be complete."""
+        with self._connect() as conn:
+            if symbol:
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(delta_fee), 0.0) FROM fee_adjustments WHERE symbol = ?",
+                    (symbol,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(delta_fee), 0.0) FROM fee_adjustments"
+                ).fetchone()
+        return float(row[0]) if row else 0.0
+
     def recent(self, limit: int = 20) -> list[dict]:
         """Return the most recent fills as a list of dicts.
 
@@ -222,6 +312,8 @@ class TradeLog:
                 conn.execute("ALTER TABLE fills ADD COLUMN exec_key TEXT")
                 logger.info("TradeLog: migrated — added exec_key column")
             conn.execute(_CREATE_EXEC_KEY_INDEX)
+            conn.execute(_CREATE_FEE_ADJUSTMENTS)
+            conn.execute(_CREATE_FEE_ADJUSTMENTS_INDEX)
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self._db_path, timeout=10)

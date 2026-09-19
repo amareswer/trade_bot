@@ -1556,6 +1556,96 @@ def test_pending_submission_resolves_once_reconciliation_recovers(tmp_path):
     assert "buy" not in ex.pending_submissions
 
 
+def test_stored_order_id_queried_directly_not_just_limited_closed_page(tmp_path):
+    """PASS-4 review finding 2, exact reproduction: a pending submission
+    already knows its real order_id (persisted the moment an earlier call
+    placed/adopted it), but the order has since scrolled off the limited
+    open-orders/10-row-closed-orders pages. The old reconciliation only
+    ever searched those two limited lists by client_order_id — never
+    queried the stored order_id directly — so an order absent from them
+    was wrongly treated as 'confirmed never placed' and a genuine
+    duplicate was submitted. Fixed: the stored order_id is queried
+    directly via fetch_order() first, unbounded by any page size."""
+    with patch("bot.execution.live_executor.cfg") as mock_cfg, patch("time.sleep"):
+        mock_cfg.exchange.limit_order_enabled = False
+        ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+        ex._pending_submissions["buy"] = {
+            "side": "buy", "client_order_id": "old-cid", "order_id": "old-order",
+            "quantity": 0.001, "price": None, "label": "test seed",
+            "created_at": "2026-09-18T00:00:00+00:00",
+        }
+        ex._save_state()
+
+        # The limited open/closed-orders pages are empty (scrolled off) —
+        # only a DIRECT fetch_order("old-order") still finds it.
+        mock_ex.fetch_open_orders.return_value = []
+        mock_ex.fetch_closed_orders.return_value = []
+        mock_ex.fetch_order.return_value = {
+            "id": "old-order", "status": "closed", "filled": 0.001,
+            "average": 90_000.0, "fee": {"cost": 0.36, "currency": "CAD"},
+        }
+
+        order = ex.execute(Signal.BUY, 91_000.0, 0.001)
+
+    assert order is not None and order.status == OrderStatus.FILLED
+    assert order.order_id == "old-order"
+    mock_ex.create_order.assert_not_called()   # no duplicate submitted
+    assert "buy" not in ex.pending_submissions
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_confirmed_canceled_zero_fill_attempt_is_replaced_not_readopted(mock_cfg, mock_sleep, tmp_path):
+    """PASS-4 review finding 4, exact reproduction: with one allowed
+    reprice, the first limit attempt times out and its cancellation is
+    CONFIRMED terminal with zero fill — and that dead order IS visible in
+    closed-order history (not even scrolled off any page). The old code
+    left the pending role populated after confirming this, so the very
+    next attempt (and the eventual market fallback) kept re-discovering
+    and re-adopting that same dead order instead of ever submitting a
+    genuinely new one — no replacement order was ever actually placed.
+    Fixed: a confirmed canceled/zero-fill attempt releases the role so the
+    next attempt gets a fresh identity."""
+    _limit_cfg(mock_cfg, enabled=True, timeout_s=0, max_retries=1)
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+    mock_ex.fetch_order_book.return_value   = _ob()
+    mock_ex.price_to_precision.return_value = "90009.0"
+
+    open_raw   = {"id": "limit-01", "status": "open", "filled": 0.0, "average": None, "fee": {}}
+    market_raw = {"id": "mkt-001", "status": "closed", "filled": 0.001,
+                  "average": 90_000.0, "fee": {"cost": 0.72, "currency": "CAD"}}
+    mock_ex.create_order.side_effect = [
+        {**open_raw, "id": "limit-01"},
+        {**open_raw, "id": "limit-02"},
+        market_raw,
+    ]
+    canceled_by_id = {
+        "limit-01": {"id": "limit-01", "status": "canceled", "type": "limit",
+                     "filled": 0.0, "amount": 0.001, "average": None, "fee": {}},
+        "limit-02": {"id": "limit-02", "status": "canceled", "type": "limit",
+                     "filled": 0.0, "amount": 0.001, "average": None, "fee": {}},
+    }
+    mock_ex.fetch_order.side_effect = lambda oid, _sym: canceled_by_id.get(
+        oid, {"id": oid, "status": "canceled", "filled": 0.0},
+    )
+    # Both dead attempts ARE visible in closed-order history (not even
+    # scrolled off any page) — the old bug re-adopted them anyway.
+    mock_ex.fetch_closed_orders.return_value = list(canceled_by_id.values())
+    mock_ex.fetch_open_orders.return_value = []
+
+    order = ex.execute(Signal.BUY, 90000.0, 0.001)
+
+    assert order is not None and order.status == OrderStatus.FILLED
+    assert order.order_id == "mkt-001"
+    # limit-01, limit-02, market — every attempt genuinely NEW, none re-adopted
+    assert mock_ex.create_order.call_count == 3
+    assert mock_ex.create_order.call_args_list[-1].args[1] == "market"
+    _client_ids = {c.args[-1].get("clientOrderId") for c in mock_ex.create_order.call_args_list}
+    assert len(_client_ids) == 3   # every attempt used a distinct identity
+
+
 def test_pending_submission_survives_restart(tmp_path):
     """The exact crash scenario: process dies with a submission genuinely
     unresolved. A restart must still see the pending submission so it can
@@ -1583,6 +1673,211 @@ def test_pending_submission_survives_restart(tmp_path):
 
     assert "buy" in ex2.pending_submissions
     assert ex2.pending_submissions["buy"]["client_order_id"] == _pending["client_order_id"]
+
+
+def test_restart_recovery_of_settled_buy_does_not_double_deduct_cash(tmp_path):
+    """PASS-4 finding 3 / PASS-5 finding 2, exact reproduction: start with
+    $1,000. A 0.001 BTC BUY at $90,000 fills; the process dies after the
+    submission wrapper persisted acceptance but before local fill
+    accounting ran. Restart with exchange CAD cash $910 and BTC 0.001 (the
+    exchange balance already reflects the settled, fee-inclusive fill).
+    The OLD code recovered the pending order through ordinary execute()
+    accounting AFTER _sync_cash() had already set cash to $910, deducting
+    ANOTHER $90 and landing at $820. Fixed: startup reconciliation runs
+    BEFORE _sync_cash()/_sync_position() and never touches cash itself —
+    the exchange sync alone establishes the correct $910, exactly once."""
+    state_path = str(tmp_path / "state.json")
+    with patch("bot.execution.live_executor.cfg") as mock_cfg, patch("time.sleep"):
+        mock_cfg.exchange.limit_order_enabled = False
+        ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, state_path=state_path, tmp_path=tmp_path)
+        mock_ex.create_order.side_effect = ccxt.RequestTimeout("response lost")
+        mock_ex.fetch_open_orders.side_effect = ccxt.NetworkError("still unreachable")
+        ex.execute(Signal.BUY, 90_000.0, 0.001)
+        assert "buy" in ex.pending_submissions
+
+    # Restart: the exchange now shows the settled fill's real, post-fee
+    # balance — $910 CAD, 0.001 BTC. The submission's exception path never
+    # learned a real order_id (the response was lost before one came
+    # back) — only its client_order_id survived, so recovery must find it
+    # the same way _find_untracked_entry_order always does: by client id,
+    # checked open then closed.
+    mock_ex.fetch_balance.return_value = {
+        "free": {"CAD": 910.0, "BTC": 0.001}, "total": {"CAD": 910.0, "BTC": 0.001},
+    }
+    _cid = ex.pending_submissions["buy"]["client_order_id"]
+    mock_ex.fetch_open_orders.side_effect = None
+    mock_ex.fetch_open_orders.return_value = []
+    mock_ex.fetch_closed_orders.return_value = [{
+        "id": "settled-buy-001", "status": "closed", "filled": 0.001,
+        "average": 90_000.0, "cost": 90.0, "clientOrderId": _cid,
+        "fee": {"cost": 0.0, "currency": "CAD"},   # already netted into the $910 free balance
+    }]
+
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls2:
+        mock_cls2.return_value = mock_ex
+        ex2 = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=1000.0, dry_run=False, state_path=state_path,
+        )
+
+    assert ex2.cash == pytest.approx(910.0)       # NOT 820.0 — no double deduction
+    assert ex2.position == pytest.approx(0.001)
+    assert "buy" not in ex2.pending_submissions   # confirmed terminal — resolved
+    assert len(ex2.pending_journal_entries) == 1  # the fill still reaches TradeLog
+    assert mock_ex.create_order.call_count == 1   # no fresh submission ever placed
+
+
+def test_restart_recovery_of_settled_sell_does_not_double_apply(tmp_path):
+    """Same class of bug as the BUY case above, for a SELL: a 0.001 BTC
+    SELL at $95,000 (cost basis $90,000) fills; the process dies before
+    local accounting runs. Restart with the exchange already reflecting
+    the closed position and increased cash. Recovery must journal the
+    realized P&L exactly once without re-deriving cash from a delta."""
+    state_path = str(tmp_path / "state.json")
+    with patch("bot.execution.live_executor.cfg") as mock_cfg, patch("time.sleep"):
+        mock_cfg.exchange.limit_order_enabled = False
+        ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, state_path=state_path, tmp_path=tmp_path)
+        ex._portfolio.position    = 0.001
+        ex._portfolio._cost_basis = 90_000.0
+        ex._bot_opened_position   = True
+        ex._save_state()
+        mock_ex.create_order.side_effect = ccxt.RequestTimeout("response lost")
+        mock_ex.fetch_open_orders.side_effect = ccxt.NetworkError("still unreachable")
+        ex.execute(Signal.SELL, 95_000.0, 0.001)
+        assert "sell" in ex.pending_submissions
+
+    # Restart: exchange already shows the position closed and cash credited.
+    mock_ex.fetch_balance.return_value = {
+        "free": {"CAD": 1095.0, "BTC": 0.0}, "total": {"CAD": 1095.0, "BTC": 0.0},
+    }
+    _cid = ex.pending_submissions["sell"]["client_order_id"]
+    mock_ex.fetch_open_orders.side_effect = None
+    mock_ex.fetch_open_orders.return_value = []
+    mock_ex.fetch_closed_orders.return_value = [{
+        "id": "settled-sell-001", "status": "closed", "filled": 0.001,
+        "average": 95_000.0, "cost": 95.0, "clientOrderId": _cid,
+        "fee": {"cost": 0.0, "currency": "CAD"},
+    }]
+
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls2:
+        mock_cls2.return_value = mock_ex
+        ex2 = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=1000.0, dry_run=False, state_path=state_path,
+        )
+
+    assert ex2.cash == pytest.approx(1095.0)      # established by the exchange sync alone
+    assert ex2.position == pytest.approx(0.0)
+    assert "sell" not in ex2.pending_submissions
+    assert len(ex2.pending_journal_entries) == 1
+    assert ex2.pending_journal_entries[0]["pnl"] == pytest.approx(5.0)   # (95000-90000)*0.001
+
+
+# ---------------------------------------------------------------------------
+# PASS-5 review finding (P1): reconcile_pending_orders() — a pending BUY/
+# SELL must be reconciled INDEPENDENTLY of a fresh signal for the same
+# role, since the state machine suppresses further BUY signals once LONG.
+# ---------------------------------------------------------------------------
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_reconcile_pending_orders_completes_a_stuck_partial_buy(mock_cfg, mock_sleep, tmp_path):
+    """PASS-5 review finding (P1), exact reproduction: a partial BUY fill
+    makes the bot LONG (further BUY signals are suppressed by the state
+    machine — not exercised directly here, but the executor-level
+    contract this depends on). The remainder must be recoverable WITHOUT
+    a second execute(BUY, ...) call — reconcile_pending_orders() alone
+    must finish the accounting."""
+    mock_cfg.exchange.limit_order_enabled = False
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+    open_partial = {
+        "id": "stuck-buy", "status": "open", "filled": 0.001, "amount": 0.002,
+        "average": 90_000.0, "fee": {"cost": 0.18, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = open_partial
+    mock_ex.fetch_order.return_value  = open_partial
+    ex.execute(Signal.BUY, 90_000.0, 0.002)
+    assert ex.position == pytest.approx(0.001)
+    assert "buy" in ex.pending_submissions
+    cash_after_first_delta = ex.cash
+
+    # No further execute(BUY, ...) call — only the exchange snapshot
+    # changes (the remainder has since filled).
+    closed_full = {
+        "id": "stuck-buy", "status": "closed", "filled": 0.002, "amount": 0.002,
+        "average": 90_000.0, "fee": {"cost": 0.36, "currency": "CAD"},
+    }
+    mock_ex.fetch_open_orders.return_value = []
+    mock_ex.fetch_closed_orders.return_value = [closed_full]
+    mock_ex.fetch_order.return_value = closed_full
+
+    discovered = ex.reconcile_pending_orders()
+
+    assert len(discovered) == 1
+    assert discovered[0].side == OrderSide.BUY
+    assert discovered[0].quantity == pytest.approx(0.001)   # only the NEW delta
+    assert ex.position == pytest.approx(0.002)
+    assert ex.cash == pytest.approx(cash_after_first_delta - 90_000.0 * 0.001 - 0.18)
+    assert "buy" not in ex.pending_submissions               # confirmed terminal — resolved
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_reconcile_pending_orders_no_op_when_nothing_pending(mock_cfg, mock_sleep, tmp_path):
+    mock_cfg.exchange.limit_order_enabled = False
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+    assert ex.reconcile_pending_orders() == []
+    mock_ex.fetch_open_orders.assert_not_called()
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_reconcile_pending_orders_still_open_leaves_pending(mock_cfg, mock_sleep, tmp_path):
+    """No NEW fill since the last check — must not fabricate anything, and
+    must not clear the pending submission (still genuinely resting)."""
+    mock_cfg.exchange.limit_order_enabled = False
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+    open_partial = {
+        "id": "still-open", "status": "open", "filled": 0.001, "amount": 0.002,
+        "average": 90_000.0, "fee": {"cost": 0.18, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = open_partial
+    mock_ex.fetch_order.return_value  = open_partial
+    ex.execute(Signal.BUY, 90_000.0, 0.002)
+    _cid = ex.pending_submissions["buy"]["client_order_id"]
+
+    # Exact same snapshot — nothing new.
+    mock_ex.fetch_open_orders.return_value = [{**open_partial, "clientOrderId": _cid}]
+
+    discovered = ex.reconcile_pending_orders()
+
+    assert discovered == []
+    assert "buy" in ex.pending_submissions
+    assert ex.position == pytest.approx(0.001)
+
+
+def test_reconcile_pending_orders_never_raises_on_lookup_failure(tmp_path):
+    """Same 'must never crash the trading loop' contract as
+    sync_protective_stop() — a lookup failure must be swallowed, leaving
+    state untouched for a retry next tick."""
+    with patch("bot.execution.live_executor.cfg") as mock_cfg, patch("time.sleep"):
+        mock_cfg.exchange.limit_order_enabled = False
+        ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+        mock_ex.create_order.side_effect = ccxt.RequestTimeout("response lost")
+        mock_ex.fetch_open_orders.side_effect = ccxt.NetworkError("still unreachable")
+        ex.execute(Signal.BUY, 90_000.0, 0.001)
+        assert "buy" in ex.pending_submissions
+
+    mock_ex.fetch_open_orders.side_effect = ccxt.NetworkError("still down")
+    mock_ex.fetch_closed_orders.side_effect = ccxt.NetworkError("still down")
+
+    discovered = ex.reconcile_pending_orders()   # must not raise
+
+    assert discovered == []
+    assert "buy" in ex.pending_submissions   # untouched — retried next tick
 
 
 # ---------------------------------------------------------------------------
@@ -1645,6 +1940,7 @@ def test_accepted_order_resolves_once_it_actually_closes(mock_cfg, mock_sleep, t
         "clientOrderId": _cid,
     }
     mock_ex.fetch_open_orders.return_value = [closed_order]
+    mock_ex.fetch_order.return_value = closed_order   # a real exchange stays consistent
 
     order = ex.execute(Signal.BUY, 91_000.0, 0.001)
 
@@ -1787,6 +2083,268 @@ def test_market_fallback_reconciles_and_adopts_on_confirmed_fill(mock_cfg, mock_
     assert order.order_id == "mkt-recovered"
     assert mock_ex.create_order.call_count == 1
     assert "buy" not in ex.pending_submissions
+
+
+# ---------------------------------------------------------------------------
+# PASS-4 review finding 1a: a positive fill on a still-OPEN order must not
+# be treated as a terminal, fully-resolved outcome.
+# ---------------------------------------------------------------------------
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_partial_fill_on_open_order_keeps_pending_and_records_delta_only(mock_cfg, mock_sleep, tmp_path):
+    """Exact PASS-4 reproduction: create/poll responses report
+    status="open", filled=0.001, amount=0.002 for a BUY of 0.002. The order
+    is NOT done — 0.001 remains unfilled and resting on the exchange. The
+    old code labelled the returned Order FILLED for the full request and
+    cleared pending_submissions entirely, losing track of the still-live
+    remainder. Fixed behavior: only the confirmed delta (0.001) is recorded,
+    and the BUY submission stays pending so a later delta/close is not lost
+    or duplicated."""
+    mock_cfg.exchange.limit_order_enabled = False
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+    open_partial = {
+        "id": "partial-1", "status": "open", "filled": 0.001, "amount": 0.002,
+        "average": 90_000.0, "fee": {"cost": 0.18, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = open_partial
+    mock_ex.fetch_order.return_value  = open_partial
+
+    order = ex.execute(Signal.BUY, 90_000.0, 0.002)
+
+    assert order is not None and order.status == OrderStatus.FILLED
+    assert order.quantity == pytest.approx(0.001)          # delta only, not the full 0.002 request
+    assert ex.position == pytest.approx(0.001)
+    assert "buy" in ex.pending_submissions                  # NOT cleared — order is still open
+    assert ex.pending_submissions["buy"]["order_id"] == "partial-1"
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_second_delta_on_same_order_completes_and_resolves_pending(mock_cfg, mock_sleep, tmp_path):
+    """Continuation of the above: the SAME order is later discovered closed
+    with the remaining quantity filled. Only the NEW delta (the remaining
+    0.001, not the full cumulative 0.002) must be applied, and the
+    submission must finally resolve."""
+    mock_cfg.exchange.limit_order_enabled = False
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+    open_partial = {
+        "id": "partial-1", "status": "open", "filled": 0.001, "amount": 0.002,
+        "average": 90_000.0, "fee": {"cost": 0.18, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = open_partial
+    mock_ex.fetch_order.return_value  = open_partial
+    ex.execute(Signal.BUY, 90_000.0, 0.002)
+    assert ex.position == pytest.approx(0.001)
+    cash_after_first_delta = ex.cash
+    _cid = ex.pending_submissions["buy"]["client_order_id"]
+
+    closed_full = {
+        "id": "partial-1", "status": "closed", "filled": 0.002, "amount": 0.002,
+        "average": 90_000.0, "fee": {"cost": 0.36, "currency": "CAD"},
+        "clientOrderId": _cid,
+    }
+    mock_ex.create_order.return_value = closed_full
+    mock_ex.fetch_order.return_value  = closed_full
+    mock_ex.fetch_open_orders.return_value = [closed_full]
+
+    order = ex.execute(Signal.BUY, 90_000.0, 0.002)
+
+    assert order is not None and order.status == OrderStatus.FILLED
+    assert order.quantity == pytest.approx(0.001)           # only the NEW delta, not 0.002 again
+    assert ex.position == pytest.approx(0.002)               # total across both deltas
+    assert ex.cash == pytest.approx(cash_after_first_delta - 90_000.0 * 0.001 - 0.18)
+    assert "buy" not in ex.pending_submissions               # now confirmed terminal — resolved
+
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_ordinary_order_fee_only_update_applied_not_discarded(mock_cfg, mock_sleep, tmp_path):
+    """PASS-5 review finding (P1), exact reproduction: an ordinary BUY is
+    initially open/partially filled at 0.001 BTC with fee $0; the NEXT
+    snapshot shows the SAME order canceled with the SAME 0.001 BTC filled
+    (no new quantity) but a finalized fee of $0.36. The old code discarded
+    this outright (returned without applying `_delta_fee`/`_delta_cost`
+    when `_delta_qty <= 0`) and emptied pending_submissions on the terminal
+    snapshot without ever booking the fee. Fixed: fee-only deltas are
+    reconciled independently of quantity, for ordinary orders too."""
+    mock_cfg.exchange.limit_order_enabled = False
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, tmp_path=tmp_path)
+
+    open_partial = {
+        "id": "partial-2", "status": "open", "filled": 0.001, "amount": 0.002,
+        "average": 90_000.0, "fee": {"cost": 0.0, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = open_partial
+    mock_ex.fetch_order.return_value  = open_partial
+    ex.execute(Signal.BUY, 90_000.0, 0.002)
+    cash_after_fill = ex.cash
+    _cid = ex.pending_submissions["buy"]["client_order_id"]
+
+    canceled_same_qty = {
+        "id": "partial-2", "status": "canceled", "filled": 0.001, "amount": 0.002,
+        "average": 90_000.0, "fee": {"cost": 0.36, "currency": "CAD"},
+        "clientOrderId": _cid,
+    }
+    mock_ex.create_order.return_value = canceled_same_qty
+    mock_ex.fetch_order.return_value  = canceled_same_qty
+    mock_ex.fetch_open_orders.return_value = [canceled_same_qty]
+
+    order = ex.execute(Signal.BUY, 90_000.0, 0.002)
+
+    assert order is None                        # no NEW quantity — no fabricated fill
+    assert ex._fees_paid == pytest.approx(0.36)
+    assert (cash_after_fill - ex.cash) == pytest.approx(0.36)
+    assert "buy" not in ex.pending_submissions   # terminal — resolved
+
+
+# ---------------------------------------------------------------------------
+# PASS-5 review finding (P0): crash-consistency between an order's progress
+# advance, its economic effect, and its journal entry — these must commit
+# as ONE atomic transition, not as separate _save_state() calls with a
+# crash window in between.
+# ---------------------------------------------------------------------------
+
+@patch("time.sleep")
+@patch("bot.execution.live_executor.cfg")
+def test_ordinary_partial_fill_crash_before_save_loses_nothing(mock_cfg, mock_sleep, tmp_path):
+    """PASS-5 review finding (P0), exact reproduction: an ordinary BUY of
+    0.002 BTC is open/partially filled at 0.001 BTC. Inject a crash
+    (unhandled exception) immediately after _record_order_delta returns —
+    i.e. AFTER progress would have been computed but BEFORE the portfolio/
+    journal effect is applied and the (now single) _save_state() call at
+    the bottom of execute() runs. Restarting from the on-disk state (which
+    the crash never touched) and replaying the IDENTICAL exchange snapshot
+    must recover the fill exactly once — not lose it."""
+    state_path = str(tmp_path / "state.json")
+    mock_cfg.exchange.limit_order_enabled = False
+    ex, mock_ex = _make(dry_run=False, starting_cash=1000.0, state_path=state_path, tmp_path=tmp_path)
+
+    open_partial = {
+        "id": "crash-1", "status": "open", "filled": 0.001, "amount": 0.002,
+        "average": 90_000.0, "fee": {"cost": 0.18, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = open_partial
+    mock_ex.fetch_order.return_value  = open_partial
+
+    class _InjectedCrash(BaseException):
+        pass
+
+    real_record_delta = ex._record_order_delta
+
+    def _crash_after_delta(*args, **kwargs):
+        result = real_record_delta(*args, **kwargs)
+        raise _InjectedCrash("process died right after the delta was computed")
+
+    with patch.object(ex, "_record_order_delta", side_effect=_crash_after_delta):
+        with pytest.raises(_InjectedCrash):
+            ex.execute(Signal.BUY, 90_000.0, 0.002)
+
+    # "Restart": load a FRESH executor from the exact on-disk state the
+    # crash left behind (never touched, since the single save runs later
+    # than the injected crash point). The order itself is genuinely still
+    # resting/partially-filled on the real exchange (the crash was in the
+    # bot's own process) — mock the exchange balance to match that reality
+    # (0.001 BTC settled, cash net of cost+fee) so startup reconciliation's
+    # recovery is confirmed by a consistent post-fill sync right after it.
+    mock_ex.fetch_balance.return_value = {
+        "free":  {"CAD": 1000.0 - 90.0 - 0.18, "BTC": 0.001},
+        "total": {"CAD": 1000.0 - 90.0 - 0.18, "BTC": 0.001},
+    }
+    mock_ex.fetch_open_orders.return_value = [open_partial]
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls2:
+        mock_cls2.return_value = mock_ex
+        ex2 = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=1000.0, dry_run=False, state_path=state_path,
+        )
+
+    # Startup reconciliation (2026-09-19 PASS-5 fix) recovers the fill
+    # immediately at construction — exactly once, not lost to the crash.
+    assert ex2.position == pytest.approx(0.001)
+    assert ex2.cash == pytest.approx(1000.0 - 90.0 - 0.18)
+    assert len(ex2.pending_journal_entries) == 1
+    assert ex2.pending_journal_entries[0]["quantity"] == pytest.approx(0.001)
+
+    # A LATER execute() call for the SAME order must not re-apply anything
+    # — the remaining 0.001 (of the original 0.002 request) is still
+    # genuinely unfilled/resting, confirmed by the SAME snapshot.
+    order = ex2.execute(Signal.BUY, 90_000.0, 0.002)
+    assert order is None   # no NEW fill since the startup reconciliation already saw this exact state
+    assert ex2.position == pytest.approx(0.001)   # unchanged — no double-apply
+    assert len(ex2.pending_journal_entries) == 1  # unchanged — no duplicate journal entry
+
+
+def test_native_stop_crash_between_fill_and_progress_advance_no_double_apply(tmp_path):
+    """PASS-5 review finding (P0), exact reproduction: a native stop fills
+    0.001 BTC out of a 0.002 BTC position. Inject a crash immediately after
+    _record_stop_triggered_fill returns — i.e. AFTER the fill's economic
+    effect would have been computed but BEFORE _cancel_native_stop advances
+    _native_stop_last_recorded_* and saves. Restarting from the (crash-
+    untouched) on-disk state and re-polling the IDENTICAL cumulative fill
+    must NOT apply it a second time."""
+    state_path = str(tmp_path / "state.json")
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True,
+                        starting_cash=1000.0, state_path=state_path, tmp_path=tmp_path)
+    ex._portfolio.position    = 0.002
+    ex._portfolio._cost_basis = 80_000.0
+    mock_ex.create_order.return_value = {"id": "stop-crash"}
+    ex.sync_protective_stop(78_000.0)
+
+    mock_ex.cancel_order.side_effect = ccxt.NetworkError("cancel timeout")
+    mock_ex.fetch_order.return_value = {
+        "id": "stop-crash", "status": "open", "filled": 0.001,
+        "average": 90_000.0, "cost": 90.0,
+        "fee": {"cost": 0.36, "currency": "CAD"},
+    }
+
+    class _InjectedCrash(BaseException):
+        pass
+
+    real_record_fill = ex._record_stop_triggered_fill
+
+    def _crash_after_fill(*args, **kwargs):
+        result = real_record_fill(*args, **kwargs)
+        raise _InjectedCrash("process died right after the fill was recorded")
+
+    with patch.object(ex, "_record_stop_triggered_fill", side_effect=_crash_after_fill):
+        with pytest.raises(_InjectedCrash):
+            ex._cancel_native_stop()
+
+    # "Restart": a fresh executor from the on-disk state as the crash left
+    # it. If the crash-window bug were still present, the fill's economic
+    # effect would already be on disk here (double-apply risk on replay).
+    # The stop order itself is still genuinely resting on the exchange for
+    # its remaining (post-fill) quantity — the crash was in the bot's own
+    # process, not Kraken's — so startup verification must see it as still
+    # open (not a gap) to exercise the SAME still-resting object this test
+    # is about, rather than an unrelated "stop is gone" reconciliation path.
+    mock_ex.fetch_balance.return_value = {
+        "free": {"CAD": ex.cash, "BTC": ex.position}, "total": {"CAD": ex.cash, "BTC": ex.position},
+    }
+    mock_ex.fetch_open_orders.return_value = [{
+        "id": "stop-crash", "status": "open", "remaining": ex.position,
+        "info": {"descr": {"ordertype": "stop-loss"}},
+    }]
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls2:
+        mock_cls2.return_value = mock_ex
+        ex2 = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=1000.0, dry_run=False, state_path=state_path,
+            native_stop_loss_enabled=True,
+        )
+    starting_cash_on_restart = ex2.cash
+    starting_position_on_restart = ex2.position
+
+    outcome, fill_order = ex2._cancel_native_stop()
+
+    assert outcome == "partial"
+    assert fill_order is not None
+    assert fill_order.quantity == pytest.approx(0.001)   # the delta, exactly once — not re-applied
+    assert ex2.position == pytest.approx(starting_position_on_restart - 0.001)
+    assert ex2.cash == pytest.approx(starting_cash_on_restart + 90.0 - 0.36)
 
 
 # ---------------------------------------------------------------------------
@@ -2217,6 +2775,99 @@ def test_native_stop_partial_fills_use_delta_price_and_fee_not_cumulative(tmp_pa
     assert ex._fees_paid == pytest.approx(0.76)   # total fee, not 1.12 (double-counted)
 
 
+def test_native_stop_fee_only_update_applied_not_discarded(tmp_path):
+    """PASS-4 review finding 5, exact reproduction: snapshot 1 is open,
+    0.001 BTC filled, fee $0. Snapshot 2 is CANCELED with the SAME 0.001
+    BTC filled but a finalized fee of $0.36 — no NEW quantity at all. The
+    old code gated fee booking on `new_delta > 0` (quantity), so this
+    fee-only correction was silently discarded, and the same terminal
+    snapshot's cleanup then wiped the tracked counters (and the stop id)
+    without ever applying it — recorded fees stayed $0. Fixed: quantity,
+    cost and fee deltas are reconciled independently."""
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True,
+                        starting_cash=1000.0, tmp_path=tmp_path)
+    ex._portfolio.position    = 0.001
+    ex._portfolio._cost_basis = 80_000.0
+    starting_cash = ex._portfolio.cash
+    mock_ex.create_order.return_value = {"id": "stop-001"}
+    ex.sync_protective_stop(78_000.0)
+
+    mock_ex.cancel_order.side_effect = ccxt.NetworkError("cancel timeout")
+    # Snapshot 1: 0.001 filled, fee $0 (provisional).
+    mock_ex.fetch_order.return_value = {
+        "id": "stop-001", "status": "open", "filled": 0.001,
+        "average": 90_000.0, "cost": 90.0,
+        "fee": {"cost": 0.0, "currency": "CAD"},
+    }
+    outcome1, fill1 = ex._cancel_native_stop()
+    assert outcome1 == "partial"
+    assert fill1.fee_cost == pytest.approx(0.0)
+    cash_after_fill = ex._portfolio.cash
+
+    # Snapshot 2: SAME 0.001 filled (no new quantity), now CANCELED, with
+    # the fee finalized at $0.36.
+    mock_ex.fetch_order.return_value = {
+        "id": "stop-001", "status": "canceled", "filled": 0.001,
+        "average": 90_000.0, "cost": 90.0,
+        "fee": {"cost": 0.36, "currency": "CAD"},
+    }
+    outcome2, fill2 = ex._cancel_native_stop()
+
+    assert outcome2 == "cancelled"   # no NEW fill quantity — not "filled" again
+    assert fill2 is None             # no fabricated zero-quantity fill Order
+    assert ex._fees_paid == pytest.approx(0.36)
+    assert (cash_after_fill - ex._portfolio.cash) == pytest.approx(0.36)
+    assert not ex.has_resting_stop   # terminal — cleared as normal
+
+
+def test_native_stop_fee_only_update_restart_between_fill_and_settlement(tmp_path):
+    """PASS-4 review finding 5 acceptance criterion: a restart between the
+    quantity fill and the fee settlement must still apply the fee
+    adjustment exactly once — the tracked baseline is itself the
+    idempotency record, and it is persisted the same way the quantity/cost
+    baseline already is."""
+    state_path = str(tmp_path / "state.json")
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True,
+                        starting_cash=1000.0, state_path=state_path, tmp_path=tmp_path)
+    ex._portfolio.position    = 0.001
+    ex._portfolio._cost_basis = 80_000.0
+    mock_ex.create_order.return_value = {"id": "stop-001"}
+    ex.sync_protective_stop(78_000.0)
+
+    mock_ex.cancel_order.side_effect = ccxt.NetworkError("cancel timeout")
+    mock_ex.fetch_order.return_value = {
+        "id": "stop-001", "status": "open", "filled": 0.001,
+        "average": 90_000.0, "cost": 90.0,
+        "fee": {"cost": 0.0, "currency": "CAD"},
+    }
+    ex._cancel_native_stop()
+
+    # Restart — a fresh executor instance loading the SAME persisted state.
+    mock_ex.fetch_balance.return_value = {
+        "free": {"CAD": ex.cash, "BTC": ex.position}, "total": {"CAD": ex.cash, "BTC": ex.position},
+    }
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls2:
+        mock_cls2.return_value = mock_ex
+        ex2 = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=1000.0, dry_run=False, state_path=state_path,
+            native_stop_loss_enabled=True,
+        )
+    cash_after_restart = ex2.cash
+
+    mock_ex.fetch_order.return_value = {
+        "id": "stop-001", "status": "canceled", "filled": 0.001,
+        "average": 90_000.0, "cost": 90.0,
+        "fee": {"cost": 0.36, "currency": "CAD"},
+    }
+    outcome, fill_order = ex2._cancel_native_stop()
+
+    assert outcome == "cancelled"
+    assert fill_order is None
+    assert ex2._fees_paid == pytest.approx(0.36)
+    assert (cash_after_restart - ex2.cash) == pytest.approx(0.36)
+
+
 def test_sync_protective_stop_does_not_replace_when_partial_fill_still_open(tmp_path):
     """2026-09-18 follow-up review finding: sync_protective_stop must not
     place a REPLACEMENT stop when the existing one is confirmed still
@@ -2254,6 +2905,75 @@ def test_native_stop_placement_failure_alerts_and_stays_unprotected(tmp_path):
     assert not ex.has_resting_stop
     mock_alert.assert_called_once()
     assert "NATIVE STOP FAILED" in mock_alert.call_args[0][0]
+
+
+def test_native_stop_placement_response_already_closed_and_filled(tmp_path):
+    """PASS-4 review finding 1b, exact reproduction: sync_protective_stop's
+    placement call comes back an ALREADY-CLOSED order fully filled for the
+    entire position (e.g. an adopted historical order that has, in fact,
+    already executed). The old code unconditionally marked this resting
+    protection (has_resting_stop=True) with the position untouched and the
+    fill journal empty. Fixed: the fill is booked through the same
+    consumer a stop discovered mid-cancel gets, and no resting protection
+    is recorded for an order that's already done."""
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True, tmp_path=tmp_path)
+    ex._portfolio.position    = 0.002
+    ex._portfolio._cost_basis = 85_000.0
+    already_closed = {
+        "id": "stop-already-filled", "status": "closed", "filled": 0.002,
+        "average": 89_000.0, "fee": {"cost": 0.32, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = already_closed
+
+    discovered = ex.sync_protective_stop(89_000.0)
+
+    assert len(discovered) == 1 and discovered[0].status == OrderStatus.FILLED
+    assert discovered[0].quantity == pytest.approx(0.002)
+    assert ex.position == pytest.approx(0.0)
+    assert not ex.has_resting_stop
+    assert len(ex.pending_journal_entries) == 1
+    assert ex.pending_journal_entries[0]["order_id"] == "native-stop:stop-already-filled"
+
+
+def test_native_stop_placement_response_already_open_partial(tmp_path):
+    """PASS-4 review finding 1b, open-partial case: the placement response
+    shows SOME of the position already filled but the order is still
+    genuinely open/resting for the remainder. Must book only the filled
+    delta and continue tracking the (now-reduced) remainder as resting."""
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True, tmp_path=tmp_path)
+    ex._portfolio.position    = 0.002
+    ex._portfolio._cost_basis = 85_000.0
+    open_partial = {
+        "id": "stop-partial", "status": "open", "filled": 0.0005,
+        "average": 89_000.0, "fee": {"cost": 0.08, "currency": "CAD"},
+    }
+    mock_ex.create_order.return_value = open_partial
+
+    discovered = ex.sync_protective_stop(89_000.0)
+
+    assert len(discovered) == 1 and discovered[0].status == OrderStatus.FILLED
+    assert discovered[0].quantity == pytest.approx(0.0005)
+    assert ex.position == pytest.approx(0.0015)
+    assert ex.has_resting_stop
+    assert ex._native_stop_order_id == "stop-partial"
+
+
+def test_native_stop_placement_response_canceled_empty_is_failure_not_resting(tmp_path):
+    """PASS-4 review finding 1b, canceled/rejected-empty case: the
+    placement response is confirmed terminal with zero fill — a genuine
+    failed placement, must never be recorded as resting protection."""
+    ex, mock_ex = _make(dry_run=False, native_stop_loss_enabled=True, tmp_path=tmp_path)
+    ex._portfolio.position = 0.002
+    rejected = {"id": "stop-rejected", "status": "rejected", "filled": 0.0}
+    mock_ex.create_order.return_value = rejected
+
+    with patch.object(ex._alerter, "error") as mock_alert:
+        discovered = ex.sync_protective_stop(89_000.0)
+
+    assert discovered == []
+    assert not ex.has_resting_stop
+    assert ex.position == pytest.approx(0.002)   # untouched — nothing executed
+    assert any("NATIVE STOP FAILED" in c.args[0] for c in mock_alert.call_args_list)
 
 
 # ---------------------------------------------------------------------------
