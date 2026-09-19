@@ -1,0 +1,145 @@
+{
+  "_provenance": {
+    "reconstruction_note": "This fixture is RECONSTRUCTED from two real historical sources — it is NOT a saved raw API response captured verbatim at request time. Every field below traces to one of those two sources; field_provenance_key explains the label on each entry. A SEPARATE test (test_kraken_ccxt_adapter_contract.py) verifies the installed ccxt library's REAL parsing behavior against an independently-defined raw payload, since this fixture's shape and KrakenFixtureSource's parser were authored together and cannot validate each other.",
+    "sources": {
+      "reconciliation_report": "logs/reconciliation_20260703.md — output of a real reconcile_ledger.py run against the live Kraken account, 2026-07-03T02:15:05Z. Its own trade table is DISPLAY-ROUNDED to 4 decimal places.",
+      "trades_db": "logs/trades.db — the bot's own real historical SQLite fills table, same account/window. Stores higher-precision floats than the report's rounded table, and its 'notes' column captured the real Kraken trade id for 6 of the 7 BTC/CAD trades used here (via reconcile_ledger.py's backfill step, 2026-07-03)."
+    },
+    "field_provenance_key": {
+      "captured": "an exact Kraken trade id, literally recorded in trades.db's notes column",
+      "db_recorded": "trades.db's own stored float for that fill — higher precision than the report's rounded table, but still the BOT's OWN recorded value, not a saved raw API payload",
+      "report_value": "the value in reconciliation_20260703.md's own trade table, sourced from a real fetch_my_trades() call but printed there already rounded to 4 decimal places",
+      "placeholder": "no real value exists in either source; a clearly-marked stand-in, never presented as captured",
+      "normalized": "a ccxt-unified value (e.g. symbol 'BTC/CAD') — Kraken's own RAW internal pair id (e.g. an 'XXBTZCAD'-style code) is not captured anywhere in this repository and is not reconstructed here; see the ccxt-adapter contract test for real raw-pair behavior instead"
+    }
+  },
+  "trades_history": {
+    "_shape_note": "Mirrors ccxt.kraken.fetch_my_trades's real raw response shape: result.trades is a dict keyed by the Kraken trade transaction id, each value carrying ordertxid/pair/time/type/ordertype/price/cost/fee/vol — confirmed against the installed ccxt==4.5.56 source this session. Every trade here uses the EXCHANGE's own true values (report_value or db_recorded from a captured trade id) — none of the bot's own local-ledger errors are mixed into this section; see local_ledger_error below for that, kept separate on purpose.",
+    "result": {
+      "trades": {
+        "TZA7XB-ANR7K-BJPM6G": {
+          "_field_provenance": {"id": "captured", "price": "db_recorded", "cost": "db_recorded", "fee": "db_recorded", "vol": "db_recorded", "time": "db_recorded", "pair": "normalized", "ordertxid": "placeholder"},
+          "ordertxid": null,
+          "pair": "BTC/CAD",
+          "time": 1781222405.0,
+          "type": "buy",
+          "ordertype": "market",
+          "price": "88870.3",
+          "cost": "10.0423439",
+          "fee": "0.08034",
+          "vol": "0.000113",
+          "misc": ""
+        },
+        "TDCRFZ-MWTNB-2NVHO6": {
+          "_field_provenance": {"id": "captured", "price": "db_recorded", "cost": "db_recorded", "fee": "db_recorded", "vol": "db_recorded", "time": "db_recorded", "pair": "normalized", "ordertxid": "placeholder"},
+          "ordertxid": null,
+          "pair": "BTC/CAD",
+          "time": 1781409380.0,
+          "type": "sell",
+          "ordertype": "market",
+          "price": "90280.1",
+          "cost": "9.930811",
+          "fee": "0.03972",
+          "vol": "0.00011",
+          "misc": ""
+        },
+        "TANQSU-QH4KF-P62EAP": {
+          "_field_provenance": {"id": "captured", "price": "db_recorded", "cost": "db_recorded", "fee": "db_recorded", "vol": "db_recorded", "time": "db_recorded", "pair": "normalized", "ordertxid": "placeholder"},
+          "ordertxid": null,
+          "pair": "BTC/CAD",
+          "time": 1781521216.0,
+          "type": "buy",
+          "ordertype": "market",
+          "price": "92050.9",
+          "cost": "9.9414972",
+          "fee": "0.07953",
+          "vol": "0.000108",
+          "misc": ""
+        },
+        "TTOXVM-N4YMU-QT5Y4S": {
+          "_field_provenance": {"id": "captured", "price": "db_recorded", "cost": "db_recorded", "fee": "db_recorded", "vol": "db_recorded", "time": "db_recorded", "pair": "normalized", "ordertxid": "placeholder"},
+          "ordertxid": null,
+          "pair": "BTC/CAD",
+          "time": 1781640003.0,
+          "type": "sell",
+          "ordertype": "market",
+          "price": "91884.5",
+          "cost": "9.923526",
+          "fee": "0.07939",
+          "vol": "0.000108",
+          "misc": ""
+        },
+        "TCLP47-3J4Q6-XNYYDG": {
+          "_field_provenance": {"id": "captured", "price": "db_recorded", "cost": "db_recorded", "fee": "db_recorded", "vol": "db_recorded", "time": "db_recorded", "pair": "normalized", "ordertxid": "placeholder"},
+          "ordertxid": null,
+          "pair": "BTC/CAD",
+          "time": 1781917217.0,
+          "type": "buy",
+          "ordertype": "market",
+          "price": "89985.1",
+          "cost": "49.7617603",
+          "fee": "0.39809",
+          "vol": "0.000553",
+          "misc": ""
+        },
+        "TRLSTP-PLACEHOLDER-ID": {
+          "_field_provenance": {"id": "placeholder", "price": "report_value", "cost": "report_value", "fee": "report_value", "vol": "db_recorded", "time": "report_value", "pair": "normalized", "ordertxid": "placeholder"},
+          "_id_note": "reconciliation_20260703.md never printed this fill's real Kraken trade id (matched by price/time proximity, not by id) — no id for it exists in either real source used by this fixture. price/cost/fee are the EXCHANGE's real true values from the report's own trade table (section 1, row 6) — these are NOT the bot's local trades.db values, which are wrong; see local_ledger_error below for that comparison.",
+          "ordertxid": null,
+          "pair": "BTC/CAD",
+          "time": 1782146174.0,
+          "type": "sell",
+          "ordertype": "market",
+          "price": "91433.5625",
+          "cost": "50.79683",
+          "fee": "0.4064",
+          "vol": "0.00055556",
+          "misc": ""
+        }
+      },
+      "count": 6
+    }
+  },
+  "local_ledger_error": {
+    "_note": "NOT exchange data. This is the bot's OWN pre-existing, real historical trades.db row (id=1) for the SAME fill as trades_history's TRLSTP-PLACEHOLDER-ID entry above, written by the live bot BEFORE reconcile_ledger.py ever ran against this account — a genuine, real local-ledger bug (predates the 2026-08-26 post-only-param fix documented in CLAUDE.md). Used by the fee-correction integration test to model a pre-existing local record being brought in line with a freshly-observed exchange trade — never framed as 'the exchange revised its fee'.",
+    "source": "logs/trades.db row id=1",
+    "recorded_price": 91433.5,
+    "recorded_fee": 0.0,
+    "recorded_quantity": 0.00055556,
+    "recorded_at": "2026-06-22T16:36:17Z"
+  },
+  "external_holdings_incident": {
+    "_note": "The real 2026-06-27 external-holdings bug (reconciliation_20260703.md section 9): a pre-existing BTC deposit (not bot-bought) was sold by the bot due to a stale state flag, before the ADOPT_EXTERNAL_HOLDINGS guard existed. trade_id is the REAL captured Kraken trade id (trades.db row id=9's notes column) -- not a placeholder.",
+    "trade_id": "TEYLVF-3GXRC-N6RME4",
+    "trade_id_provenance": "captured — trades.db row id=9 notes: '[kraken_backfill] kraken trade id=TEYLVF-3GXRC-N6RME4'",
+    "order_id": "O2EWIU-KB3MN-4X2WSX",
+    "order_id_provenance": "captured — reconciliation_20260703.md section 9, via a real fetch_order() call",
+    "pair": "BTC/CAD",
+    "type": "sell",
+    "ordertype": "market",
+    "time": 1782590402.0,
+    "price": "85341.3",
+    "cost": "32.229995358",
+    "fee": "0.25784",
+    "vol": "0.00037766",
+    "field_provenance": {"price": "db_recorded", "cost": "db_recorded", "fee": "db_recorded", "vol": "db_recorded", "time": "db_recorded"},
+    "kraken_order_metadata": {
+      "userref": 0,
+      "oflags": "fciq",
+      "ordertype": "market"
+    }
+  },
+  "balance": {
+    "_source": "reconciliation_20260703.md section 4 — real fetch_balance() result at report time (report_value)",
+    "total": {
+      "CAD": 154.1094,
+      "ETH": 0.03411722
+    }
+  },
+  "deposits": {
+    "_source": "reconciliation_20260703.md section 4a — real fetch_deposits(code='CAD') result (report_value)",
+    "CAD": [
+      {"timestamp": "2026-06-07T00:57:00Z", "amount": 100.0, "fee": 0.0, "method": "Interac E-Transfer"}
+    ]
+  }
+}
