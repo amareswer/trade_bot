@@ -16,7 +16,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _accounting_fake_exchange import FakeExchangeAdapter  # noqa: E402
+from _accounting_fake_exchange import FakeExchangeAdapter, FlakyConn  # noqa: E402
 
 from bot.accounting import engine, store  # noqa: E402
 from bot.accounting.reconciliation import run_cycle, resolve_exit_quantity  # noqa: E402
@@ -86,6 +86,70 @@ def test_a_successful_cycle_followed_by_a_failing_one_ends_up_blocked(tmp_path):
     bad_state = run_cycle(_NowBroken(), conn, tl, quote="CAD", symbols=["BTC/CAD"], now_ms=T0 + 200)
     assert bad_state.blocked_for_buy("BTC/CAD")
     assert bad_state is not good_state  # a fresh object — nothing here can be "the old permissive state"
+
+
+# ============================================================================
+# Freshness expiry (money-readiness review 2026-09-20, P1: "a previously
+# successful reconciliation may approve BUYs for up to the configured
+# interval without a freshness deadline").
+# ============================================================================
+
+def test_clean_state_blocks_once_older_than_max_age(tmp_path):
+    ex = FakeExchangeAdapter()
+    ex.deposit("CAD", 1000.0, timestamp_ms=T0)
+    _, conn, tl = _setup(tmp_path)
+    state = run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=1, now_ms=T0 + 100)
+    assert state.reconciled
+    assert not state.blocked_for_buy("BTC/CAD")  # no staleness args — old behavior unaffected
+
+    max_age_ms = 3_600_000  # 1h
+    # Just within the deadline: still clean.
+    assert not state.blocked_for_buy(
+        "BTC/CAD", now_ms=state.computed_at_ms + max_age_ms - 1, max_age_ms=max_age_ms,
+    )
+    # Past the deadline: blocked, even though nothing about the state
+    # itself changed — only real elapsed time did.
+    assert state.blocked_for_buy(
+        "BTC/CAD", now_ms=state.computed_at_ms + max_age_ms + 1, max_age_ms=max_age_ms,
+    )
+    assert "stale" in state.explain(now_ms=state.computed_at_ms + max_age_ms + 1, max_age_ms=max_age_ms)
+
+
+def test_stale_check_is_opt_in_omitting_either_arg_keeps_old_behavior(tmp_path):
+    ex = FakeExchangeAdapter()
+    ex.deposit("CAD", 1000.0, timestamp_ms=T0)
+    _, conn, tl = _setup(tmp_path)
+    state = run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=1, now_ms=T0 + 100)
+    far_future = state.computed_at_ms + 999_999_999
+    assert not state.blocked_for_buy("BTC/CAD", now_ms=far_future)              # max_age_ms omitted
+    assert not state.blocked_for_buy("BTC/CAD", max_age_ms=1000)                # now_ms omitted
+    assert not state.blocked_for_buy("BTC/CAD")                                 # both omitted
+
+
+def test_failed_scheduled_refresh_replaces_a_stale_clean_state_with_a_hard_block(tmp_path):
+    """The scenario the review named: a clean state ages toward its
+    deadline, and the scheduled refresh that was supposed to renew it
+    fails outright — the replacement state (what bot/main.py actually
+    stores) must be a hard block, not merely 'still the old clean state,
+    now also technically stale'. Combines the P0 replace-don't-preserve
+    fix with the P1 freshness fix end to end."""
+    ex = FakeExchangeAdapter()
+    ex.deposit("CAD", 1000.0, timestamp_ms=T0)
+    _, conn, tl = _setup(tmp_path)
+    good_state = run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=1, now_ms=T0 + 100)
+    assert good_state.reconciled
+
+    class _NowBroken:
+        def fetch_my_trades_page(self, *a, **k):
+            raise RuntimeError("exchange unreachable during the scheduled refresh")
+
+    much_later = T0 + 100 + 7_200_000  # 2h later — well past any reasonable interval+grace
+    refreshed = run_cycle(_NowBroken(), conn, tl, quote="CAD", symbols=["BTC/CAD"], now_ms=much_later)
+    assert not refreshed.reconciled
+    assert refreshed.blocked_for_buy("BTC/CAD")
+    # And even if a caller forgot to pass staleness args, the P0 fix alone
+    # already blocks this on `reconciled` — belt and suspenders.
+    assert refreshed.blocked_for_buy("BTC/CAD", now_ms=much_later, max_age_ms=3_600_000)
 
 
 def test_bootstrap_cycle_never_blocks_and_commits_opening_checkpoints(tmp_path):
@@ -195,6 +259,39 @@ def test_fee_correction_recorded_via_existing_fee_adjustments_table(tmp_path):
     # observed_trades' own frozen original payload is untouched.
     stored = store.get_observed_trade(conn, t.trade_id)
     assert stored.fee_cost == 0.09
+
+
+def test_fee_correction_crash_leaves_no_orphan_and_retry_converges(tmp_path):
+    """money-readiness review 2026-09-20, P1: a fee correction detected in
+    the SAME cycle as a batch-commit failure must not survive that
+    failure on its own — and once the underlying failure is gone, a plain
+    retry (same inputs) must still converge to the correct final state."""
+    db_path, conn, tl = _setup(tmp_path)
+    ex = FakeExchangeAdapter()
+    ex.deposit("CAD", 1000.0, timestamp_ms=T0)
+    run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 100)
+    t = ex.execute_trade(symbol="BTC/CAD", side="buy", price=90_000.0, amount=0.001,
+                          timestamp_ms=T0 + 1000, fee_cost=0.09, fee_currency="CAD")
+    run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 2000)
+    ex.revise_trade_fee(t.trade_id, 0.15)
+
+    flaky = FlakyConn(conn, match_prefix="INSERT INTO checkpoints")
+    state = run_cycle(ex, flaky, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 3000)
+    # run_cycle's own top-level try/except must have caught the injected
+    # failure and returned a blocked state, never propagated it.
+    assert not state.reconciled
+    assert "observation phase raised" in state.coverage_reason
+    # And nothing partially persisted from the attempt.
+    assert store.fee_correction_deltas_for_trade(conn, t.trade_id) == []
+    stored = store.get_observed_trade(conn, t.trade_id)
+    assert stored.fee_cost == 0.09  # unchanged — the correction never landed
+
+    # Retry with the SAME inputs (the flaky wrapper is gone) — converges cleanly.
+    state2 = run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 4000)
+    assert state2.reconciled
+    deltas = store.fee_correction_deltas_for_trade(conn, t.trade_id)
+    assert len(deltas) == 1
+    assert abs(deltas[0] - 0.06) < 1e-9
 
 
 def test_price_change_on_known_trade_is_an_anomaly_not_a_correction(tmp_path):
@@ -348,3 +445,153 @@ def test_coverage_incomplete_this_cycle_blocks_every_symbol(tmp_path):
     state = run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=1, now_ms=T0 + 100)
     assert state.coverage_blocked
     assert state.blocked_for_buy("BTC/CAD")
+
+
+# ============================================================================
+# Delayed-visibility straggler linking (money-readiness review 2026-09-20,
+# P1: "the periodic reconciliation cycle does not implement the promised
+# late-fill matcher").
+# ============================================================================
+
+def test_straggler_links_a_delayed_visibility_fill_to_existing_row(tmp_path):
+    """The exact scenario the review named: a fill is logged first (the
+    live path already wrote its `fills` row via a synthetic exec_key, but
+    live_observe's synchronous linker never ran — e.g. the exchange
+    visibility was delayed past it), and the NEXT reconciliation cycle
+    links exactly one observed trade to that existing row."""
+    _, conn, tl = _setup(tmp_path)
+    tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.001, price=90_000.0,
+                fee_cost=0.09, fee_currency="CAD", exec_key="uuid-abc-123",
+                order_id="ORD1", timestamp=engine.iso_from_ms(T0 + 1000))
+    fill_row = store.fills_row_by_exec_key(conn, "uuid-abc-123")
+    assert fill_row is not None
+    assert not store.is_ledger_represented(conn, "trade-does-not-exist-yet")
+
+    ex = FakeExchangeAdapter()
+    ex.deposit("CAD", 1000.0, timestamp_ms=T0)
+    run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 100)
+
+    # The real trade executes but is NOT yet visible — same delayed-
+    # visibility mechanism as the checkpoint-race tests above.
+    t = ex.execute_trade(symbol="BTC/CAD", side="buy", price=90_000.0, amount=0.001,
+                          timestamp_ms=T0 + 1000, order_id="ORD1", fee_cost=0.09,
+                          fee_currency="CAD", visible=False)
+    state1 = run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 2000)
+    assert state1.blocked_for_buy("BTC/CAD")  # unexplained residual — not yet observed
+    assert not store.is_ledger_represented(conn, t.trade_id)
+
+    # Now it becomes visible.
+    ex.reveal_all()
+    state2 = run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 3000)
+    assert state2.explain() == "ok"
+    assert store.is_ledger_represented(conn, t.trade_id)
+    assert store.trade_ids_for_fill(conn, fill_row["id"]) == [t.trade_id]
+
+
+def test_straggler_linking_is_idempotent_across_cycles(tmp_path):
+    _, conn, tl = _setup(tmp_path)
+    tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.001, price=90_000.0,
+                fee_cost=0.09, fee_currency="CAD", exec_key="uuid-1",
+                order_id="ORD1", timestamp=engine.iso_from_ms(T0 + 1000))
+    fill_row = store.fills_row_by_exec_key(conn, "uuid-1")
+
+    ex = FakeExchangeAdapter()
+    ex.deposit("CAD", 1000.0, timestamp_ms=T0)
+    run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 100)
+    ex.execute_trade(symbol="BTC/CAD", side="buy", price=90_000.0, amount=0.001,
+                      timestamp_ms=T0 + 1000, order_id="ORD1", fee_cost=0.09, fee_currency="CAD")
+    state1 = run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 2000)
+    assert state1.explain() == "ok"
+    linked_once = store.trade_ids_for_fill(conn, fill_row["id"])
+    assert len(linked_once) == 1
+
+    # A further cycle with nothing new must not re-link, duplicate, or block.
+    state2 = run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 3000)
+    assert state2.explain() == "ok"
+    assert store.trade_ids_for_fill(conn, fill_row["id"]) == linked_once
+
+
+def test_straggler_linking_blocks_on_ambiguous_match(tmp_path):
+    """Two real trades that BOTH exactly conserve an unlinked fills row's
+    totals — never guessed, always blocks that symbol for manual review
+    (same discipline as migration.py's ambiguity handling)."""
+    _, conn, tl = _setup(tmp_path)
+    tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.001, price=90_000.0,
+                fee_cost=0.09, fee_currency="CAD", exec_key="uuid-amb",
+                order_id="ORD1", timestamp=engine.iso_from_ms(T0 + 1000))
+
+    ex = FakeExchangeAdapter()
+    ex.deposit("CAD", 1000.0, timestamp_ms=T0)
+    run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 100)
+    # Two DIFFERENT orders' trades, same qty/fee, both inside the fills
+    # row's matching window — genuinely ambiguous which one it represents.
+    ex.execute_trade(symbol="BTC/CAD", side="buy", price=90_000.0, amount=0.001,
+                      timestamp_ms=T0 + 990, order_id="ORD_X", fee_cost=0.09, fee_currency="CAD")
+    ex.execute_trade(symbol="BTC/CAD", side="buy", price=88_000.0, amount=0.001,
+                      timestamp_ms=T0 + 1010, order_id="ORD_Y", fee_cost=0.09, fee_currency="CAD")
+    state = run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 2000)
+
+    assert state.blocked_for_buy("BTC/CAD")
+    assert "straggler-link" in state.symbol_reason["BTC/CAD"]
+    assert "ambiguous" in state.symbol_reason["BTC/CAD"]
+
+
+def test_straggler_linking_survives_restart(tmp_path):
+    """A link made in one process must be visible and treated as already-
+    resolved by a genuinely fresh connection opened later ('restart'),
+    not re-processed or re-blocked."""
+    db_path, conn, tl = _setup(tmp_path)
+    tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.001, price=90_000.0,
+                fee_cost=0.09, fee_currency="CAD", exec_key="uuid-restart",
+                order_id="ORD1", timestamp=engine.iso_from_ms(T0 + 1000))
+    fill_row = store.fills_row_by_exec_key(conn, "uuid-restart")
+
+    ex = FakeExchangeAdapter()
+    ex.deposit("CAD", 1000.0, timestamp_ms=T0)
+    run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 100)
+    ex.execute_trade(symbol="BTC/CAD", side="buy", price=90_000.0, amount=0.001,
+                      timestamp_ms=T0 + 1000, order_id="ORD1", fee_cost=0.09, fee_currency="CAD")
+    run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 2000)
+    linked = store.trade_ids_for_fill(conn, fill_row["id"])
+    assert len(linked) == 1
+    conn.close()
+
+    # "Restart": fresh connection, fresh TradeLog, same db file.
+    conn2 = store.connect(db_path)
+    tl2 = TradeLog(db_path=db_path)
+    state = run_cycle(ex, conn2, tl2, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 3000)
+    assert state.explain() == "ok"
+    assert store.trade_ids_for_fill(conn2, fill_row["id"]) == linked
+
+
+def test_straggler_linking_crash_leaves_no_partial_link(tmp_path):
+    """link_trade_to_fill's own transaction (store.py) must not leave a
+    trade_fill_links row without the paired ledger_written_at stamp, or
+    vice versa, if interrupted mid-write."""
+    _, conn, tl = _setup(tmp_path)
+    tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.001, price=90_000.0,
+                fee_cost=0.09, fee_currency="CAD", exec_key="uuid-crash",
+                order_id="ORD1", timestamp=engine.iso_from_ms(T0 + 1000))
+    fill_row = store.fills_row_by_exec_key(conn, "uuid-crash")
+    t = engine.ObservedTrade(
+        trade_id="T-crash", order_id="ORD1", symbol="BTC/CAD", side="buy",
+        price=90_000.0, amount=0.001, cost=90.0, fee_cost=0.09, fee_currency="CAD",
+        exchange_timestamp=engine.iso_from_ms(T0 + 1000), source="live",
+    )
+    store.upsert_observed_trade(conn, t)
+
+    flaky = FlakyConn(conn, match_prefix="UPDATE observed_trades SET ledger_written_at")
+    try:
+        store.link_trade_to_fill(flaky, "T-crash", fill_row["id"])
+        assert False, "expected the injected failure to propagate"
+    except RuntimeError:
+        pass
+
+    # Nothing partially persisted — no link row, no ledger_written_at stamp.
+    assert not store.is_ledger_represented(conn, "T-crash")
+    stored = store.get_observed_trade(conn, "T-crash")
+    assert stored is not None  # the trade itself was already committed before this call
+
+    # Retry succeeds cleanly.
+    store.link_trade_to_fill(conn, "T-crash", fill_row["id"])
+    assert store.is_ledger_represented(conn, "T-crash")

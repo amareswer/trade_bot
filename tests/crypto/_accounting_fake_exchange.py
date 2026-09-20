@@ -28,6 +28,35 @@ def iso(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+class FlakyConn:
+    """sqlite3.Connection.execute is a read-only C attribute — cannot be
+    monkeypatched directly. This thin proxy forwards everything to the
+    real connection (including the `with conn:` transaction protocol)
+    except execute(), which raises once a caller-chosen SQL statement
+    prefix has been seen `fail_on_nth_match` times — for proving a
+    multi-statement atomic write rolls back completely on a crash
+    partway through, regardless of which statement's turn it was."""
+    def __init__(self, real, *, match_prefix: str, fail_on_nth_match: int = 1):
+        self._real = real
+        self._match_prefix = match_prefix
+        self._fail_on_nth_match = fail_on_nth_match
+        self.n = 0
+
+    def execute(self, sql, *args, **kwargs):
+        if sql.strip().startswith(self._match_prefix):
+            self.n += 1
+            if self.n == self._fail_on_nth_match:
+                raise RuntimeError(f"simulated crash on match #{self.n} of {self._match_prefix!r}")
+        return self._real.execute(sql, *args, **kwargs)
+
+    def __enter__(self):
+        self._real.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._real.__exit__(exc_type, exc, tb)
+
+
 def ms(iso_str: str) -> int:
     dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
     return int(dt.timestamp() * 1000)

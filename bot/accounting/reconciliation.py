@@ -8,17 +8,35 @@ run_cycle() is the one entry point bot/main.py calls periodically
      (kraken_adapter's `symbol=None` mode — see that module's docstring for
      why this must be account-wide, not per-symbol, to keep Kraken's own
      `count` meaningful).
-  2. Observes every newly-visible trade into `observed_trades`.
+  2. Observes every newly-visible trade into `observed_trades`, ATOMICALLY
+     with the retrieval-watermark checkpoint AND any fee-correction rows
+     detected this cycle (store.commit_observation_batch, one SQLite
+     transaction — money-readiness review 2026-09-20 P1: fee corrections
+     used to be written separately via TradeLog's own connection, so a
+     later failure in the SAME cycle could leave a correction durable
+     while the trades/watermark it was detected alongside rolled back).
   3. Runs the §2 balance-identity check separately for the shared CAD cash
      pool (account level, once) and for each traded symbol's base-asset
      inventory (design §6 — cash is never checked per-symbol).
   4. Detects fee corrections on trades re-observed inside the watermark's
-     safety-margin overlap window, recording them via the EXISTING
-     TradeLog.log_fee_adjustment (design §4) — never a silent overwrite.
+     safety-margin overlap window (design §4) — never a silent overwrite.
   5. Detects genuine data-integrity anomalies (a trade_id re-observed with a
      different price/amount/side) and blocks rather than guesses.
-  6. Returns a BlockState — the ONLY thing bot/main.py's BUY gate needs to
-     consult. Exits are NEVER gated by this (see resolve_exit_quantity()).
+  6. Links delayed-visibility "stragglers" — a trade whose real exchange id
+     became observable only AFTER live_observe.py's synchronous, exact
+     order-id match already ran (or never ran at all, e.g. a
+     broker-triggered native-stop fill) — to their existing `fills` row via
+     the same exact-conservation matcher migration.py uses. Idempotent;
+     blocks (does not link) on ambiguity or a non-conserving candidate set
+     (money-readiness review 2026-09-20 P1: this was documented as the
+     periodic cycle's job but never actually wired in).
+  7. Returns a BlockState — the ONLY thing bot/main.py's BUY gate needs to
+     consult. A clean state EXPIRES after max_age_ms of real wall-clock
+     time (BlockState.is_stale / blocked_for_buy's now_ms/max_age_ms
+     kwargs — money-readiness review 2026-09-20 P1: a successful cycle
+     used to authorize BUYs indefinitely until the NEXT scheduled cycle
+     happened to run, with no independent staleness check of its own).
+     Exits are NEVER gated by this (see resolve_exit_quantity()).
 
 Bootstrap (first-ever cycle for a scope, no committed checkpoint yet): there
 is no trustworthy prior balance to diff against without item 8's migration
@@ -38,7 +56,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from bot.accounting import engine, store
-from bot.accounting.engine import ExchangeAdapter, LedgerMovement, ObservedTrade
+from bot.accounting.engine import ExchangeAdapter, LedgerMovement, ObservedTrade, UnlinkedFill
 
 
 def _now_ms() -> int:
@@ -68,7 +86,20 @@ class BlockState:
     a full observation phase (coverage-proof retrieval + fee-correction
     sweep + the atomic trade/watermark commit) has genuinely completed —
     never on an early return, never on a caught exception. `blocked_for_buy`
-    treats "never reconciled" identically to "actively blocked"."""
+    treats "never reconciled" identically to "actively blocked".
+
+    `computed_at_ms` + `is_stale`/`blocked_for_buy`'s `now_ms`/`max_age_ms`
+    kwargs — money-readiness review 2026-09-20, P1 finding: a clean,
+    successful cycle used to authorize BUYs indefinitely until the NEXT
+    scheduled run_cycle() call happened to fire (up to
+    cfg.accounting.reconcile_interval_s later, or longer if a scheduled
+    refresh itself hung), with nothing checking whether the state was
+    still fresh in between. A caller that wants this protection passes
+    both `now_ms` (real current time) and `max_age_ms` (reconcile_interval
+    + grace period) to `blocked_for_buy`/`explain` at the moment of
+    consulting the state — omitting either keeps the OLD behavior
+    (no staleness check), so existing callers/tests are unaffected unless
+    they opt in."""
     reconciled:             bool = False
     account_cash_blocked:  bool = False
     account_cash_reason:   str  = ""
@@ -77,15 +108,31 @@ class BlockState:
     coverage_blocked:      bool = False   # a fetch itself was incomplete this cycle
     coverage_reason:       str  = ""
     last_cycle_at:         str  = ""
+    computed_at_ms:        int  = 0       # wall-clock ms this state became valid — see is_stale()
     scope_results:         list = field(default_factory=list)   # list[ScopeResult]
 
-    def blocked_for_buy(self, symbol: str) -> bool:
+    def is_stale(self, *, now_ms: int, max_age_ms: int) -> bool:
+        """True once more than max_age_ms of REAL elapsed wall-clock time
+        has passed since this state was computed — independent of
+        whatever cadence the caller's own scheduling loop intended, and
+        independent of `reconciled`/the block flags (a clean state can be
+        stale; a blocked state is already blocked regardless)."""
+        return (now_ms - self.computed_at_ms) > max_age_ms
+
+    def blocked_for_buy(
+        self, symbol: str, *, now_ms: "int | None" = None, max_age_ms: "int | None" = None,
+    ) -> bool:
         """§7: account-cash block covers every symbol; a coverage failure
         this cycle is treated the same way (nothing new can be trusted to
         be reconciled while the retrieval itself is incomplete). A state
         that has never completed a successful cycle at all — the startup
         default, or the result of an exception this cycle — blocks every
-        symbol unconditionally (P0 fix above)."""
+        symbol unconditionally (P0 fix). Passing both `now_ms` and
+        `max_age_ms` additionally blocks a state that has simply gone
+        stale, even if it was clean the moment it was computed (P1 fix,
+        2026-09-20)."""
+        if now_ms is not None and max_age_ms is not None and self.is_stale(now_ms=now_ms, max_age_ms=max_age_ms):
+            return True
         return (
             not self.reconciled
             or self.account_cash_blocked
@@ -93,8 +140,11 @@ class BlockState:
             or self.symbol_blocked.get(symbol, False)
         )
 
-    def explain(self) -> str:
+    def explain(self, *, now_ms: "int | None" = None, max_age_ms: "int | None" = None) -> str:
         parts = []
+        if now_ms is not None and max_age_ms is not None and self.is_stale(now_ms=now_ms, max_age_ms=max_age_ms):
+            age_s = (now_ms - self.computed_at_ms) / 1000.0
+            parts.append(f"state is stale (age={age_s:.0f}s > max_age={max_age_ms / 1000:.0f}s)")
         if not self.reconciled and not self.coverage_blocked:
             parts.append("no reconciliation cycle has completed yet")
         if self.coverage_blocked:
@@ -128,13 +178,19 @@ class FeeSweepResult:
     notes: "list[str]" = field(default_factory=list)
     anomalous_trade_ids: set = field(default_factory=set)
     anomalous_symbols: set = field(default_factory=set)
+    pending_corrections: "list[store.FeeCorrectionWrite]" = field(default_factory=list)
 
 
-def _apply_fee_corrections(conn, trade_log, coverage_trades: "list[ObservedTrade]") -> FeeSweepResult:
+def _apply_fee_corrections(conn, coverage_trades: "list[ObservedTrade]") -> FeeSweepResult:
     """For every re-observed trade already known to observed_trades, compare
-    its freshly-fetched fee to the current effective fee and record a
-    correction via the EXISTING fee_adjustments table if it changed. Also
-    detects a genuine integrity anomaly instead of ever silently
+    its freshly-fetched fee to the current effective fee and, if it
+    changed, compute the correction to record — returned, NOT written here
+    (money-readiness review 2026-09-20, P1 finding: writing directly via
+    TradeLog's own separate connection let a fee correction persist even
+    when the SAME-cycle trade/watermark commit later rolled back). The
+    caller commits `pending_corrections` atomically alongside the trade
+    upserts and watermark checkpoint via store.commit_observation_batch.
+    Also detects a genuine integrity anomaly instead of ever silently
     overwriting the immutable observed_trades payload."""
     out = FeeSweepResult()
     for fresh in coverage_trades:
@@ -156,11 +212,11 @@ def _apply_fee_corrections(conn, trade_log, coverage_trades: "list[ObservedTrade
         all_ids = store.all_fee_correction_adjustment_ids(conn)
         revision = engine.next_fee_correction_revision(all_ids, fresh.trade_id)
         delta = fresh.fee_cost - current_effective
-        trade_log.log_fee_adjustment(
+        out.pending_corrections.append(store.FeeCorrectionWrite(
             order_id=fresh.order_id, symbol=fresh.symbol, delta_fee=delta,
             fee_currency=fresh.fee_currency,
             adjustment_id=engine.fee_correction_adjustment_id(fresh.trade_id, revision),
-        )
+        ))
         out.notes.append(
             f"FEE CORRECTION: trade {fresh.trade_id} ({fresh.symbol}) "
             f"delta={delta:+.8f} {fresh.fee_currency} (revision {revision})"
@@ -179,13 +235,24 @@ def run_cycle(
     treated as "everything's fine". conn must already have store.init_db()
     run against it.
 
+    trade_log: accepted for call-site/signature stability only — fee
+    corrections are now written directly via `conn` inside the atomic
+    observation-batch commit (money-readiness review 2026-09-20 P1), not
+    through TradeLog's own separate connection. Kept as a parameter rather
+    than removed so bot/main.py's existing call sites and every test that
+    already constructs one don't need to change for an internal detail.
+
     now_ms: injectable wall-clock override, real time if None. Every
     watermark/safety-margin computation in this function is written in
     terms of this value, never a bare `datetime.now()` call buried deeper
     in the call graph — this is what makes checkpoint-race and
     delayed-visibility scenarios deterministically testable instead of
-    depending on real elapsed wall-clock time between test steps."""
-    state = BlockState(last_cycle_at=engine.now_iso())   # reconciled=False — fail-closed until proven otherwise
+    depending on real elapsed wall-clock time between test steps.
+    Resolved once, right here, so it's available for `state.computed_at_ms`
+    even if the very first exchange call fails."""
+    now_ms = now_ms if now_ms is not None else _now_ms()
+    state = BlockState(last_cycle_at=engine.iso_from_ms(now_ms), computed_at_ms=now_ms)
+    # reconciled=False — fail-closed until proven otherwise
 
     # ── Observation phase: retrieval, fee-correction sweep, and the
     # atomic trade+watermark commit. Money-readiness review 2026-09-19,
@@ -205,7 +272,6 @@ def run_cycle(
             state.coverage_reason = coverage.reason
             return state
 
-        now_ms = now_ms if now_ms is not None else _now_ms()
         prior_watermark_ms = engine.ts_ms(prior_watermark_iso) if prior_watermark_iso else None
         new_watermark_ms = engine.compute_safe_watermark(
             coverage, now_ms=now_ms, previous_watermark_ms=prior_watermark_ms,
@@ -237,18 +303,24 @@ def run_cycle(
         # fetch returned (including ones already known, inside the
         # overlap window) — reads existing observed_trades/fee_adjustments
         # state, unaffected by trades this cycle hasn't inserted yet.
-        sweep = _apply_fee_corrections(conn, trade_log, coverage.trades)
+        # Computes what to write; does not write anything itself (see its
+        # own docstring — money-readiness review 2026-09-20 P1).
+        sweep = _apply_fee_corrections(conn, coverage.trades)
 
         # Atomic: every genuinely new trade (never one flagged anomalous
         # this cycle — it stays represented by its ORIGINAL stored
-        # payload) AND the account-wide retrieval-watermark commit,
-        # together, in one transaction.
+        # payload), the account-wide retrieval-watermark commit, AND any
+        # fee corrections detected this cycle — together, in ONE
+        # transaction (money-readiness review 2026-09-20 P1: a correction
+        # written through a separate connection could persist even when
+        # the trades/watermark it was detected alongside later rolled
+        # back; now all three are the same atomic write).
         new_trades = [t for t in coverage.trades if t.trade_id not in sweep.anomalous_trade_ids]
         checkpoint_id = engine.new_checkpoint_id()
         store.commit_observation_batch(
             conn, new_trades=new_trades, retrieval_scope=account_scope,
             window_since=prior_watermark_iso, window_until=new_watermark_iso,
-            checkpoint_id=checkpoint_id,
+            checkpoint_id=checkpoint_id, fee_corrections=sweep.pending_corrections,
         )
         state.reconciled = True
     except Exception as exc:
@@ -300,7 +372,81 @@ def run_cycle(
                 state.symbol_blocked[sym] = True
                 state.symbol_reason[sym] = (state.symbol_reason.get(sym, "") + "; " if state.symbol_reason.get(sym) else "") + anomaly_text
 
+    # ── Delayed-visibility straggler linking (money-readiness review
+    # 2026-09-20, P1): live_observe.py's synchronous, exact order-id match
+    # handles the common case; this is the promised periodic safety net
+    # for whatever it missed (a fetch_my_trades propagation delay, or a
+    # fill discovered outside the normal execute() path with no
+    # synchronous observer call at all). Runs regardless of this cycle's
+    # own coverage/balance outcome — it only reads/links what's ALREADY
+    # persisted, so it's still worth attempting even on an otherwise
+    # degraded cycle. Never raises; a failure here blocks the affected
+    # symbol rather than the whole cycle.
+    try:
+        straggler_result = _link_stragglers(conn, symbols)
+    except Exception as exc:
+        straggler_result = StragglerLinkResult(
+            blocked={sym: f"straggler-linking raised: {exc}" for sym in symbols},
+        )
+    for sym, reason in straggler_result.blocked.items():
+        if sym in state.symbol_blocked:
+            state.symbol_blocked[sym] = True
+            state.symbol_reason[sym] = (
+                (state.symbol_reason.get(sym, "") + "; ") if state.symbol_reason.get(sym) else ""
+            ) + f"straggler-link: {reason}"
+
     return state
+
+
+@dataclass
+class StragglerLinkResult:
+    linked: "dict[str, list[str]]" = field(default_factory=dict)   # symbol -> [trade_id, ...] newly linked
+    blocked: "dict[str, str]" = field(default_factory=dict)        # symbol -> reason (last blocking reason this cycle)
+
+
+def _link_stragglers(conn, symbols: "list[str]", *, window_s: float = 300.0) -> StragglerLinkResult:
+    """Delayed-visibility straggler linking (money-readiness review
+    2026-09-20, P1: "the periodic reconciliation cycle does not implement
+    the promised late-fill matcher"). For each symbol, finds `fills` rows
+    with no trade_fill_links row yet (store.unlinked_fills) and tries to
+    match each one against currently-unlinked observed_trades using the
+    SAME exact-conservation matcher migration.py uses
+    (engine.match_legacy_fill) — never a nearest-timestamp guess.
+
+    Idempotent: an already-linked trade is excluded from the candidate
+    pool (store.already_linked_trade_ids, refreshed after each successful
+    link within this same call so two fills rows in one cycle can never
+    both claim the same trade), and a fills row with nothing new to link
+    against is silently skipped, not re-reported, every subsequent call.
+
+    "no candidate trades in window" is NOT reported as blocked — it is the
+    ORDINARY, expected state for a fill whose real trade simply hasn't
+    been observed yet (the common case this function exists to eventually
+    resolve, not evidence of a problem). Every OTHER match_legacy_fill
+    outcome (no exact-conserving subset despite candidates existing,
+    ambiguous, or too large a pool) DOES block that symbol — a genuine
+    data-quality signal, not routine latency."""
+    result = StragglerLinkResult()
+    already_linked = store.already_linked_trade_ids(conn)
+    for sym in symbols:
+        unlinked_rows = store.unlinked_fills(conn, sym)
+        if not unlinked_rows:
+            continue
+        candidate_trades = [t for t in store.load_observed_trades(conn, sym) if t.trade_id not in already_linked]
+        for row in unlinked_rows:
+            unlinked = UnlinkedFill.from_fills_row(row, window_s=window_s)
+            match = engine.match_legacy_fill(unlinked, candidate_trades, already_linked=already_linked)
+            if match.blocked:
+                if match.reason != "no candidate trades in window":
+                    result.blocked[sym] = f"fills.id={match.fill_id}: {match.reason}"
+                continue
+            matched = [t for t in candidate_trades if t.trade_id in match.matched_trade_ids]
+            for t in matched:
+                store.link_trade_to_fill(conn, t.trade_id, match.fill_id)
+            result.linked.setdefault(sym, []).extend(match.matched_trade_ids)
+            already_linked = already_linked | set(match.matched_trade_ids)
+            candidate_trades = [t for t in candidate_trades if t.trade_id not in match.matched_trade_ids]
+    return result
 
 
 def _scope_trades(conn, symbols_for_scope: "list[str]") -> "list[ObservedTrade]":

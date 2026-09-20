@@ -2864,6 +2864,11 @@ def run():
     _accounting_state       = AccountingBlockState()   # unblocked default until the first cycle completes
     _accounting_last_cycle  = 0.0
     _accounting_quote       = list(executors.keys())[0].split("/")[1] if executors else "CAD"
+    # Freshness deadline (money-readiness review 2026-09-20, P1): a clean
+    # state stops authorizing BUYs once it is older than this, checked
+    # against REAL wall-clock time at every consult (BlockState.is_stale),
+    # independent of the tick loop's own reconcile_interval_s scheduling.
+    _accounting_max_age_ms  = int((cfg.accounting.reconcile_interval_s + cfg.accounting.stale_grace_s) * 1000)
     if cfg.accounting.enabled and not _accounting_enabled:
         logger.info(
             "Accounting reconciliation: ACCOUNTING_ENABLED=true but not applicable "
@@ -3746,7 +3751,9 @@ def run():
                         and ss['pm'].quantity > 0
                     ):
                         _p_qty = round(ss['pm'].quantity * cfg.backtest.partial_tp_size, 6)
-                        if _accounting_enabled and _accounting_state.blocked_for_buy(sym):
+                        if _accounting_enabled and _accounting_state.blocked_for_buy(
+                            sym, now_ms=int(time.time() * 1000), max_age_ms=_accounting_max_age_ms,
+                        ):
                             _p_qty = round(
                                 accounting_reconciliation.resolve_exit_quantity(
                                     _accounting_adapter, sym, _p_qty,
@@ -3878,7 +3885,9 @@ def run():
                         # PositionManager already believes is held (see
                         # resolve_exit_quantity's own docstring — external
                         # holdings / reserved-quantity handling).
-                        if _accounting_enabled and _accounting_state.blocked_for_buy(sym):
+                        if _accounting_enabled and _accounting_state.blocked_for_buy(
+                            sym, now_ms=int(time.time() * 1000), max_age_ms=_accounting_max_age_ms,
+                        ):
                             _ic_qty = accounting_reconciliation.resolve_exit_quantity(
                                 _accounting_adapter, sym, _ic_qty,
                             )
@@ -4335,7 +4344,9 @@ def run():
                 # and partial-TP exit paths: only when accounting is
                 # enabled AND this symbol/account is currently blocked,
                 # never sizing above what PositionManager already tracks.
-                if _accounting_enabled and _accounting_state.blocked_for_buy(sym):
+                if _accounting_enabled and _accounting_state.blocked_for_buy(
+                    sym, now_ms=int(time.time() * 1000), max_age_ms=_accounting_max_age_ms,
+                ):
                     trade_qty = accounting_reconciliation.resolve_exit_quantity(
                         _accounting_adapter, sym, trade_qty,
                     )
@@ -4403,12 +4414,22 @@ def run():
             # residual blocks new BUYs — checked only when risk_manager
             # would otherwise have approved (never overrides a MORE severe
             # existing block, and never touches a SELL/exit at all).
+            # now_ms/max_age_ms (money-readiness review 2026-09-20 P1):
+            # a clean state ALSO expires after reconcile_interval_s +
+            # stale_grace_s of real elapsed time — checked here, at the
+            # moment of actually consulting the state, not just at the
+            # moment it was computed.
+            _acct_now_ms = int(time.time() * 1000)
             if (
                 approval and final_signal == Signal.BUY
                 and cfg.accounting.enabled and cfg.accounting.block_buys_on_unreconciled
-                and _accounting_state.blocked_for_buy(sym)
+                and _accounting_state.blocked_for_buy(
+                    sym, now_ms=_acct_now_ms, max_age_ms=_accounting_max_age_ms,
+                )
             ):
-                _acct_block_reason = _accounting_state.explain()
+                _acct_block_reason = _accounting_state.explain(
+                    now_ms=_acct_now_ms, max_age_ms=_accounting_max_age_ms,
+                )
                 approval = ApprovalResult(
                     approved=False,
                     message=f"Accounting reconciliation unresolved: {_acct_block_reason}",

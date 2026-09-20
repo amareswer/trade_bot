@@ -33,6 +33,16 @@ one transactional boundary"):
 fee_adjustments (existing table, bot/data/trade_log.py) is reused as-is for
 trade-level fee corrections (design §4), keyed
 `adjustment_id=f"{trade_id}:fee_correction:{n}"` — no new fee table here.
+Its schema is ALSO declared (byte-identical, both `IF NOT EXISTS`) in this
+module's own `_SCHEMA` below — money-readiness review 2026-09-20, P1
+finding: fee corrections are now written through the SAME `conn` this
+module uses (via commit_observation_batch), atomically with the trade/
+watermark commit, rather than through TradeLog's own separate connection
+(which could let a correction persist durably even when the trades/
+watermark it was detected alongside later rolled back in the SAME cycle).
+Declaring the table here too means this module never depends on ordering
+— store.init_db() alone is enough to make fee_adjustments writable, with
+or without a TradeLog ever having been constructed against this path.
 """
 from __future__ import annotations
 
@@ -77,6 +87,17 @@ CREATE TABLE IF NOT EXISTS trade_fill_links (
     linked_at    TEXT NOT NULL,
     PRIMARY KEY (trade_id, fill_id)
 );
+CREATE TABLE IF NOT EXISTS fee_adjustments (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp     TEXT    NOT NULL,
+    order_id      TEXT    NOT NULL,
+    symbol        TEXT    NOT NULL,
+    delta_fee     REAL    NOT NULL,
+    fee_currency  TEXT    DEFAULT '',
+    adjustment_id TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fee_adjustments_adjustment_id
+ON fee_adjustments(adjustment_id) WHERE adjustment_id IS NOT NULL AND adjustment_id != '';
 """
 
 
@@ -148,19 +169,41 @@ def upsert_observed_trade(conn: sqlite3.Connection, trade: ObservedTrade) -> boo
     return True
 
 
+@dataclass
+class FeeCorrectionWrite:
+    """A computed-but-not-yet-persisted fee_adjustments row (see
+    reconciliation._apply_fee_corrections' own docstring — money-readiness
+    review 2026-09-20, P1: this must commit in the SAME transaction as the
+    observed trades/watermark it was detected alongside, never through a
+    separate connection that could leave it durable on its own)."""
+    order_id: str
+    symbol: str
+    delta_fee: float
+    fee_currency: str
+    adjustment_id: str
+
+
 def commit_observation_batch(
     conn: sqlite3.Connection, *, new_trades: list[ObservedTrade], retrieval_scope: str,
     window_since: Optional[str], window_until: str, checkpoint_id: str,
+    fee_corrections: "list[FeeCorrectionWrite] | None" = None,
 ) -> None:
-    """Atomically inserts every newly-observed trade AND the account-wide
-    RETRIEVAL-WATERMARK checkpoint row in ONE transaction (money-readiness
-    review 2026-09-19, P1 finding: "the account watermark is committed
-    before the cycle has reconciled successfully... later failures can
-    leave a durable cursor ahead of uncommitted observations"). Either
-    every trade in `new_trades` AND the watermark checkpoint are all
-    durably persisted together, or NONE of them are — a crash or exception
+    """Atomically inserts every newly-observed trade, any fee corrections
+    detected this cycle, AND the account-wide RETRIEVAL-WATERMARK
+    checkpoint row — all in ONE transaction (money-readiness review
+    2026-09-19 P1: "the account watermark is committed before the cycle
+    has reconciled successfully..."; 2026-09-20 P1: "fee corrections are
+    not atomic with observation commits"). Either everything here is
+    durably persisted together, or none of it is — a crash or exception
     partway through can never advance the retrieval cursor past a trade
-    that didn't actually get saved.
+    that didn't actually get saved, and can never leave a fee correction
+    durable on its own while the trade/watermark it was detected
+    alongside rolled back.
+
+    fee_corrections uses `INSERT OR IGNORE` against fee_adjustments'
+    existing partial-unique-index on adjustment_id (idempotent — same
+    discipline as TradeLog.log_fee_adjustment, just issued against THIS
+    connection/transaction instead of TradeLog's own).
 
     This is intentionally a DIFFERENT checkpoint row than commit_checkpoint
     (which records a currency-scope's own balance-identity checkpoint) —
@@ -184,6 +227,13 @@ def commit_observation_batch(
                 """,
                 (t.trade_id, t.order_id, t.symbol, t.side, t.price, t.amount, t.cost,
                  t.fee_cost, t.fee_currency, t.exchange_timestamp, _now_iso(), t.source),
+            )
+        for fc in (fee_corrections or []):
+            conn.execute(
+                "INSERT OR IGNORE INTO fee_adjustments "
+                "(timestamp, order_id, symbol, delta_fee, fee_currency, adjustment_id) "
+                "VALUES (?,?,?,?,?,?)",
+                (_now_iso(), fc.order_id, fc.symbol, fc.delta_fee, fc.fee_currency, fc.adjustment_id),
             )
         conn.execute(
             "INSERT INTO checkpoints (checkpoint_id, currency_scope, window_since, "

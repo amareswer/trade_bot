@@ -584,12 +584,21 @@ class AccountingConfig:
     watermark_safety_margin_s: float = 900.0  # ACCOUNTING_WATERMARK_SAFETY_MARGIN_S — see engine.compute_safe_watermark
     block_buys_on_unreconciled: bool = True   # ACCOUNTING_BLOCK_BUYS_ON_UNRECONCILED — the actual gate switch;
                                                # False makes the subsystem purely observational (reports but never blocks)
+    stale_grace_s:        float = 300.0   # ACCOUNTING_STALE_GRACE_S — money-readiness review 2026-09-20 P1: a
+                                           # successfully-reconciled state stops authorizing BUYs once it is older
+                                           # than reconcile_interval_s + this grace period (real wall-clock time,
+                                           # checked at every BUY-gate consult — bot/accounting/reconciliation.py's
+                                           # BlockState.is_stale). The grace period exists so an ordinary tick
+                                           # arriving a few seconds after the interval elapsed (normal scheduling
+                                           # jitter, not a real staleness problem) doesn't spuriously block.
 
     def __post_init__(self):
         if self.reconcile_interval_s <= 0:
             raise ValueError("ACCOUNTING_RECONCILE_INTERVAL_S must be > 0")
         if self.watermark_safety_margin_s <= 0:
             raise ValueError("ACCOUNTING_WATERMARK_SAFETY_MARGIN_S must be > 0")
+        if self.stale_grace_s < 0:
+            raise ValueError("ACCOUNTING_STALE_GRACE_S must be >= 0")
 
 
 # ---------------------------------------------------------------------------
@@ -954,6 +963,7 @@ def _load() -> AppConfig:
             reconcile_interval_s        = _float("ACCOUNTING_RECONCILE_INTERVAL_S",     3600.0),
             watermark_safety_margin_s   = _float("ACCOUNTING_WATERMARK_SAFETY_MARGIN_S", 900.0),
             block_buys_on_unreconciled  = _bool ("ACCOUNTING_BLOCK_BUYS_ON_UNRECONCILED", True),
+            stale_grace_s               = _float("ACCOUNTING_STALE_GRACE_S",         300.0),
         ),
     )
 

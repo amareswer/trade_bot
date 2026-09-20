@@ -362,6 +362,88 @@ def test_commit_observation_batch_atomic_on_injected_failure(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0] == 0
 
 
+def test_commit_observation_batch_fee_correction_atomic_on_injected_failure(tmp_path):
+    """money-readiness review 2026-09-20, P1 finding: a fee correction
+    used to be written through TradeLog's own separate connection, so it
+    could persist durably even when the SAME-cycle trade/watermark commit
+    it was detected alongside later rolled back. Proves the opposite now:
+    a crash AFTER the fee_adjustments insert but BEFORE the checkpoint row
+    rolls back the correction too — nothing orphaned."""
+    from _accounting_fake_exchange import FlakyConn
+
+    db_path = str(tmp_path / "trades.db")
+    store.init_db(db_path)
+    conn = store.connect(db_path)
+    t1 = _t("T1", "O1", "BTC/CAD", "buy", 100.0, 1.0, 1000, fee=0.09)
+    fc = store.FeeCorrectionWrite(
+        order_id="O1", symbol="BTC/CAD", delta_fee=0.06, fee_currency="CAD",
+        adjustment_id="T1:fee_correction:1",
+    )
+    flaky = FlakyConn(conn, match_prefix="INSERT INTO checkpoints")
+    try:
+        store.commit_observation_batch(
+            flaky, new_trades=[t1], retrieval_scope="__account__",
+            window_since=None, window_until=iso(5000), checkpoint_id="CP1",
+            fee_corrections=[fc],
+        )
+        assert False, "expected the injected failure to propagate"
+    except RuntimeError:
+        pass
+
+    assert conn.execute("SELECT COUNT(*) FROM observed_trades").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM fee_adjustments").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0] == 0
+
+
+def test_commit_observation_batch_fee_correction_succeeds_together(tmp_path):
+    db_path = str(tmp_path / "trades.db")
+    store.init_db(db_path)
+    conn = store.connect(db_path)
+    t1 = _t("T1", "O1", "BTC/CAD", "buy", 100.0, 1.0, 1000, fee=0.09)
+    fc = store.FeeCorrectionWrite(
+        order_id="O1", symbol="BTC/CAD", delta_fee=0.06, fee_currency="CAD",
+        adjustment_id="T1:fee_correction:1",
+    )
+    store.commit_observation_batch(
+        conn, new_trades=[t1], retrieval_scope="__account__",
+        window_since=None, window_until=iso(5000), checkpoint_id="CP1",
+        fee_corrections=[fc],
+    )
+    assert store.get_observed_trade(conn, "T1") is not None
+    deltas = store.fee_correction_deltas_for_trade(conn, "T1")
+    assert deltas == [0.06]
+
+
+def test_commit_observation_batch_fee_correction_idempotent_on_replay(tmp_path):
+    """Restart convergence: re-submitting the SAME fee correction
+    (adjustment_id unchanged) after a successful commit is a no-op, not a
+    duplicate delta — matches TradeLog.log_fee_adjustment's own
+    idempotency discipline, now enforced by the shared partial unique
+    index regardless of which connection writes through it."""
+    db_path = str(tmp_path / "trades.db")
+    store.init_db(db_path)
+    conn = store.connect(db_path)
+    t1 = _t("T1", "O1", "BTC/CAD", "buy", 100.0, 1.0, 1000, fee=0.09)
+    fc = store.FeeCorrectionWrite(
+        order_id="O1", symbol="BTC/CAD", delta_fee=0.06, fee_currency="CAD",
+        adjustment_id="T1:fee_correction:1",
+    )
+    store.commit_observation_batch(
+        conn, new_trades=[t1], retrieval_scope="__account__",
+        window_since=None, window_until=iso(5000), checkpoint_id="CP1",
+        fee_corrections=[fc],
+    )
+    # Re-submit (simulating a restart re-detecting the same correction
+    # before its own watermark/checkpoint has advanced past it).
+    store.commit_observation_batch(
+        conn, new_trades=[], retrieval_scope="__account__",
+        window_since=iso(5000), window_until=iso(6000), checkpoint_id="CP2",
+        fee_corrections=[fc],
+    )
+    deltas = store.fee_correction_deltas_for_trade(conn, "T1")
+    assert deltas == [0.06]  # not [0.06, 0.06]
+
+
 def test_commit_observation_batch_succeeds_together(tmp_path):
     db_path = str(tmp_path / "trades.db")
     store.init_db(db_path)
