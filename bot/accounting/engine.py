@@ -469,9 +469,14 @@ def match_legacy_fill(
     misattribution, which is off by orders of magnitude, not cents.
 
     When row.order_id is known (fills.order_id populated), the candidate
-    pool is narrowed to that order_id FIRST, before the conservation
-    combinatorics run — a real, exact disambiguator when available. A
-    legacy row with no order_id (the common case for true pre-order-
+    pool is narrowed to EXACTLY that order_id, unconditionally — a real,
+    exact disambiguator when available. This must never fall back to the
+    unfiltered pool when the narrowed one comes up empty (a second review
+    pass's own P1 finding, 2026-09-20: the first version of this fix did
+    exactly that — `if order_pool: pool = order_pool` — so a known order_id
+    with no matching candidate silently matched against a completely
+    UNRELATED order instead, which is worse than not narrowing at all).
+    A legacy row with no order_id (the common case for true pre-order-
     tracking history) still requires full quantity+fee+cost conservation
     with no narrowing; this is a strict ADDITION to the existing check,
     never a replacement for it, so it only prevents matches the old check
@@ -483,9 +488,7 @@ def match_legacy_fill(
         and row.window_start_ms <= _ts_ms(t.exchange_timestamp) <= row.window_end_ms
     ]
     if row.order_id:
-        order_pool = [t for t in pool if t.order_id == row.order_id]
-        if order_pool:
-            pool = order_pool
+        pool = [t for t in pool if t.order_id == row.order_id]
     pool_ids = [t.trade_id for t in pool]
     if not pool:
         return MatchResult(row.fill_id, [], True, "no candidate trades in window", pool_ids)

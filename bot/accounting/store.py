@@ -306,11 +306,40 @@ def link_trades_to_fill(conn: sqlite3.Connection, trade_ids: "list[str]", fill_i
     matched set links together, or none of it does — there is no
     partially-linked state a restart could ever observe. Idempotent per
     trade_id (INSERT OR IGNORE), so re-submitting an already-fully-linked
-    group is a safe no-op."""
+    group is a safe no-op.
+
+    One-fill-owner-per-trade + no-dangling-fill enforcement (accounting
+    review, second follow-up pass, 2026-09-20, P1: "duplicate ownership and
+    dangling links still pass verification" — the read-side
+    four_way.verify_ledger_delivery_consistency check catches an EXISTING
+    violation, but this is the write-side guard that stops one from being
+    created in the first place). A real ALTER TABLE to add a UNIQUE
+    constraint on trade_fill_links.trade_id was deliberately not done here
+    — this table already has real linked rows in the live database, and
+    rebuilding a live financial table's schema is a separate, riskier
+    decision than an application-level guard; every write to this table
+    already goes through this one function. Raises ValueError (not a
+    silent skip) if fill_id doesn't exist in `fills`, or if any trade_id is
+    already linked to a DIFFERENT fill_id — re-linking to the SAME fill_id
+    remains the idempotent no-op described above."""
     if not trade_ids:
         return
     with conn:
+        fill_exists = conn.execute("SELECT 1 FROM fills WHERE id = ?", (fill_id,)).fetchone()
+        if fill_exists is None:
+            raise ValueError(f"link_trades_to_fill: fill_id={fill_id} does not exist in fills")
         for trade_id in trade_ids:
+            existing_fill_ids = {
+                r[0] for r in conn.execute(
+                    "SELECT fill_id FROM trade_fill_links WHERE trade_id = ?", (trade_id,)
+                )
+            }
+            if existing_fill_ids and existing_fill_ids != {fill_id}:
+                raise ValueError(
+                    f"link_trades_to_fill: trade_id={trade_id} is already linked to "
+                    f"fill_id(s) {sorted(existing_fill_ids)} — one fill owner per trade, "
+                    f"refusing to also link fill_id={fill_id}"
+                )
             conn.execute(
                 "INSERT OR IGNORE INTO trade_fill_links (trade_id, fill_id, linked_at) VALUES (?,?,?)",
                 (trade_id, fill_id, _now_iso()),

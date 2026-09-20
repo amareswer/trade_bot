@@ -15,6 +15,8 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(__file__))
 from _accounting_fake_exchange import FakeExchangeAdapter, FlakyConn  # noqa: E402
 
@@ -514,18 +516,21 @@ def test_straggler_linking_is_idempotent_across_cycles(tmp_path):
 def test_straggler_linking_blocks_on_ambiguous_match(tmp_path):
     """Two real trades that BOTH exactly conserve an unlinked fills row's
     totals — never guessed, always blocks that symbol for manual review
-    (same discipline as migration.py's ambiguity handling)."""
+    (same discipline as migration.py's ambiguity handling). No order_id is
+    known on the local row (true legacy shape), so this is genuine
+    conservation-only ambiguity, not the known-order-id case covered
+    separately below."""
     _, conn, tl = _setup(tmp_path)
     tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.001, price=90_000.0,
                 fee_cost=0.09, fee_currency="CAD", exec_key="uuid-amb",
-                order_id="ORD1", timestamp=engine.iso_from_ms(T0 + 1000))
+                timestamp=engine.iso_from_ms(T0 + 1000))
 
     ex = FakeExchangeAdapter()
     ex.deposit("CAD", 1000.0, timestamp_ms=T0)
     run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 100)
-    # Two DIFFERENT orders' trades, same qty/fee/cost, neither matching the
-    # local row's own (unrelated) order_id, both inside the fills row's
-    # matching window — genuinely ambiguous which one it represents.
+    # Two DIFFERENT orders' trades, same qty/fee/cost, both inside the
+    # fills row's matching window — genuinely ambiguous which one it
+    # represents, since the local row doesn't know which order it came from.
     ex.execute_trade(symbol="BTC/CAD", side="buy", price=90_000.0, amount=0.001,
                       timestamp_ms=T0 + 990, order_id="ORD_X", fee_cost=0.09, fee_currency="CAD")
     ex.execute_trade(symbol="BTC/CAD", side="buy", price=90_000.0, amount=0.001,
@@ -535,6 +540,38 @@ def test_straggler_linking_blocks_on_ambiguous_match(tmp_path):
     assert state.blocked_for_buy("BTC/CAD")
     assert "straggler-link" in state.symbol_reason["BTC/CAD"]
     assert "ambiguous" in state.symbol_reason["BTC/CAD"]
+
+
+def test_straggler_linking_known_order_id_never_falls_back_to_a_different_order(tmp_path):
+    """Second review pass, 2026-09-20, P1 reproduction: a local row that
+    DOES know its own order_id must never match a candidate from a
+    DIFFERENT order, even one that fully conserves quantity/fee/cost and
+    even when no candidate for the row's actual order is visible yet. The
+    first version of the order-identity fix fell back to the unfiltered
+    pool whenever the narrowed one came up empty — worse than not having
+    the feature at all, since it actively preferred a wrong-order match
+    over correctly reporting 'not visible yet'."""
+    _, conn, tl = _setup(tmp_path)
+    tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.001, price=90_000.0,
+                fee_cost=0.09, fee_currency="CAD", exec_key="uuid-known-order",
+                order_id="EXPECTED", timestamp=engine.iso_from_ms(T0 + 1000))
+
+    ex = FakeExchangeAdapter()
+    ex.deposit("CAD", 1000.0, timestamp_ms=T0)
+    run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 100)
+    # A fully-conserving candidate exists in the window, but from a
+    # DIFFERENT order than the local row is known to belong to — must be
+    # refused, not matched, regardless of how well it conserves.
+    ex.execute_trade(symbol="BTC/CAD", side="buy", price=90_000.0, amount=0.001,
+                      timestamp_ms=T0 + 990, order_id="OTHER", fee_cost=0.09, fee_currency="CAD")
+    state = run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 2000)
+
+    fill_row = store.unlinked_fills(conn, "BTC/CAD")
+    assert len(fill_row) == 1   # still unlinked — the OTHER-order trade was correctly refused
+    # "no candidate trades in window" is the expected, non-blocking-alert
+    # outcome (see _link_stragglers' own docstring) — it must NOT have been
+    # silently linked to the wrong order's trade.
+    assert "BTC/CAD" not in state.symbol_reason or "ambiguous" not in state.symbol_reason.get("BTC/CAD", "")
 
 
 def test_straggler_linking_survives_restart(tmp_path):
@@ -647,6 +684,61 @@ def test_multi_trade_straggler_match_crash_leaves_no_partial_link(tmp_path):
     assert store.is_ledger_represented(conn, "T1")
     assert store.is_ledger_represented(conn, "T2")
     assert sorted(store.trade_ids_for_fill(conn, fill_row["id"])) == ["T1", "T2"]
+
+
+def test_link_trades_to_fill_refuses_a_second_different_fill_owner(tmp_path):
+    """Accounting review, second follow-up pass, 2026-09-20, P1: 'linking
+    one exchange trade to two identical fill rows returned ok=True' at the
+    read-side verifier. This is the write-side guard that stops it being
+    created in the first place — store.link_trades_to_fill must refuse to
+    link a trade that's already linked to a DIFFERENT fill_id, rather than
+    silently creating a second ownership row."""
+    db_path, conn, tl = _setup(tmp_path)
+    tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.001, price=90_000.0,
+                fee_cost=0.09, fee_currency="CAD", exec_key="uuid-owner-1",
+                timestamp=engine.iso_from_ms(T0 + 1000))
+    tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.001, price=90_000.0,
+                fee_cost=0.09, fee_currency="CAD", exec_key="uuid-owner-2",
+                timestamp=engine.iso_from_ms(T0 + 2000))
+    fill1 = store.fills_row_by_exec_key(conn, "uuid-owner-1")
+    fill2 = store.fills_row_by_exec_key(conn, "uuid-owner-2")
+    t = engine.ObservedTrade(
+        trade_id="T-dup", order_id="O1", symbol="BTC/CAD", side="buy",
+        price=90_000.0, amount=0.001, cost=90.0, fee_cost=0.09, fee_currency="CAD",
+        exchange_timestamp=engine.iso_from_ms(T0 + 1000), source="live",
+    )
+    store.upsert_observed_trade(conn, t)
+    store.link_trades_to_fill(conn, ["T-dup"], fill1["id"])
+
+    with pytest.raises(ValueError):
+        store.link_trades_to_fill(conn, ["T-dup"], fill2["id"])
+
+    # Refused cleanly — still owned by fill1 only, fill2 untouched.
+    assert store.trade_ids_for_fill(conn, fill1["id"]) == ["T-dup"]
+    assert store.trade_ids_for_fill(conn, fill2["id"]) == []
+
+    # Re-linking to the SAME fill it already owns remains the documented
+    # idempotent no-op — the guard must not break that.
+    store.link_trades_to_fill(conn, ["T-dup"], fill1["id"])
+    assert store.trade_ids_for_fill(conn, fill1["id"]) == ["T-dup"]
+
+
+def test_link_trades_to_fill_refuses_a_nonexistent_fill_id(tmp_path):
+    """Companion write-side guard: refuse to create a dangling link to a
+    fill_id that doesn't exist in `fills` at all, rather than silently
+    inserting a trade_fill_links row nothing can ever resolve back to."""
+    _, conn, tl = _setup(tmp_path)
+    t = engine.ObservedTrade(
+        trade_id="T-ghost", order_id="O1", symbol="BTC/CAD", side="buy",
+        price=90_000.0, amount=0.001, cost=90.0, fee_cost=0.09, fee_currency="CAD",
+        exchange_timestamp=engine.iso_from_ms(T0), source="live",
+    )
+    store.upsert_observed_trade(conn, t)
+
+    with pytest.raises(ValueError):
+        store.link_trades_to_fill(conn, ["T-ghost"], 999999)
+
+    assert not store.is_ledger_represented(conn, "T-ghost")
 
 
 def test_straggler_matching_through_run_cycle_survives_a_crash_mid_multi_link(tmp_path):

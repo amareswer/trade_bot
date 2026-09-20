@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from bot.accounting import engine, store
-from bot.accounting.reconciliation import BlockState, _effective_fee_trades, base_asset
+from bot.accounting.reconciliation import BlockState, base_asset
 
 _QTY_TOLERANCE = 1e-6
 _FEE_TOLERANCE = 1e-6
@@ -32,7 +32,9 @@ class LedgerDeliveryResult:
     ok: bool
     orphaned_marker_trade_ids: "list[str]" = field(default_factory=list)   # ledger_written_at set but no link row
     unwritten_trade_ids: "list[str]" = field(default_factory=list)         # link row exists but ledger_written_at NULL
-    double_represented_fill_ids: "list[int]" = field(default_factory=list)  # a fills row linked to >1 trade with mismatched sum
+    double_represented_fill_ids: "list[int]" = field(default_factory=list)  # a fills row linked to trades with mismatched sum
+    duplicate_owner_trade_ids: "list[str]" = field(default_factory=list)   # one trade linked to >1 DIFFERENT fill_id
+    dangling_fill_ids: "list[int]" = field(default_factory=list)          # a link references a fill_id no longer in `fills`
 
 
 def verify_ledger_delivery_consistency(conn, symbol: str) -> LedgerDeliveryResult:
@@ -48,12 +50,22 @@ def verify_ledger_delivery_consistency(conn, symbol: str) -> LedgerDeliveryResul
     fixed — see live_observe.py). Existence alone can't catch that: both
     trades genuinely have a link row and a marker, so nothing above flags
     it. This additionally sums, per fill_id, every trade currently linked
-    to it (using the CURRENT correction-adjusted fee, same
-    _effective_fee_trades transformation diff_position_against_fold already
-    applies below) and compares against what the fills row itself recorded
-    — a fill_id whose linked trades over- or under-represent it lands in
+    to it and compares against what the fills row itself recorded — a
+    fill_id whose linked trades over- or under-represent it lands in
     double_represented_fill_ids and fails `ok`, regardless of how the
-    mismatch happened."""
+    mismatch happened.
+
+    Deliberately uses each trade's ORIGINAL fee_cost, NOT the correction-
+    adjusted effective fee (unlike diff_position_against_fold below, which
+    correctly wants the current corrected value for its own purpose). A
+    second review pass, 2026-09-20, found the first version of this check
+    used the corrected fee here too — but fills.fee_cost is a frozen,
+    execution-time value that a later fee_adjustments correction NEVER
+    updates, so comparing a corrected observed-trade fee against an
+    uncorrected fills-row fee made a perfectly valid, correctly-recorded
+    correction look like a broken link. This check's job is verifying the
+    LINK's conservation as originally established, which a subsequent
+    legitimate correction does not change or invalidate."""
     trades = store.load_observed_trades(conn, symbol)
     orphaned, unwritten = [], []
     for t in trades:
@@ -67,7 +79,25 @@ def verify_ledger_delivery_consistency(conn, symbol: str) -> LedgerDeliveryResul
         elif has_link and not is_written:
             unwritten.append(t.trade_id)
 
+    # Duplicate ownership (accounting review, second follow-up pass,
+    # 2026-09-20, P1: "linking one exchange trade to two identical fill
+    # rows returned ok=True"). store.link_trades_to_fill now REFUSES to
+    # create this going forward (application-level guard — see its own
+    # docstring for why a schema-level UNIQUE constraint wasn't used on a
+    # live financial table), but this detects any such row that already
+    # existed before that guard, or slipped in some other way.
+    duplicate_owner = []
+    for t in trades:
+        owner_fill_ids = {
+            r[0] for r in conn.execute(
+                "SELECT fill_id FROM trade_fill_links WHERE trade_id = ?", (t.trade_id,)
+            )
+        }
+        if len(owner_fill_ids) > 1:
+            duplicate_owner.append(t.trade_id)
+
     double_represented = []
+    dangling_fill_ids = []
     trade_ids = [t.trade_id for t in trades]
     fill_ids = sorted(store.linked_fill_ids_for_trades(conn, trade_ids)) if trade_ids else []
     trades_by_id = {t.trade_id: t for t in trades}
@@ -76,25 +106,32 @@ def verify_ledger_delivery_consistency(conn, symbol: str) -> LedgerDeliveryResul
             "SELECT quantity, fee_cost, value FROM fills WHERE id = ?", (fill_id,)
         ).fetchone()
         if fill_row is None:
-            continue  # a link pointing at a nonexistent fills row is a different failure mode, not this check's job
+            # Second follow-up pass, 2026-09-20, P1: "deleting the
+            # referenced fills also returned ok=True because missing rows
+            # are skipped." A link pointing at a fills row that no longer
+            # exists is exactly the kind of corruption this function
+            # exists to catch — it must never be silently passed over.
+            dangling_fill_ids.append(fill_id)
+            continue
         fill_qty, fill_fee, fill_value = fill_row
         linked_trade_ids = store.trade_ids_for_fill(conn, fill_id)
         linked_trades = [trades_by_id[tid] for tid in linked_trade_ids if tid in trades_by_id]
         if len(linked_trades) != len(linked_trade_ids):
             continue  # a trade linked here belongs to a different symbol's fold — out of scope for this call
-        effective = _effective_fee_trades(conn, linked_trades)
-        sum_qty = sum(t.amount for t in effective)
-        sum_fee = sum(t.fee_cost for t in effective)
-        sum_cost = sum(t.cost for t in effective)
+        sum_qty = sum(t.amount for t in linked_trades)
+        sum_fee = sum(t.fee_cost for t in linked_trades)
+        sum_cost = sum(t.cost for t in linked_trades)
         if (abs(sum_qty - float(fill_qty or 0.0)) > _QTY_TOLERANCE
                 or abs(sum_fee - float(fill_fee or 0.0)) > _FEE_TOLERANCE
                 or abs(sum_cost - float(fill_value or 0.0)) > _COST_TOLERANCE):
             double_represented.append(fill_id)
 
-    ok = not orphaned and not unwritten and not double_represented
+    ok = (not orphaned and not unwritten and not double_represented
+          and not duplicate_owner and not dangling_fill_ids)
     return LedgerDeliveryResult(
         ok=ok, orphaned_marker_trade_ids=orphaned, unwritten_trade_ids=unwritten,
         double_represented_fill_ids=double_represented,
+        duplicate_owner_trade_ids=duplicate_owner, dangling_fill_ids=dangling_fill_ids,
     )
 
 

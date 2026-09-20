@@ -282,6 +282,23 @@ def test_match_legacy_fill_order_identity_disambiguates():
     assert result.matched_trade_ids == ["T1"]
 
 
+def test_match_legacy_fill_known_order_id_never_falls_back_to_a_different_order():
+    """Second review pass, 2026-09-20, P1 reproduction: EXPECTED is the
+    row's own known order_id; only OTHER's trade is available, and it
+    fully conserves quantity/fee/cost. The first version of the
+    order-identity fix fell back to the unfiltered pool when the narrowed
+    (exact-order) pool came up empty — matching OTHER anyway. This must
+    instead report no usable candidate, never guess a different order."""
+    row = UnlinkedFill(fill_id=1, symbol="BTC/CAD", side="buy", quantity=1.0, fee_cost=1.0,
+                        window_start_ms=900, window_end_ms=1100, cost=100.0, order_id="EXPECTED")
+    other = _t("T1", "OTHER", "BTC/CAD", "buy", 100.0, 1.0, 1000, fee=1.0)  # fully conserves, wrong order
+    result = engine.match_legacy_fill(row, [other])
+    assert result.blocked
+    assert result.matched_trade_ids == []
+    assert "no candidate" in result.reason
+    assert result.candidate_trade_ids == []  # T1 must not even be reported as a real candidate
+
+
 def test_match_legacy_fill_blocks_on_no_match():
     row = UnlinkedFill(fill_id=1, symbol="BTC/CAD", side="buy", quantity=5.0, fee_cost=1.0,
                         window_start_ms=900, window_end_ms=1100, cost=500.0)

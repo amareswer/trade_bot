@@ -208,3 +208,97 @@ def test_ledger_delivery_detects_double_represented_fill(tmp_path):
     result = four_way.verify_ledger_delivery_consistency(conn, "BTC/CAD")
     assert not result.ok
     assert fill_row["id"] in result.double_represented_fill_ids
+
+
+def test_ledger_delivery_detects_duplicate_owner(tmp_path):
+    """Second review pass, 2026-09-20, P1: 'linking one exchange trade to
+    two identical fill rows returned ok=True.' store.link_trades_to_fill
+    now REFUSES to create this going forward (see its own docstring) —
+    this proves the read-side check also catches it as defense in depth,
+    for a row that predates the guard or was corrupted some other way."""
+    conn, tl = _setup(tmp_path)
+    tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.001, price=90_000.0,
+                fee_cost=0.09, fee_currency="CAD", exec_key="uuid-owner-a",
+                timestamp=iso(T0))
+    tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.001, price=90_000.0,
+                fee_cost=0.09, fee_currency="CAD", exec_key="uuid-owner-b",
+                timestamp=iso(T0 + 1000))
+    fill_a = store.fills_row_by_exec_key(conn, "uuid-owner-a")
+    fill_b = store.fills_row_by_exec_key(conn, "uuid-owner-b")
+    t = store.ObservedTrade(
+        trade_id="T-dup-owner", order_id="O1", symbol="BTC/CAD", side="buy", price=90_000.0,
+        amount=0.001, cost=90.0, fee_cost=0.09, fee_currency="CAD",
+        exchange_timestamp=iso(T0), source="live",
+    )
+    store.upsert_observed_trade(conn, t)
+    # Bypass the write-side guard directly (raw SQL) to construct the
+    # corrupted state it now prevents — proving the READ-side check also
+    # catches it independently.
+    with conn:
+        conn.execute("INSERT INTO trade_fill_links (trade_id, fill_id, linked_at) VALUES (?,?,?)",
+                      ("T-dup-owner", fill_a["id"], iso(T0)))
+        conn.execute("INSERT INTO trade_fill_links (trade_id, fill_id, linked_at) VALUES (?,?,?)",
+                      ("T-dup-owner", fill_b["id"], iso(T0 + 1000)))
+
+    result = four_way.verify_ledger_delivery_consistency(conn, "BTC/CAD")
+    assert not result.ok
+    assert result.duplicate_owner_trade_ids == ["T-dup-owner"]
+
+
+def test_ledger_delivery_detects_dangling_fill_reference(tmp_path):
+    """Second review pass, 2026-09-20, P1: 'deleting the referenced fills
+    also returned ok=True because missing rows are skipped.' A link
+    pointing at a fills row that no longer exists must fail loudly, not be
+    silently passed over."""
+    conn, tl = _setup(tmp_path)
+    tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.001, price=90_000.0,
+                fee_cost=0.09, fee_currency="CAD", exec_key="uuid-vanish",
+                timestamp=iso(T0))
+    fill_row = store.fills_row_by_exec_key(conn, "uuid-vanish")
+    t = store.ObservedTrade(
+        trade_id="T-vanish", order_id="O1", symbol="BTC/CAD", side="buy", price=90_000.0,
+        amount=0.001, cost=90.0, fee_cost=0.09, fee_currency="CAD",
+        exchange_timestamp=iso(T0), source="live",
+    )
+    store.upsert_observed_trade(conn, t)
+    store.link_trade_to_fill(conn, "T-vanish", fill_row["id"])
+
+    with conn:
+        conn.execute("DELETE FROM fills WHERE id = ?", (fill_row["id"],))
+
+    result = four_way.verify_ledger_delivery_consistency(conn, "BTC/CAD")
+    assert not result.ok
+    assert fill_row["id"] in result.dangling_fill_ids
+
+
+def test_ledger_delivery_ok_despite_a_later_valid_fee_correction(tmp_path):
+    """Second review pass, 2026-09-20, P1 reproduction: a correctly
+    recorded fee correction (the exchange settling a different final fee
+    than first observed) must not flip a genuinely correct link to a
+    failure. fills.fee_cost is a frozen execution-time value the
+    correction never touches — comparing against each trade's ORIGINAL
+    fee_cost, not the corrected effective one, is what keeps a valid
+    correction from looking like a broken link."""
+    conn, tl = _setup(tmp_path)
+    ex = FakeExchangeAdapter()
+    ex.deposit("CAD", 1000.0, timestamp_ms=T0)
+    reconciliation.run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100, now_ms=T0 + 100)
+
+    tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.001, price=90_000.0,
+                fee_cost=0.09, fee_currency="CAD", exec_key="uuid-fee-corr",
+                timestamp=iso(T0 + 1000))
+    fill_row = store.fills_row_by_exec_key(conn, "uuid-fee-corr")
+
+    t = ex.execute_trade(symbol="BTC/CAD", side="buy", price=90_000.0, amount=0.001,
+                          timestamp_ms=T0 + 1000, fee_cost=0.09, fee_currency="CAD")
+    reconciliation.run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 2000)
+    store.link_trade_to_fill(conn, t.trade_id, fill_row["id"])
+    assert four_way.verify_ledger_delivery_consistency(conn, "BTC/CAD").ok
+
+    ex.revise_trade_fee(t.trade_id, 0.15)  # exchange settles a higher final fee
+    reconciliation.run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 3000)
+    deltas = store.fee_correction_deltas_for_trade(conn, t.trade_id)
+    assert len(deltas) == 1 and abs(deltas[0] - 0.06) < 1e-9  # correction genuinely recorded
+
+    result = four_way.verify_ledger_delivery_consistency(conn, "BTC/CAD")
+    assert result.ok, result.double_represented_fill_ids  # the fix: correction must not break this
