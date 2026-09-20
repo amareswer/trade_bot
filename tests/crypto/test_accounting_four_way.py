@@ -274,11 +274,11 @@ def test_ledger_delivery_detects_dangling_fill_reference(tmp_path):
 def test_ledger_delivery_ok_despite_a_later_valid_fee_correction(tmp_path):
     """Second review pass, 2026-09-20, P1 reproduction: a correctly
     recorded fee correction (the exchange settling a different final fee
-    than first observed) must not flip a genuinely correct link to a
-    failure. fills.fee_cost is a frozen execution-time value the
-    correction never touches — comparing against each trade's ORIGINAL
-    fee_cost, not the corrected effective one, is what keeps a valid
-    correction from looking like a broken link."""
+    than first observed) arriving AFTER the fill was already linked must
+    not flip a genuinely correct link to a failure. fills.fee_cost is a
+    frozen execution-time value the correction never touches — this fill
+    was recorded using the ORIGINAL (pre-correction) fee, so checking the
+    original fee is what keeps this specific timing order passing."""
     conn, tl = _setup(tmp_path)
     ex = FakeExchangeAdapter()
     ex.deposit("CAD", 1000.0, timestamp_ms=T0)
@@ -295,10 +295,87 @@ def test_ledger_delivery_ok_despite_a_later_valid_fee_correction(tmp_path):
     store.link_trade_to_fill(conn, t.trade_id, fill_row["id"])
     assert four_way.verify_ledger_delivery_consistency(conn, "BTC/CAD").ok
 
-    ex.revise_trade_fee(t.trade_id, 0.15)  # exchange settles a higher final fee
+    # NOW the correction arrives, after the link already exists.
+    ex.revise_trade_fee(t.trade_id, 0.15)
     reconciliation.run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 3000)
-    deltas = store.fee_correction_deltas_for_trade(conn, t.trade_id)
-    assert len(deltas) == 1 and abs(deltas[0] - 0.06) < 1e-9  # correction genuinely recorded
+    assert store.fee_correction_deltas_for_trade(conn, t.trade_id) == [0.06]
+    result = four_way.verify_ledger_delivery_consistency(conn, "BTC/CAD")
+    assert result.ok, result.double_represented_fill_ids
+
+
+def test_ledger_delivery_ok_when_matching_and_fill_both_used_the_corrected_fee(tmp_path):
+    """Third review pass, 2026-09-20, P1 reproduction: 'matching and
+    verification disagree on fees' — original fee $1, correction +$1
+    (settling at $2), and the fills row itself was recorded with fee_cost
+    $2 (the opposite timing order from the test above: the correction
+    happened BEFORE this fill was ever created/linked, so $2 — the
+    CORRECTED total — is the only value that was ever true at match time).
+    reconciliation.run_cycle's straggler matcher (_link_stragglers) always
+    matches using the corrected effective fee, so it correctly links this;
+    checking ONLY the original fee here would then wrongly reject the very
+    link the matcher just approved — exactly what a second-pass version of
+    this fix did. Verification must accept either fee vintage."""
+    conn, tl = _setup(tmp_path)
+    ex = FakeExchangeAdapter()
+    ex.deposit("CAD", 1000.0, timestamp_ms=T0)
+    reconciliation.run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100, now_ms=T0 + 100)
+
+    # Trade observed at its original $1 fee, then corrected to $2 — both
+    # BEFORE any fills row for it exists.
+    t = ex.execute_trade(symbol="BTC/CAD", side="buy", price=90_000.0, amount=0.001,
+                          timestamp_ms=T0 + 1000, fee_cost=1.0, fee_currency="CAD")
+    reconciliation.run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 2000)
+    ex.revise_trade_fee(t.trade_id, 2.0)
+    reconciliation.run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 3000)
+    assert store.fee_correction_deltas_for_trade(conn, t.trade_id) == [1.0]
+
+    # The legacy fills row is recorded NOW, reflecting the already-
+    # corrected $2 total (e.g. an old CSV backfill capturing the fee as it
+    # stood at record time) — never linked yet.
+    tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.001, price=90_000.0,
+                fee_cost=2.0, fee_currency="CAD", exec_key="uuid-fee-corr-first",
+                timestamp=iso(T0 + 1000))
+
+    # The straggler matcher must find and link it using the corrected fee.
+    # (Not asserting on state.blocked_for_buy here — this synthetic scenario's
+    # deposit/fee bookkeeping isn't set up to also satisfy the unrelated
+    # account-wide cash-residual check; the actual claim under test is the
+    # straggler-link outcome itself, checked directly below.)
+    reconciliation.run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"],
+                              safety_margin_s=100_000, now_ms=T0 + 4000)
+    assert store.is_ledger_represented(conn, t.trade_id)
+
+    # And verification must agree it's a clean link, not reject it.
+    result = four_way.verify_ledger_delivery_consistency(conn, "BTC/CAD")
+    assert result.ok, result.double_represented_fill_ids
+
+
+def test_ledger_delivery_detects_missing_referenced_trade(tmp_path):
+    """Third review pass, 2026-09-20, P1: 'missing referenced trades still
+    pass verification... it starts from existing observed trades, so it
+    never examines the orphaned link.' A trade_fill_links row whose
+    trade_id has no observed_trades row at all (deleted, or never written)
+    must be caught even though the main loop can never reach it by
+    iterating store.load_observed_trades."""
+    conn, tl = _setup(tmp_path)
+    tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.001, price=90_000.0,
+                fee_cost=0.09, fee_currency="CAD", exec_key="uuid-missing-trade",
+                timestamp=iso(T0))
+    fill_row = store.fills_row_by_exec_key(conn, "uuid-missing-trade")
+    t = store.ObservedTrade(
+        trade_id="T-will-vanish", order_id="O1", symbol="BTC/CAD", side="buy", price=90_000.0,
+        amount=0.001, cost=90.0, fee_cost=0.09, fee_currency="CAD",
+        exchange_timestamp=iso(T0), source="live",
+    )
+    store.upsert_observed_trade(conn, t)
+    store.link_trade_to_fill(conn, "T-will-vanish", fill_row["id"])
+    assert four_way.verify_ledger_delivery_consistency(conn, "BTC/CAD").ok
+
+    with conn:
+        conn.execute("DELETE FROM observed_trades WHERE trade_id = ?", ("T-will-vanish",))
+    # The link row itself is left behind, dangling.
+    assert store.trade_ids_for_fill(conn, fill_row["id"]) == ["T-will-vanish"]
 
     result = four_way.verify_ledger_delivery_consistency(conn, "BTC/CAD")
-    assert result.ok, result.double_represented_fill_ids  # the fix: correction must not break this
+    assert not result.ok
+    assert "T-will-vanish" in result.dangling_trade_ids

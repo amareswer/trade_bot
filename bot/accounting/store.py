@@ -295,6 +295,60 @@ def link_trade_to_fill(conn: sqlite3.Connection, trade_id: str, fill_id: int) ->
     link_trades_to_fill(conn, [trade_id], fill_id)
 
 
+def link_trades_to_fill_nocommit(conn: sqlite3.Connection, trade_ids: "list[str]", fill_id: int) -> None:
+    """Same guarded linking logic as link_trades_to_fill, but never opens
+    its own `with conn:` — for a caller that needs to compose this into a
+    LARGER atomic transaction it already owns (third review pass, 2026-09-20,
+    P1: "the ownership guard is not universal" — migration.py and
+    live_observe.py both inserted into trade_fill_links directly, via raw
+    SQL, to get atomicity with their own upsert_observed_trade_nocommit
+    calls — which correctly fixed the FIRST review's atomicity finding but
+    silently bypassed the SECOND review's one-fill-owner-per-trade guard
+    entirely, since that guard only lived inside link_trades_to_fill's own
+    `with conn:`. This is the single guarded primitive both the committing
+    wrapper below AND those two callers now share — mirrors
+    upsert_observed_trade/upsert_observed_trade_nocommit's split for the
+    exact same reason.
+
+    One-fill-owner-per-trade + no-dangling-fill enforcement (accounting
+    review, second follow-up pass, 2026-09-20, P1: "duplicate ownership and
+    dangling links still pass verification"). A real ALTER TABLE to add a
+    UNIQUE constraint on trade_fill_links.trade_id was deliberately not
+    done here — this table already has real linked rows in the live
+    database, and rebuilding a live financial table's schema is a
+    separate, riskier decision than an application-level guard every write
+    to this table now goes through. Raises ValueError (not a silent skip)
+    if fill_id doesn't exist in `fills`, or if any trade_id is already
+    linked to a DIFFERENT fill_id — re-linking to the SAME fill_id remains
+    the idempotent no-op link_trades_to_fill's own docstring describes."""
+    if not trade_ids:
+        return
+    fill_exists = conn.execute("SELECT 1 FROM fills WHERE id = ?", (fill_id,)).fetchone()
+    if fill_exists is None:
+        raise ValueError(f"link_trades_to_fill: fill_id={fill_id} does not exist in fills")
+    for trade_id in trade_ids:
+        existing_fill_ids = {
+            r[0] for r in conn.execute(
+                "SELECT fill_id FROM trade_fill_links WHERE trade_id = ?", (trade_id,)
+            )
+        }
+        if existing_fill_ids and existing_fill_ids != {fill_id}:
+            raise ValueError(
+                f"link_trades_to_fill: trade_id={trade_id} is already linked to "
+                f"fill_id(s) {sorted(existing_fill_ids)} — one fill owner per trade, "
+                f"refusing to also link fill_id={fill_id}"
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO trade_fill_links (trade_id, fill_id, linked_at) VALUES (?,?,?)",
+            (trade_id, fill_id, _now_iso()),
+        )
+        conn.execute(
+            "UPDATE observed_trades SET ledger_written_at = COALESCE(ledger_written_at, ?) "
+            "WHERE trade_id = ?",
+            (_now_iso(), trade_id),
+        )
+
+
 def link_trades_to_fill(conn: sqlite3.Connection, trade_ids: "list[str]", fill_id: int) -> None:
     """Links EVERY trade_id in a matched multi-trade group to the SAME
     EXISTING fills.id row, and marks each ledger-written, all in ONE
@@ -308,47 +362,12 @@ def link_trades_to_fill(conn: sqlite3.Connection, trade_ids: "list[str]", fill_i
     trade_id (INSERT OR IGNORE), so re-submitting an already-fully-linked
     group is a safe no-op.
 
-    One-fill-owner-per-trade + no-dangling-fill enforcement (accounting
-    review, second follow-up pass, 2026-09-20, P1: "duplicate ownership and
-    dangling links still pass verification" — the read-side
-    four_way.verify_ledger_delivery_consistency check catches an EXISTING
-    violation, but this is the write-side guard that stops one from being
-    created in the first place). A real ALTER TABLE to add a UNIQUE
-    constraint on trade_fill_links.trade_id was deliberately not done here
-    — this table already has real linked rows in the live database, and
-    rebuilding a live financial table's schema is a separate, riskier
-    decision than an application-level guard; every write to this table
-    already goes through this one function. Raises ValueError (not a
-    silent skip) if fill_id doesn't exist in `fills`, or if any trade_id is
-    already linked to a DIFFERENT fill_id — re-linking to the SAME fill_id
-    remains the idempotent no-op described above."""
-    if not trade_ids:
-        return
+    Standalone convenience wrapper (own transaction) — a caller composing
+    this into a larger atomic operation must use link_trades_to_fill_nocommit
+    instead, inside its own `with conn:` block; see that function's
+    docstring for the one-fill-owner-per-trade guard both share."""
     with conn:
-        fill_exists = conn.execute("SELECT 1 FROM fills WHERE id = ?", (fill_id,)).fetchone()
-        if fill_exists is None:
-            raise ValueError(f"link_trades_to_fill: fill_id={fill_id} does not exist in fills")
-        for trade_id in trade_ids:
-            existing_fill_ids = {
-                r[0] for r in conn.execute(
-                    "SELECT fill_id FROM trade_fill_links WHERE trade_id = ?", (trade_id,)
-                )
-            }
-            if existing_fill_ids and existing_fill_ids != {fill_id}:
-                raise ValueError(
-                    f"link_trades_to_fill: trade_id={trade_id} is already linked to "
-                    f"fill_id(s) {sorted(existing_fill_ids)} — one fill owner per trade, "
-                    f"refusing to also link fill_id={fill_id}"
-                )
-            conn.execute(
-                "INSERT OR IGNORE INTO trade_fill_links (trade_id, fill_id, linked_at) VALUES (?,?,?)",
-                (trade_id, fill_id, _now_iso()),
-            )
-            conn.execute(
-                "UPDATE observed_trades SET ledger_written_at = COALESCE(ledger_written_at, ?) "
-                "WHERE trade_id = ?",
-                (_now_iso(), trade_id),
-            )
+        link_trades_to_fill_nocommit(conn, trade_ids, fill_id)
 
 
 def linked_fill_ids_for_trades(conn: sqlite3.Connection, trade_ids: list[str]) -> set[int]:

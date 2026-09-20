@@ -87,18 +87,15 @@ def observe_fill(
         )
         return False
     with conn:
+        # NOT store.upsert_observed_trade / store.link_trades_to_fill — see
+        # migration.py's identical comment: those helpers' own `with conn:`
+        # would commit this outer block's pending work early, AND a raw
+        # INSERT here (the previous code) bypassed link_trades_to_fill's
+        # one-fill-owner-per-trade guard entirely (third review pass,
+        # 2026-09-20, P1: "the ownership guard is not universal").
         for t in matches:
             store.upsert_observed_trade_nocommit(conn, t)
-        for t in matches:
-            conn.execute(
-                "INSERT OR IGNORE INTO trade_fill_links (trade_id, fill_id, linked_at) VALUES (?,?,?)",
-                (t.trade_id, fill_id, engine.now_iso()),
-            )
-            conn.execute(
-                "UPDATE observed_trades SET ledger_written_at = COALESCE(ledger_written_at, ?) "
-                "WHERE trade_id = ?",
-                (engine.now_iso(), t.trade_id),
-            )
+        store.link_trades_to_fill_nocommit(conn, [t.trade_id for t in matches], fill_id)
     logger.info(
         "live_observe: linked %d real trade(s) to fill_id=%s (order_id=%s)",
         len(matches), fill_id, order_id,

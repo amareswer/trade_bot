@@ -75,25 +75,19 @@ def run_migration(
                     continue
                 matched = [t for t in sym_trades if t.trade_id in result.matched_trade_ids]
                 with conn:
+                    # NOT store.upsert_observed_trade / store.link_trades_to_fill
+                    # — those helpers open their OWN `with conn:`, which is
+                    # not a nested savepoint in Python's sqlite3 and would
+                    # commit this outer block's pending work early (first
+                    # review pass, 2026-09-20, P1). The nocommit variants
+                    # compose correctly into this outer transaction AND
+                    # (link_trades_to_fill_nocommit specifically) carry the
+                    # one-fill-owner-per-trade guard — a raw INSERT here used
+                    # to bypass that guard entirely (third review pass,
+                    # 2026-09-20, P1: "the ownership guard is not universal").
                     for t in matched:
-                        # NOT store.upsert_observed_trade — that helper opens
-                        # its OWN `with conn:`, which is not a nested
-                        # savepoint in Python's sqlite3 and would commit this
-                        # outer block's pending work early on the second
-                        # trade of a multi-trade group (accounting review
-                        # follow-up, 2026-09-20, P1). The nocommit variant
-                        # composes correctly into this outer transaction.
                         store.upsert_observed_trade_nocommit(conn, t)
-                        conn.execute(
-                            "INSERT OR IGNORE INTO trade_fill_links (trade_id, fill_id, linked_at) "
-                            "VALUES (?, ?, ?)",
-                            (t.trade_id, result.fill_id, engine.now_iso()),
-                        )
-                        conn.execute(
-                            "UPDATE observed_trades SET ledger_written_at = COALESCE(ledger_written_at, ?) "
-                            "WHERE trade_id = ?",
-                            (engine.now_iso(), t.trade_id),
-                        )
+                    store.link_trades_to_fill_nocommit(conn, result.matched_trade_ids, result.fill_id)
                 already_linked = already_linked | set(result.matched_trade_ids)
                 report.linked.append(result)
 
