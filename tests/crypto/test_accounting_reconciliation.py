@@ -741,6 +741,64 @@ def test_link_trades_to_fill_refuses_a_nonexistent_fill_id(tmp_path):
     assert not store.is_ledger_represented(conn, "T-ghost")
 
 
+def test_link_trades_to_fill_refuses_a_nonexistent_trade_id(tmp_path):
+    """Fourth review pass, 2026-09-20: 'add the missing trade_id existence
+    guard now — it directly enforces the link API's contract, just like
+    the existing fill_id check.' Refuse to link a trade_id with no
+    observed_trades row at all, mirroring the fill_id-side guard above."""
+    _, conn, tl = _setup(tmp_path)
+    tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.001, price=90_000.0,
+                fee_cost=0.09, fee_currency="CAD", exec_key="uuid-no-trade",
+                timestamp=engine.iso_from_ms(T0))
+    fill_row = store.fills_row_by_exec_key(conn, "uuid-no-trade")
+
+    with pytest.raises(ValueError):
+        store.link_trades_to_fill(conn, ["T-never-observed"], fill_row["id"])
+
+    assert store.trade_ids_for_fill(conn, fill_row["id"]) == []
+
+
+def test_link_trades_to_fill_rejects_whole_group_on_one_invalid_trade_id(tmp_path):
+    """Fourth review pass, 2026-09-20: 'include one regression proving that
+    an invalid trade anywhere in a group rejects the whole transaction
+    without partial writes.' Two of three trade_ids in the group are real
+    and observed; the middle one was never observed. NONE of the three —
+    including the two otherwise-valid ones — may end up linked."""
+    _, conn, tl = _setup(tmp_path)
+    tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.003, price=90_000.0,
+                fee_cost=0.27, fee_currency="CAD", exec_key="uuid-group-reject",
+                timestamp=engine.iso_from_ms(T0))
+    fill_row = store.fills_row_by_exec_key(conn, "uuid-group-reject")
+    t1 = engine.ObservedTrade(
+        trade_id="TG1", order_id="O1", symbol="BTC/CAD", side="buy",
+        price=90_000.0, amount=0.001, cost=90.0, fee_cost=0.09, fee_currency="CAD",
+        exchange_timestamp=engine.iso_from_ms(T0), source="live",
+    )
+    t3 = engine.ObservedTrade(
+        trade_id="TG3", order_id="O1", symbol="BTC/CAD", side="buy",
+        price=90_000.0, amount=0.001, cost=90.0, fee_cost=0.09, fee_currency="CAD",
+        exchange_timestamp=engine.iso_from_ms(T0 + 20), source="live",
+    )
+    store.upsert_observed_trade(conn, t1)
+    store.upsert_observed_trade(conn, t3)
+    # "TG2" is never observed — the invalid one, placed in the MIDDLE of
+    # the group so a naive per-trade loop would have already inserted TG1
+    # before ever reaching it.
+
+    with pytest.raises(ValueError):
+        store.link_trades_to_fill(conn, ["TG1", "TG2", "TG3"], fill_row["id"])
+
+    # Zero partial writes — not even the valid TG1/TG3 got linked.
+    assert store.trade_ids_for_fill(conn, fill_row["id"]) == []
+    assert not store.is_ledger_represented(conn, "TG1")
+    assert not store.is_ledger_represented(conn, "TG3")
+    assert any(r["id"] == fill_row["id"] for r in store.unlinked_fills(conn, "BTC/CAD"))
+
+    # Retry with the group corrected (drop the invalid one) succeeds cleanly.
+    store.link_trades_to_fill(conn, ["TG1", "TG3"], fill_row["id"])
+    assert sorted(store.trade_ids_for_fill(conn, fill_row["id"])) == ["TG1", "TG3"]
+
+
 def test_straggler_matching_through_run_cycle_survives_a_crash_mid_multi_link(tmp_path):
     """End-to-end version through run_cycle/_link_stragglers: a two-trade
     match crashes mid-link; the cycle reports it blocked (not silently

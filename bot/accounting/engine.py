@@ -345,6 +345,49 @@ def fold_position(trades_in_order: "list[ObservedTrade]") -> FoldResult:
     return FoldResult(qty, avg_cost, realized, per_trade)
 
 
+def fold_position_gross(trades_in_order: "list[ObservedTrade]") -> FoldResult:
+    """Same FIFO-average-cost fold as fold_position, but GROSS — price
+    only, no fee term anywhere — deliberately mirroring the EXACT formulas
+    bot/portfolio/position_manager.py's PositionManager and bot/execution/
+    live_executor.py's LiveExecutor._portfolio both use for their own
+    live-tracked avg_cost/realized_pnl (verified by reading both, not
+    assumed): avg_cost = weighted average of price*quantity only on a BUY;
+    realized pnl = (price - avg_cost) * quantity on a SELL, no fee
+    subtracted. Fee correction-awareness is irrelevant here by
+    construction — a fee correction never touches price or quantity, so
+    unlike fold_position, this never needs correction-adjusted trades as
+    input; raw observed_trades are always correct for this fold.
+
+    Exists specifically so four_way.diff_position_against_fold can compare
+    LiveExecutor's own GROSS avg_cost against a reconstruction using the
+    SAME (gross) methodology (accounting review, fifth pass, 2026-09-20:
+    the pre-fix code compared this gross live value against fold_position's
+    fee-INCLUSIVE avg_cost — a real, latent false-reconciliation-failure
+    risk for any open position with a nonzero entry fee, caught before it
+    ever ran against a real position since ACCOUNTING_ENABLED defaults
+    false). fold_position (net, fee-inclusive) remains the correct choice
+    for anything computing genuine net P&L — this function is not a
+    replacement for it, only a second, methodologically-matched fold for
+    the specific gross-vs-gross comparison four_way needs."""
+    qty = 0.0
+    avg_cost = 0.0
+    realized = 0.0
+    per_trade: "dict[str, float]" = {}
+    for t in trades_in_order:
+        if t.side == "buy":
+            new_qty = qty + t.amount
+            avg_cost = ((avg_cost * qty) + t.cost) / new_qty if new_qty > 0 else 0.0
+            qty = new_qty
+        else:
+            proceeds = t.cost
+            cost_of_sold = avg_cost * t.amount
+            pnl = proceeds - cost_of_sold
+            realized += pnl
+            per_trade[t.trade_id] = pnl
+            qty -= t.amount
+    return FoldResult(qty, avg_cost, realized, per_trade)
+
+
 # ============================================================================
 # Fee corrections — layered on the EXISTING fee_adjustments table
 # (bot/data/trade_log.py), never a new fee table (design §4).

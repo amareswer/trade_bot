@@ -90,7 +90,11 @@ class TelegramAlerter:
         reason:      str             = "",
     ) -> None:
         side_emoji = "🟢 BUY" if side.upper() == "BUY" else "🔴 SELL"
-        pnl_str    = f"\nP&L: {'🟢' if pnl and pnl >= 0 else '🔴'} ${pnl:+.2f}" if pnl is not None else ""
+        # "Gross" (accounting review, fifth pass, 2026-09-20): this pnl is
+        # PositionManager.on_sell()'s price-only figure — fees are never
+        # subtracted here. Labeled explicitly so the number isn't mistaken
+        # for the fee-inclusive net result live_comparison.py reports.
+        pnl_str    = f"\nGross P&L: {'🟢' if pnl and pnl >= 0 else '🔴'} ${pnl:+.2f}" if pnl is not None else ""
         reason_str = f"\nReason: {reason}" if reason else ""
         msg = (
             f"{side_emoji}  {symbol}\n"

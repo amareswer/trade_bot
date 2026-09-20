@@ -320,12 +320,29 @@ def link_trades_to_fill_nocommit(conn: sqlite3.Connection, trade_ids: "list[str]
     to this table now goes through. Raises ValueError (not a silent skip)
     if fill_id doesn't exist in `fills`, or if any trade_id is already
     linked to a DIFFERENT fill_id — re-linking to the SAME fill_id remains
-    the idempotent no-op link_trades_to_fill's own docstring describes."""
+    the idempotent no-op link_trades_to_fill's own docstring describes.
+
+    Also requires every trade_id to already exist in observed_trades
+    (accounting review, fourth pass, 2026-09-20: "add the missing trade_id
+    existence guard — it directly enforces the link API's contract, just
+    like the existing fill_id check"). Checked for the WHOLE group before
+    any row is inserted for ANY of them — one bad trade_id anywhere in a
+    matched group must reject the entire group, not just skip that one
+    trade while linking the rest (every real caller treats a matched group
+    as one atomic economic claim; a link API that silently linked the
+    valid trades and dropped the invalid one would misrepresent what was
+    actually matched)."""
     if not trade_ids:
         return
     fill_exists = conn.execute("SELECT 1 FROM fills WHERE id = ?", (fill_id,)).fetchone()
     if fill_exists is None:
         raise ValueError(f"link_trades_to_fill: fill_id={fill_id} does not exist in fills")
+    for trade_id in trade_ids:
+        trade_exists = conn.execute(
+            "SELECT 1 FROM observed_trades WHERE trade_id = ?", (trade_id,)
+        ).fetchone()
+        if trade_exists is None:
+            raise ValueError(f"link_trades_to_fill: trade_id={trade_id} does not exist in observed_trades")
     for trade_id in trade_ids:
         existing_fill_ids = {
             r[0] for r in conn.execute(

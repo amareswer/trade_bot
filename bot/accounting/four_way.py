@@ -182,8 +182,9 @@ def verify_ledger_delivery_consistency(conn, symbol: str) -> LedgerDeliveryResul
 class PositionRebuildDiff:
     ok: bool
     fold_qty: float = 0.0
-    fold_avg_cost: float = 0.0
-    fold_realized_pnl: float = 0.0
+    fold_avg_cost: float = 0.0            # GROSS reconstruction — this is what's compared against live_avg_cost
+    fold_avg_cost_net: float = 0.0        # fee-inclusive reconstruction — informational only, never compared
+    fold_realized_pnl: float = 0.0        # NET (fee-inclusive) — informational only, never compared (see module note)
     live_qty: float = 0.0
     live_avg_cost: float = 0.0
     live_realized_pnl: float = 0.0
@@ -199,6 +200,39 @@ def diff_position_against_fold(
     difference means the in-memory state was not actually rebuilt from the
     ledger at last startup (a wiring bug), not an exchange-reconciliation
     problem — reported distinctly from the balance-identity checks above.
+
+    GROSS vs GROSS (accounting review, fifth pass, 2026-09-20, P1 — "fix
+    four_way's open-position comparison"): live_avg_cost is LiveExecutor's
+    own GROSS average entry (price-weighted only, no fee — verified by
+    reading bot/execution/live_executor.py directly, not assumed). The
+    comparison below now uses engine.fold_position_gross, which mirrors
+    that EXACT gross methodology, rather than engine.fold_position's
+    fee-inclusive avg_cost. A prior version of this function compared
+    live_avg_cost (gross) against fold_position's avg_cost (net) — for any
+    OPEN position with a nonzero entry fee, those two differ by roughly
+    fee/quantity, almost always far more than cash_tolerance, which would
+    have produced a FALSE reconciliation failure the moment a real held
+    position was checked (never reached in production, since
+    ACCOUNTING_ENABLED defaults false — caught by a production-path
+    integration test, not a live incident). The fee-inclusive NET fold is
+    still computed and returned (fold_avg_cost_net, fold_realized_pnl) —
+    genuinely useful for net-P&L purposes — it is simply never the value
+    diffed against the live executor's gross figure. The check itself was
+    never weakened or widened to accommodate this: it is the same
+    cash_tolerance=0.01 as before, now applied to two values that actually
+    share a methodology.
+
+    LIMITATION, stated explicitly (accounting review, fifth pass,
+    2026-09-20): this function NEVER compares fold_realized_pnl against
+    live_realized_pnl for pass/fail — only qty and (now) gross avg_cost.
+    A passing PositionRebuildDiff.ok, and therefore a passing
+    FourWayReport.ready, does NOT validate that realized P&L is correct
+    anywhere in the system — it validates that the CURRENT position
+    (quantity and gross cost basis) was correctly rebuilt from the ledger.
+    Realized-P&L correctness is evidenced separately, by
+    tests/crypto/test_production_pnl_reporting_paths.py exercising the
+    real PositionManager / live_comparison.py / dashboard renderer paths
+    directly — never by this function or by four_way passing.
 
     Honest scope note: until item 8's migration has run for a symbol,
     observed_trades may only contain a SUBSET of that symbol's real
@@ -231,6 +265,14 @@ def diff_position_against_fold(
         return PositionRebuildDiff(ok=True, live_qty=live_qty, live_avg_cost=live_avg_cost,
                                     live_realized_pnl=live_realized_pnl,
                                     reason="flat, no observed_trades for this symbol yet — nothing at risk to verify")
+    ordered = engine.causal_order(trades)
+    if ordered is None:
+        return PositionRebuildDiff(
+            ok=False, live_qty=live_qty, live_avg_cost=live_avg_cost, live_realized_pnl=live_realized_pnl,
+            reason="observed trades could not be causally ordered — data integrity problem",
+        )
+    gross_fold = engine.fold_position_gross(ordered)  # fee corrections are irrelevant to a gross fold by construction
+
     corrected = []
     for t in trades:
         deltas = store.fee_correction_deltas_for_trade(conn, t.trade_id)
@@ -241,19 +283,20 @@ def diff_position_against_fold(
             fee_currency=t.fee_currency, exchange_timestamp=t.exchange_timestamp, source=t.source,
         ))
     try:
-        fold = engine.recover_position(corrected)
+        net_fold = engine.recover_position(corrected)
     except ValueError as exc:
         return PositionRebuildDiff(ok=False, live_qty=live_qty, live_avg_cost=live_avg_cost,
                                     live_realized_pnl=live_realized_pnl, reason=str(exc))
-    qty_ok = abs(fold.final_qty - live_qty) <= qty_tolerance
-    cost_ok = fold.final_qty <= qty_tolerance or abs(fold.avg_cost - live_avg_cost) <= cash_tolerance
+    qty_ok = abs(gross_fold.final_qty - live_qty) <= qty_tolerance
+    cost_ok = gross_fold.final_qty <= qty_tolerance or abs(gross_fold.avg_cost - live_avg_cost) <= cash_tolerance
     ok = qty_ok and cost_ok
     reason = "" if ok else (
-        f"qty diff={fold.final_qty - live_qty:.10f}" if not qty_ok
-        else f"avg_cost diff={fold.avg_cost - live_avg_cost:.6f}"
+        f"qty diff={gross_fold.final_qty - live_qty:.10f}" if not qty_ok
+        else f"avg_cost diff={gross_fold.avg_cost - live_avg_cost:.6f} (gross vs gross)"
     )
     return PositionRebuildDiff(
-        ok=ok, fold_qty=fold.final_qty, fold_avg_cost=fold.avg_cost, fold_realized_pnl=fold.realized_pnl,
+        ok=ok, fold_qty=gross_fold.final_qty, fold_avg_cost=gross_fold.avg_cost,
+        fold_avg_cost_net=net_fold.avg_cost, fold_realized_pnl=net_fold.realized_pnl,
         live_qty=live_qty, live_avg_cost=live_avg_cost, live_realized_pnl=live_realized_pnl, reason=reason,
     )
 
@@ -271,7 +314,18 @@ class FourWayReport:
         NOT a profitability or resumption verdict — the 2026-09-12
         review-deadline decision's fresh out-of-sample walk-forward
         requirement is a completely separate, additional gate, unaffected
-        by this property."""
+        by this property.
+
+        Also NOT a realized-P&L validation (accounting review, fifth pass,
+        2026-09-20, stated explicitly rather than left implicit):
+        diff_position_against_fold — the only check here that even looks
+        at a position — compares quantity and GROSS average cost, never
+        realized_pnl. A `ready=True` result says the current position was
+        correctly rebuilt from the ledger; it says nothing about whether
+        any past trade's reported profit or loss was correct. That
+        evidence comes from tests/crypto/test_production_pnl_reporting_paths.py
+        exercising the real reporting paths (PositionManager, live_comparison.py,
+        the dashboard renderer) directly, not from this report passing."""
         if self.block_state.account_cash_blocked or self.block_state.coverage_blocked:
             return False
         if any(self.block_state.symbol_blocked.values()):
