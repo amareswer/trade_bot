@@ -8,6 +8,22 @@ Usage:
     .venv/bin/python migrate_legacy_fills.py                  # dry run on a DB copy
     .venv/bin/python migrate_legacy_fills.py --apply-to-live   # explicit, separate step
 
+Safety, gated-readiness review 2026-09-20:
+  - `--apply-to-live` first copies the REAL logs/trades.db to a timestamped
+    `logs/trades_pre_migration_backup_<ts>.db` — unconditionally, cannot be
+    skipped — before touching it. Restore by copying that file back over
+    logs/trades.db if a migration run needs to be undone.
+  - Only exact-conservation matches are ever linked automatically
+    (bot/accounting/engine.match_legacy_fill — quantity+fee sum must
+    conserve within 1e-6, never a nearest-timestamp guess). Anything
+    ambiguous or unmatched is BLOCKED and printed for manual review, never
+    silently applied — this script cannot override that; it is enforced in
+    bot/accounting/migration.py itself.
+  - The recommended workflow is: run the default dry-run mode first, read
+    the full report (every blocked row's reason + candidate trade ids,
+    every proposed link's fill-id -> trade-id(s) mapping), and only pass
+    --apply-to-live after a human has reviewed it.
+
 Does NOT place any order, touch logs/HALT, or import bot/execution or
 bot/main. Requires KRAKEN_API_KEY/KRAKEN_API_SECRET (read-only trade/
 balance history calls only — Query Funds / Query Orders capability, no
@@ -36,6 +52,21 @@ _SYMBOLS = ["BTC/CAD", "SOL/CAD"]  # matches CLAUDE.md's UNIVERSE_WHITELIST at t
 def _copy_db(live_path: str) -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     dest = os.path.join(os.path.dirname(live_path), f"trades_migration_copy_{ts}.db")
+    shutil.copyfile(live_path, dest)
+    return dest
+
+
+def _backup_live_db(live_path: str) -> str:
+    """Unconditional pre-apply backup — separate from _copy_db's dry-run
+    working copy. Named distinctly (trades_pre_migration_backup_*, not
+    trades_migration_copy_*) so it's unambiguous which files are safe-to-
+    delete dry-run scratch copies and which are the one real restore point
+    for an --apply-to-live run. Restore: copy this file back over
+    logs/trades.db."""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest = os.path.join(
+        os.path.dirname(live_path), f"trades_pre_migration_backup_{ts}.db",
+    )
     shutil.copyfile(live_path, dest)
     return dest
 
@@ -80,7 +111,10 @@ def main() -> int:
         return 1
     print(f"  {len(all_trades)} real trades retrieved across the whole account.")
 
+    backup_path = None
     if args.apply_to_live:
+        backup_path = _backup_live_db(_LIVE_DB)
+        print(f"Backed up live DB to: {backup_path}  (restore by copying it back over trades.db)")
         db_path = _LIVE_DB
         print(f"OPERATING ON THE LIVE DATABASE: {db_path}")
     else:
@@ -91,20 +125,37 @@ def main() -> int:
 
     print("\n=== Migration report ===")
     print(report.summary)
+    print(
+        "Matching is exact-conservation only (quantity+fee sum, tolerance 1e-6) — "
+        "never a nearest-timestamp guess. Every entry below is either an unambiguous "
+        "exact match or a block; nothing approximate is ever auto-linked."
+    )
     if report.blocked:
         print("\nBLOCKED — needs manual review (no subset matched, or ambiguous):")
         for r in report.blocked:
+            candidates = ", ".join(r.candidate_trade_ids) or "(none in window)"
             print(f"  fills.id={r.fill_id}: {r.reason}")
+            print(f"    candidate trade id(s) considered: {candidates}")
     if report.orphan_trades_inserted:
         print(f"\nOrphan trades backfilled (no prior fills row existed): {len(report.orphan_trades_inserted)}")
         for tid in report.orphan_trades_inserted:
             print(f"  {tid}")
     if report.linked:
-        print(f"\nLinked {len(report.linked)} existing fills row(s) to their real trade id(s).")
+        print(f"\nLinked {len(report.linked)} existing fills row(s) to their real trade id(s) — review each:")
+        for r in report.linked:
+            print(f"  fills.id={r.fill_id}  <-  trade id(s): {', '.join(r.matched_trade_ids)}")
+
+    if args.apply_to_live and report.blocked:
+        print(
+            f"\nNOTE: {len(report.blocked)} row(s) remain BLOCKED even after this live apply — "
+            "those fills are still unlinked and need manual resolution (they were "
+            "deliberately not guessed at). Nothing exact-and-unambiguous was skipped."
+        )
 
     print(
         "\nlogs/HALT untouched. No order placed. "
-        f"{'LIVE DB was modified.' if args.apply_to_live else 'Live trades.db was NOT modified — copy only.'}"
+        f"{'LIVE DB was modified' if args.apply_to_live else 'Live trades.db was NOT modified — copy only'}"
+        f"{f'. Pre-migration backup: {backup_path}' if backup_path else '.'}"
     )
     return 0
 

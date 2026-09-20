@@ -140,3 +140,94 @@ memory note). All crypto/accounting-relevant tests pass, including the 7 new one
 
 **Until all four clear: correct status is HALT.** Nothing in this pass changes that, and
 nothing in this pass was intended to.
+
+---
+
+## Follow-up pass, same day — migration hardening
+
+Continuation of the same readiness process: harden `migrate_legacy_fills.py` /
+`bot/accounting/migration.py` (dry-run workflow, live-DB backup, exact-match-only matching
+verification, idempotency/restart-recovery/duplicate-prevention/rollback tests), re-verify the
+dynamic-universe accounting gate, and consolidate into one final blocker report.
+
+**No live trading enabled. No order placed. No strategy parameter changed. HALT untouched.
+The live migration was NOT applied to the real `logs/trades.db` — see item 3 below for why.**
+
+### What changed this pass
+
+1. **Real bug found and fixed: a partial-crash restart-recovery gap in the orphan-backfill
+   path of `bot/accounting/migration.py`.** The four writes a genuine orphan trade (one with
+   no prior `fills` row at all) needs — `upsert_observed_trade`, `log_fill` (a SEPARATE
+   connection via `TradeLog`), `fills_row_by_exec_key`, `link_trade_to_fill` — are each
+   individually idempotent, but were not wrapped in one transaction, and the loop's guard
+   (`if store.get_observed_trade(...) is not None: continue`) treated "already observed" as
+   "already fully done." A crash between the first write succeeding and the rest completing
+   would leave the trade observed-but-unlinked forever — every future migration run would see
+   the observed row and skip it, permanently. Fixed: the guard now distinguishes a trade this
+   migration itself partially created (`source == "migration"`, safe to resume — every
+   remaining step is idempotent) from a trade observed via a different source (e.g. "live",
+   left alone — forcibly backfilling it would double-count a trade the live path already
+   knows about). Proven by two new tests reproducing each crash point exactly
+   (`test_migration_recovers_an_orphan_stranded_after_observe_but_before_fills_row`,
+   `..._after_fills_row_but_before_link` — the second of which turned out to already self-heal
+   via the pre-existing general exact-match loop, which runs first and treats any now-existing
+   unlinked fills row like any other legacy row; only the first crash point needed the new
+   code path).
+2. **`migrate_legacy_fills.py --apply-to-live` now takes an unconditional backup first.**
+   Before this pass, `--apply-to-live` pointed straight at the real `logs/trades.db` with no
+   backup step at all — the dry-run copy helper (`_copy_db`) only ever ran in the default
+   (safe) mode. Added `_backup_live_db()`, called unconditionally at the start of an
+   `--apply-to-live` run, writing `logs/trades_pre_migration_backup_<timestamp>.db` (named
+   distinctly from the dry-run's `trades_migration_copy_<timestamp>.db` so the two are never
+   confused on disk). Restore path: copy the backup back over `trades.db`. 3 new tests on the
+   pure file-copy helpers (no network needed).
+3. **Report output improved for manual review.** Blocked rows now print their full candidate
+   trade-id list alongside the reason; linked rows now print the exact fill-id → trade-id(s)
+   mapping being proposed, not just an aggregate count — so a human reviewing a dry-run report
+   can actually verify each proposed match individually, per the explicit "manually review
+   every proposed match" instruction.
+4. **Confirmed, not changed: matching was already exact-conservation-only.**
+   `bot/accounting/engine.match_legacy_fill` already refuses anything but an exact
+   quantity+fee-conserving subset (tolerance 1e-6) and blocks — never guesses — on no match,
+   ambiguity, or an oversized candidate pool. No code change was needed here; verified by
+   reading it and confirmed by the existing `test_match_legacy_fill_blocks_on_ambiguity` /
+   `test_match_legacy_fill_blocks_on_no_match` / `test_migration_blocks_on_ambiguous_legacy_row`
+   tests, which already passed before this pass.
+5. **5 new tests added to `tests/crypto/test_accounting_migration.py`**: orphan-backfill
+   idempotency across two full runs, the two restart-recovery crash points above,
+   duplicate-prevention (a live-observed unlinked trade is left alone, not backfilled), and
+   rollback (an injected exception mid multi-trade link leaves zero partial state, confirmed
+   by direct row counts, and a clean re-run afterward completes correctly). **3 new tests** in
+   `tests/crypto/test_migrate_legacy_fills_cli.py` for the new backup helper.
+6. **Dynamic-universe accounting gate re-verified with the full suite** (not re-changed this
+   pass — it was fixed in the prior same-day pass): `tests/crypto/test_accounting_buy_gate_
+   wiring.py` (5 tests) and the 2 behavioral tests in `test_dynamic_live_integration.py` all
+   still pass.
+
+**Full suite: 1372 passed, 2 failed** (`.venv/bin/python -m pytest --tb=short -q`) — the same
+2 pre-existing, unrelated failures as the earlier pass today
+(`tests/stock/test_weekly_monitor.py::test_scan_log_buckets_faults_vs_noise` and
+`::test_scan_log_respects_time_window`, stock-bot weekly-monitor log scanning, untouched by
+any crypto/accounting work). **Tracked separately from crypto-release evidence, per explicit
+instruction** — not a crypto-readiness blocker, but also not fixed by, or masked by, this pass.
+
+### Migration: dry-run built and hardened, NOT applied to the live database
+
+**Deliberately not run against the real `logs/trades.db` this pass.** The instruction's own
+sequencing — dry-run first, a human manually reviews every proposed match, only then decide
+whether to apply — puts the actual apply-to-live decision on the operator, not on an
+automated pass. What's ready now: `migrate_legacy_fills.py` (default dry-run mode, operating
+on a disposable copy, zero risk to the live file) can be run at any time to produce the
+match-by-match report described above; `--apply-to-live` is available with the new automatic
+backup once that report has been reviewed and the operator is ready to apply it.
+
+### Final blocker report
+
+| # | Blocker | Status | What's needed to close it |
+|---|---|---|---|
+| 1 | Kraken withdrawal permission sign-off | **Open** | 2-minute manual check in the Kraken UI (Settings → API) — checklist in `CRYPTO_BOT_SECURITY_REVIEW_2026-09-20.md` §1. No automated check exists (Kraken exposes no permission-introspection endpoint); nothing on record confirms this was ever done against the live key. |
+| 2 | Paper/shadow run — duration and results | **Open, not started** | Runbook is ready (`deploy/PAPER_SHADOW_RUNBOOK.md`): `LIVE_TRADING=true` + `DRY_RUN=true` + `ACCOUNTING_ENABLED=true`, HALT still engaged as a second guarantee. Needs real elapsed time — a restart, a multi-hour stretch for staleness/scheduling, ideally a real API hiccup (this account has hit two before) — and a clean `scripts/accounting_shadow_report.py` result throughout. Zero hours logged so far. |
+| 3 | Migrated legacy fills and residuals | **Tooling hardened this pass; migration NOT yet applied** | 10 pre-existing unlinked legacy fills confirmed (8 BTC/CAD, 2 SOL/CAD). Dry-run workflow ready with exact-match-only guarantees, automatic pre-apply backup, and a per-match report for manual review. Next step is an operator running the dry-run, reviewing every proposed match by hand, and deciding whether to `--apply-to-live`. |
+| 4 | Profitability floor | **Open — re-confirmed this pass, unchanged from 2026-09-12** | Pinned net PF 0.82, rolling net PF 1.17, walk-forward TRAINING net PF 0.67 (BTC); rolling net PF 1.05 (SOL) — all below the documented floor once fees are correctly attributed. Needs either a genuinely out-of-sample post-2026-09-12 walk-forward pass (data doesn't exist yet) or a formal retire/redesign decision per the existing 2026-09-12 review-deadline policy. Not something a code pass can resolve by re-running the same historical window again. |
+
+**Money-readiness is not declared. All four blockers remain open. Correct status: HALT.**

@@ -110,7 +110,43 @@ def run_migration(
                     continue
                 if t.trade_id in blocked_candidates:
                     continue
-                if store.get_observed_trade(conn, t.trade_id) is not None:
+                existing_observed = store.get_observed_trade(conn, t.trade_id)
+                if existing_observed is not None:
+                    # Restart recovery (money-readiness review 2026-09-20,
+                    # follow-up finding): the four writes below
+                    # (upsert_observed_trade, log_fill, fills_row_by_exec_key,
+                    # link_trade_to_fill) are NOT one transaction — log_fill
+                    # uses TradeLog's own separate connection. A crash after
+                    # upsert_observed_trade succeeds but before
+                    # link_trade_to_fill completes used to strand this trade
+                    # forever: `get_observed_trade` would find the row on
+                    # every retry and `continue` past it, never reaching the
+                    # idempotent steps that would actually finish the job.
+                    # Every step here (upsert_observed_trade on trade_id,
+                    # log_fill on exec_key, link_trade_to_fill on the
+                    # (trade_id, fill_id) pair) is independently idempotent —
+                    # so a trade THIS migration already created (source=
+                    # "migration") is safe to simply resume rather than skip.
+                    # A trade observed by a DIFFERENT source (e.g. "live",
+                    # still unlinked for its own reasons) is deliberately
+                    # left alone — backfilling a synthetic migration fills
+                    # row on top of a genuinely live-observed trade would be
+                    # a real double-count, not a recovery.
+                    if existing_observed.source == "migration":
+                        row = store.fills_row_by_exec_key(conn, f"migration:{t.trade_id}")
+                        if row is None:
+                            trade_log.log_fill(
+                                side=t.side.upper(), symbol=t.symbol, quantity=t.amount,
+                                price=t.price, exchange="kraken",
+                                signal_reason="migration_backfill", risk_decision="n/a",
+                                fee_cost=t.fee_cost, fee_currency=t.fee_currency,
+                                source="migration_backfill", exec_key=f"migration:{t.trade_id}",
+                                timestamp=t.exchange_timestamp, order_id=t.order_id,
+                            )
+                            row = store.fills_row_by_exec_key(conn, f"migration:{t.trade_id}")
+                        if row is not None:
+                            store.link_trade_to_fill(conn, t.trade_id, row["id"])
+                            report.orphan_trades_inserted.append(t.trade_id)
                     continue
                 store.upsert_observed_trade(conn, engine.ObservedTrade(
                     trade_id=t.trade_id, order_id=t.order_id, symbol=t.symbol, side=t.side,
