@@ -698,6 +698,74 @@ def test_ranked_execution_halt_equivalent_blocks_every_candidate():
     assert exec_a.execute_calls == []   # execute() was never even called
 
 
+def test_ranked_execution_blocks_on_unreconciled_accounting_state():
+    """Money-readiness review 2026-09-20: the fixed-roster BUY path
+    (bot.main.run() section 7a) refuses a BUY while the accounting
+    BlockState is unreconciled/stale, but this function used to never
+    consult the block state at all — only passing accounting_enabled/
+    conn/adapter through for fee recording after a fill. A dynamically
+    admitted symbol could therefore bypass the same protection the fixed
+    roster gets. Proves the gate is now wired: a default (never-reconciled)
+    BlockState blocks every candidate exactly like a HALT-equivalent risk
+    rejection, and execute() is never reached."""
+    from bot.accounting.reconciliation import BlockState
+
+    exec_a = FakeExecutor(symbol="A/CAD", starting_cash=100.0)
+    exec_a.queue_order(_filled_order(OrderSide.BUY, price=10.0, qty=1.0))
+    ss_a = _new_ss(executor=exec_a, strategy_adx=35.0)
+    pool = CapitalPool(total_capital=100.0, max_concurrent=1)
+    risk = FakeRisk(approve=True)
+    queue = [
+        dict(sym="A/CAD", ss=ss_a, final_signal=Signal.BUY, price=10.0, trade_qty=1.0,
+             raw_signal=Signal.BUY, filter_reason="", adx=35.0, quote_volume=1),
+    ]
+
+    filled, blocked = bot_main._execute_ranked_dynamic_buys(
+        queue, capital_pool=pool, risk=risk, account_value_fn=lambda: 100.0,
+        alerter=MagicMock(), trade_log=MagicMock(), stuck_detector=MagicMock(),
+        is_indicator=True, max_concurrent=1,
+        accounting_enabled=True,
+        accounting_state=BlockState(),   # default = never reconciled
+        accounting_block_buys_on_unreconciled=True,
+        accounting_max_age_ms=3_600_000,
+    )
+
+    assert filled == []
+    assert blocked == {"A/CAD": "accounting"}
+    assert exec_a.execute_calls == []
+    assert not pool.is_allocated("A/CAD")
+
+
+def test_ranked_execution_accounting_disabled_is_a_no_op():
+    """The gate must be additive: with accounting_enabled=False (today's
+    default), a blocked BlockState must not affect execution at all — the
+    same result as before this fix."""
+    from bot.accounting.reconciliation import BlockState
+
+    exec_a = FakeExecutor(symbol="A/CAD", starting_cash=100.0)
+    exec_a.queue_order(_filled_order(OrderSide.BUY, price=10.0, qty=1.0))
+    ss_a = _new_ss(executor=exec_a, strategy_adx=35.0)
+    pool = CapitalPool(total_capital=100.0, max_concurrent=1)
+    risk = FakeRisk(approve=True)
+    queue = [
+        dict(sym="A/CAD", ss=ss_a, final_signal=Signal.BUY, price=10.0, trade_qty=1.0,
+             raw_signal=Signal.BUY, filter_reason="", adx=35.0, quote_volume=1),
+    ]
+
+    filled, blocked = bot_main._execute_ranked_dynamic_buys(
+        queue, capital_pool=pool, risk=risk, account_value_fn=lambda: 100.0,
+        alerter=MagicMock(), trade_log=MagicMock(), stuck_detector=MagicMock(),
+        is_indicator=True, max_concurrent=1,
+        accounting_enabled=False,
+        accounting_state=BlockState(),
+        accounting_block_buys_on_unreconciled=True,
+        accounting_max_age_ms=3_600_000,
+    )
+
+    assert filled == ["A/CAD"]
+    assert blocked == {}
+
+
 # ── Fixed-mode compatibility ──────────────────────────────────────────────
 
 def test_compute_account_value_unaffected_by_admitting_flat_symbol():

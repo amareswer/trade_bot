@@ -1742,6 +1742,9 @@ def _execute_ranked_dynamic_buys(
     accounting_enabled: bool = False,
     accounting_conn=None,
     accounting_adapter=None,
+    accounting_state=None,
+    accounting_block_buys_on_unreconciled: bool = False,
+    accounting_max_age_ms: int = 0,
 ) -> "tuple[list, dict]":
     """
     Rank every BUY signal gathered this tick (bot.dynamic.ranking — ADX
@@ -1793,6 +1796,22 @@ def _execute_ranked_dynamic_buys(
     and this function processes candidates strictly sequentially (one at a
     time, never concurrently), so capital_pool.allocate() firing on a
     CONFIRMED fill can never be double-claimed.
+
+    Accounting reconciliation gate (FIXED 2026-09-20, money-readiness
+    review): the fixed-roster BUY path (section 7a) refuses a new BUY
+    while `accounting_state.blocked_for_buy()` is true, but this function
+    only ever received accounting_enabled/conn/adapter for FEE RECORDING
+    inside `_execute_approved_signal` — it never consulted the block
+    state itself before executing. A dynamically-admitted symbol could
+    therefore open a new position during an unreconciled/stale accounting
+    window even with `ACCOUNTING_ENABLED=true` and
+    `block_buys_on_unreconciled=true`, the exact bypass the fixed roster
+    is protected against. Currently unreachable in production (dynamic
+    mode is off by default and explicitly parked — see CLAUDE.md "Dynamic
+    Crypto Universe"), but fixed here so the gate is genuinely active
+    the moment either subsystem is turned on, not just today's config.
+    accounting_state defaults to None (no gate) purely so existing unit
+    tests that don't exercise accounting can omit it.
 
     Price refresh (FIXED 2026-09-13, real gap confirmed by external
     review: "refresh liquidity checks and prices before executing queued
@@ -1912,6 +1931,21 @@ def _execute_ranked_dynamic_buys(
                 rsym, fresh_approval.message,
             )
             continue
+
+        if (
+            accounting_enabled and accounting_block_buys_on_unreconciled
+            and accounting_state is not None
+            and accounting_state.blocked_for_buy(
+                rsym, now_ms=int(time.time() * 1000), max_age_ms=accounting_max_age_ms,
+            )
+        ):
+            blocked[rsym] = "accounting"
+            logger.info(
+                "Dynamic ranked BUY [%s]: accounting reconciliation unresolved"
+                " — skipped this tick", rsym,
+            )
+            continue
+
         order = _execute_approved_signal(
             rsym, cand['ss'], cand['final_signal'], exec_price,
             cand['trade_qty'], cand['raw_signal'], cand['filter_reason'],
@@ -4641,6 +4675,9 @@ def run():
                 refresh_price_fn=_refresh_dynamic_price,
                 accounting_enabled=_accounting_enabled, accounting_conn=_accounting_conn,
                 accounting_adapter=_accounting_adapter,
+                accounting_state=_accounting_state,
+                accounting_block_buys_on_unreconciled=cfg.accounting.block_buys_on_unreconciled,
+                accounting_max_age_ms=_accounting_max_age_ms,
             )
 
         # ── 0c. Dynamic universe discovery + admission/retirement ─────────

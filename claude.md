@@ -997,6 +997,26 @@ trigger review earlier, but neither can be pushed out past this date by "not eno
   between now and the review date unless a specific bug is suspected — user's explicit call,
   2026-09-12 (7 review passes already ran on this exact code this month).
 
+### Execution-accounting reconciliation (crypto — built 2026-09-19/20, opt-in, off by default)
+`bot/accounting/` — a real SQLite-backed reconciliation layer that observes actual Kraken
+trade history, links it to the bot's own fill records, runs four-way verification (exchange
+trades vs. local ledger vs. account cash vs. position), and blocks new BUYs
+(`ACCOUNTING_ENABLED=true` + `block_buys_on_unreconciled=true`, both required) while anything
+is unreconciled or stale. `cfg.accounting.enabled` defaults `false` — with it off, `bot/main.py`
+behaves exactly as before this subsystem existed. Built across 11+ same-week review passes
+(2026-09-13 → 2026-09-20); design + full pass-by-pass findings live in the standalone
+`CRYPTO_BOT_EXECUTION_ACCOUNTING_DESIGN_2026-09-19.md` and `CRYPTO_BOT_MONEY_READINESS_REVIEW_*.md`
+files at repo root, not duplicated here. `migrate_legacy_fills.py` (one-time, pre-accounting
+fills backfill) has **never been run** — confirmed 2026-09-20 (`scripts/accounting_shadow_report.py`
+finds 10 pre-existing unlinked legacy fills). A gated paper/shadow + security readiness review
+(`CRYPTO_BOT_GATED_READINESS_REPORT_2026-09-20.md`, `CRYPTO_BOT_SECURITY_REVIEW_2026-09-20.md`,
+`deploy/PAPER_SHADOW_RUNBOOK.md`) found and fixed one real gap (the dynamic-universe ranked-BUY
+path didn't consult the accounting block state — fixed, unreachable in production either way
+since dynamic mode is off) and confirmed the Kraken key's actual permission scope has never
+been manually verified against the checklist that already existed in "Exchange Setup" below.
+None of this changes HALT status — see the review-deadline section above; profitability is the
+independent, still-unmet reason the bot stays halted regardless of accounting readiness.
+
 ### Current operational status
 - **Crypto bot:** live on Kraken, **but its profitability basis is now in question
   (2026-09-12)** — see "Canonical strategy fingerprint" above. The walk-forward/backtest
