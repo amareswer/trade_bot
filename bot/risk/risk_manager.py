@@ -72,6 +72,15 @@ class BlockReason(Enum):
     DAILY_TRADE_CAP = "DAILY_TRADE_CAP"
     DAILY_LOSS      = "DAILY_LOSS"
     POSITION_SIZE   = "POSITION_SIZE"
+    # Not set by RiskManager.evaluate() itself — bot/main.py constructs an
+    # ApprovalResult with this reason when the execution-accounting
+    # reconciliation layer (bot/accounting/, opt-in via
+    # cfg.accounting.enabled) reports a symbol or the shared account cash
+    # pool as unreconciled (design doc CRYPTO_BOT_EXECUTION_ACCOUNTING_
+    # DESIGN_2026-09-19.md §7). Listed here so it participates in the same
+    # ApprovalResult/BlockReason type every other gate uses, rather than a
+    # parallel ad-hoc block representation.
+    ACCOUNTING      = "ACCOUNTING"
 
 
 @dataclass

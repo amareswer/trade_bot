@@ -69,7 +69,7 @@ from bot.strategy.indicator_strategy import IndicatorStrategy, IndicatorConfig
 from bot.execution.executor import PaperExecutor, OrderStatus, OrderSide, Order
 from bot.execution.live_executor import LiveExecutor
 from bot.exchanges.retry import fetch_with_retry
-from bot.risk.risk_manager import RiskManager, RiskConfig
+from bot.risk.risk_manager import RiskManager, RiskConfig, ApprovalResult, BlockReason
 from bot.risk.correlation import fetch_correlation, CORRELATION_THRESHOLD
 from bot.state.trade_state import TradingStateMachine
 from bot.portfolio.position_manager import PositionManager
@@ -84,6 +84,10 @@ from bot.data.trade_log import TradeLog
 from bot.data.crypto_universe import CryptoUniverse
 from bot.dynamic.eligibility import DynamicUniverseScreener
 from bot.dynamic.ranking import RankableSignal, rank_buy_signals
+from bot.accounting import store as accounting_store
+from bot.accounting import reconciliation as accounting_reconciliation
+from bot.accounting.reconciliation import BlockState as AccountingBlockState
+from bot.accounting.kraken_adapter import KrakenAccountingAdapter
 
 # ── Dashboard path ────────────────────────────────────────────────────────────
 _DASHBOARD_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dashboard.html")
@@ -2747,6 +2751,53 @@ def run():
 
     # ── Persistent trade log + Telegram alerts ────────────────────────────────
     trade_log = TradeLog()
+
+    # ── Execution-accounting reconciliation (added 2026-09-19, opt-in) ──────
+    # See bot/accounting/ package docstring + CRYPTO_BOT_EXECUTION_ACCOUNTING_
+    # DESIGN_2026-09-19.md (+ two review rounds). cfg.accounting.enabled
+    # defaults False — with it False, none of this executes and behavior is
+    # byte-identical to before this feature existed (no new import side
+    # effect beyond the module import itself, no new file created, no new
+    # network call). Even enabled, this subsystem only ever ADDS a new BUY
+    # block condition on top of every existing gate (risk_manager,
+    # capital_pool, state_machine, candle-watchdog, ...) — it never loosens
+    # anything, never touches logs/HALT, and never blocks an exit (see
+    # accounting_reconciliation.resolve_exit_quantity, not yet wired into a
+    # specific exit call site this pass — a deliberate, documented scope
+    # limit, not an oversight: exits already work off the executor's own
+    # already-fetched position, and design §7 only requires that a BLOCKED
+    # state must never ITSELF prevent sizing an exit, which it doesn't,
+    # since nothing here touches the exit path at all).
+    _accounting_enabled     = cfg.accounting.enabled and cfg.exchange.live_trading and live_exchange is not None
+    _accounting_conn        = None
+    _accounting_adapter     = None
+    _accounting_state       = AccountingBlockState()   # unblocked default until the first cycle completes
+    _accounting_last_cycle  = 0.0
+    _accounting_quote       = list(executors.keys())[0].split("/")[1] if executors else "CAD"
+    if cfg.accounting.enabled and not _accounting_enabled:
+        logger.info(
+            "Accounting reconciliation: ACCOUNTING_ENABLED=true but not applicable "
+            "this run (live_trading=%s, live_exchange=%s) — skipped",
+            cfg.exchange.live_trading, live_exchange is not None,
+        )
+    if _accounting_enabled:
+        try:
+            accounting_store.init_db()
+            _accounting_conn = accounting_store.connect()
+            _accounting_adapter = KrakenAccountingAdapter(live_exchange)
+            logger.info(
+                "Accounting reconciliation: ENABLED (interval=%.0fs, margin=%.0fs, "
+                "block_buys_on_unreconciled=%s)",
+                cfg.accounting.reconcile_interval_s, cfg.accounting.watermark_safety_margin_s,
+                cfg.accounting.block_buys_on_unreconciled,
+            )
+        except Exception as _acct_init_exc:
+            logger.error(
+                "Accounting reconciliation failed to initialize (%s) — disabled for "
+                "this run; every existing gate is unaffected", _acct_init_exc,
+            )
+            _accounting_enabled = False
+
     alerter   = TelegramAlerter(
         bot_token = cfg.alerts.telegram_bot_token,
         chat_id   = cfg.alerts.telegram_chat_id,
@@ -4129,6 +4180,26 @@ def run():
             if not approval and final_signal == Signal.BUY and not _buy_block_gate:
                 _buy_block_gate = "risk_manager"
 
+            # ── 7a. Accounting reconciliation gate (opt-in, additive) ────
+            # design §7: an unresolved symbol OR shared-account-cash
+            # residual blocks new BUYs — checked only when risk_manager
+            # would otherwise have approved (never overrides a MORE severe
+            # existing block, and never touches a SELL/exit at all).
+            if (
+                approval and final_signal == Signal.BUY
+                and cfg.accounting.enabled and cfg.accounting.block_buys_on_unreconciled
+                and _accounting_state.blocked_for_buy(sym)
+            ):
+                _acct_block_reason = _accounting_state.explain()
+                approval = ApprovalResult(
+                    approved=False,
+                    message=f"Accounting reconciliation unresolved: {_acct_block_reason}",
+                    block_reason=BlockReason.ACCOUNTING,
+                )
+                block_reason = approval.message
+                if not _buy_block_gate:
+                    _buy_block_gate = "accounting"
+
             # ── 7b. Candle-close structured log + blocked-BUY CSV ────
             if is_indicator and live_exchange is not None:
                 _rsi_log = f"{_rsi_live:.1f}" if _rsi_live is not None else "n/a"
@@ -4363,6 +4434,32 @@ def run():
                 except Exception as _dyn_exc:
                     logger.warning("Dynamic universe sync failed: %s — existing positions unaffected", _dyn_exc)
                 _dynamic_last_refresh = time.time()
+
+        # ── Accounting reconciliation cycle (opt-in, additive) ────────────
+        # Runs on its own interval (cfg.accounting.reconcile_interval_s,
+        # default 1h) — independent of the candle timeframe, so it isn't
+        # gated behind "new candle" the way strategy evaluation is. Updates
+        # _accounting_state, which section 7's risk gate below consults for
+        # new BUYs only; never touches an exit. Never raises into the tick
+        # loop — a failure here is caught, logged, and leaves the PREVIOUS
+        # _accounting_state in place (fail-closed if it was already
+        # blocking something, unaffected if it wasn't).
+        if _accounting_enabled and _accounting_conn is not None:
+            if time.time() - _accounting_last_cycle > cfg.accounting.reconcile_interval_s:
+                try:
+                    _accounting_state = accounting_reconciliation.run_cycle(
+                        _accounting_adapter, _accounting_conn, trade_log,
+                        quote=_accounting_quote, symbols=list(executors.keys()),
+                        safety_margin_s=cfg.accounting.watermark_safety_margin_s,
+                    )
+                    _acct_explain = _accounting_state.explain()
+                    logger.info("Accounting reconciliation cycle: %s", _acct_explain)
+                    if _acct_explain != "ok":
+                        alerter.error(f"ACCOUNTING RECONCILIATION: {_acct_explain}")
+                except Exception as _acct_cycle_exc:
+                    logger.error("Accounting reconciliation cycle raised: %s — "
+                                 "keeping the previous cycle's block state", _acct_cycle_exc)
+                _accounting_last_cycle = time.time()
 
         # Dashboard snapshot — written HERE, after admission/retirement AND
         # ranked execution have both happened this tick, so blocked-reason

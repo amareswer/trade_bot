@@ -558,6 +558,40 @@ class DynamicUniverseConfig:
         return {b.strip().upper() for b in self.exclude_bases.split(",") if b.strip()}
 
 
+@dataclass
+class AccountingConfig:
+    """Config for the execution-accounting reconciliation layer (added
+    2026-09-19 — CRYPTO_BOT_EXECUTION_ACCOUNTING_DESIGN_2026-09-19.md and its
+    two review rounds). Entirely additive: `enabled=False` (the default)
+    means `bot/main.py` never constructs the accounting store/reconciler at
+    all — zero behavior change for anyone who hasn't touched this section.
+
+    Even with `enabled=True`, this subsystem can only ever ADD a new BUY
+    block condition (symbol_reconciliation_blocked / account_cash_
+    reconciliation_blocked) on top of every existing gate — it never
+    unblocks anything, never resizes a position, and never touches
+    logs/HALT. Exits are explicitly never blocked by it (see
+    bot/accounting/reconciliation.py's own docstring).
+
+    Tier A (fetch_ledger, requires Kraken's "Query Ledger Entries"
+    permission) is NOT implemented in this pass — per the design's §11,
+    that permission is not currently granted and enabling it is a human
+    decision. Only Tier B (the balance-identity protocol over fetch_balance
+    + fetch_my_trades + fetch_deposits/fetch_withdrawals) is built here.
+    """
+    enabled:              bool  = False   # ACCOUNTING_ENABLED
+    reconcile_interval_s: float = 3600.0  # ACCOUNTING_RECONCILE_INTERVAL_S — how often a full coverage+balance cycle runs
+    watermark_safety_margin_s: float = 900.0  # ACCOUNTING_WATERMARK_SAFETY_MARGIN_S — see engine.compute_safe_watermark
+    block_buys_on_unreconciled: bool = True   # ACCOUNTING_BLOCK_BUYS_ON_UNRECONCILED — the actual gate switch;
+                                               # False makes the subsystem purely observational (reports but never blocks)
+
+    def __post_init__(self):
+        if self.reconcile_interval_s <= 0:
+            raise ValueError("ACCOUNTING_RECONCILE_INTERVAL_S must be > 0")
+        if self.watermark_safety_margin_s <= 0:
+            raise ValueError("ACCOUNTING_WATERMARK_SAFETY_MARGIN_S must be > 0")
+
+
 # ---------------------------------------------------------------------------
 # Root config
 # ---------------------------------------------------------------------------
@@ -575,6 +609,7 @@ class AppConfig:
     universe:  UniverseConfig
     paper:     PaperConfig = field(default_factory=PaperConfig)
     dynamic:   DynamicUniverseConfig = field(default_factory=DynamicUniverseConfig)
+    accounting: AccountingConfig = field(default_factory=AccountingConfig)
 
     def calc_trade_qty(self, cash: float, price: float) -> float:
         """
@@ -913,6 +948,12 @@ def _load() -> AppConfig:
             starting_cash_cad         = _float("DYNAMIC_STARTING_CASH_CAD",      1000.0),
             refresh_hours             = _float("DYNAMIC_REFRESH_HOURS",          4.0),
             cache_max_age_hours       = _float("DYNAMIC_CACHE_MAX_AGE_HOURS",    48.0),
+        ),
+        accounting=AccountingConfig(
+            enabled                     = _bool ("ACCOUNTING_ENABLED",                 False),
+            reconcile_interval_s        = _float("ACCOUNTING_RECONCILE_INTERVAL_S",     3600.0),
+            watermark_safety_margin_s   = _float("ACCOUNTING_WATERMARK_SAFETY_MARGIN_S", 900.0),
+            block_buys_on_unreconciled  = _bool ("ACCOUNTING_BLOCK_BUYS_ON_UNRECONCILED", True),
         ),
     )
 
