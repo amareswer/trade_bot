@@ -81,12 +81,30 @@ def diff_position_against_fold(
     evidence of a bug. Callers should treat this check as meaningful only
     once a symbol has a migration-backed complete observed_trades history
     (tracked externally, e.g. via a migration report, not by this
-    function, which has no way to know that on its own)."""
+    function, which has no way to know that on its own).
+
+    Money-readiness review 2026-09-19: "do not let an empty or
+    pre-migration ledger appear healthy merely because there are no link
+    errors." A FLAT symbol (live_qty ~= 0) with no observed_trades is
+    genuinely fine — nothing is at risk, there is nothing to verify. A
+    symbol currently HOLDING a real position with zero observed-trade
+    history is the opposite of healthy: it means this accounting layer
+    has no ledger evidence at all for money that is actually at risk right
+    now (the exact pre-migration gap), and must not report ok=True."""
     trades = store.load_observed_trades(conn, symbol)
     if not trades:
+        if abs(live_qty) > qty_tolerance:
+            return PositionRebuildDiff(
+                ok=False, live_qty=live_qty, live_avg_cost=live_avg_cost,
+                live_realized_pnl=live_realized_pnl,
+                reason=(
+                    f"holding a live position (qty={live_qty}) with ZERO observed_trades "
+                    f"history for this symbol — unverifiable pre-migration gap, not treated as healthy"
+                ),
+            )
         return PositionRebuildDiff(ok=True, live_qty=live_qty, live_avg_cost=live_avg_cost,
                                     live_realized_pnl=live_realized_pnl,
-                                    reason="no observed_trades for this symbol yet — nothing to diff against")
+                                    reason="flat, no observed_trades for this symbol yet — nothing at risk to verify")
     corrected = []
     for t in trades:
         deltas = store.fee_correction_deltas_for_trade(conn, t.trade_id)

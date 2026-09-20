@@ -86,6 +86,8 @@ from bot.dynamic.eligibility import DynamicUniverseScreener
 from bot.dynamic.ranking import RankableSignal, rank_buy_signals
 from bot.accounting import store as accounting_store
 from bot.accounting import reconciliation as accounting_reconciliation
+from bot.accounting import four_way as accounting_four_way
+from bot.accounting import live_observe as accounting_live_observe
 from bot.accounting.reconciliation import BlockState as AccountingBlockState
 from bot.accounting.kraken_adapter import KrakenAccountingAdapter
 
@@ -554,7 +556,10 @@ def _check_orphaned_positions(
     return orphaned
 
 
-def _replay_pending_journal_entries(executors: dict, trade_log, alerter: "TelegramAlerter") -> list[str]:
+def _replay_pending_journal_entries(
+    executors: dict, trade_log, alerter: "TelegramAlerter", *,
+    accounting_enabled: bool = False, accounting_conn=None, accounting_adapter=None,
+) -> list[str]:
     """
     2026-09-18 review finding (P1-3): LiveExecutor.execute() persists a
     fill's accounting effect (cash/position/pnl) to its own state file
@@ -638,6 +643,12 @@ def _replay_pending_journal_entries(executors: dict, trade_log, alerter: "Telegr
                     exec_key      = entry.get("exec_key", ""),
                     timestamp     = entry.get("filled_at"),
                     order_id      = entry.get("order_id", ""),
+                )
+                _observe_live_fill(
+                    accounting_enabled, accounting_conn, accounting_adapter,
+                    order_id=entry.get("order_id", ""), symbol=entry["symbol"],
+                    exec_key=entry.get("exec_key", ""), side=entry["side"],
+                    quantity=entry["quantity"],
                 )
                 executor.ack_journal_entry(entry["order_id"])
                 recovered.append(sym)
@@ -900,7 +911,50 @@ _BUY_BLOCK_REASONS = {
     "candle_watchdog": "the candle feed is stale — BUYs paused until it recovers",
     "mtf_trend":       "the daily (1D) trend is BEARISH",
     "regime":          "the market regime is not favourable for a new entry (strategy 200-EMA / volatile)",
+    "accounting":      "execution-accounting reconciliation is unresolved (unreconciled symbol/cash, or no successful cycle yet)",
 }
+
+
+def _observe_live_fill(
+    accounting_enabled: bool, accounting_conn, accounting_adapter, *, order_id: str,
+    symbol: str, exec_key: str, side: str, quantity: float,
+) -> None:
+    """Best-effort synchronous per-fill real-trade-id observation
+    (execution-accounting implementation item 2 / money-readiness review
+    2026-09-19 P1: "live_observe()... not wired into the live fill path").
+
+    Called AFTER an ordinary live fill has already been logged via
+    trade_log.log_fill() — never before, and never as a precondition for
+    it. Looks up the exchange trade id(s) for `order_id` and links them to
+    the `fills` row `exec_key` just created — an EXACT match, not
+    ambiguous, since order_id is already known. If the real trade isn't
+    visible yet or the lookup fails outright, this is a silent no-op (see
+    live_observe.observe_fill's own docstring) — the next periodic
+    reconciliation cycle's coverage-proof pull picks up the same trade via
+    the straggler matcher instead. NEVER raises: an accounting-observation
+    failure must never affect an already-confirmed, already-logged fill."""
+    if not accounting_enabled or accounting_conn is None or accounting_adapter is None:
+        return
+    if not exec_key or not order_id:
+        return
+    try:
+        row = accounting_store.fills_row_by_exec_key(accounting_conn, exec_key)
+        if row is None:
+            logger.warning(
+                "live_observe: no fills row found for exec_key=%s (order_id=%s) — skipping",
+                exec_key, order_id,
+            )
+            return
+        since_iso = (datetime.now(_tz.utc) - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        accounting_live_observe.observe_fill(
+            accounting_adapter, accounting_conn, order_id=order_id, symbol=symbol,
+            fill_id=row["id"], since=since_iso, side=side, quantity=quantity,
+        )
+    except Exception as exc:
+        logger.warning(
+            "live_observe: unexpected error observing fill (exec_key=%s order_id=%s): %s",
+            exec_key, order_id, exc,
+        )
 
 
 def _evaluate_buy_signal_alert(
@@ -1138,6 +1192,9 @@ def _execute_approved_signal(
     trade_log,
     stuck_detector,
     is_indicator: bool,
+    accounting_enabled: bool = False,
+    accounting_conn=None,
+    accounting_adapter=None,
 ):
     """
     Execute an approved (risk-gate-passed, non-HOLD) signal and apply every
@@ -1238,6 +1295,8 @@ def _execute_approved_signal(
                     sym, ss, _discovered, "native_stop_discovered",
                     capital_pool=capital_pool, risk=risk,
                     alerter=alerter, trade_log=trade_log,
+                    accounting_enabled=accounting_enabled, accounting_conn=accounting_conn,
+                    accounting_adapter=accounting_adapter,
                 )
             else:
                 pnl = ss['pm'].on_sell(order.price, order.quantity)
@@ -1252,6 +1311,8 @@ def _execute_approved_signal(
                         sym, ss, _discovered, "native_stop_discovered",
                         capital_pool=capital_pool, risk=risk,
                         alerter=alerter, trade_log=trade_log,
+                        accounting_enabled=accounting_enabled, accounting_conn=accounting_conn,
+                        accounting_adapter=accounting_adapter,
                     )
                 else:
                     # Partial fill leaving a residual position (not
@@ -1263,6 +1324,8 @@ def _execute_approved_signal(
                         sym, ss, _discovered, "native_stop_discovered",
                         capital_pool=capital_pool, risk=risk,
                         alerter=alerter, trade_log=trade_log,
+                        accounting_enabled=accounting_enabled, accounting_conn=accounting_conn,
+                        accounting_adapter=accounting_adapter,
                     )
 
             display.fill(
@@ -1286,6 +1349,11 @@ def _execute_approved_signal(
                 # only replay-to-replay.
                 exec_key      = order.exec_key,
                 order_id      = order.order_id,
+            )
+            _observe_live_fill(
+                accounting_enabled, accounting_conn, accounting_adapter,
+                order_id=order.order_id, symbol=sym, exec_key=order.exec_key,
+                side=order.side.value, quantity=order.quantity,
             )
             # 2026-09-18 review finding (P1-3, durable fill journal): the
             # trade_log write above and the accounting update inside
@@ -1338,6 +1406,7 @@ def _execute_approved_signal(
 def _process_discovered_sell_fill(
     sym: str, ss: dict, order: Order, reason: str,
     *, capital_pool: CapitalPool, risk: RiskManager, alerter, trade_log,
+    accounting_enabled: bool = False, accounting_conn=None, accounting_adapter=None,
 ) -> None:
     """
     Route a SELL fill DISCOVERED outside the normal execute() call path —
@@ -1434,6 +1503,11 @@ def _process_discovered_sell_fill(
         exec_key      = order.exec_key,
         order_id      = order.order_id,
     )
+    _observe_live_fill(
+        accounting_enabled, accounting_conn, accounting_adapter,
+        order_id=order.order_id, symbol=sym, exec_key=order.exec_key,
+        side="SELL", quantity=order.quantity,
+    )
     if hasattr(ss['executor'], 'ack_journal_entry'):
         ss['executor'].ack_journal_entry(order.order_id)
     alerter.fill(
@@ -1451,6 +1525,7 @@ def _process_discovered_sell_fill(
 def _process_discovered_sell_fills(
     sym: str, ss: dict, orders: "list[Order]", reason: str,
     *, capital_pool: CapitalPool, risk: RiskManager, alerter, trade_log,
+    accounting_enabled: bool = False, accounting_conn=None, accounting_adapter=None,
 ) -> None:
     """Plural wrapper around _process_discovered_sell_fill (2026-09-19
     PASS-5 review finding, P1): sync_protective_stop()/_resync_native_stop()
@@ -1467,12 +1542,15 @@ def _process_discovered_sell_fills(
         _process_discovered_sell_fill(
             sym, ss, order, reason,
             capital_pool=capital_pool, risk=risk, alerter=alerter, trade_log=trade_log,
+            accounting_enabled=accounting_enabled, accounting_conn=accounting_conn,
+            accounting_adapter=accounting_adapter,
         )
 
 
 def _process_discovered_buy_fill(
     sym: str, ss: dict, order: Order, reason: str,
     *, capital_pool: CapitalPool, risk: RiskManager, alerter, trade_log,
+    accounting_enabled: bool = False, accounting_conn=None, accounting_adapter=None,
 ) -> None:
     """Route a BUY fill DISCOVERED outside the normal execute() call path —
     specifically, LiveExecutor.reconcile_pending_orders() resolving a
@@ -1570,6 +1648,11 @@ def _process_discovered_buy_fill(
             exec_key      = order.exec_key,
             order_id      = order.order_id,
         )
+        _observe_live_fill(
+            accounting_enabled, accounting_conn, accounting_adapter,
+            order_id=order.order_id, symbol=sym, exec_key=order.exec_key,
+            side="BUY", quantity=order.quantity,
+        )
         if hasattr(ss['executor'], 'ack_journal_entry'):
             ss['executor'].ack_journal_entry(order.order_id)
         alerter.fill(
@@ -1634,6 +1717,8 @@ def _process_discovered_buy_fill(
             sym, ss, _bf_discovered, "native_stop_discovered",
             capital_pool=capital_pool, risk=risk,
             alerter=alerter, trade_log=trade_log,
+            accounting_enabled=accounting_enabled, accounting_conn=accounting_conn,
+            accounting_adapter=accounting_adapter,
         )
 
 
@@ -1654,6 +1739,9 @@ def _execute_ranked_dynamic_buys(
     correlation_threshold: "float | None" = None,
     refresh_price_fn=None,
     max_price_deviation_pct: "float | None" = None,
+    accounting_enabled: bool = False,
+    accounting_conn=None,
+    accounting_adapter=None,
 ) -> "tuple[list, dict]":
     """
     Rank every BUY signal gathered this tick (bot.dynamic.ranking — ADX
@@ -1830,6 +1918,8 @@ def _execute_ranked_dynamic_buys(
             capital_pool=capital_pool, risk=risk, alerter=alerter,
             trade_log=trade_log, stuck_detector=stuck_detector,
             is_indicator=is_indicator,
+            accounting_enabled=accounting_enabled, accounting_conn=accounting_conn,
+            accounting_adapter=accounting_adapter,
         )
         if order is not None and order.status == OrderStatus.FILLED:
             filled.append(rsym)
@@ -2844,7 +2934,11 @@ def run():
     # Before any new trading this run: recover any fill whose accounting
     # was already persisted by a prior process but never made it into
     # trade_log because the process crashed between those two writes.
-    _replay_pending_journal_entries(executors, trade_log, alerter)
+    _replay_pending_journal_entries(
+        executors, trade_log, alerter,
+        accounting_enabled=_accounting_enabled, accounting_conn=_accounting_conn,
+        accounting_adapter=_accounting_adapter,
+    )
 
     # ── Derive live candle timeframe from CANDLE_MINUTES ─────────────────────
     # This is the timeframe used for ALL live candle operations:
@@ -3344,6 +3438,74 @@ def run():
             if (_dynamic_mode_active and _dynamic_last_screen is not None) else {}
         )
 
+        # ── Accounting reconciliation cycle (opt-in, additive) ────────────
+        # Runs BEFORE the per-symbol BUY-gate loop below — money-readiness
+        # review 2026-09-19, P0 fix: this used to run AFTER that loop, so a
+        # tick's own BUY decision never benefited from that SAME tick's
+        # reconciliation (and the very first tick's BUY evaluation used
+        # nothing but the bare startup default). _accounting_state starts
+        # as a fully BLOCKED BlockState() (reconciled=False, see
+        # reconciliation.BlockState's own docstring) until this actually
+        # completes at least once. On ANY failure — including the
+        # unexpected case caught here as a last line of defense, since
+        # run_cycle's own internal try/except should already turn every
+        # ordinary failure into a blocked RETURN value rather than a
+        # raised exception — the state is REPLACED with a fresh
+        # hard-blocked one, never left as whatever a previous, possibly
+        # permissive cycle produced (the exact P0 finding: "the code keeps
+        # the previous state... stays permissive after a failed
+        # reconciliation").
+        if _accounting_enabled and _accounting_conn is not None:
+            if time.time() - _accounting_last_cycle > cfg.accounting.reconcile_interval_s:
+                try:
+                    _accounting_state = accounting_reconciliation.run_cycle(
+                        _accounting_adapter, _accounting_conn, trade_log,
+                        quote=_accounting_quote, symbols=list(executors.keys()),
+                        safety_margin_s=cfg.accounting.watermark_safety_margin_s,
+                    )
+                    # Four-way verification (design §9 / money-readiness
+                    # review P1 "not wired into... the operational BUY
+                    # gate"): only meaningful once the base reconciliation
+                    # cycle itself completed — layered ON TOP of, never
+                    # instead of, the balance-identity blocks above. Any
+                    # failure here escalates this SAME _accounting_state to
+                    # blocked, rather than being a separate, un-consulted
+                    # report nothing reads.
+                    if _accounting_state.reconciled:
+                        _live_positions = {
+                            _fw_sym: {
+                                "qty":          _fw_exc.position,
+                                "avg_cost":     _fw_exc.avg_entry,
+                                "realized_pnl": _fw_exc.portfolio.realized_pnl,
+                            }
+                            for _fw_sym, _fw_exc in executors.items()
+                        }
+                        _fw_report = accounting_four_way.run_four_way_verification(
+                            _accounting_conn, _accounting_state,
+                            symbols=list(executors.keys()), live_positions=_live_positions,
+                        )
+                        if not _fw_report.ready:
+                            _accounting_state.account_cash_blocked = True
+                            _accounting_state.account_cash_reason = (
+                                (_accounting_state.account_cash_reason + "; ")
+                                if _accounting_state.account_cash_reason else ""
+                            ) + f"four-way verification: {_fw_report.explain()}"
+                    _acct_explain = _accounting_state.explain()
+                    logger.info("Accounting reconciliation cycle: %s", _acct_explain)
+                    if _acct_explain != "ok":
+                        alerter.error(f"ACCOUNTING RECONCILIATION: {_acct_explain}")
+                except Exception as _acct_cycle_exc:
+                    logger.error(
+                        "Accounting reconciliation cycle raised unexpectedly: %s — "
+                        "failing closed (blocking every symbol), NOT keeping the "
+                        "previous cycle's state", _acct_cycle_exc,
+                    )
+                    _accounting_state = AccountingBlockState(
+                        coverage_blocked=True,
+                        coverage_reason=f"reconciliation cycle raised unexpectedly: {_acct_cycle_exc}",
+                    )
+                _accounting_last_cycle = time.time()
+
         # ── Per-symbol processing ─────────────────────────────────────
         for sym, ss in symbol_state.items():
 
@@ -3429,12 +3591,16 @@ def run():
                             sym, ss, _pr_order, "pending_order_reconciled",
                             capital_pool=capital_pool, risk=risk,
                             alerter=alerter, trade_log=trade_log,
+                            accounting_enabled=_accounting_enabled, accounting_conn=_accounting_conn,
+                            accounting_adapter=_accounting_adapter,
                         )
                     else:
                         _process_discovered_buy_fill(
                             sym, ss, _pr_order, "pending_order_reconciled",
                             capital_pool=capital_pool, risk=risk,
                             alerter=alerter, trade_log=trade_log,
+                            accounting_enabled=_accounting_enabled, accounting_conn=_accounting_conn,
+                            accounting_adapter=_accounting_adapter,
                         )
 
             # 2026-09-19 PASS-7 review — carried-over correctness gap, now
@@ -3455,12 +3621,16 @@ def run():
                             sym, ss, _rf_order, "native_stop_discovered",
                             capital_pool=capital_pool, risk=risk,
                             alerter=alerter, trade_log=trade_log,
+                            accounting_enabled=_accounting_enabled, accounting_conn=_accounting_conn,
+                            accounting_adapter=_accounting_adapter,
                         )
                     else:
                         _process_discovered_buy_fill(
                             sym, ss, _rf_order, "native_stop_discovered",
                             capital_pool=capital_pool, risk=risk,
                             alerter=alerter, trade_log=trade_log,
+                            accounting_enabled=_accounting_enabled, accounting_conn=_accounting_conn,
+                            accounting_adapter=_accounting_adapter,
                         )
 
             # ── 1c. Position drift reconciliation (every symbol, every 120 ticks, live) ──
@@ -3561,6 +3731,8 @@ def run():
                             sym, ss, _tr_discovered, "native_stop_discovered",
                             capital_pool=capital_pool, risk=risk,
                             alerter=alerter, trade_log=trade_log,
+                            accounting_enabled=_accounting_enabled, accounting_conn=_accounting_conn,
+                            accounting_adapter=_accounting_adapter,
                         )
 
                     _partial_tp_level = (
@@ -3574,6 +3746,12 @@ def run():
                         and ss['pm'].quantity > 0
                     ):
                         _p_qty = round(ss['pm'].quantity * cfg.backtest.partial_tp_size, 6)
+                        if _accounting_enabled and _accounting_state.blocked_for_buy(sym):
+                            _p_qty = round(
+                                accounting_reconciliation.resolve_exit_quantity(
+                                    _accounting_adapter, sym, _p_qty,
+                                ), 6,
+                            )
                         if _p_qty > 0:
                             # Partial TP is an exit — classified with SL/TP, not with
                             # strategy SELLs: it bypasses the risk gate (only the halt
@@ -3616,6 +3794,8 @@ def run():
                                         sym, ss, _pt_discovered, "native_stop_discovered",
                                         capital_pool=capital_pool, risk=risk,
                                         alerter=alerter, trade_log=trade_log,
+                                        accounting_enabled=_accounting_enabled, accounting_conn=_accounting_conn,
+                                        accounting_adapter=_accounting_adapter,
                                     )
                                     print(f"           📊 PARTIAL TP [{sym}]:  {_p_qty:.6f} @ {price:,.2f}  PnL={_p_pnl:+.2f}", flush=True)
                                     logger.warning("PARTIAL TP [%s]: sold %.6f @ %.2f  pnl=%.2f", sym, _p_qty, price, _p_pnl)
@@ -3640,6 +3820,11 @@ def run():
                                         fee_currency  = _p_order.fee_currency,
                                         exec_key      = _p_order.exec_key,
                                         order_id      = _p_order.order_id,
+                                    )
+                                    _observe_live_fill(
+                                        _accounting_enabled, _accounting_conn, _accounting_adapter,
+                                        order_id=_p_order.order_id, symbol=sym, exec_key=_p_order.exec_key,
+                                        side="SELL", quantity=_p_order.quantity,
                                     )
                                     if hasattr(ss['executor'], 'ack_journal_entry'):
                                         ss['executor'].ack_journal_entry(_p_order.order_id)
@@ -3682,6 +3867,21 @@ def run():
                             )
                             print(f"           ✅ TAKE PROFIT [{sym}]  price={price:,.2f}  entry={_ic_entry:,.2f}", flush=True)
                         _ic_qty      = ss['pm'].quantity
+                        # Fresh-balance exit sizing (design §7 / money-
+                        # readiness review 2026-09-19 P1: "exit-size
+                        # reconciliation is not integrated"). Only when
+                        # accounting is enabled AND this symbol/account is
+                        # currently reconciliation-blocked — a healthy
+                        # state has no reason to spend an extra exchange
+                        # call on every SL/TP-eligible tick. Never blocks
+                        # the exit itself, never sizes ABOVE what
+                        # PositionManager already believes is held (see
+                        # resolve_exit_quantity's own docstring — external
+                        # holdings / reserved-quantity handling).
+                        if _accounting_enabled and _accounting_state.blocked_for_buy(sym):
+                            _ic_qty = accounting_reconciliation.resolve_exit_quantity(
+                                _accounting_adapter, sym, _ic_qty,
+                            )
                         # SL/TP bypasses the risk gate so stops always fire.
                         # Only when RISK_HALT_BLOCKS_STOPS=true does a manual halt suppress them.
                         _sl_tp_halted = (
@@ -3728,6 +3928,8 @@ def run():
                                         sym, ss, _ic_discovered, "native_stop_discovered",
                                         capital_pool=capital_pool, risk=risk,
                                         alerter=alerter, trade_log=trade_log,
+                                        accounting_enabled=_accounting_enabled, accounting_conn=_accounting_conn,
+                                        accounting_adapter=_accounting_adapter,
                                     )
                                 else:
                                     # Urgent market SELL only partially filled — a
@@ -3741,6 +3943,8 @@ def run():
                                         sym, ss, _ic_discovered, "native_stop_discovered",
                                         capital_pool=capital_pool, risk=risk,
                                         alerter=alerter, trade_log=trade_log,
+                                        accounting_enabled=_accounting_enabled, accounting_conn=_accounting_conn,
+                                        accounting_adapter=_accounting_adapter,
                                     )
                                 _ic_reason = (
                                     "trail_stop" if (_trail_sl_level > 0 and price <= _trail_sl_level)
@@ -3764,6 +3968,11 @@ def run():
                                     fee_currency  = _ic_order.fee_currency,
                                     exec_key      = _ic_order.exec_key,
                                     order_id      = _ic_order.order_id,
+                                )
+                                _observe_live_fill(
+                                    _accounting_enabled, _accounting_conn, _accounting_adapter,
+                                    order_id=_ic_order.order_id, symbol=sym, exec_key=_ic_order.exec_key,
+                                    side="SELL", quantity=_ic_order.quantity,
                                 )
                                 if hasattr(ss['executor'], 'ack_journal_entry'):
                                     ss['executor'].ack_journal_entry(_ic_order.order_id)
@@ -4121,6 +4330,15 @@ def run():
             _max_cash_for_sym = ss['executor'].cash
             if filtered_signal == Signal.SELL:
                 trade_qty = ss['pm'].quantity
+                # Fresh-balance exit sizing (design §7 / money-readiness
+                # review 2026-09-19 P1) — same rule as the urgent SL/TP
+                # and partial-TP exit paths: only when accounting is
+                # enabled AND this symbol/account is currently blocked,
+                # never sizing above what PositionManager already tracks.
+                if _accounting_enabled and _accounting_state.blocked_for_buy(sym):
+                    trade_qty = accounting_reconciliation.resolve_exit_quantity(
+                        _accounting_adapter, sym, trade_qty,
+                    )
             else:
                 _requested_qty = cfg.calc_trade_qty(_max_cash_for_sym, price)
                 trade_qty       = _requested_qty
@@ -4344,6 +4562,8 @@ def run():
                     capital_pool=capital_pool, risk=risk, alerter=alerter,
                     trade_log=trade_log, stuck_detector=stuck_detector,
                     is_indicator=is_indicator,
+                    accounting_enabled=_accounting_enabled, accounting_conn=_accounting_conn,
+                    accounting_adapter=_accounting_adapter,
                 )
 
             # ── 10. Position summary ──────────────────────────────────
@@ -4398,6 +4618,8 @@ def run():
                 is_indicator=is_indicator, max_concurrent=_max_conc,
                 symbol_state=symbol_state, live_exchange=live_exchange,
                 refresh_price_fn=_refresh_dynamic_price,
+                accounting_enabled=_accounting_enabled, accounting_conn=_accounting_conn,
+                accounting_adapter=_accounting_adapter,
             )
 
         # ── 0c. Dynamic universe discovery + admission/retirement ─────────
@@ -4434,32 +4656,6 @@ def run():
                 except Exception as _dyn_exc:
                     logger.warning("Dynamic universe sync failed: %s — existing positions unaffected", _dyn_exc)
                 _dynamic_last_refresh = time.time()
-
-        # ── Accounting reconciliation cycle (opt-in, additive) ────────────
-        # Runs on its own interval (cfg.accounting.reconcile_interval_s,
-        # default 1h) — independent of the candle timeframe, so it isn't
-        # gated behind "new candle" the way strategy evaluation is. Updates
-        # _accounting_state, which section 7's risk gate below consults for
-        # new BUYs only; never touches an exit. Never raises into the tick
-        # loop — a failure here is caught, logged, and leaves the PREVIOUS
-        # _accounting_state in place (fail-closed if it was already
-        # blocking something, unaffected if it wasn't).
-        if _accounting_enabled and _accounting_conn is not None:
-            if time.time() - _accounting_last_cycle > cfg.accounting.reconcile_interval_s:
-                try:
-                    _accounting_state = accounting_reconciliation.run_cycle(
-                        _accounting_adapter, _accounting_conn, trade_log,
-                        quote=_accounting_quote, symbols=list(executors.keys()),
-                        safety_margin_s=cfg.accounting.watermark_safety_margin_s,
-                    )
-                    _acct_explain = _accounting_state.explain()
-                    logger.info("Accounting reconciliation cycle: %s", _acct_explain)
-                    if _acct_explain != "ok":
-                        alerter.error(f"ACCOUNTING RECONCILIATION: {_acct_explain}")
-                except Exception as _acct_cycle_exc:
-                    logger.error("Accounting reconciliation cycle raised: %s — "
-                                 "keeping the previous cycle's block state", _acct_cycle_exc)
-                _accounting_last_cycle = time.time()
 
         # Dashboard snapshot — written HERE, after admission/retirement AND
         # ranked execution have both happened this tick, so blocked-reason
@@ -4505,7 +4701,11 @@ def run():
         # idempotent to call every tick (usually a no-op — empty lists);
         # piggybacks on this existing per-tick maintenance point rather
         # than adding a new one.
-        _replay_pending_journal_entries(executors, trade_log, alerter)
+        _replay_pending_journal_entries(
+            executors, trade_log, alerter,
+            accounting_enabled=_accounting_enabled, accounting_conn=_accounting_conn,
+            accounting_adapter=_accounting_adapter,
+        )
 
         # Daily both-bots health digest (local-time scheduled, once/day).
         _maybe_send_health_digest(

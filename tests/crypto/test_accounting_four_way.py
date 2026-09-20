@@ -81,16 +81,45 @@ def test_position_fold_diff_detects_a_wiring_bug_not_exchange_problem(tmp_path):
     assert "position-fold" in report.explain()
 
 
-def test_position_diff_ok_when_no_observed_trades_yet_pre_migration_honesty(tmp_path):
-    """Before item 8's migration has run for a symbol, observed_trades may
-    be empty even though the live position is real — this is explicitly
-    NOT treated as a diff (see diff_position_against_fold's docstring)."""
+def test_position_diff_flat_and_no_observed_trades_is_genuinely_ok(tmp_path):
+    """A symbol that has never traded (flat, zero observed_trades) has
+    nothing at risk to verify — this IS treated as healthy."""
+    conn, _ = _setup(tmp_path)
+    diff = four_way.diff_position_against_fold(
+        conn, "BTC/CAD", live_qty=0.0, live_avg_cost=0.0, live_realized_pnl=0.0,
+    )
+    assert diff.ok
+    assert "nothing at risk" in diff.reason
+
+
+def test_position_diff_not_ok_when_holding_with_zero_observed_trades(tmp_path):
+    """Money-readiness review 2026-09-19: 'do not let an empty or
+    pre-migration ledger appear healthy merely because there are no link
+    errors.' A REAL held position with zero ledger evidence (the exact
+    pre-migration gap) must NOT report ok=True."""
     conn, _ = _setup(tmp_path)
     diff = four_way.diff_position_against_fold(
         conn, "BTC/CAD", live_qty=0.05, live_avg_cost=90_000.0, live_realized_pnl=0.0,
     )
-    assert diff.ok
-    assert "nothing to diff" in diff.reason
+    assert not diff.ok
+    assert "ZERO observed_trades" in diff.reason
+
+
+def test_four_way_not_ready_when_holding_a_position_with_no_ledger_history(tmp_path):
+    """End-to-end version of the above through run_four_way_verification —
+    proves the escalation actually reaches the top-level ready/explain."""
+    conn, tl = _setup(tmp_path)
+    ex = FakeExchangeAdapter()
+    ex.deposit("CAD", 1000.0, timestamp_ms=T0)
+    state = reconciliation.run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=1, now_ms=T0 + 100)
+    assert state.explain() == "ok"
+
+    report = four_way.run_four_way_verification(
+        conn, state, symbols=["BTC/CAD"],
+        live_positions={"BTC/CAD": {"qty": 0.05, "avg_cost": 90_000.0, "realized_pnl": 0.0}},
+    )
+    assert not report.ready
+    assert "position-fold" in report.explain()
 
 
 def test_ledger_delivery_consistency_ok_after_a_clean_link(tmp_path):

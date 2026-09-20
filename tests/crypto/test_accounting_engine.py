@@ -310,6 +310,71 @@ def test_commit_checkpoint_atomic_on_injected_failure(tmp_path):
     assert row[0] is None
 
 
+def test_commit_observation_batch_atomic_on_injected_failure(tmp_path):
+    """money-readiness review 2026-09-19, P1 finding: the retrieval
+    watermark used to be committed in a SEPARATE write from the trades it
+    claims to cover — a crash between the two could advance the cursor
+    past data that was never saved. commit_observation_batch puts both in
+    ONE transaction; this proves a failure partway through (after the
+    first trade insert, before the watermark row) leaves NEITHER."""
+    db_path = str(tmp_path / "trades.db")
+    store.init_db(db_path)
+    conn = store.connect(db_path)
+    t1 = _t("T1", "O1", "BTC/CAD", "buy", 100.0, 1.0, 1000)
+    t2 = _t("T2", "O2", "BTC/CAD", "buy", 100.0, 1.0, 1001)
+
+    class _FlakyConn:
+        """sqlite3.Connection.execute is a read-only C attribute — cannot be
+        monkeypatched directly. This thin proxy forwards everything to the
+        real connection (including the `with conn:` transaction protocol)
+        except execute(), which injects a failure after the first
+        observed_trades insert."""
+        def __init__(self, real):
+            self._real = real
+            self.n = 0
+
+        def execute(self, sql, *args, **kwargs):
+            if sql.strip().startswith("INSERT INTO observed_trades"):
+                self.n += 1
+                if self.n == 2:
+                    raise RuntimeError("simulated crash mid-batch")
+            return self._real.execute(sql, *args, **kwargs)
+
+        def __enter__(self):
+            self._real.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return self._real.__exit__(exc_type, exc, tb)
+
+    flaky = _FlakyConn(conn)
+    try:
+        store.commit_observation_batch(
+            flaky, new_trades=[t1, t2], retrieval_scope="__account__",
+            window_since=None, window_until=iso(5000), checkpoint_id="CP1",
+        )
+        assert False, "expected the injected failure to propagate"
+    except RuntimeError:
+        pass
+
+    # Nothing partially persisted: not the first trade, not the second, not the checkpoint.
+    assert conn.execute("SELECT COUNT(*) FROM observed_trades").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0] == 0
+
+
+def test_commit_observation_batch_succeeds_together(tmp_path):
+    db_path = str(tmp_path / "trades.db")
+    store.init_db(db_path)
+    conn = store.connect(db_path)
+    t1 = _t("T1", "O1", "BTC/CAD", "buy", 100.0, 1.0, 1000)
+    store.commit_observation_batch(
+        conn, new_trades=[t1], retrieval_scope="__account__",
+        window_since=None, window_until=iso(5000), checkpoint_id="CP1",
+    )
+    assert store.get_observed_trade(conn, "T1") is not None
+    assert store.recover_watermark(conn, "__account__") == iso(5000)
+
+
 def test_commit_checkpoint_succeeds_and_stamps_every_covered_trade(tmp_path):
     db_path = str(tmp_path / "trades.db")
     store.init_db(db_path)

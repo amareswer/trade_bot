@@ -33,6 +33,61 @@ def _setup(tmp_path):
     return db_path, conn, tl
 
 
+def test_default_block_state_blocks_every_symbol_before_any_cycle():
+    """money-readiness review 2026-09-19, P0 finding: the bare default
+    BlockState() used to read as fully unblocked, so a BUY evaluated
+    before the very first reconciliation cycle ever ran would sail
+    through. This is the state bot/main.py must use at startup, before
+    the first cycle has had a chance to run."""
+    from bot.accounting.reconciliation import BlockState
+    fresh = BlockState()
+    assert fresh.blocked_for_buy("BTC/CAD")
+    assert fresh.blocked_for_buy("SOL/CAD")
+    assert fresh.blocked_for_buy("ANY/SYMBOL")
+    assert "no reconciliation cycle" in fresh.explain()
+
+
+def test_observation_phase_exception_returns_a_blocked_not_a_permissive_state(tmp_path):
+    """money-readiness review 2026-09-19, P0/P1: an exception during the
+    observation phase (retrieval, fee-correction sweep, or the atomic
+    commit) must come back as a BLOCKED state with reconciled=False —
+    never partially successful, never something a caller could mistake
+    for 'the previous good cycle is still valid'."""
+    _, conn, tl = _setup(tmp_path)
+
+    class _BrokenExchange:
+        def fetch_my_trades_page(self, *a, **k):
+            raise RuntimeError("simulated exchange outage")
+
+    state = run_cycle(_BrokenExchange(), conn, tl, quote="CAD", symbols=["BTC/CAD"], now_ms=T0)
+    assert not state.reconciled
+    assert state.blocked_for_buy("BTC/CAD")
+    assert "observation phase raised" in state.coverage_reason
+
+
+def test_a_successful_cycle_followed_by_a_failing_one_ends_up_blocked(tmp_path):
+    """The exact P0 scenario named in the review: cycle 1 succeeds
+    (permissive), cycle 2's exchange then fails outright — the SECOND
+    call's own return value must be blocked. (bot/main.py is responsible
+    for actually REPLACING its stored state with this return value rather
+    than defensively keeping the old one — this test proves run_cycle's
+    own contract; the main.py wiring is covered by not silently
+    swallowing a raised exception into "keep the old state".)"""
+    ex = FakeExchangeAdapter()
+    ex.deposit("CAD", 1000.0, timestamp_ms=T0)
+    _, conn, tl = _setup(tmp_path)
+    good_state = run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=1, now_ms=T0 + 100)
+    assert not good_state.blocked_for_buy("BTC/CAD")
+
+    class _NowBroken:
+        def fetch_my_trades_page(self, *a, **k):
+            raise RuntimeError("exchange now unreachable")
+
+    bad_state = run_cycle(_NowBroken(), conn, tl, quote="CAD", symbols=["BTC/CAD"], now_ms=T0 + 200)
+    assert bad_state.blocked_for_buy("BTC/CAD")
+    assert bad_state is not good_state  # a fresh object — nothing here can be "the old permissive state"
+
+
 def test_bootstrap_cycle_never_blocks_and_commits_opening_checkpoints(tmp_path):
     _, conn, tl = _setup(tmp_path)
     ex = FakeExchangeAdapter()
@@ -248,10 +303,25 @@ def test_three_restarts_recover_identical_position_purely_from_persisted_store(t
     assert fold3.realized_pnl > 0  # bought at 90k/95k, sold at 100k
 
 
-def test_resolve_exit_quantity_uses_fresh_balance_never_a_stale_local_value(tmp_path):
+def test_resolve_exit_quantity_shrinks_to_a_smaller_fresh_balance():
+    """A stale local quantity larger than what the exchange actually shows
+    (e.g. a missed correction) must shrink to the exchange-confirmed
+    reality, avoiding an oversell rejection."""
     ex = FakeExchangeAdapter()
     ex.execute_trade(symbol="BTC/CAD", side="buy", price=90_000.0, amount=0.005, timestamp_ms=T0)
-    qty = resolve_exit_quantity(ex, "BTC/CAD", fallback_qty=999.0)
+    qty = resolve_exit_quantity(ex, "BTC/CAD", tracked_qty=999.0)
+    assert abs(qty - 0.005) < 1e-9
+
+
+def test_resolve_exit_quantity_never_exceeds_tracked_qty_external_holdings():
+    """Money-readiness review 2026-09-19, P1: 'explicit handling for...
+    external holdings.' A fresh exchange balance LARGER than what the bot
+    itself tracks (someone else's coins in the same account, or an
+    under-tracked fill) must never inflate the sell size beyond what the
+    bot has a basis to claim as its own."""
+    ex = FakeExchangeAdapter()
+    ex.execute_trade(symbol="BTC/CAD", side="buy", price=90_000.0, amount=0.5, timestamp_ms=T0)
+    qty = resolve_exit_quantity(ex, "BTC/CAD", tracked_qty=0.005)
     assert abs(qty - 0.005) < 1e-9
 
 
@@ -260,7 +330,7 @@ def test_resolve_exit_quantity_falls_back_on_a_failed_fresh_read():
         def fetch_balance_total(self, asset):
             raise RuntimeError("network blip")
 
-    qty = resolve_exit_quantity(_Broken(), "BTC/CAD", fallback_qty=0.005)
+    qty = resolve_exit_quantity(_Broken(), "BTC/CAD", tracked_qty=0.005)
     assert qty == 0.005
 
 

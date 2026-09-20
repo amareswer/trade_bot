@@ -58,7 +58,18 @@ class ScopeResult:
 class BlockState:
     """The single artifact bot/main.py's BUY gate consults. Recomputed
     fresh every cycle (never incrementally mutated) — replace-in-place,
-    don't patch."""
+    don't patch.
+
+    `reconciled` defaults to False — money-readiness review 2026-09-19,
+    P0 finding: the bare-default `BlockState()` used to read as fully
+    unblocked, so a BUY evaluated before the first reconciliation cycle
+    ever completed (or right after a cycle that raised) sailed through
+    with nothing to check against. `run_cycle()` sets this True ONLY once
+    a full observation phase (coverage-proof retrieval + fee-correction
+    sweep + the atomic trade/watermark commit) has genuinely completed —
+    never on an early return, never on a caught exception. `blocked_for_buy`
+    treats "never reconciled" identically to "actively blocked"."""
+    reconciled:             bool = False
     account_cash_blocked:  bool = False
     account_cash_reason:   str  = ""
     symbol_blocked:        dict = field(default_factory=dict)   # symbol -> bool
@@ -71,15 +82,21 @@ class BlockState:
     def blocked_for_buy(self, symbol: str) -> bool:
         """§7: account-cash block covers every symbol; a coverage failure
         this cycle is treated the same way (nothing new can be trusted to
-        be reconciled while the retrieval itself is incomplete)."""
+        be reconciled while the retrieval itself is incomplete). A state
+        that has never completed a successful cycle at all — the startup
+        default, or the result of an exception this cycle — blocks every
+        symbol unconditionally (P0 fix above)."""
         return (
-            self.account_cash_blocked
+            not self.reconciled
+            or self.account_cash_blocked
             or self.coverage_blocked
             or self.symbol_blocked.get(symbol, False)
         )
 
     def explain(self) -> str:
         parts = []
+        if not self.reconciled and not self.coverage_blocked:
+            parts.append("no reconciliation cycle has completed yet")
         if self.coverage_blocked:
             parts.append(f"coverage incomplete ({self.coverage_reason})")
         if self.account_cash_blocked:
@@ -168,80 +185,90 @@ def run_cycle(
     in the call graph — this is what makes checkpoint-race and
     delayed-visibility scenarios deterministically testable instead of
     depending on real elapsed wall-clock time between test steps."""
-    state = BlockState(last_cycle_at=engine.now_iso())
+    state = BlockState(last_cycle_at=engine.now_iso())   # reconciled=False — fail-closed until proven otherwise
+
+    # ── Observation phase: retrieval, fee-correction sweep, and the
+    # atomic trade+watermark commit. Money-readiness review 2026-09-19,
+    # P1 finding: the watermark used to be committed BEFORE trades were
+    # observed and BEFORE this phase was known to succeed — a later
+    # exception could leave a durable cursor ahead of data that was never
+    # actually saved. Everything in this phase now either all commits
+    # together (store.commit_observation_batch, one transaction) or none
+    # of it does, and `state.reconciled` is set True only after that
+    # commit has actually happened — never speculatively, never on an
+    # early return or a caught exception.
     try:
         prior_watermark_iso = store.recover_watermark(conn, account_scope)
         coverage = engine.retrieve_with_coverage_proof(exchange, None, since=prior_watermark_iso)
+        if not coverage.complete:
+            state.coverage_blocked = True
+            state.coverage_reason = coverage.reason
+            return state
+
+        now_ms = now_ms if now_ms is not None else _now_ms()
+        prior_watermark_ms = engine.ts_ms(prior_watermark_iso) if prior_watermark_iso else None
+        new_watermark_ms = engine.compute_safe_watermark(
+            coverage, now_ms=now_ms, previous_watermark_ms=prior_watermark_ms,
+            safety_margin_ms=int(safety_margin_s * 1000),
+        )
+        if new_watermark_ms is None:
+            # No previous watermark AND coverage somehow incomplete is
+            # already returned above; this only remains reachable if
+            # safety_margin itself is misconfigured to exceed "now" —
+            # treat conservatively.
+            state.coverage_blocked = True
+            state.coverage_reason = "could not compute a safe watermark this cycle"
+            return state
+        new_watermark_iso = engine.iso_from_ms(new_watermark_ms)
+        # Real moment fresh_balance is captured below — DELIBERATELY
+        # separate from new_watermark_iso above. new_watermark_iso is the
+        # conservative RETRIEVAL cursor (now - safety_margin): it only
+        # bounds what `since` the NEXT cycle's account-wide fetch_my_trades
+        # pull uses, so a delayed-visibility trade keeps getting
+        # re-fetched until it appears. A per-scope checkpoint's own
+        # `window_until`, below, must instead be the ACTUAL moment its
+        # `fresh_balance` was read — using the conservative watermark
+        # there instead (an earlier bug caught while writing this)
+        # double-counts any deposit/trade whose real timestamp falls
+        # inside the safety-margin gap between the two.
+        balance_as_of_iso = engine.iso_from_ms(now_ms)
+
+        # Fee-correction / integrity-anomaly sweep over EVERY trade this
+        # fetch returned (including ones already known, inside the
+        # overlap window) — reads existing observed_trades/fee_adjustments
+        # state, unaffected by trades this cycle hasn't inserted yet.
+        sweep = _apply_fee_corrections(conn, trade_log, coverage.trades)
+
+        # Atomic: every genuinely new trade (never one flagged anomalous
+        # this cycle — it stays represented by its ORIGINAL stored
+        # payload) AND the account-wide retrieval-watermark commit,
+        # together, in one transaction.
+        new_trades = [t for t in coverage.trades if t.trade_id not in sweep.anomalous_trade_ids]
+        checkpoint_id = engine.new_checkpoint_id()
+        store.commit_observation_batch(
+            conn, new_trades=new_trades, retrieval_scope=account_scope,
+            window_since=prior_watermark_iso, window_until=new_watermark_iso,
+            checkpoint_id=checkpoint_id,
+        )
+        state.reconciled = True
     except Exception as exc:
         state.coverage_blocked = True
-        state.coverage_reason = f"retrieval raised: {exc}"
+        state.coverage_reason = f"observation phase raised: {exc}"
         return state
 
-    if not coverage.complete:
-        state.coverage_blocked = True
-        state.coverage_reason = coverage.reason
-        return state
-
-    now_ms = now_ms if now_ms is not None else _now_ms()
-    prior_watermark_ms = engine.ts_ms(prior_watermark_iso) if prior_watermark_iso else None
-    new_watermark_ms = engine.compute_safe_watermark(
-        coverage, now_ms=now_ms, previous_watermark_ms=prior_watermark_ms,
-        safety_margin_ms=int(safety_margin_s * 1000),
-    )
-    if new_watermark_ms is None:
-        # No previous watermark AND coverage somehow incomplete is already
-        # returned above; this only remains reachable if safety_margin
-        # itself is misconfigured to exceed "now" — treat conservatively.
-        state.coverage_blocked = True
-        state.coverage_reason = "could not compute a safe watermark this cycle"
-        return state
-    new_watermark_iso = engine.iso_from_ms(new_watermark_ms)
-    # Real moment fresh_balance is captured below — DELIBERATELY separate
-    # from new_watermark_iso above. new_watermark_iso is the conservative
-    # RETRIEVAL cursor (now - safety_margin): it only bounds what `since`
-    # the NEXT cycle's account-wide fetch_my_trades pull uses, so a
-    # delayed-visibility trade keeps getting re-fetched until it appears.
-    # A per-scope checkpoint's own `window_until`, below, must instead be
-    # the ACTUAL moment its `fresh_balance` was read — using the
-    # conservative watermark there instead (an earlier bug caught while
-    # writing this) double-counts any deposit/trade whose real timestamp
-    # falls inside the safety-margin gap between the two: it's already
-    # baked into `fresh_balance` (read at real "now") but its own
-    # timestamp is still later than the conservative watermark, so a
-    # naive `since=watermark` re-fetch of deposits/trades next cycle would
-    # count it a SECOND time on top of a prior_balance that already
-    # reflects it.
-    balance_as_of_iso = engine.iso_from_ms(now_ms)
-
-    # Persist the account-wide retrieval watermark itself (a separate,
-    # dedicated checkpoint scope — balance_after/covered_trade_ids are
-    # unused for this row, it exists purely so store.recover_watermark()
-    # has something to recover on the next cycle/restart).
-    store.commit_checkpoint(
-        conn, currency_scope=account_scope, window_since=prior_watermark_iso,
-        window_until=new_watermark_iso, balance_after=0.0, covered_trade_ids=[],
-        checkpoint_id=engine.new_checkpoint_id(),
-    )
-
-    # Fee-correction / integrity-anomaly sweep over EVERY trade this fetch
-    # returned (including ones already known, inside the overlap window).
-    sweep = _apply_fee_corrections(conn, trade_log, coverage.trades)
-
-    # Observe every genuinely new trade — but never one flagged anomalous
-    # this cycle (it's already represented by its ORIGINAL stored payload;
-    # upserting is a no-op for an already-known trade_id anyway, this
-    # `continue` is just explicit about why).
-    for t in coverage.trades:
-        if t.trade_id in sweep.anomalous_trade_ids:
-            continue
-        store.upsert_observed_trade(conn, t)
-
-    # -- account cash (once, shared across every symbol) -----------------
-    cash_result = _reconcile_scope(
-        conn, exchange, scope="CAD", asset=quote, side_asset_is_quote=True,
-        window_until_iso=balance_as_of_iso, symbols_for_scope=symbols,
-        tolerance=exchange.cash_tolerance(quote) if hasattr(exchange, "cash_tolerance") else 0.005,
-    )
+    # ── Balance-identity phase: each scope is checked and isolated
+    # independently — a scope's own exception (e.g. a transient
+    # fetch_balance_total failure) blocks ONLY that scope, never aborts
+    # the whole cycle (which would otherwise silently skip every OTHER
+    # scope's check this cycle) and never gets treated as a pass either.
+    try:
+        cash_result = _reconcile_scope(
+            conn, exchange, scope="CAD", asset=quote, side_asset_is_quote=True,
+            window_until_iso=balance_as_of_iso, symbols_for_scope=symbols,
+            tolerance=exchange.cash_tolerance(quote) if hasattr(exchange, "cash_tolerance") else 0.005,
+        )
+    except Exception as exc:
+        cash_result = ScopeResult(scope="CAD", blocked=True, reason=f"cash scope check raised: {exc}")
     state.account_cash_blocked = cash_result.blocked
     state.account_cash_reason  = cash_result.reason
     state.scope_results.append(cash_result)
@@ -250,10 +277,13 @@ def run_cycle(
     for sym in symbols:
         base = base_asset(sym)
         tol = exchange.amount_tolerance(sym) if hasattr(exchange, "amount_tolerance") else 1e-8
-        sym_result = _reconcile_scope(
-            conn, exchange, scope=sym, asset=base, side_asset_is_quote=False,
-            window_until_iso=balance_as_of_iso, symbols_for_scope=[sym], tolerance=tol,
-        )
+        try:
+            sym_result = _reconcile_scope(
+                conn, exchange, scope=sym, asset=base, side_asset_is_quote=False,
+                window_until_iso=balance_as_of_iso, symbols_for_scope=[sym], tolerance=tol,
+            )
+        except Exception as exc:
+            sym_result = ScopeResult(scope=sym, blocked=True, reason=f"scope check raised: {exc}")
         state.symbol_blocked[sym] = sym_result.blocked
         state.symbol_reason[sym]  = sym_result.reason
         state.scope_results.append(sym_result)
@@ -337,18 +367,42 @@ def _reconcile_scope(
     return ScopeResult(scope=scope, blocked=False, residual=result.residual)
 
 
-def resolve_exit_quantity(exchange: ExchangeAdapter, symbol: str, fallback_qty: float) -> float:
+def resolve_exit_quantity(exchange: ExchangeAdapter, symbol: str, tracked_qty: float) -> float:
     """design §7: reconciliation-blocked prevents advancing derived
     accounting/journal state on ambiguous evidence; it must NEVER prevent
     refreshing the exchange-authoritative quantity used to size an actual
     exit. Callers sizing a protective SELL while ANY block flag is set
-    should use this instead of a locally-derived position quantity. Falls
-    back to `fallback_qty` (whatever the caller already had) if the fresh
-    read itself fails — an exit must still have SOME number to act on, and
-    a failed fresh read is a worse moment to give up sizing an exit
-    entirely than to fall back to the last-known value."""
+    should use this instead of a locally-derived position quantity.
+
+    Money-readiness review 2026-09-19, P1 finding ("explicit handling for
+    reserved quantities, external holdings, and failed fresh reads"):
+
+    - Reserved quantities: fetch_balance_total() reads the exchange's
+      `total` (design §6 — never `free`/`used`), the same figure a
+      resting native stop's 100%-reservation doesn't reduce. The exit's
+      own order placement already cancels any resting native stop BEFORE
+      selling (bot/execution/live_executor.py, the 2026-08-27 deadlock
+      fix), so by the time this quantity is actually used the reservation
+      is gone — sizing against `total` up front is correct, not a race.
+    - External holdings: the fresh EXCHANGE balance can legitimately be
+      LARGER than `tracked_qty` — someone else's coins in the same
+      account (ADOPT_EXTERNAL_HOLDINGS=false, the default) or an
+      under-tracked fill — and this function must never let an
+      unreconciled accounting state cause the bot to sell more than it
+      itself believes it owns. The result is therefore capped at
+      `min(fresh, tracked_qty)`: only ever corrects DOWNWARD, toward
+      exchange-confirmed reality (protecting against a stale/overstated
+      local quantity that would otherwise get rejected as an oversell),
+      never upward into inventory the bot has no basis to claim.
+    - Failed fresh reads: falls back to `tracked_qty` unchanged — an exit
+      must still have SOME number to act on, and a failed fresh read is a
+      worse moment to give up sizing an exit entirely than to fall back
+      to the last-known value."""
     try:
         base = base_asset(symbol)
-        return exchange.fetch_balance_total(base)
+        fresh = exchange.fetch_balance_total(base)
     except Exception:
-        return fallback_qty
+        return tracked_qty
+    if fresh < 0:
+        return tracked_qty
+    return min(fresh, tracked_qty)

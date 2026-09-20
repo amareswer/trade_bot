@@ -148,6 +148,51 @@ def upsert_observed_trade(conn: sqlite3.Connection, trade: ObservedTrade) -> boo
     return True
 
 
+def commit_observation_batch(
+    conn: sqlite3.Connection, *, new_trades: list[ObservedTrade], retrieval_scope: str,
+    window_since: Optional[str], window_until: str, checkpoint_id: str,
+) -> None:
+    """Atomically inserts every newly-observed trade AND the account-wide
+    RETRIEVAL-WATERMARK checkpoint row in ONE transaction (money-readiness
+    review 2026-09-19, P1 finding: "the account watermark is committed
+    before the cycle has reconciled successfully... later failures can
+    leave a durable cursor ahead of uncommitted observations"). Either
+    every trade in `new_trades` AND the watermark checkpoint are all
+    durably persisted together, or NONE of them are — a crash or exception
+    partway through can never advance the retrieval cursor past a trade
+    that didn't actually get saved.
+
+    This is intentionally a DIFFERENT checkpoint row than commit_checkpoint
+    (which records a currency-scope's own balance-identity checkpoint) —
+    `retrieval_scope` is the account-wide cursor scope
+    (reconciliation.py's `account_scope`, "__account__"), with
+    `balance_after=0.0` and `covered_trade_ids=[]` (unused for this row;
+    it exists purely so recover_watermark() has something to recover)."""
+    with conn:
+        for t in new_trades:
+            existing = conn.execute(
+                "SELECT 1 FROM observed_trades WHERE trade_id = ?", (t.trade_id,)
+            ).fetchone()
+            if existing is not None:
+                continue
+            conn.execute(
+                """
+                INSERT INTO observed_trades
+                    (trade_id, order_id, symbol, side, price, amount, cost,
+                     fee_cost, fee_currency, exchange_timestamp, observed_at, source)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (t.trade_id, t.order_id, t.symbol, t.side, t.price, t.amount, t.cost,
+                 t.fee_cost, t.fee_currency, t.exchange_timestamp, _now_iso(), t.source),
+            )
+        conn.execute(
+            "INSERT INTO checkpoints (checkpoint_id, currency_scope, window_since, "
+            "window_until, balance_after, covered_trade_ids, committed_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (checkpoint_id, retrieval_scope, window_since, window_until, 0.0, "[]", _now_iso()),
+        )
+
+
 def get_observed_trade(conn: sqlite3.Connection, trade_id: str) -> Optional[ObservedTrade]:
     row = conn.execute(
         "SELECT trade_id, order_id, symbol, side, price, amount, cost, fee_cost, "
