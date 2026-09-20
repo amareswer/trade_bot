@@ -2844,24 +2844,24 @@ def run():
 
     # ── Execution-accounting reconciliation (added 2026-09-19, opt-in) ──────
     # See bot/accounting/ package docstring + CRYPTO_BOT_EXECUTION_ACCOUNTING_
-    # DESIGN_2026-09-19.md (+ two review rounds). cfg.accounting.enabled
-    # defaults False — with it False, none of this executes and behavior is
-    # byte-identical to before this feature existed (no new import side
-    # effect beyond the module import itself, no new file created, no new
-    # network call). Even enabled, this subsystem only ever ADDS a new BUY
-    # block condition on top of every existing gate (risk_manager,
-    # capital_pool, state_machine, candle-watchdog, ...) — it never loosens
-    # anything, never touches logs/HALT, and never blocks an exit (see
-    # accounting_reconciliation.resolve_exit_quantity, not yet wired into a
-    # specific exit call site this pass — a deliberate, documented scope
-    # limit, not an oversight: exits already work off the executor's own
-    # already-fetched position, and design §7 only requires that a BLOCKED
-    # state must never ITSELF prevent sizing an exit, which it doesn't,
-    # since nothing here touches the exit path at all).
+    # DESIGN_2026-09-19.md (+ four money-readiness review rounds,
+    # 2026-09-19/20). cfg.accounting.enabled defaults False — with it False,
+    # none of this executes and behavior is byte-identical to before this
+    # feature existed (no new import side effect beyond the module import
+    # itself, no new file created, no new network call). Even enabled, this
+    # subsystem only ever ADDS a new BUY block condition on top of every
+    # existing gate (risk_manager, capital_pool, state_machine,
+    # candle-watchdog, ...) — it never loosens anything, never touches
+    # logs/HALT, and never BLOCKS an exit outright: it can only re-SIZE one
+    # downward (accounting_reconciliation.resolve_exit_quantity, wired into
+    # all three crypto exit-sizing paths — urgent SL/TP, partial-TP, and the
+    # ordinary strategy SELL — active whenever accounting is enabled and the
+    # symbol/account is currently blocked-or-stale; see each call site's own
+    # comment), never above what PositionManager already tracks.
     _accounting_enabled     = cfg.accounting.enabled and cfg.exchange.live_trading and live_exchange is not None
     _accounting_conn        = None
     _accounting_adapter     = None
-    _accounting_state       = AccountingBlockState()   # unblocked default until the first cycle completes
+    _accounting_state       = AccountingBlockState()   # fully blocked until the first successful cycle completes
     _accounting_last_cycle  = 0.0
     _accounting_quote       = list(executors.keys())[0].split("/")[1] if executors else "CAD"
     # Freshness deadline (money-readiness review 2026-09-20, P1): a clean

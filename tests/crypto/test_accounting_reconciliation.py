@@ -595,3 +595,131 @@ def test_straggler_linking_crash_leaves_no_partial_link(tmp_path):
     # Retry succeeds cleanly.
     store.link_trade_to_fill(conn, "T-crash", fill_row["id"])
     assert store.is_ledger_represented(conn, "T-crash")
+
+
+def test_multi_trade_straggler_match_crash_leaves_no_partial_link(tmp_path):
+    """money-readiness review 2026-09-20, P1 (second follow-up round): a
+    legacy fills row that matches TWO trades used to link them in
+    separate per-trade transactions — a crash after the first left the
+    fill permanently unresolvable (unlinked_fills() excludes any fill
+    with even one link, so the second trade could never be reconsidered).
+    Proves the whole matched group now links in ONE transaction: nothing
+    partially persists, and a clean retry links BOTH trades together."""
+    db_path, conn, tl = _setup(tmp_path)
+    # A legacy fills row worth 0.002 total qty / 0.18 total fee — matches
+    # the SUM of two real trades, not either one alone.
+    tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.002, price=90_000.0,
+                fee_cost=0.18, fee_currency="CAD", exec_key="uuid-multi",
+                order_id="ORD1", timestamp=engine.iso_from_ms(T0 + 1000))
+    fill_row = store.fills_row_by_exec_key(conn, "uuid-multi")
+    t1 = engine.ObservedTrade(
+        trade_id="T1", order_id="ORD1", symbol="BTC/CAD", side="buy",
+        price=90_000.0, amount=0.001, cost=90.0, fee_cost=0.09, fee_currency="CAD",
+        exchange_timestamp=engine.iso_from_ms(T0 + 999), source="live",
+    )
+    t2 = engine.ObservedTrade(
+        trade_id="T2", order_id="ORD1", symbol="BTC/CAD", side="buy",
+        price=90_000.0, amount=0.001, cost=90.0, fee_cost=0.09, fee_currency="CAD",
+        exchange_timestamp=engine.iso_from_ms(T0 + 1001), source="live",
+    )
+    store.upsert_observed_trade(conn, t1)
+    store.upsert_observed_trade(conn, t2)
+
+    # Fail on the SECOND trade_fill_links insert — i.e. after T1 would
+    # have linked but before T2 does, exactly the partial-link scenario.
+    flaky = FlakyConn(conn, match_prefix="INSERT OR IGNORE INTO trade_fill_links", fail_on_nth_match=2)
+    try:
+        store.link_trades_to_fill(flaky, ["T1", "T2"], fill_row["id"])
+        assert False, "expected the injected failure to propagate"
+    except RuntimeError:
+        pass
+
+    # Nothing partially persisted — NEITHER trade is linked.
+    assert not store.is_ledger_represented(conn, "T1")
+    assert not store.is_ledger_represented(conn, "T2")
+    assert store.trade_ids_for_fill(conn, fill_row["id"]) == []
+    # And the fill still shows up as unlinked — recoverable, not orphaned.
+    assert any(r["id"] == fill_row["id"] for r in store.unlinked_fills(conn, "BTC/CAD"))
+
+    # Clean retry links BOTH together.
+    store.link_trades_to_fill(conn, ["T1", "T2"], fill_row["id"])
+    assert store.is_ledger_represented(conn, "T1")
+    assert store.is_ledger_represented(conn, "T2")
+    assert sorted(store.trade_ids_for_fill(conn, fill_row["id"])) == ["T1", "T2"]
+
+
+def test_straggler_matching_through_run_cycle_survives_a_crash_mid_multi_link(tmp_path):
+    """End-to-end version through run_cycle/_link_stragglers: a two-trade
+    match crashes mid-link; the cycle reports it blocked (not silently
+    partial), and the NEXT cycle (no injected failure) finds and links
+    the complete group in one shot — proving the fill was never made
+    unrecoverable by the crash."""
+    db_path, conn, tl = _setup(tmp_path)
+    tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.002, price=90_000.0,
+                fee_cost=0.18, fee_currency="CAD", exec_key="uuid-e2e-multi",
+                order_id="ORD1", timestamp=engine.iso_from_ms(T0 + 1000))
+    fill_row = store.fills_row_by_exec_key(conn, "uuid-e2e-multi")
+
+    ex = FakeExchangeAdapter()
+    ex.deposit("CAD", 1000.0, timestamp_ms=T0)
+    run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 100)
+    ex.execute_trade(symbol="BTC/CAD", side="buy", price=90_000.0, amount=0.001,
+                      timestamp_ms=T0 + 999, order_id="ORD1", fee_cost=0.09, fee_currency="CAD")
+    ex.execute_trade(symbol="BTC/CAD", side="buy", price=90_000.0, amount=0.001,
+                      timestamp_ms=T0 + 1001, order_id="ORD1", fee_cost=0.09, fee_currency="CAD")
+
+    flaky_conn = FlakyConn(conn, match_prefix="INSERT OR IGNORE INTO trade_fill_links", fail_on_nth_match=2)
+    # _link_stragglers itself catches nothing internally on purpose — its
+    # OWN caller (run_cycle) wraps it; the crash must not corrupt the
+    # cycle's otherwise-successful observation phase.
+    run_cycle(ex, flaky_conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 2000)
+    assert store.trade_ids_for_fill(conn, fill_row["id"]) == []
+
+    state = run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 3000)
+    assert state.explain() == "ok"
+    assert sorted(store.trade_ids_for_fill(conn, fill_row["id"])) == \
+        sorted(t.trade_id for t in store.load_observed_trades(conn, "BTC/CAD"))
+
+
+def test_straggler_matching_uses_correction_adjusted_effective_fee(tmp_path):
+    """money-readiness review 2026-09-20, P1 (second follow-up round):
+    matching used to compare a fills row's fee against each candidate's
+    FROZEN ORIGINAL fee_cost — a trade whose fee was corrected after
+    being observed would be wrongly rejected as non-conserving even
+    though its CURRENT effective fee matches exactly."""
+    _, conn, tl = _setup(tmp_path)
+    # The legacy fills row reflects the CORRECTED fee total (0.15), not
+    # the original (0.09) — exactly the real-world case: Kraken settled a
+    # higher final fee after the trade first executed.
+    tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.001, price=90_000.0,
+                fee_cost=0.15, fee_currency="CAD", exec_key="uuid-corrected",
+                order_id="ORD1", timestamp=engine.iso_from_ms(T0 + 1000))
+    fill_row = store.fills_row_by_exec_key(conn, "uuid-corrected")
+
+    t = engine.ObservedTrade(
+        trade_id="T-corr", order_id="ORD1", symbol="BTC/CAD", side="buy",
+        price=90_000.0, amount=0.001, cost=90.0, fee_cost=0.09, fee_currency="CAD",
+        exchange_timestamp=engine.iso_from_ms(T0 + 1000), source="live",
+    )
+    store.upsert_observed_trade(conn, t)
+    # Record the correction directly (the same mechanism
+    # _apply_fee_corrections/commit_observation_batch would have used).
+    store.commit_observation_batch(
+        conn, new_trades=[], retrieval_scope="__account__", window_since=None,
+        window_until=engine.iso_from_ms(T0 + 2000), checkpoint_id="CPX",
+        fee_corrections=[store.FeeCorrectionWrite(
+            order_id="ORD1", symbol="BTC/CAD", delta_fee=0.06, fee_currency="CAD",
+            adjustment_id="T-corr:fee_correction:1",
+        )],
+    )
+    assert store.fee_correction_deltas_for_trade(conn, "T-corr") == [0.06]
+
+    from bot.accounting.reconciliation import _link_stragglers
+    result = _link_stragglers(conn, ["BTC/CAD"])
+    assert "BTC/CAD" not in result.blocked, result.blocked
+    assert store.is_ledger_represented(conn, "T-corr")
+    assert store.trade_ids_for_fill(conn, fill_row["id"]) == ["T-corr"]
+    # The stored observed_trades row itself is untouched — still the
+    # original, frozen fee.
+    stored = store.get_observed_trade(conn, "T-corr")
+    assert stored.fee_cost == 0.09

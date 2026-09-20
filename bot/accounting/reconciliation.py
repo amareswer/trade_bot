@@ -36,7 +36,10 @@ run_cycle() is the one entry point bot/main.py calls periodically
      kwargs — money-readiness review 2026-09-20 P1: a successful cycle
      used to authorize BUYs indefinitely until the NEXT scheduled cycle
      happened to run, with no independent staleness check of its own).
-     Exits are NEVER gated by this (see resolve_exit_quantity()).
+     Exits are NEVER BLOCKED by this — resolve_exit_quantity(), wired into
+     every crypto exit-sizing path in bot/main.py, can only RE-SIZE an
+     exit downward toward a fresh, tracked-qty-capped exchange balance; it
+     never prevents, delays, or enlarges one.
 
 Bootstrap (first-ever cycle for a scope, no committed checkpoint yet): there
 is no trustworthy prior balance to diff against without item 8's migration
@@ -404,6 +407,30 @@ class StragglerLinkResult:
     blocked: "dict[str, str]" = field(default_factory=dict)        # symbol -> reason (last blocking reason this cycle)
 
 
+def _effective_fee_trades(conn, trades: "list[ObservedTrade]") -> "list[ObservedTrade]":
+    """Returns trades with fee_cost replaced by the CURRENT correction-
+    adjusted effective fee (engine.effective_fee_cost over
+    store.fee_correction_deltas_for_trade) — the immutable stored
+    observed_trades row is never modified; this builds fresh copies for
+    matching/folding purposes only. Same transformation
+    four_way.diff_position_against_fold already applies before calling
+    engine.recover_position — money-readiness review 2026-09-20, P1:
+    _link_stragglers previously matched against the FROZEN ORIGINAL
+    fee_cost, so a trade whose fee was corrected after being observed
+    could be wrongly rejected as non-conserving against a fills row that
+    reflects (or itself later reconciles to) the corrected total."""
+    out = []
+    for t in trades:
+        deltas = store.fee_correction_deltas_for_trade(conn, t.trade_id)
+        effective_fee = engine.effective_fee_cost(t.fee_cost, deltas)
+        out.append(engine.ObservedTrade(
+            trade_id=t.trade_id, order_id=t.order_id, symbol=t.symbol, side=t.side,
+            price=t.price, amount=t.amount, cost=t.cost, fee_cost=effective_fee,
+            fee_currency=t.fee_currency, exchange_timestamp=t.exchange_timestamp, source=t.source,
+        ))
+    return out
+
+
 def _link_stragglers(conn, symbols: "list[str]", *, window_s: float = 300.0) -> StragglerLinkResult:
     """Delayed-visibility straggler linking (money-readiness review
     2026-09-20, P1: "the periodic reconciliation cycle does not implement
@@ -411,13 +438,27 @@ def _link_stragglers(conn, symbols: "list[str]", *, window_s: float = 300.0) -> 
     with no trade_fill_links row yet (store.unlinked_fills) and tries to
     match each one against currently-unlinked observed_trades using the
     SAME exact-conservation matcher migration.py uses
-    (engine.match_legacy_fill) — never a nearest-timestamp guess.
+    (engine.match_legacy_fill) — never a nearest-timestamp guess. Matching
+    uses each candidate's CURRENT, correction-adjusted effective fee
+    (_effective_fee_trades) — never the frozen original — so a trade whose
+    fee was corrected after observation still matches correctly (a second
+    money-readiness review 2026-09-20 P1 finding, fixed alongside the
+    atomicity one below).
 
     Idempotent: an already-linked trade is excluded from the candidate
     pool (store.already_linked_trade_ids, refreshed after each successful
     link within this same call so two fills rows in one cycle can never
     both claim the same trade), and a fills row with nothing new to link
     against is silently skipped, not re-reported, every subsequent call.
+
+    A matched GROUP (possibly several trades for one fills row) links via
+    store.link_trades_to_fill — ONE transaction for the whole group, never
+    a per-trade loop of independent commits (a third money-readiness
+    review 2026-09-20 P1 finding: a crash between two of a multi-trade
+    group's per-trade commits used to leave the fills row PARTIALLY
+    linked — and because store.unlinked_fills() excludes any fill with
+    even one link row, that partial match became permanently invisible to
+    future re-matching, with the remaining trade(s) never reconsidered).
 
     "no candidate trades in window" is NOT reported as blocked — it is the
     ORDINARY, expected state for a fill whose real trade simply hasn't
@@ -432,7 +473,8 @@ def _link_stragglers(conn, symbols: "list[str]", *, window_s: float = 300.0) -> 
         unlinked_rows = store.unlinked_fills(conn, sym)
         if not unlinked_rows:
             continue
-        candidate_trades = [t for t in store.load_observed_trades(conn, sym) if t.trade_id not in already_linked]
+        raw_candidates = [t for t in store.load_observed_trades(conn, sym) if t.trade_id not in already_linked]
+        candidate_trades = _effective_fee_trades(conn, raw_candidates)
         for row in unlinked_rows:
             unlinked = UnlinkedFill.from_fills_row(row, window_s=window_s)
             match = engine.match_legacy_fill(unlinked, candidate_trades, already_linked=already_linked)
@@ -440,9 +482,7 @@ def _link_stragglers(conn, symbols: "list[str]", *, window_s: float = 300.0) -> 
                 if match.reason != "no candidate trades in window":
                     result.blocked[sym] = f"fills.id={match.fill_id}: {match.reason}"
                 continue
-            matched = [t for t in candidate_trades if t.trade_id in match.matched_trade_ids]
-            for t in matched:
-                store.link_trade_to_fill(conn, t.trade_id, match.fill_id)
+            store.link_trades_to_fill(conn, match.matched_trade_ids, match.fill_id)
             result.linked.setdefault(sym, []).extend(match.matched_trade_ids)
             already_linked = already_linked | set(match.matched_trade_ids)
             candidate_trades = [t for t in candidate_trades if t.trade_id not in match.matched_trade_ids]

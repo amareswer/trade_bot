@@ -561,17 +561,22 @@ class DynamicUniverseConfig:
 @dataclass
 class AccountingConfig:
     """Config for the execution-accounting reconciliation layer (added
-    2026-09-19 — CRYPTO_BOT_EXECUTION_ACCOUNTING_DESIGN_2026-09-19.md and its
-    two review rounds). Entirely additive: `enabled=False` (the default)
-    means `bot/main.py` never constructs the accounting store/reconciler at
-    all — zero behavior change for anyone who hasn't touched this section.
+    2026-09-19 — CRYPTO_BOT_EXECUTION_ACCOUNTING_DESIGN_2026-09-19.md and four
+    money-readiness review rounds, 2026-09-19/20). Entirely additive:
+    `enabled=False` (the default) means `bot/main.py` never constructs the
+    accounting store/reconciler at all — zero behavior change for anyone who
+    hasn't touched this section.
 
     Even with `enabled=True`, this subsystem can only ever ADD a new BUY
     block condition (symbol_reconciliation_blocked / account_cash_
     reconciliation_blocked) on top of every existing gate — it never
-    unblocks anything, never resizes a position, and never touches
-    logs/HALT. Exits are explicitly never blocked by it (see
-    bot/accounting/reconciliation.py's own docstring).
+    unblocks anything and never touches logs/HALT. Exits are explicitly
+    never BLOCKED by it — but an exit's sizing CAN be re-capped downward,
+    toward a fresh exchange balance, while the relevant symbol/account is
+    blocked or stale (bot/accounting/reconciliation.resolve_exit_quantity,
+    wired into every crypto exit-sizing path in bot/main.py); it never
+    sizes an exit above what PositionManager already tracks, and it can
+    only shrink a size, never enlarge or cancel one.
 
     Tier A (fetch_ledger, requires Kraken's "Query Ledger Entries"
     permission) is NOT implemented in this pass — per the design's §11,

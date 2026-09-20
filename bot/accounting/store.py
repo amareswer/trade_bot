@@ -277,17 +277,43 @@ def link_trade_to_fill(conn: sqlite3.Connection, trade_id: str, fill_id: int) ->
     """Links trade_id to an EXISTING fills.id row and marks the observed
     trade ledger-written, in one transaction — the atomic-write invariant
     design §3.1 demands for the ledger-written obligation. Idempotent:
-    linking the same (trade_id, fill_id) pair twice is a no-op."""
+    linking the same (trade_id, fill_id) pair twice is a no-op.
+
+    Single-trade convenience wrapper around link_trades_to_fill — use THAT
+    directly for a multi-trade match (money-readiness review 2026-09-20,
+    P1: calling this in a loop, once per trade, let a crash between calls
+    leave a fills row PARTIALLY linked — and because store.unlinked_fills()
+    excludes any fill with even one trade_fill_links row, that partial
+    match becomes permanently invisible to future re-matching, with the
+    remaining trade(s) never reconsidered)."""
+    link_trades_to_fill(conn, [trade_id], fill_id)
+
+
+def link_trades_to_fill(conn: sqlite3.Connection, trade_ids: "list[str]", fill_id: int) -> None:
+    """Links EVERY trade_id in a matched multi-trade group to the SAME
+    EXISTING fills.id row, and marks each ledger-written, all in ONE
+    transaction (money-readiness review 2026-09-20, P1 — see
+    link_trade_to_fill's docstring for the exact failure this closes: a
+    crash after linking only SOME of a matched group's trades left the
+    fill permanently un-reconsiderable, since store.unlinked_fills()
+    treats "has any link at all" as "already resolved"). Either the WHOLE
+    matched set links together, or none of it does — there is no
+    partially-linked state a restart could ever observe. Idempotent per
+    trade_id (INSERT OR IGNORE), so re-submitting an already-fully-linked
+    group is a safe no-op."""
+    if not trade_ids:
+        return
     with conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO trade_fill_links (trade_id, fill_id, linked_at) VALUES (?,?,?)",
-            (trade_id, fill_id, _now_iso()),
-        )
-        conn.execute(
-            "UPDATE observed_trades SET ledger_written_at = COALESCE(ledger_written_at, ?) "
-            "WHERE trade_id = ?",
-            (_now_iso(), trade_id),
-        )
+        for trade_id in trade_ids:
+            conn.execute(
+                "INSERT OR IGNORE INTO trade_fill_links (trade_id, fill_id, linked_at) VALUES (?,?,?)",
+                (trade_id, fill_id, _now_iso()),
+            )
+            conn.execute(
+                "UPDATE observed_trades SET ledger_written_at = COALESCE(ledger_written_at, ?) "
+                "WHERE trade_id = ?",
+                (_now_iso(), trade_id),
+            )
 
 
 def linked_fill_ids_for_trades(conn: sqlite3.Connection, trade_ids: list[str]) -> set[int]:

@@ -24,20 +24,39 @@ Package layout:
                           (ccxt's unified fetch_my_trades does not paginate
                           or expose Kraken's own `count` — see the module
                           docstring and design §1).
-    reconciliation.py  — the per-cycle orchestration: pull → observe → check
-                          → checkpoint → block/unblock. This is what
-                          bot/main.py calls periodically.
+    reconciliation.py  — the per-cycle orchestration: pull → observe/link →
+                          check → checkpoint → block/unblock. This is what
+                          bot/main.py calls periodically, right before the
+                          per-symbol BUY-gate loop each tick. Also runs the
+                          delayed-visibility straggler linker
+                          (_link_stragglers, reuses engine.match_legacy_fill)
+                          every cycle, and exposes resolve_exit_quantity() —
+                          wired into all three crypto exit-sizing paths in
+                          bot/main.py (urgent SL/TP, partial-TP, ordinary
+                          strategy SELL) to re-size (never block) an exit off
+                          a fresh, tracked-qty-capped exchange balance while
+                          the relevant symbol/account is blocked or stale.
+    four_way.py         — joint verification (exchange data / executor state /
+                          PositionManager+CapitalPool / SQLite), consulted by
+                          bot/main.py's reconciliation cycle every time it
+                          runs — a failure here escalates the SAME BlockState
+                          the BUY gate already checks, not a separate report.
     live_observe.py    — synchronous, per-fill observation: right after an
                           ordinary live fill is confirmed and logged, look up
                           its REAL exchange trade id(s) by order_id (exact,
                           not ambiguous — the order_id is already known) and
-                          link them. This is the common case; reconciliation
-                          cycles handle whatever this misses (e.g. a
+                          link them. This is the common case; the periodic
+                          reconciliation cycle's straggler linker (above)
+                          handles whatever this misses (e.g. a
                           broker-triggered native-stop fill, a fetch delay).
     migration.py        — one-time historical backfill (§3.3 / item 8):
                           conservation-based matching, blocks ambiguous rows.
 
-Nothing in this package is imported by bot/main.py or bot/execution/
-live_executor.py unless cfg.accounting.enabled is True — see AccountingConfig
-in config.py. logs/HALT is never read or written here.
+bot/main.py imports this package's modules unconditionally at load time (an
+ordinary Python import, not itself gated) — but constructs the store/adapter
+and runs any cycle, BUY-gate check, or exit-sizing call ONLY when
+cfg.accounting.enabled is True (see AccountingConfig in config.py); with it
+False, every accounting-related code path in bot/main.py is a no-op and
+behavior is byte-identical to before this feature existed. logs/HALT is
+never read or written anywhere in this package.
 """
