@@ -405,7 +405,16 @@ def recover_position(trades: "list[ObservedTrade]") -> FoldResult:
 @dataclass
 class UnlinkedFill:
     """Adapts a real `fills` row (dict, store.unlinked_fills) into the
-    shape the conservation matcher needs."""
+    shape the conservation matcher needs.
+
+    cost and order_id (accounting review follow-up, 2026-09-20, P1) are
+    NOT optional decoration — without them the matcher below only conserves
+    quantity+fee, which a real reproduction showed accepts a completely
+    wrong candidate (same quantity and fee, unrelated price/order) as an
+    unambiguous match. cost defaults to 0.0 and order_id to None for the
+    rare legacy row where neither is available (true pre-order-tracking
+    history) — see match_legacy_fill's docstring for exactly how those
+    defaults degrade the check rather than silently skipping it."""
     fill_id: int
     symbol: str
     side: str                  # "buy" / "sell" (lowercased from fills.side)
@@ -413,6 +422,8 @@ class UnlinkedFill:
     fee_cost: float
     window_start_ms: int
     window_end_ms: int
+    cost: float = 0.0
+    order_id: "str | None" = None
 
     @classmethod
     def from_fills_row(cls, row: dict, *, window_s: float = 300.0) -> "UnlinkedFill":
@@ -421,6 +432,7 @@ class UnlinkedFill:
             fill_id=row["id"], symbol=row["symbol"], side=(row["side"] or "").lower(),
             quantity=float(row["quantity"] or 0.0), fee_cost=float(row["fee_cost"] or 0.0),
             window_start_ms=ts_ms - int(window_s * 1000), window_end_ms=ts_ms + int(window_s * 1000),
+            cost=float(row["value"] or 0.0), order_id=(row.get("order_id") or None),
         )
 
 
@@ -435,21 +447,45 @@ class MatchResult:
 
 def match_legacy_fill(
     row: UnlinkedFill, candidate_trades: "list[ObservedTrade]", *,
-    tolerance: float = 1e-6, already_linked: "frozenset[str] | set[str]" = frozenset(),
+    tolerance: float = 1e-6, cost_tolerance: float = 1e-4,
+    already_linked: "frozenset[str] | set[str]" = frozenset(),
 ) -> MatchResult:
     """Finds a SUBSET of candidate_trades (same symbol/side, within the
-    row's time window) whose summed quantity and fee EXACTLY matches the
-    fills row's own totals (within tolerance) — never a nearest-timestamp
-    proximity guess (the weakness of reconcile_ledger.py's existing
-    matcher, which checks only timestamp+side+symbol proximity with no
-    amount check at all). No match, or more than one disjoint subset
-    matching equally well, BLOCKS for manual resolution rather than
-    guessing — item 8's explicit requirement."""
+    row's time window) whose summed quantity, fee, AND cost (notional,
+    quantity*price) EXACTLY matches the fills row's own totals (within
+    tolerance) — never a nearest-timestamp proximity guess (the weakness of
+    reconcile_ledger.py's existing matcher, which checks only
+    timestamp+side+symbol proximity with no amount check at all). No match,
+    or more than one disjoint subset matching equally well, BLOCKS for
+    manual resolution rather than guessing — item 8's explicit requirement.
+
+    cost conservation was added after an accounting review follow-up
+    (2026-09-20, P1) reproduced quantity+fee-only matching silently
+    accepting a WRONG candidate: a quantity-1 BUY at $100 matched a sole
+    candidate priced at $900 (same quantity, same zero fee, different
+    order) with blocked=False. Cost uses a looser cost_tolerance than
+    quantity/fee (float products of two already-rounded numbers compound
+    more rounding noise) but is still tight enough to catch a real
+    misattribution, which is off by orders of magnitude, not cents.
+
+    When row.order_id is known (fills.order_id populated), the candidate
+    pool is narrowed to that order_id FIRST, before the conservation
+    combinatorics run — a real, exact disambiguator when available. A
+    legacy row with no order_id (the common case for true pre-order-
+    tracking history) still requires full quantity+fee+cost conservation
+    with no narrowing; this is a strict ADDITION to the existing check,
+    never a replacement for it, so it only prevents matches the old check
+    would have wrongly allowed, never accepts anything the old check
+    would have refused."""
     pool = [
         t for t in candidate_trades
         if t.symbol == row.symbol and t.side == row.side and t.trade_id not in already_linked
         and row.window_start_ms <= _ts_ms(t.exchange_timestamp) <= row.window_end_ms
     ]
+    if row.order_id:
+        order_pool = [t for t in pool if t.order_id == row.order_id]
+        if order_pool:
+            pool = order_pool
     pool_ids = [t.trade_id for t in pool]
     if not pool:
         return MatchResult(row.fill_id, [], True, "no candidate trades in window", pool_ids)
@@ -463,11 +499,13 @@ def match_legacy_fill(
         for combo in itertools.combinations(pool, r):
             qty = sum(t.amount for t in combo)
             fee = sum(t.fee_cost for t in combo)
-            if abs(qty - row.quantity) < tolerance and abs(fee - row.fee_cost) < tolerance:
+            cost = sum(t.cost for t in combo)
+            if (abs(qty - row.quantity) < tolerance and abs(fee - row.fee_cost) < tolerance
+                    and abs(cost - row.cost) < cost_tolerance):
                 matches.append(tuple(sorted(t.trade_id for t in combo)))
     unique_matches = set(matches)
     if len(unique_matches) == 0:
-        return MatchResult(row.fill_id, [], True, "no subset conserves quantity/fee exactly", pool_ids)
+        return MatchResult(row.fill_id, [], True, "no subset conserves quantity/fee/cost exactly", pool_ids)
     if len(unique_matches) > 1:
         return MatchResult(row.fill_id, [], True,
                             f"{len(unique_matches)} disjoint subsets all conserve totals — ambiguous",

@@ -523,11 +523,12 @@ def test_straggler_linking_blocks_on_ambiguous_match(tmp_path):
     ex = FakeExchangeAdapter()
     ex.deposit("CAD", 1000.0, timestamp_ms=T0)
     run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 100)
-    # Two DIFFERENT orders' trades, same qty/fee, both inside the fills
-    # row's matching window — genuinely ambiguous which one it represents.
+    # Two DIFFERENT orders' trades, same qty/fee/cost, neither matching the
+    # local row's own (unrelated) order_id, both inside the fills row's
+    # matching window — genuinely ambiguous which one it represents.
     ex.execute_trade(symbol="BTC/CAD", side="buy", price=90_000.0, amount=0.001,
                       timestamp_ms=T0 + 990, order_id="ORD_X", fee_cost=0.09, fee_currency="CAD")
-    ex.execute_trade(symbol="BTC/CAD", side="buy", price=88_000.0, amount=0.001,
+    ex.execute_trade(symbol="BTC/CAD", side="buy", price=90_000.0, amount=0.001,
                       timestamp_ms=T0 + 1010, order_id="ORD_Y", fee_cost=0.09, fee_currency="CAD")
     state = run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=100_000, now_ms=T0 + 2000)
 

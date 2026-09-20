@@ -76,7 +76,14 @@ def run_migration(
                 matched = [t for t in sym_trades if t.trade_id in result.matched_trade_ids]
                 with conn:
                     for t in matched:
-                        store.upsert_observed_trade(conn, t)
+                        # NOT store.upsert_observed_trade — that helper opens
+                        # its OWN `with conn:`, which is not a nested
+                        # savepoint in Python's sqlite3 and would commit this
+                        # outer block's pending work early on the second
+                        # trade of a multi-trade group (accounting review
+                        # follow-up, 2026-09-20, P1). The nocommit variant
+                        # composes correctly into this outer transaction.
+                        store.upsert_observed_trade_nocommit(conn, t)
                         conn.execute(
                             "INSERT OR IGNORE INTO trade_fill_links (trade_id, fill_id, linked_at) "
                             "VALUES (?, ?, ?)",

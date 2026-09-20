@@ -1006,9 +1006,7 @@ is unreconciled or stale. `cfg.accounting.enabled` defaults `false` — with it 
 behaves exactly as before this subsystem existed. Built across 11+ same-week review passes
 (2026-09-13 → 2026-09-20); design + full pass-by-pass findings live in the standalone
 `CRYPTO_BOT_EXECUTION_ACCOUNTING_DESIGN_2026-09-19.md` and `CRYPTO_BOT_MONEY_READINESS_REVIEW_*.md`
-files at repo root, not duplicated here. `migrate_legacy_fills.py` (one-time, pre-accounting
-fills backfill) has **never been run** — confirmed 2026-09-20 (`scripts/accounting_shadow_report.py`
-finds 10 pre-existing unlinked legacy fills). A gated paper/shadow + security readiness review
+files at repo root, not duplicated here. A gated paper/shadow + security readiness review
 (`CRYPTO_BOT_GATED_READINESS_REPORT_2026-09-20.md`, `CRYPTO_BOT_SECURITY_REVIEW_2026-09-20.md`,
 `deploy/PAPER_SHADOW_RUNBOOK.md`) found and fixed one real gap (the dynamic-universe ranked-BUY
 path didn't consult the accounting block state — fixed, unreachable in production either way
@@ -1016,6 +1014,33 @@ since dynamic mode is off) and confirmed the Kraken key's actual permission scop
 been manually verified against the checklist that already existed in "Exchange Setup" below.
 None of this changes HALT status — see the review-deadline section above; profitability is the
 independent, still-unmet reason the bot stays halted regardless of accounting readiness.
+
+**`migrate_legacy_fills.py` applied to the live DB 2026-09-20** (dry-run reviewed first, per
+the readiness report's own "review every proposed match before applying" instruction —
+`--apply-to-live` took an unconditional backup first: `logs/trades_pre_migration_backup_
+20260920T150248Z.db`, restore by copying it back over `logs/trades.db`). Result: 8 fills
+linked to their real Kraken trade ids, 3 orphan trades backfilled, 10 pre-existing unlinked
+legacy fills → 2 remaining, both confirmed as legacy-bug artifacts rather than real
+unaccounted trades and left permanently blocked (exact-conservation matching refuses to guess):
+- `fills.id=1` — BTC/CAD SELL 2026-06-22 (the day the post-only bug went live), fee recorded
+  locally as $0.00; the real Kraken trade almost certainly charged a nonzero fee, so it can't
+  conserve. Unresolved — would need the real trade's fee pulled from Kraken to correct the
+  local row, which hasn't been done (a data-correction write, not a review).
+- `fills.id=2` — BTC/CAD SELL 2026-06-27, recorded with **quantity=0.0**; `scripts/
+  accounting_shadow_report.py` labels it `[phantom] zero-qty row`. `fills.id=9` has the same
+  second/side/symbol with the correct quantity/price/fee and is already linked to the real
+  trade — `fills.id=2` is a duplicate artifact from the old qty=0 recording bug, not a second
+  real trade. Safe to leave blocked.
+`scripts/accounting_shadow_report.py` re-run post-migration: BTC/CAD 2 residuals (both above,
+expected), SOL/CAD 0 residuals.
+
+**Kraken key permission check completed 2026-09-20** (manual UI check, `trade_bot_local` key,
+created 2026-09-04): Withdraw Funds **disabled** (confirmed — the security-critical item).
+Query/Query orders/Create & modify orders/Cancel & close orders all enabled as expected. IP
+address restriction is **Off** — a known, deliberate prior tradeoff (see
+`.memory/project_kraken_auth_outage_2026-09-04.md`: IP restriction previously caused real auth
+outages against a dynamic IP), not an oversight, but worth revisiting if a static IP is ever
+set up. Security-review Gate 2's blocking item is now closed.
 
 ### Current operational status
 - **Crypto bot:** live on Kraken, **but its profitability basis is now in question

@@ -227,7 +227,7 @@ def test_effective_fee_cost_applies_deltas_in_order():
 
 def test_match_legacy_fill_exact_single_match():
     row = UnlinkedFill(fill_id=1, symbol="BTC/CAD", side="buy", quantity=1.0, fee_cost=1.0,
-                        window_start_ms=900, window_end_ms=1100)
+                        window_start_ms=900, window_end_ms=1100, cost=100.0)
     t1 = _t("T1", "O1", "BTC/CAD", "buy", 100.0, 1.0, 1000, fee=1.0)
     result = engine.match_legacy_fill(row, [t1])
     assert not result.blocked
@@ -236,7 +236,7 @@ def test_match_legacy_fill_exact_single_match():
 
 def test_match_legacy_fill_many_to_one():
     row = UnlinkedFill(fill_id=1, symbol="BTC/CAD", side="buy", quantity=2.0, fee_cost=2.0,
-                        window_start_ms=900, window_end_ms=1100)
+                        window_start_ms=900, window_end_ms=1100, cost=200.0)
     t1 = _t("T1", "O1", "BTC/CAD", "buy", 100.0, 1.0, 1000, fee=1.0)
     t2 = _t("T2", "O1", "BTC/CAD", "buy", 100.0, 1.0, 1001, fee=1.0)
     result = engine.match_legacy_fill(row, [t1, t2])
@@ -245,20 +245,46 @@ def test_match_legacy_fill_many_to_one():
 
 
 def test_match_legacy_fill_blocks_on_ambiguity():
-    """Two disjoint subsets both conserve totals exactly — must block, not
-    guess which one is real (design §3.3 / review R2 finding 2)."""
+    """Two disjoint subsets both conserve quantity/fee/cost exactly (same
+    price too, different orders) — must block, not guess which one is real
+    (design §3.3 / review R2 finding 2)."""
     row = UnlinkedFill(fill_id=1, symbol="BTC/CAD", side="buy", quantity=1.0, fee_cost=1.0,
-                        window_start_ms=900, window_end_ms=1100)
+                        window_start_ms=900, window_end_ms=1100, cost=100.0)
     t1 = _t("T1", "O1", "BTC/CAD", "buy", 100.0, 1.0, 1000, fee=1.0)
-    t2 = _t("T2", "O2", "BTC/CAD", "buy", 200.0, 1.0, 1000, fee=1.0)  # different price, same qty/fee — still ambiguous
+    t2 = _t("T2", "O2", "BTC/CAD", "buy", 100.0, 1.0, 1000, fee=1.0)  # same price/qty/fee, different order — still ambiguous
     result = engine.match_legacy_fill(row, [t1, t2])
     assert result.blocked
     assert "ambiguous" in result.reason
 
 
+def test_match_legacy_fill_requires_cost_conservation():
+    """Accounting review follow-up, 2026-09-20, P1 reproduction: quantity
+    and fee alone used to accept a completely wrong candidate. A $100 BUY
+    must not match a same-quantity/fee candidate actually priced at $900."""
+    row = UnlinkedFill(fill_id=1, symbol="BTC/CAD", side="buy", quantity=1.0, fee_cost=0.0,
+                        window_start_ms=900, window_end_ms=1100, cost=100.0)
+    wrong = _t("T1", "O1", "BTC/CAD", "buy", 900.0, 1.0, 1000, fee=0.0)  # qty/fee match, price/cost does not
+    result = engine.match_legacy_fill(row, [wrong])
+    assert result.blocked
+    assert "no subset" in result.reason
+
+
+def test_match_legacy_fill_order_identity_disambiguates():
+    """A known order_id on the local row narrows the pool to that order
+    FIRST — two candidates that would otherwise tie on quantity/fee/cost
+    are disambiguated by the row already knowing which order it came from."""
+    row = UnlinkedFill(fill_id=1, symbol="BTC/CAD", side="buy", quantity=1.0, fee_cost=1.0,
+                        window_start_ms=900, window_end_ms=1100, cost=100.0, order_id="O1")
+    t1 = _t("T1", "O1", "BTC/CAD", "buy", 100.0, 1.0, 1000, fee=1.0)
+    t2 = _t("T2", "O2", "BTC/CAD", "buy", 100.0, 1.0, 1000, fee=1.0)  # ties on qty/fee/cost, wrong order
+    result = engine.match_legacy_fill(row, [t1, t2])
+    assert not result.blocked
+    assert result.matched_trade_ids == ["T1"]
+
+
 def test_match_legacy_fill_blocks_on_no_match():
     row = UnlinkedFill(fill_id=1, symbol="BTC/CAD", side="buy", quantity=5.0, fee_cost=1.0,
-                        window_start_ms=900, window_end_ms=1100)
+                        window_start_ms=900, window_end_ms=1100, cost=500.0)
     t1 = _t("T1", "O1", "BTC/CAD", "buy", 100.0, 1.0, 1000, fee=1.0)
     result = engine.match_legacy_fill(row, [t1])
     assert result.blocked
@@ -267,7 +293,7 @@ def test_match_legacy_fill_blocks_on_no_match():
 
 def test_match_legacy_fill_excludes_already_linked():
     row = UnlinkedFill(fill_id=1, symbol="BTC/CAD", side="buy", quantity=1.0, fee_cost=1.0,
-                        window_start_ms=900, window_end_ms=1100)
+                        window_start_ms=900, window_end_ms=1100, cost=100.0)
     t1 = _t("T1", "O1", "BTC/CAD", "buy", 100.0, 1.0, 1000, fee=1.0)
     result = engine.match_legacy_fill(row, [t1], already_linked={"T1"})
     assert result.blocked

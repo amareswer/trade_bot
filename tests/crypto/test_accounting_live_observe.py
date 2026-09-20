@@ -84,6 +84,61 @@ def test_observe_fill_never_raises_on_a_broken_exchange(tmp_path):
     assert result is False
 
 
+def test_observe_fill_does_not_double_link_a_multi_execution_order_to_one_row(tmp_path):
+    """Accounting review follow-up, 2026-09-20, P1 reproduction: an order
+    worked in two separate quantity-1 executions, but only ONE local
+    quantity-1 fill row observed so far (the executor logs partial fills
+    as separate local rows; this call is only for the first of them). The
+    old code matched by order_id+symbol alone, ignoring quantity entirely,
+    and linked BOTH real executions to this single row — permanently
+    stranding the second local row (whenever it's observed) with nothing
+    left to claim, since store.is_ledger_represented already treats a
+    trade as spoken for once ANY fill links to it. The fix requires the
+    full candidate set to conserve THIS row's own quantity before linking
+    anything; here it doesn't (2 vs 1), so this must do nothing and leave
+    it to the periodic reconciliation cycle's straggler matcher instead."""
+    db_path = str(tmp_path / "trades.db")
+    store.init_db(db_path)
+    conn = store.connect(db_path)
+    ex = FakeExchangeAdapter()
+    t1 = ex.execute_trade(symbol="BTC/CAD", side="buy", price=90_000.0, amount=0.001,
+                           timestamp_ms=T0, order_id="ORD1")
+    t2 = ex.execute_trade(symbol="BTC/CAD", side="buy", price=90_000.0, amount=0.001,
+                           timestamp_ms=T0 + 10, order_id="ORD1")
+
+    linked = live_observe.observe_fill(
+        ex, conn, order_id="ORD1", symbol="BTC/CAD", fill_id=42, since=None,
+        side="buy", quantity=0.001,   # this local row's own qty — only HALF the order's real total
+    )
+    assert not linked
+    assert store.trade_ids_for_fill(conn, 42) == []
+    assert not store.is_ledger_represented(conn, t1.trade_id)
+    assert not store.is_ledger_represented(conn, t2.trade_id)
+
+
+def test_observe_fill_links_full_order_when_its_own_quantity_conserves(tmp_path):
+    """The normal, common case: one order worked as two executions, but a
+    SINGLE local fill row already records the order's FULL quantity (the
+    executor's own book-keeping, not a partial-fill split) — the whole
+    remaining candidate set conserves this row's quantity, so both real
+    executions correctly link to the one row."""
+    db_path = str(tmp_path / "trades.db")
+    store.init_db(db_path)
+    conn = store.connect(db_path)
+    ex = FakeExchangeAdapter()
+    t1 = ex.execute_trade(symbol="BTC/CAD", side="buy", price=90_000.0, amount=0.001,
+                           timestamp_ms=T0, order_id="ORD1")
+    t2 = ex.execute_trade(symbol="BTC/CAD", side="buy", price=90_000.0, amount=0.001,
+                           timestamp_ms=T0 + 10, order_id="ORD1")
+
+    linked = live_observe.observe_fill(
+        ex, conn, order_id="ORD1", symbol="BTC/CAD", fill_id=42, since=None,
+        side="buy", quantity=0.002,   # this local row's own qty — the order's FULL total
+    )
+    assert linked
+    assert sorted(store.trade_ids_for_fill(conn, 42)) == sorted([t1.trade_id, t2.trade_id])
+
+
 def test_observe_fill_no_op_without_an_order_id(tmp_path):
     db_path = str(tmp_path / "trades.db")
     store.init_db(db_path)

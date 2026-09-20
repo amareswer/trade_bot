@@ -139,6 +139,38 @@ class ObservedTrade:
     source: str = "live"       # "live" | "migration"
 
 
+def upsert_observed_trade_nocommit(conn: sqlite3.Connection, trade: ObservedTrade) -> bool:
+    """Same insert-if-new logic as upsert_observed_trade, but never opens
+    its own `with conn:` — for a caller that needs to compose this into a
+    LARGER atomic transaction it already owns (e.g. migration.py linking a
+    multi-trade group). Python's sqlite3 `with conn:` is not a nested
+    savepoint: calling a with-conn-wrapped helper from inside an outer
+    with-conn block commits the OUTER block's pending work early (accounting
+    review follow-up, 2026-09-20, P1 — reproduced: a crash right after the
+    second of two per-trade upserts in a matched group left only the first
+    trade linked, and a retry could never re-consider the second because
+    store.unlinked_fills() already excludes any fill with even one link
+    row). Callers owning their own transaction must call this instead of
+    upsert_observed_trade and wrap the whole group in their own `with conn:`."""
+    existing = conn.execute(
+        "SELECT 1 FROM observed_trades WHERE trade_id = ?", (trade.trade_id,)
+    ).fetchone()
+    if existing is not None:
+        return False
+    conn.execute(
+        """
+        INSERT INTO observed_trades
+            (trade_id, order_id, symbol, side, price, amount, cost,
+             fee_cost, fee_currency, exchange_timestamp, observed_at, source)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (trade.trade_id, trade.order_id, trade.symbol, trade.side, trade.price,
+         trade.amount, trade.cost, trade.fee_cost, trade.fee_currency,
+         trade.exchange_timestamp, _now_iso(), trade.source),
+    )
+    return True
+
+
 def upsert_observed_trade(conn: sqlite3.Connection, trade: ObservedTrade) -> bool:
     """Insert a newly-observed trade. Idempotent on trade_id (the exchange's
     own id) — a re-observation of an already-known trade with an UNCHANGED
@@ -148,25 +180,13 @@ def upsert_observed_trade(conn: sqlite3.Connection, trade: ObservedTrade) -> boo
     overwrites price/amount/side; it only ever inserts fresh or leaves an
     existing row untouched, so a caller that wants to react to a genuine
     correction must check BEFORE calling this, not rely on it to signal one.
-    Returns True if a new row was inserted, False if trade_id already existed."""
-    existing = conn.execute(
-        "SELECT 1 FROM observed_trades WHERE trade_id = ?", (trade.trade_id,)
-    ).fetchone()
-    if existing is not None:
-        return False
+    Returns True if a new row was inserted, False if trade_id already existed.
+
+    Standalone convenience wrapper (own transaction) — a caller composing
+    this into a larger atomic operation must use upsert_observed_trade_nocommit
+    instead, inside its own `with conn:` block; see that function's docstring."""
     with conn:
-        conn.execute(
-            """
-            INSERT INTO observed_trades
-                (trade_id, order_id, symbol, side, price, amount, cost,
-                 fee_cost, fee_currency, exchange_timestamp, observed_at, source)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (trade.trade_id, trade.order_id, trade.symbol, trade.side, trade.price,
-             trade.amount, trade.cost, trade.fee_cost, trade.fee_currency,
-             trade.exchange_timestamp, _now_iso(), trade.source),
-        )
-    return True
+        return upsert_observed_trade_nocommit(conn, trade)
 
 
 @dataclass
@@ -213,21 +233,7 @@ def commit_observation_batch(
     it exists purely so recover_watermark() has something to recover)."""
     with conn:
         for t in new_trades:
-            existing = conn.execute(
-                "SELECT 1 FROM observed_trades WHERE trade_id = ?", (t.trade_id,)
-            ).fetchone()
-            if existing is not None:
-                continue
-            conn.execute(
-                """
-                INSERT INTO observed_trades
-                    (trade_id, order_id, symbol, side, price, amount, cost,
-                     fee_cost, fee_currency, exchange_timestamp, observed_at, source)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (t.trade_id, t.order_id, t.symbol, t.side, t.price, t.amount, t.cost,
-                 t.fee_cost, t.fee_currency, t.exchange_timestamp, _now_iso(), t.source),
-            )
+            upsert_observed_trade_nocommit(conn, t)
         for fc in (fee_corrections or []):
             conn.execute(
                 "INSERT OR IGNORE INTO fee_adjustments "

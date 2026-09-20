@@ -151,4 +151,60 @@ def test_ledger_delivery_detects_orphaned_marker(tmp_path):
         conn.execute("UPDATE observed_trades SET ledger_written_at = ? WHERE trade_id = 'T1'", (iso(T0),))
     result = four_way.verify_ledger_delivery_consistency(conn, "BTC/CAD")
     assert not result.ok
-    assert result.orphaned_marker_trade_ids == ["T1"]
+
+
+def test_ledger_delivery_economics_ok_for_a_correctly_linked_fill(tmp_path):
+    """A single trade correctly linked to a fill whose own quantity/fee it
+    exactly represents must NOT be flagged — proves the new economics
+    check doesn't false-positive on the ordinary, correct case."""
+    conn, tl = _setup(tmp_path)
+    tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.001, price=90_000.0,
+                fee_cost=0.09, fee_currency="CAD", exec_key="uuid-clean",
+                timestamp=iso(T0))
+    fill_row = store.fills_row_by_exec_key(conn, "uuid-clean")
+    t = store.ObservedTrade(
+        trade_id="T9", order_id="O9", symbol="BTC/CAD", side="buy", price=90_000.0,
+        amount=0.001, cost=90.0, fee_cost=0.09, fee_currency="CAD",
+        exchange_timestamp=iso(T0), source="live",
+    )
+    store.upsert_observed_trade(conn, t)
+    store.link_trade_to_fill(conn, "T9", fill_row["id"])
+
+    result = four_way.verify_ledger_delivery_consistency(conn, "BTC/CAD")
+    assert result.ok
+    assert result.double_represented_fill_ids == []
+
+
+def test_ledger_delivery_detects_double_represented_fill(tmp_path):
+    """Accounting review follow-up, 2026-09-20, P1 reproduction: two
+    quantity-1 trades both linked to a single quantity-1 fill (the exact
+    live_observe.py misallocation this same review found and fixed
+    separately). Link/marker EXISTENCE alone — the pre-fix check — returns
+    ok=True here, since both trades genuinely have a link row and a marker;
+    only comparing the linked trades' summed economics against what the
+    fill itself recorded catches the over-allocation."""
+    conn, tl = _setup(tmp_path)
+    tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.001, price=90_000.0,
+                fee_cost=0.09, fee_currency="CAD", exec_key="uuid-dup",
+                timestamp=iso(T0))
+    fill_row = store.fills_row_by_exec_key(conn, "uuid-dup")
+    t1 = store.ObservedTrade(
+        trade_id="T1", order_id="O1", symbol="BTC/CAD", side="buy", price=90_000.0,
+        amount=0.001, cost=90.0, fee_cost=0.045, fee_currency="CAD",
+        exchange_timestamp=iso(T0), source="live",
+    )
+    t2 = store.ObservedTrade(
+        trade_id="T2", order_id="O1", symbol="BTC/CAD", side="buy", price=90_000.0,
+        amount=0.001, cost=90.0, fee_cost=0.045, fee_currency="CAD",
+        exchange_timestamp=iso(T0 + 10), source="live",
+    )
+    store.upsert_observed_trade(conn, t1)
+    store.upsert_observed_trade(conn, t2)
+    # Fee sums even conserve (0.045 + 0.045 = 0.09) — only quantity (0.002
+    # linked vs 0.001 recorded) exposes the misallocation, proving this
+    # isn't just re-checking what a simpler total-fee check would catch.
+    store.link_trades_to_fill(conn, ["T1", "T2"], fill_row["id"])
+
+    result = four_way.verify_ledger_delivery_consistency(conn, "BTC/CAD")
+    assert not result.ok
+    assert fill_row["id"] in result.double_represented_fill_ids

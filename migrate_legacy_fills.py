@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
+import sqlite3
 import sys
 from datetime import datetime, timezone
 
@@ -49,10 +49,41 @@ _LIVE_DB = os.path.join(os.path.dirname(__file__), "logs", "trades.db")
 _SYMBOLS = ["BTC/CAD", "SOL/CAD"]  # matches CLAUDE.md's UNIVERSE_WHITELIST at time of writing
 
 
+def _sqlite_backup(src_path: str, dest_path: str) -> None:
+    """A true consistent SQLite snapshot via the connection backup API
+    (accounting review follow-up, 2026-09-20, P1) — NOT shutil.copyfile,
+    which raw-copies the main database file only. That's unsafe in two
+    ways: (1) in WAL mode, committed transactions can still live in the
+    separate -wal file and never make it into a copy of the main file alone
+    (reproduced: a WAL-mode DB with a committed row copied via copyfile came
+    back missing the table entirely), and (2) even in the current rollback-
+    journal mode, a copy racing a concurrent writer mid-transaction can read
+    a torn/inconsistent file. sqlite3.Connection.backup() uses SQLite's own
+    online backup API, which is safe against a live writer in either
+    journal mode and captures anything already committed regardless of
+    which journal mode is active. Runs a PRAGMA integrity_check on the
+    result and raises if it doesn't come back clean — a snapshot that isn't
+    verified is not a real safety net."""
+    src = sqlite3.connect(src_path)
+    try:
+        dest = sqlite3.connect(dest_path)
+        try:
+            src.backup(dest)
+            (result,) = dest.execute("PRAGMA integrity_check").fetchone()
+            if result != "ok":
+                raise RuntimeError(
+                    f"sqlite backup of {src_path} -> {dest_path} failed integrity_check: {result}"
+                )
+        finally:
+            dest.close()
+    finally:
+        src.close()
+
+
 def _copy_db(live_path: str) -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     dest = os.path.join(os.path.dirname(live_path), f"trades_migration_copy_{ts}.db")
-    shutil.copyfile(live_path, dest)
+    _sqlite_backup(live_path, dest)
     return dest
 
 
@@ -67,7 +98,7 @@ def _backup_live_db(live_path: str) -> str:
     dest = os.path.join(
         os.path.dirname(live_path), f"trades_pre_migration_backup_{ts}.db",
     )
-    shutil.copyfile(live_path, dest)
+    _sqlite_backup(live_path, dest)
     return dest
 
 

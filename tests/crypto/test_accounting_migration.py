@@ -55,6 +55,7 @@ def test_migration_links_exact_single_match(tmp_path):
 
 def test_migration_blocks_on_ambiguous_legacy_row(tmp_path):
     """Two real trades that BOTH exactly conserve the legacy row's totals —
+    including cost, since the legacy row has no order_id to disambiguate —
     never guessed, always blocked for manual review (item 8's explicit
     requirement)."""
     db_path = str(tmp_path / "trades.db")
@@ -62,7 +63,7 @@ def test_migration_blocks_on_ambiguous_legacy_row(tmp_path):
     _seed_legacy_fill(db_path, side="BUY", symbol="BTC/CAD", qty=0.001, price=90_000.0,
                        fee=0.09, ts_ms=1_000_000)
     t1 = _t("T1", "O1", "BTC/CAD", "buy", 90_000.0, 0.001, 1_000_000, fee=0.09)
-    t2 = _t("T2", "O2", "BTC/CAD", "buy", 88_000.0, 0.001, 1_000_050, fee=0.09)  # same qty/fee, different price
+    t2 = _t("T2", "O2", "BTC/CAD", "buy", 90_000.0, 0.001, 1_000_050, fee=0.09)  # same qty/fee/cost, different order
 
     report = migration.run_migration(db_path, [t1, t2], symbols=["BTC/CAD"])
     assert len(report.linked) == 0
@@ -261,7 +262,19 @@ def test_migration_rolls_back_a_failed_multi_trade_link(tmp_path, monkeypatch):
     partially-linked fills row: the whole match is committed inside one
     `with conn:` block, so SQLite rolls back the entire group on an
     uncaught exception. Re-running afterward (without the injected fault)
-    must then complete cleanly from scratch — nothing was left half-done."""
+    must then complete cleanly from scratch — nothing was left half-done.
+
+    Fault is injected on store.upsert_observed_trade_nocommit — the
+    no-commit primitive migration.py's own outer `with conn:` composes
+    (accounting review follow-up, 2026-09-20, P1). The OLD code called
+    store.upsert_observed_trade instead, which opens its OWN `with conn:`
+    and therefore COMMITS the first trade's insert immediately, before the
+    outer block ever sees the second trade's failure — a stray, permanently
+    orphaned observed_trades row for T1 with no link, invisible to
+    store.unlinked_fills() forever after. The real proof this fix works is
+    NOT just "no trade_fill_links row" (that part rolled back even in the
+    old, buggy code) — it's that T1's observed_trades row ALSO doesn't
+    survive the failed attempt, which the old code got wrong."""
     db_path = str(tmp_path / "trades.db")
     store.init_db(db_path)
     _seed_legacy_fill(db_path, side="BUY", symbol="BTC/CAD", qty=0.002, price=90_000.0,
@@ -269,16 +282,16 @@ def test_migration_rolls_back_a_failed_multi_trade_link(tmp_path, monkeypatch):
     t1 = _t("T1", "O1", "BTC/CAD", "buy", 90_000.0, 0.001, 999_990, fee=0.09)
     t2 = _t("T2", "O1", "BTC/CAD", "buy", 90_000.0, 0.001, 1_000_010, fee=0.09)
 
-    original_upsert = store.upsert_observed_trade
+    original_upsert_nocommit = store.upsert_observed_trade_nocommit
     calls = {"n": 0}
 
-    def _flaky_upsert(conn, trade):
+    def _flaky_upsert_nocommit(conn, trade):
         calls["n"] += 1
         if calls["n"] == 2:
             raise RuntimeError("simulated crash mid-transaction")
-        return original_upsert(conn, trade)
+        return original_upsert_nocommit(conn, trade)
 
-    monkeypatch.setattr(migration.store, "upsert_observed_trade", _flaky_upsert)
+    monkeypatch.setattr(migration.store, "upsert_observed_trade_nocommit", _flaky_upsert_nocommit)
     with pytest.raises(RuntimeError):
         migration.run_migration(db_path, [t1, t2], symbols=["BTC/CAD"])
 
@@ -286,9 +299,11 @@ def test_migration_rolls_back_a_failed_multi_trade_link(tmp_path, monkeypatch):
     assert not store.is_ledger_represented(conn, "T1")
     assert not store.is_ledger_represented(conn, "T2")
     links = conn.execute("SELECT COUNT(*) FROM trade_fill_links").fetchone()[0]
-    assert links == 0   # rollback proven — T1's upsert didn't survive on its own
+    assert links == 0
+    assert store.get_observed_trade(conn, "T1") is None  # the actual atomicity proof — see docstring
+    assert store.get_observed_trade(conn, "T2") is None
     conn.close()
 
-    monkeypatch.setattr(migration.store, "upsert_observed_trade", original_upsert)
+    monkeypatch.setattr(migration.store, "upsert_observed_trade_nocommit", original_upsert_nocommit)
     report2 = migration.run_migration(db_path, [t1, t2], symbols=["BTC/CAD"])
     assert sorted(report2.linked[0].matched_trade_ids) == ["T1", "T2"]

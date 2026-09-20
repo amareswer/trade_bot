@@ -20,7 +20,11 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from bot.accounting import engine, store
-from bot.accounting.reconciliation import BlockState, base_asset
+from bot.accounting.reconciliation import BlockState, _effective_fee_trades, base_asset
+
+_QTY_TOLERANCE = 1e-6
+_FEE_TOLERANCE = 1e-6
+_COST_TOLERANCE = 1e-4
 
 
 @dataclass
@@ -35,7 +39,21 @@ def verify_ledger_delivery_consistency(conn, symbol: str) -> LedgerDeliveryResul
     """design §9 step 3: every observed_trades row with ledger_written_at
     set must have exactly one trade_fill_links row, and vice versa — a
     failure here is a CODE BUG in this package's own bookkeeping, never an
-    exchange-data problem, and is reported as such."""
+    exchange-data problem, and is reported as such.
+
+    Economics check (accounting review follow-up, 2026-09-20, P1): the
+    link/marker existence check above returned ok=True for a real
+    reproduced misallocation — two quantity-1 trades both linked to a
+    single quantity-1 fill (live_observe's old order_id-only match, since
+    fixed — see live_observe.py). Existence alone can't catch that: both
+    trades genuinely have a link row and a marker, so nothing above flags
+    it. This additionally sums, per fill_id, every trade currently linked
+    to it (using the CURRENT correction-adjusted fee, same
+    _effective_fee_trades transformation diff_position_against_fold already
+    applies below) and compares against what the fills row itself recorded
+    — a fill_id whose linked trades over- or under-represent it lands in
+    double_represented_fill_ids and fails `ok`, regardless of how the
+    mismatch happened."""
     trades = store.load_observed_trades(conn, symbol)
     orphaned, unwritten = [], []
     for t in trades:
@@ -48,8 +66,36 @@ def verify_ledger_delivery_consistency(conn, symbol: str) -> LedgerDeliveryResul
             orphaned.append(t.trade_id)
         elif has_link and not is_written:
             unwritten.append(t.trade_id)
-    ok = not orphaned and not unwritten
-    return LedgerDeliveryResult(ok=ok, orphaned_marker_trade_ids=orphaned, unwritten_trade_ids=unwritten)
+
+    double_represented = []
+    trade_ids = [t.trade_id for t in trades]
+    fill_ids = sorted(store.linked_fill_ids_for_trades(conn, trade_ids)) if trade_ids else []
+    trades_by_id = {t.trade_id: t for t in trades}
+    for fill_id in fill_ids:
+        fill_row = conn.execute(
+            "SELECT quantity, fee_cost, value FROM fills WHERE id = ?", (fill_id,)
+        ).fetchone()
+        if fill_row is None:
+            continue  # a link pointing at a nonexistent fills row is a different failure mode, not this check's job
+        fill_qty, fill_fee, fill_value = fill_row
+        linked_trade_ids = store.trade_ids_for_fill(conn, fill_id)
+        linked_trades = [trades_by_id[tid] for tid in linked_trade_ids if tid in trades_by_id]
+        if len(linked_trades) != len(linked_trade_ids):
+            continue  # a trade linked here belongs to a different symbol's fold — out of scope for this call
+        effective = _effective_fee_trades(conn, linked_trades)
+        sum_qty = sum(t.amount for t in effective)
+        sum_fee = sum(t.fee_cost for t in effective)
+        sum_cost = sum(t.cost for t in effective)
+        if (abs(sum_qty - float(fill_qty or 0.0)) > _QTY_TOLERANCE
+                or abs(sum_fee - float(fill_fee or 0.0)) > _FEE_TOLERANCE
+                or abs(sum_cost - float(fill_value or 0.0)) > _COST_TOLERANCE):
+            double_represented.append(fill_id)
+
+    ok = not orphaned and not unwritten and not double_represented
+    return LedgerDeliveryResult(
+        ok=ok, orphaned_marker_trade_ids=orphaned, unwritten_trade_ids=unwritten,
+        double_represented_fill_ids=double_represented,
+    )
 
 
 @dataclass
