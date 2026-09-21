@@ -116,9 +116,22 @@ _signal_module.signal(_signal_module.SIGTERM, _handle_sigint)
 # ---------------------------------------------------------------------------
 
 def _build_exchange():
-    """Create a ccxt exchange instance for candle fetching."""
+    """Create a ccxt exchange instance for candle fetching — and, when this
+    same instance is later reused for KrakenAccountingAdapter, authenticated
+    private calls too (first real shadow-run finding, 2026-09-20, P0):
+    every accounting reconciliation cycle failed immediately with
+    'kraken requires "apiKey" credential' because this instance never
+    carried credentials at all — KrakenAccountingAdapter's own docstring
+    says plainly "the caller owns API keys", but nothing here ever did.
+    Including credentials unconditionally is safe for the pre-existing
+    candle-fetching use — a public endpoint's behavior is unaffected by an
+    authenticated client also being able to reach private ones."""
     cls = getattr(_ccxt, cfg.exchange.exchange.lower())
-    return cls({"timeout": 15_000})
+    return cls({
+        "apiKey": cfg.exchange.api_key,
+        "secret": cfg.exchange.api_secret,
+        "timeout": 15_000,
+    })
 
 
 def _minutes_to_timeframe(minutes: int) -> str:
@@ -2685,8 +2698,15 @@ def run():
             )
             # Derive slot_cash for new symbols from the first executor's balance
             # so their "ready" log matches the actual pool slot instead of showing
-            # the full cfg.portfolio.starting_cash.
-            _slot_for_new = _exc0.cash / max(1, cfg.portfolio.max_concurrent_positions)
+            # the full cfg.portfolio.starting_cash. Same dry-run caveat as
+            # _pool_total below: _exc0.cash is only a trustworthy whole-account
+            # figure when _sync_cash() actually ran (real live trading, not
+            # dry_run) — in dry-run it's whatever _exc0's own state file held,
+            # already slot-scoped from a prior run.
+            _slot_for_new = (
+                _exc0.cash if not cfg.exchange.dry_run
+                else cfg.portfolio.starting_cash
+            ) / max(1, cfg.portfolio.max_concurrent_positions)
             # Pass 2: remaining executors — new symbols get slot_for_new, existing
             # symbols get starting_cash (overridden by _load_state anyway).
             executors = {_sym0: _exc0}
@@ -2722,11 +2742,29 @@ def run():
         }
         executor = executors[cfg.exchange.symbol]
     # ── Capital pool — single cash pool shared across all symbols ─────────────
-    # For live trading: use actual Kraken balance from the first executor as
-    # the pool total (both executors read the same account, so we only count it once).
-    # For paper/simulated: use STARTING_CASH as the total pool.
+    # For REAL live trading: use actual Kraken balance from the first executor
+    # as the pool total (both executors read the same account, so we only
+    # count it once) — trustworthy ONLY because _sync_cash() actually ran and
+    # fetched the real, whole-account balance before any slot-splitting
+    # happened. For paper/simulated AND dry-run: use STARTING_CASH.
+    #
+    # dry_run was WRONGLY grouped into the "trust _first_exec.cash" branch
+    # (first real shadow-run finding, 2026-09-20, P0): in dry-run mode
+    # _sync_cash() is skipped (see the executor-construction comment above),
+    # so _first_exec.cash instead comes from its OWN persisted state file —
+    # which, for an existing symbol, already reflects ITS OWN slot allocation
+    # from the capital-pool-forcing loop below on some PRIOR run, not the
+    # whole account. Reproduced live: BTC/CAD's slot ($77) became the ENTIRE
+    # pool's total_capital, capital_pool.available_cash started at $77
+    # instead of the real ~$554, and the kill-switch tripped (falsely) on an
+    # apparent 86% drawdown — persisted to the real logs/risk_state.json.
+    # No real money was ever at risk (HALT was already engaged and dry_run
+    # makes order submission unreachable regardless), but the pool accounting
+    # itself was wrong for the whole run. Fixed: dry_run now takes the same
+    # STARTING_CASH path as paper_mode — the persisted per-symbol state file
+    # is not a trustworthy whole-account total in either case.
     _max_conc = cfg.portfolio.max_concurrent_positions
-    if cfg.exchange.live_trading and not cfg.paper.paper_mode:
+    if cfg.exchange.live_trading and not cfg.paper.paper_mode and not cfg.exchange.dry_run:
         _first_exec = next(iter(executors.values()))
         _pool_total = _first_exec.cash   # real Kraken CAD balance
     else:
