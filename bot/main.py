@@ -88,11 +88,40 @@ from bot.accounting import store as accounting_store
 from bot.accounting import reconciliation as accounting_reconciliation
 from bot.accounting import four_way as accounting_four_way
 from bot.accounting import live_observe as accounting_live_observe
+from bot.accounting import cycle_status as accounting_cycle_status
 from bot.accounting.reconciliation import BlockState as AccountingBlockState
 from bot.accounting.kraken_adapter import KrakenAccountingAdapter
 
+# ── Shadow-mode isolation (2026-09-21, P1 — external review of the actual
+# shadow run: "shadow mode writes production state") ───────────────────────
+# LIVE_TRADING=true + DRY_RUN=true (never combined with paper_mode, which has
+# its own always-simulated identity) is the exact, only combination the
+# paper/shadow readiness runbook uses. Before this fix, that mode still used
+# every PRODUCTION path unchanged — logs/live_state_*.json, logs/risk_state.json,
+# logs/trades.db — so a shadow session's startup capital-pool-forcing loop and
+# its risk-breaker state saves silently overwrote real persisted state
+# (reproduced live, same day: a shadow restart corrupted both executors'
+# real cash values and force-tripped the real kill-switch in the real
+# risk_state.json). Every state-bearing path below is redirected under
+# logs/shadow/ whenever this flag is true; real live trading (dry_run=False)
+# and pure paper_mode are both completely unaffected — this is additive,
+# gated behind a combination no other mode uses.
+_SHADOW_MODE = cfg.exchange.live_trading and not cfg.paper.paper_mode and cfg.exchange.dry_run
+_STATE_LOG_DIR = os.path.join(_log_dir, "shadow") if _SHADOW_MODE else _log_dir
+if _SHADOW_MODE:
+    os.makedirs(_STATE_LOG_DIR, exist_ok=True)
+
+
+def _live_state_path(sym: str) -> str:
+    return os.path.join(_STATE_LOG_DIR, f"live_state_{sym.replace('/', '_')}.json")
+
+
 # ── Dashboard path ────────────────────────────────────────────────────────────
-_DASHBOARD_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dashboard.html")
+# Also isolated in shadow mode (same finding, "output directory") — a shadow
+# session must never overwrite the dashboard file a human might be reading
+# for the REAL bot's actual status.
+_DASHBOARD_PATH = os.path.join(_STATE_LOG_DIR, "dashboard.html") if _SHADOW_MODE else \
+    os.path.join(os.path.dirname(os.path.dirname(__file__)), "dashboard.html")
 
 # ---------------------------------------------------------------------------
 # Graceful shutdown
@@ -2058,7 +2087,7 @@ def _make_dynamic_executor(sym: str, state_path: "str | None" = None) -> LiveExe
     single position's sizing basis.
     """
     if state_path is None:
-        state_path = f"logs/live_state_{sym.replace('/', '_')}.json"
+        state_path = _live_state_path(sym)
     return LiveExecutor(
         exchange_id              = cfg.exchange.exchange,
         symbol                   = sym,
@@ -2669,7 +2698,7 @@ def run():
                     starting_cash            = cfg.paper.paper_starting_cash,
                     dry_run                  = True,
                     order_type               = cfg.exchange.order_type,
-                    state_path               = f"logs/live_state_{sym.replace('/', '_')}.json",
+                    state_path               = _live_state_path(sym),
                     adopt_external_holdings  = cfg.exchange.adopt_external_holdings,
                     native_stop_loss_enabled = cfg.exchange.native_stop_loss_enabled,
                     max_slippage_pct         = cfg.exchange.max_slippage_pct,
@@ -2691,7 +2720,7 @@ def run():
                 starting_cash            = cfg.portfolio.starting_cash,
                 dry_run                  = cfg.exchange.dry_run,
                 order_type               = cfg.exchange.order_type,
-                state_path               = f"logs/live_state_{_sym0.replace('/', '_')}.json",
+                state_path               = _live_state_path(_sym0),
                 adopt_external_holdings  = cfg.exchange.adopt_external_holdings,
                 native_stop_loss_enabled = cfg.exchange.native_stop_loss_enabled,
                 max_slippage_pct         = cfg.exchange.max_slippage_pct,
@@ -2711,7 +2740,7 @@ def run():
             # symbols get starting_cash (overridden by _load_state anyway).
             executors = {_sym0: _exc0}
             for _s in _universe_list[1:]:
-                _sp = f"logs/live_state_{_s.replace('/', '_')}.json"
+                _sp = _live_state_path(_s)
                 executors[_s] = LiveExecutor(
                     exchange_id              = cfg.exchange.exchange,
                     symbol                   = _s,
@@ -2893,8 +2922,10 @@ def run():
             kill_switch_pct       = cfg.risk.kill_switch_pct,
         ),
         # Persist breaker state (drawdown peak, daily counters) across restarts
-        # in live mode only — backtests/paper runs stay stateless.
-        state_path = os.path.join(_log_dir, "risk_state.json")
+        # in live mode only — backtests/paper runs stay stateless. Isolated
+        # under logs/shadow/ in shadow mode (see _STATE_LOG_DIR) — a shadow
+        # session must never read or write the REAL risk-breaker state.
+        state_path = os.path.join(_STATE_LOG_DIR, "risk_state.json")
                      if cfg.exchange.live_trading else None,
     )
     ai = AIEngine(
@@ -2912,7 +2943,12 @@ def run():
     # Full trail: CLAUDE_HISTORY.md "Crypto BUY-overlay audit — 2026-09-02".
 
     # ── Persistent trade log + Telegram alerts ────────────────────────────────
-    trade_log = TradeLog()
+    # Isolated under logs/shadow/trades.db in shadow mode — TradeLog and the
+    # accounting store below share ONE database by design (store.py's own
+    # docstring: "one database, one transactional boundary"), so both must
+    # point at the same isolated path together, never the real trades.db.
+    _trade_log_db_path = os.path.join(_STATE_LOG_DIR, "trades.db") if _SHADOW_MODE else None
+    trade_log = TradeLog(db_path=_trade_log_db_path) if _trade_log_db_path else TradeLog()
 
     # ── Execution-accounting reconciliation (added 2026-09-19, opt-in) ──────
     # See bot/accounting/ package docstring + CRYPTO_BOT_EXECUTION_ACCOUNTING_
@@ -2949,14 +2985,22 @@ def run():
         )
     if _accounting_enabled:
         try:
-            accounting_store.init_db()
-            _accounting_conn = accounting_store.connect()
+            # Same isolated db path as trade_log above in shadow mode — the
+            # accounting tables live in the SAME database file (store.py's
+            # "one database" design), so both must agree on which file that is.
+            _accounting_db_path = _trade_log_db_path if _SHADOW_MODE else None
+            if _accounting_db_path:
+                accounting_store.init_db(_accounting_db_path)
+                _accounting_conn = accounting_store.connect(_accounting_db_path)
+            else:
+                accounting_store.init_db()
+                _accounting_conn = accounting_store.connect()
             _accounting_adapter = KrakenAccountingAdapter(live_exchange)
             logger.info(
                 "Accounting reconciliation: ENABLED (interval=%.0fs, margin=%.0fs, "
-                "block_buys_on_unreconciled=%s)",
+                "block_buys_on_unreconciled=%s, db=%s)",
                 cfg.accounting.reconcile_interval_s, cfg.accounting.watermark_safety_margin_s,
-                cfg.accounting.block_buys_on_unreconciled,
+                cfg.accounting.block_buys_on_unreconciled, _accounting_db_path or "logs/trades.db",
             )
         except Exception as _acct_init_exc:
             logger.error(
@@ -3117,15 +3161,25 @@ def run():
         print(f"\n  {len(symbol_state)} symbols ready: {list(symbol_state.keys())}", flush=True)
 
         # ── Regime monitor background thread ──────────────────────────────────
-        _rm_interval = int(os.getenv("REGIME_MONITOR_INTERVAL", "14400"))
-        _monitor_thread = threading.Thread(
-            target=_regime_monitor_loop,
-            args=(list(_universe_symbols), cfg.exchange.exchange, _rm_interval),
-            daemon=True,
-            name="regime-monitor",
-        )
-        _monitor_thread.start()
-        logger.info("Regime monitor thread started (interval=%ds)", _rm_interval)
+        # Disabled entirely in shadow mode (external review, sixth pass,
+        # 2026-09-21: "the acknowledged background-thread paths should also
+        # be isolated or disabled before claiming complete production-file
+        # isolation") — it writes to logs/regime_health.log, a hardcoded
+        # production path this isolation boundary doesn't cover, and a
+        # shadow session's own regime observations have no reason to be
+        # mixed into the real bot's monitoring history.
+        if not _SHADOW_MODE:
+            _rm_interval = int(os.getenv("REGIME_MONITOR_INTERVAL", "14400"))
+            _monitor_thread = threading.Thread(
+                target=_regime_monitor_loop,
+                args=(list(_universe_symbols), cfg.exchange.exchange, _rm_interval),
+                daemon=True,
+                name="regime-monitor",
+            )
+            _monitor_thread.start()
+            logger.info("Regime monitor thread started (interval=%ds)", _rm_interval)
+        else:
+            logger.info("Regime monitor thread skipped (shadow mode — writes a production log path)")
 
         # MTF daily closes are fetched per symbol at decision time (gate 2c) —
         # no startup prefetch: it added to the Kraken connection burst and the
@@ -3356,7 +3410,13 @@ def run():
     # ── Unified dashboard background thread ───────────────────────────────
     # UNIFIED_DASHBOARD_INTERVAL=0 disables (e.g. when running
     # `python unified_dashboard.py --watch` manually instead).
-    _ud_interval = int(os.getenv("UNIFIED_DASHBOARD_INTERVAL", "60"))
+    # Also disabled in shadow mode: unified_dashboard.py is a separate
+    # subprocess/script that reads/writes its OWN hardcoded production
+    # paths (logs/unified_dashboard.html, both bots' real state) — outside
+    # this isolation boundary entirely. Running it during a shadow session
+    # would either read the isolated shadow dashboard as if real or
+    # overwrite the real unified dashboard with a shadow-session mix.
+    _ud_interval = 0 if _SHADOW_MODE else int(os.getenv("UNIFIED_DASHBOARD_INTERVAL", "60"))
     if cfg.dashboard.enabled and _ud_interval > 0:
         _ud_thread = threading.Thread(
             target=_unified_dashboard_loop,
@@ -3370,7 +3430,11 @@ def run():
               f"  (refreshes every {_ud_interval}s)\n", flush=True)
 
     # ── Scheduled audits thread (replaces macOS cron — see ops/crontab.txt) ──
-    if os.getenv("AUDIT_SCHEDULER_ENABLED", "true").lower() == "true":
+    # Disabled entirely in shadow mode (same finding as the regime monitor
+    # above) — it runs shadow_signal.py / live_comparison.py / rescreen.py
+    # as subprocesses against the REAL logs/trades.db and REAL log files,
+    # all hardcoded, outside this isolation boundary.
+    if os.getenv("AUDIT_SCHEDULER_ENABLED", "true").lower() == "true" and not _SHADOW_MODE:
         _audit_thread = threading.Thread(
             target=_scheduled_audits_loop,
             daemon=True,
@@ -3534,6 +3598,15 @@ def run():
         # reconciliation").
         if _accounting_enabled and _accounting_conn is not None:
             if time.time() - _accounting_last_cycle > cfg.accounting.reconcile_interval_s:
+                # Reset every cycle attempt BEFORE run_cycle() so an
+                # exception raised inside it (caught below) still reports a
+                # fresh "four-way did not run this time" rather than
+                # silently keeping a PREVIOUS cycle's four-way outcome —
+                # see cycle_status.write's own "every cycle overwrites"
+                # contract just below.
+                _four_way_ran_this_cycle = False
+                _four_way_ready_this_cycle = None
+                _four_way_explain_this_cycle = None
                 try:
                     _accounting_state = accounting_reconciliation.run_cycle(
                         _accounting_adapter, _accounting_conn, trade_log,
@@ -3549,18 +3622,69 @@ def run():
                     # blocked, rather than being a separate, un-consulted
                     # report nothing reads.
                     if _accounting_state.reconciled:
-                        _live_positions = {
-                            _fw_sym: {
-                                "qty":          _fw_exc.position,
-                                "avg_cost":     _fw_exc.avg_entry,
-                                "realized_pnl": _fw_exc.portfolio.realized_pnl,
+                        # Shadow-mode split (2026-09-21, P1 — external
+                        # review: "simulated inventory is compared with real
+                        # account history"): dry_run's executor.position is
+                        # PURELY simulated (LiveExecutor skips real position
+                        # sync in dry_run — see the executor-construction
+                        # comment above) and has no relationship to what the
+                        # exchange actually shows. Comparing it against
+                        # accounting's REAL observed-trades ledger fold is a
+                        # category error that can only ever coincidentally
+                        # agree (both flat) or produce a meaningless
+                        # mismatch (a simulated fill the exchange never saw).
+                        # Account-observation shadow testing must use an
+                        # exchange-backed snapshot instead: the REAL current
+                        # base-asset balance, fetched fresh via the same
+                        # authenticated adapter accounting itself uses.
+                        # avg_cost/realized_pnl have no independent real-data
+                        # source without re-deriving them from the same
+                        # ledger being verified, so they stay at the
+                        # existing "no data" sentinel (0.0) — for a
+                        # genuinely flat symbol (qty~0, true today for both
+                        # BTC/CAD and SOL/CAD) diff_position_against_fold's
+                        # own flat short-circuit makes that correct; for a
+                        # real open position during a shadow session, this
+                        # correctly reports "cannot verify" rather than
+                        # quietly comparing fiction against reality.
+                        if _SHADOW_MODE:
+                            _live_positions = {}
+                            for _fw_sym in executors:
+                                try:
+                                    _fw_qty = _accounting_adapter.fetch_balance_total(_fw_sym.split("/")[0])
+                                except Exception as _fw_bal_exc:
+                                    logger.warning(
+                                        "Shadow four-way: real balance fetch failed for %s (%s) — "
+                                        "treating as unverifiable this cycle, not as flat",
+                                        _fw_sym, _fw_bal_exc,
+                                    )
+                                    # NaN deliberately, not 0.0/flat: every
+                                    # comparison against NaN is False in
+                                    # Python, so diff_position_against_fold's
+                                    # qty_ok deterministically fails closed
+                                    # here instead of a failed fetch being
+                                    # silently read as "confirmed flat".
+                                    _fw_qty = float("nan")
+                                _live_positions[_fw_sym] = {
+                                    "qty": _fw_qty,
+                                    "avg_cost": 0.0, "realized_pnl": 0.0,
+                                }
+                        else:
+                            _live_positions = {
+                                _fw_sym: {
+                                    "qty":          _fw_exc.position,
+                                    "avg_cost":     _fw_exc.avg_entry,
+                                    "realized_pnl": _fw_exc.portfolio.realized_pnl,
+                                }
+                                for _fw_sym, _fw_exc in executors.items()
                             }
-                            for _fw_sym, _fw_exc in executors.items()
-                        }
                         _fw_report = accounting_four_way.run_four_way_verification(
                             _accounting_conn, _accounting_state,
                             symbols=list(executors.keys()), live_positions=_live_positions,
                         )
+                        _four_way_ran_this_cycle = True
+                        _four_way_ready_this_cycle = _fw_report.ready
+                        _four_way_explain_this_cycle = _fw_report.explain()
                         if not _fw_report.ready:
                             _accounting_state.account_cash_blocked = True
                             _accounting_state.account_cash_reason = (
@@ -3582,6 +3706,27 @@ def run():
                         coverage_reason=f"reconciliation cycle raised unexpectedly: {_acct_cycle_exc}",
                     )
                 _accounting_last_cycle = time.time()
+                # Persisted cycle outcome (accounting review, sixth pass,
+                # 2026-09-21, P1: "shadow report can falsely declare
+                # PASSED" — raw checkpoint rows can't distinguish "this
+                # symbol was actually verified" from "some other write
+                # landed nearby in time", and a checkpoint from an earlier
+                # SUCCESSFUL cycle survives unchanged after a later failed
+                # one). Written on EVERY cycle attempt, success or
+                # exception, so a reader always sees the true latest
+                # outcome — never a stale success masking a real failure.
+                try:
+                    accounting_cycle_status.write(
+                        os.path.join(_STATE_LOG_DIR, "accounting_cycle_status.json"),
+                        requested_symbols=list(executors.keys()),
+                        block_state_ok=(_accounting_state.explain() == "ok"),
+                        block_state_explain=_accounting_state.explain(),
+                        four_way_ran=_four_way_ran_this_cycle,
+                        four_way_ready=_four_way_ready_this_cycle,
+                        four_way_explain=_four_way_explain_this_cycle,
+                    )
+                except Exception as _cycle_status_exc:
+                    logger.warning("Accounting cycle-status persistence failed: %s", _cycle_status_exc)
 
         # ── Per-symbol processing ─────────────────────────────────────
         for sym, ss in symbol_state.items():

@@ -125,6 +125,26 @@ def test_dry_run_buy_fills_portfolio(tmp_path):
     assert ex.filled_orders()[0].status == OrderStatus.FILLED
 
 
+def test_dry_run_sell_never_calls_create_order(tmp_path):
+    """Shadow-environment review, 2026-09-21: 'add tests proving... exchange
+    order mutations are refused.' The BUY side was already covered above —
+    this is the SELL-side complement, since a shadow session's own exit
+    path (urgent=True SL/TP, or an ordinary strategy SELL) must be equally
+    incapable of reaching create_order, not just the entry side."""
+    ex, mock_ex = _make(dry_run=True, starting_cash=1000.0, tmp_path=tmp_path)
+    price = 90_000.0
+    qty   = 0.001
+    ex.execute(Signal.BUY, price, qty)
+    mock_ex.reset_mock()
+
+    order = ex.execute(Signal.SELL, price * 1.01, qty)
+
+    assert order is not None
+    assert order.status == OrderStatus.FILLED
+    assert order.side   == OrderSide.SELL
+    mock_ex.create_order.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Test 2: validation rejects order below minimum amount
 # ---------------------------------------------------------------------------

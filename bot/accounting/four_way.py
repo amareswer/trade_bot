@@ -16,6 +16,7 @@ trading state.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -250,7 +251,29 @@ def diff_position_against_fold(
     symbol currently HOLDING a real position with zero observed-trade
     history is the opposite of healthy: it means this accounting layer
     has no ledger evidence at all for money that is actually at risk right
-    now (the exact pre-migration gap), and must not report ok=True."""
+    now (the exact pre-migration gap), and must not report ok=True.
+
+    Non-finite rejection (accounting review, sixth pass, 2026-09-21, P1):
+    "failed balance fetch can still appear healthy." bot/main.py's shadow
+    branch deliberately feeds NaN for live_qty when a real balance fetch
+    fails, specifically so every comparison against it is False and the
+    check fails closed — but the EMPTY-observed-trades branch above tests
+    `abs(live_qty) > qty_tolerance`, which is ALSO False for NaN, and falls
+    through to the "genuinely flat, ok=True" return. The exact same trap
+    in the opposite polarity from the one this dtype was chosen to avoid.
+    Reproduced: an empty-history symbol with live_qty=NaN reported ok=True.
+    Fixed by rejecting non-finite live values unconditionally, before
+    either the empty-history or the populated-history path ever runs —
+    this can no longer depend on which branch's comparison happens to
+    trip on NaN and which doesn't."""
+    if not (math.isfinite(live_qty) and math.isfinite(live_avg_cost)):
+        return PositionRebuildDiff(
+            ok=False, live_qty=live_qty, live_avg_cost=live_avg_cost, live_realized_pnl=live_realized_pnl,
+            reason=(
+                f"live position data is not finite (qty={live_qty!r}, avg_cost={live_avg_cost!r}) "
+                f"— cannot verify against a non-numeric live value"
+            ),
+        )
     trades = store.load_observed_trades(conn, symbol)
     if not trades:
         if abs(live_qty) > qty_tolerance:

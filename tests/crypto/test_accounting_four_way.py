@@ -92,6 +92,40 @@ def test_position_diff_flat_and_no_observed_trades_is_genuinely_ok(tmp_path):
     assert "nothing at risk" in diff.reason
 
 
+def test_position_diff_rejects_nan_qty_with_empty_history(tmp_path):
+    """Accounting review, sixth pass, 2026-09-21, P1 reproduction: a failed
+    balance fetch (bot/main.py's shadow branch deliberately feeds NaN so
+    every comparison fails) with EMPTY observed-trades history used to
+    fall through the flat-position shortcut — abs(NaN) > tolerance is
+    False, same as abs(0.0) > tolerance — and report ok=True. Must fail."""
+    conn, _ = _setup(tmp_path)
+    diff = four_way.diff_position_against_fold(
+        conn, "BTC/CAD", live_qty=float("nan"), live_avg_cost=0.0, live_realized_pnl=0.0,
+    )
+    assert not diff.ok
+    assert "not finite" in diff.reason
+
+
+def test_position_diff_rejects_nan_qty_with_populated_history(tmp_path):
+    """Same failed-fetch scenario, but with real observed_trades history —
+    the non-empty-history branch's own comparison already happened to fail
+    closed on NaN (every comparison with NaN is False, so qty_ok was
+    already False), but this proves the SAME explicit, deliberate rejection
+    covers both paths rather than relying on incidental comparison luck."""
+    conn, tl = _setup(tmp_path)
+    ex = FakeExchangeAdapter()
+    ex.deposit("CAD", 1000.0, timestamp_ms=T0)
+    reconciliation.run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=1, now_ms=T0 + 100)
+    ex.execute_trade(symbol="BTC/CAD", side="buy", price=90_000.0, amount=0.001, timestamp_ms=T0 + 1000)
+    reconciliation.run_cycle(ex, conn, tl, quote="CAD", symbols=["BTC/CAD"], safety_margin_s=1, now_ms=T0 + 2000)
+
+    diff = four_way.diff_position_against_fold(
+        conn, "BTC/CAD", live_qty=float("nan"), live_avg_cost=0.0, live_realized_pnl=0.0,
+    )
+    assert not diff.ok
+    assert "not finite" in diff.reason
+
+
 def test_position_diff_not_ok_when_holding_with_zero_observed_trades(tmp_path):
     """Money-readiness review 2026-09-19: 'do not let an empty or
     pre-migration ledger appear healthy merely because there are no link
