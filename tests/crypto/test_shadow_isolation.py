@@ -17,6 +17,8 @@ see test_accounting_buy_gate_wiring.py's own docstring for why).
 import inspect
 import os
 
+import pytest
+
 import bot.main as main_mod
 
 
@@ -164,30 +166,170 @@ def test_accounting_cycle_status_written_after_every_cycle_attempt():
     assert try_i < except_i < write_i
 
 
-def test_accounting_cycle_status_in_progress_marker_written_before_run_cycle():
-    """External review, seventh pass, 2026-09-21, P1: 'a failed status
-    write preserves an earlier PASSED result' — the in-progress marker
-    must be written BEFORE run_cycle() is even called, so a crash or
-    exception anywhere in the reconciliation attempt leaves in_progress=True
-    on disk rather than a stale prior success."""
+def test_persist_accounting_cycle_start_called_before_run_cycle_with_no_enclosing_except():
+    """External review, seventh + eighth passes, 2026-09-21, P1: the
+    in-progress marker (now behind _persist_accounting_cycle_start,
+    extracted for direct testability — see test_shadow_isolation below)
+    must run BEFORE run_cycle(), and run()'s own call site must NOT wrap
+    it in a try/except of its own — a raise from it (the eighth-pass
+    'must stop the shadow acceptance run' requirement) has to propagate
+    all the way to __main__'s crash handler, not be swallowed here."""
     src = _run_src()
-    in_progress_i = src.index("accounting_cycle_status.write_in_progress(")
+    call_i = src.index("_persist_accounting_cycle_start(")
     run_cycle_i = src.index("accounting_reconciliation.run_cycle(")
     final_write_i = src.index("accounting_cycle_status.write(\n")
-    assert in_progress_i < run_cycle_i < final_write_i
+    assert call_i < run_cycle_i < final_write_i
+    # No try: immediately preceding this call site within a tight window —
+    # if one existed, an except Exception: nearby could swallow the raise.
+    preceding = src[max(0, call_i - 120):call_i]
+    assert "try:" not in preceding
 
 
-def test_db_identity_read_before_both_cycle_status_writes():
+def test_db_identity_read_before_persist_accounting_cycle_start():
     """Seventh pass, P1, finding 2: both the in-progress marker and the
     final outcome must carry the same db_identity the shadow report will
     later validate against — established once via
     accounting_store.get_or_create_db_identity."""
     src = _run_src()
     identity_i = src.index("accounting_store.get_or_create_db_identity(")
-    in_progress_i = src.index("accounting_cycle_status.write_in_progress(")
-    assert identity_i < in_progress_i
-    window = src[in_progress_i:in_progress_i + 300]
+    call_i = src.index("_persist_accounting_cycle_start(")
+    assert identity_i < call_i
+    window = src[call_i:call_i + 300]
     assert "db_identity=_accounting_db_identity" in window
+    assert "shadow_mode=_SHADOW_MODE" in window
+
+
+# ============================================================================
+# _persist_accounting_cycle_start — direct behavioral tests (eighth pass,
+# 2026-09-21, P1: "must stop the shadow acceptance run with a nonzero exit
+# before calling reconciliation — logging or alerting alone is
+# insufficient")
+# ============================================================================
+
+def test_persist_accounting_cycle_start_ok_when_write_succeeds(tmp_path):
+    class _Alerter:
+        def __init__(self):
+            self.errors = []
+        def error(self, msg):
+            self.errors.append(msg)
+
+    path = str(tmp_path / "status.json")
+    alerter = _Alerter()
+    main_mod._persist_accounting_cycle_start(
+        path, requested_symbols=["BTC/CAD"], db_identity="db-1",
+        shadow_mode=True, alerter=alerter,
+    )
+    from bot.accounting import cycle_status
+    status = cycle_status.read(path)
+    assert status.in_progress is True
+    assert alerter.errors == []
+
+
+def test_persist_accounting_cycle_start_raises_in_shadow_mode_on_write_failure(monkeypatch, tmp_path):
+    """The exact reproduction: a previous PASSED status exists, the
+    in-progress marker write fails, and shadow_mode=True must RAISE —
+    propagating toward a nonzero process exit — rather than merely log."""
+    from bot.accounting import cycle_status
+
+    path = str(tmp_path / "status.json")
+    cycle_status.write(
+        path, requested_symbols=["BTC/CAD"], block_state_ok=True, block_state_explain="ok",
+        four_way_ran=True, four_way_ready=True, four_way_explain="ok", db_identity="db-1",
+    )
+    assert cycle_status.read(path).ready is True   # sanity: really was PASSED
+
+    def _boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(main_mod.accounting_cycle_status, "write_in_progress", _boom)
+
+    class _Alerter:
+        def __init__(self):
+            self.errors = []
+        def error(self, msg):
+            self.errors.append(msg)
+    alerter = _Alerter()
+
+    with pytest.raises(RuntimeError):
+        main_mod._persist_accounting_cycle_start(
+            path, requested_symbols=["BTC/CAD"], db_identity="db-1",
+            shadow_mode=True, alerter=alerter,
+        )
+    assert alerter.errors   # still alerted loudly, in addition to raising
+
+
+def test_persist_accounting_cycle_start_does_not_raise_outside_shadow_mode(monkeypatch, tmp_path):
+    """Real live trading keeps the softer behavior — a write failure here
+    must not crash a real trading process; reconciliation still needs to
+    run for the bot's own safety regardless of this evidence file."""
+    path = str(tmp_path / "status.json")
+
+    def _boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(main_mod.accounting_cycle_status, "write_in_progress", _boom)
+
+    class _Alerter:
+        def __init__(self):
+            self.errors = []
+        def error(self, msg):
+            self.errors.append(msg)
+    alerter = _Alerter()
+
+    main_mod._persist_accounting_cycle_start(   # must NOT raise
+        path, requested_symbols=["BTC/CAD"], db_identity="db-1",
+        shadow_mode=False, alerter=alerter,
+    )
+    assert alerter.errors
+
+
+def test_reconciliation_never_called_when_shadow_mode_persist_start_raises(monkeypatch, tmp_path):
+    """The precise behavioral chain the eighth-pass finding asked for:
+    previous PASSED -> marker write fails -> reconciliation is NEVER
+    called -> the caller sees a raised failure, not a quiet continuation.
+    Modeled on run()'s own call ordering: _persist_accounting_cycle_start
+    is called with no enclosing try, immediately before run_cycle."""
+    from bot.accounting import cycle_status
+
+    path = str(tmp_path / "status.json")
+    cycle_status.write(
+        path, requested_symbols=["BTC/CAD"], block_state_ok=True, block_state_explain="ok",
+        four_way_ran=True, four_way_ready=True, four_way_explain="ok", db_identity="db-1",
+    )
+
+    def _boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(main_mod.accounting_cycle_status, "write_in_progress", _boom)
+
+    run_cycle_calls = []
+
+    def _fake_run_cycle(*a, **k):
+        run_cycle_calls.append((a, k))
+
+    class _Alerter:
+        def error(self, msg):
+            pass
+
+    def _simulated_tick():
+        # Mirrors run()'s exact call order: _persist_accounting_cycle_start
+        # first, with NO try/except around it, then run_cycle.
+        main_mod._persist_accounting_cycle_start(
+            path, requested_symbols=["BTC/CAD"], db_identity="db-1",
+            shadow_mode=True, alerter=_Alerter(),
+        )
+        _fake_run_cycle()   # must never be reached
+
+    with pytest.raises(RuntimeError):
+        _simulated_tick()
+
+    assert run_cycle_calls == []   # reconciliation was never attempted
+    # The file itself is UNCHANGED — write_in_progress raised before it
+    # could write anything, so the old PASSED content is still sitting
+    # there. That's exactly why this can't rely on the file alone: the
+    # raised RuntimeError above (stopping the caller before run_cycle,
+    # and — via run()'s own uncaught-propagation — the whole process) is
+    # the actual protection here, not a file-content change. This is the
+    # residual gap "ensure the acceptance runner checks process failure
+    # as well as the status file" refers to.
+    assert cycle_status.read(path).ready is True   # unchanged — proves the file alone is not the safety net here
 
 
 def test_four_way_shadow_balance_fetch_failure_uses_nan_not_zero():

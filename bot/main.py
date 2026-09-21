@@ -1219,6 +1219,59 @@ def _compute_account_value(capital_pool: CapitalPool, executors: dict, symbol_st
     return total
 
 
+def _persist_accounting_cycle_start(
+    path: str, *, requested_symbols: "list[str]", db_identity: "str | None",
+    shadow_mode: bool, alerter,
+) -> None:
+    """Writes the cycle-status 'in progress' marker BEFORE a reconciliation
+    attempt starts (see bot/accounting/cycle_status.py's own docstring for
+    why this ordering matters). Extracted to module level purely for
+    direct unit testability — same pattern as _compute_account_value above.
+
+    Accounting review, eighth pass, 2026-09-21, P1: "if write_in_progress()
+    fails, stop the shadow acceptance run with a nonzero exit before
+    calling reconciliation — logging or alerting alone is insufficient."
+    A write failure is ALWAYS logged and alerted (loud, either mode) —
+    but in shadow_mode specifically, it also RAISES, uncaught, letting it
+    propagate all the way to __main__'s existing crash handler (logs
+    critical, sends a final crash alert, re-raises — an uncaught exception
+    at the top level is a real nonzero process exit). The caller in run()
+    calls this BEFORE accounting_reconciliation.run_cycle() with no
+    enclosing try/except of its own around this call, so a raise here
+    guarantees run_cycle() is never even attempted this cycle.
+
+    Real live trading (shadow_mode=False) keeps the softer loud-alert-but-
+    continue behavior instead of raising: crashing a real trading process
+    over an accounting-EVIDENCE file write issue is a materially different,
+    wider decision than this shadow-acceptance requirement covers, and
+    reconciliation itself is independent of this file — it still needs to
+    run for the bot's own real safety regardless of whether this specific
+    JSON write succeeded."""
+    try:
+        accounting_cycle_status.write_in_progress(
+            path, requested_symbols=requested_symbols, db_identity=db_identity,
+        )
+    except Exception as exc:
+        logger.error(
+            "Accounting cycle-status 'in progress' marker failed to persist (%s) — "
+            "any existing status file may still show a stale prior result; "
+            "shadow acceptance evidence cannot be trusted until this is resolved.",
+            exc,
+        )
+        alerter.error(
+            f"ACCOUNTING CYCLE-STATUS PERSISTENCE FAILED (in-progress marker): "
+            f"{exc} — treat any shadow acceptance evidence as unverified until "
+            f"this is resolved."
+        )
+        if shadow_mode:
+            raise RuntimeError(
+                f"Shadow acceptance run stopped: cycle-status 'in progress' marker "
+                f"failed to persist ({exc}). Reconciliation was never attempted this "
+                f"cycle — evidence integrity for a shadow acceptance run cannot rest "
+                f"on a log line and an alert alone."
+            ) from exc
+
+
 def _execute_approved_signal(
     sym: str,
     ss: dict,
@@ -3621,27 +3674,28 @@ def run():
                 # A crash or exception anywhere between here and the final
                 # write() below leaves the file showing in_progress=True —
                 # never a stale PASSED result that predates this attempt.
-                # A failure to even write THIS marker is escalated loudly
-                # (not just logged) — a human overseeing a shadow
-                # acceptance run needs an unmissable signal that the
-                # evidence trail itself can no longer be trusted.
-                try:
-                    accounting_cycle_status.write_in_progress(
-                        _cycle_status_path, requested_symbols=list(executors.keys()),
-                        db_identity=_accounting_db_identity,
-                    )
-                except Exception as _status_start_exc:
-                    logger.error(
-                        "Accounting cycle-status 'in progress' marker failed to persist (%s) — "
-                        "any existing status file may still show a stale prior result; "
-                        "shadow acceptance evidence cannot be trusted until this is resolved.",
-                        _status_start_exc,
-                    )
-                    alerter.error(
-                        f"ACCOUNTING CYCLE-STATUS PERSISTENCE FAILED (in-progress marker): "
-                        f"{_status_start_exc} — treat any shadow acceptance evidence as "
-                        f"unverified until this is resolved."
-                    )
+                #
+                # Eighth pass, 2026-09-21, P1: "logging or alerting alone
+                # is insufficient" — in shadow mode specifically, a failure
+                # to even write THIS marker now STOPS the shadow acceptance
+                # run outright (raises, uncaught, all the way to
+                # __main__'s existing crash handler, which alerts and
+                # re-raises — a real nonzero process exit) BEFORE
+                # reconciliation.run_cycle() is ever called. Real live
+                # trading keeps the softer loud-alert-but-continue
+                # behavior — crashing a real trading process over an
+                # accounting-evidence file write issue is a materially
+                # different, wider decision this shadow-acceptance
+                # requirement doesn't cover, and reconciliation still
+                # needs to run there for the bot's own safety regardless
+                # of whether this particular evidence file could be
+                # written. See _persist_accounting_cycle_start's own
+                # docstring and test_shadow_isolation.py for the
+                # behavioral proof.
+                _persist_accounting_cycle_start(
+                    _cycle_status_path, requested_symbols=list(executors.keys()),
+                    db_identity=_accounting_db_identity, shadow_mode=_SHADOW_MODE, alerter=alerter,
+                )
                 try:
                     _accounting_state = accounting_reconciliation.run_cycle(
                         _accounting_adapter, _accounting_conn, trade_log,

@@ -305,3 +305,67 @@ def test_requesting_a_subset_of_the_cycles_symbols_still_passes(tmp_path):
     exit_code, out = _run(db_path, ["BTC/CAD"])
     assert exit_code == 0
     assert "PASSED" in out
+
+
+# ============================================================================
+# --pid process-liveness check (eighth pass, 2026-09-21, P1: "ensure the
+# acceptance runner checks process failure as well as the status file")
+# ============================================================================
+
+def test_process_alive_true_for_current_process():
+    assert report._process_alive(os.getpid()) is True
+
+
+def test_process_alive_false_for_a_pid_that_does_not_exist():
+    # A PID far beyond any real process table entry, extremely unlikely to
+    # collide with a real running process during the test.
+    assert report._process_alive(2**30) is False
+
+
+def test_stopped_process_overrides_a_passing_status_file(tmp_path):
+    """The exact property this check exists for: even a fresh, fully
+    passing status file must not report PASSED if the process it belongs
+    to has already stopped — proven by pairing a real PASSED status with
+    a deliberately-nonexistent pid."""
+    db_path, identity = _prep_db(tmp_path)
+    _write_status(
+        db_path, identity,
+        requested_symbols=["BTC/CAD"], block_state_ok=True, block_state_explain="ok",
+        four_way_ran=True, four_way_ready=True, four_way_explain="ok",
+    )
+    # Sanity: without --pid, this genuinely passes.
+    exit_code, out = _run(db_path, ["BTC/CAD"])
+    assert exit_code == 0 and "PASSED" in out
+
+    old_argv = sys.argv
+    buf = io.StringIO()
+    try:
+        sys.argv = ["accounting_shadow_report.py", "--db", db_path, "--pid", str(2**30), "BTC/CAD"]
+        with redirect_stdout(buf):
+            exit_code = report.main()
+    finally:
+        sys.argv = old_argv
+    out = buf.getvalue()
+    assert exit_code == 6
+    assert "PROCESS_STOPPED" in out
+    assert "Verdict: PROCESS_STOPPED" in out
+
+
+def test_alive_process_does_not_change_a_passing_verdict(tmp_path):
+    db_path, identity = _prep_db(tmp_path)
+    _write_status(
+        db_path, identity,
+        requested_symbols=["BTC/CAD"], block_state_ok=True, block_state_explain="ok",
+        four_way_ran=True, four_way_ready=True, four_way_explain="ok",
+    )
+    old_argv = sys.argv
+    buf = io.StringIO()
+    try:
+        sys.argv = ["accounting_shadow_report.py", "--db", db_path, "--pid", str(os.getpid()), "BTC/CAD"]
+        with redirect_stdout(buf):
+            exit_code = report.main()
+    finally:
+        sys.argv = old_argv
+    out = buf.getvalue()
+    assert exit_code == 0
+    assert "PASSED" in out

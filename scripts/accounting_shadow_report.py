@@ -106,6 +106,28 @@ def _status_age_s(status: "cycle_status.CycleStatus") -> "float | None":
     return (datetime.now(timezone.utc) - computed_dt).total_seconds()
 
 
+def _process_alive(pid: int) -> bool:
+    """Eighth pass, 2026-09-21: 'ensure the acceptance runner checks
+    process failure as well as the status file.' A behavioral test in
+    this same review (test_shadow_isolation.py) proved the status file
+    ALONE cannot always detect a stopped acceptance run: if the
+    in-progress marker write itself is what's failing, the file is left
+    holding whatever it held before — potentially a still-fresh-looking
+    PASSED result — while the bot process may have already exited hard
+    (accounting review's own new hard-stop behavior in shadow mode, or
+    any other crash). Checking the process is still alive is independent,
+    additional evidence a status-file-only check cannot provide.
+    os.kill(pid, 0) sends no signal — it only probes whether the pid
+    exists and is signalable; this makes no other change to the process."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True   # exists, just owned by someone else — still "alive"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("symbols", nargs="*", help="Symbols to check (default: UNIVERSE_WHITELIST/SYMBOL from .env)")
@@ -115,6 +137,11 @@ def main() -> int:
                               "cycle-status file is always read from the SAME directory — there is "
                               "no separate --status argument, to make a --db/--status mismatch "
                               "structurally impossible.")
+    parser.add_argument("--pid", type=int, default=None,
+                         help="PID of the bot process this shadow session is running as (e.g. from "
+                              "`pgrep -f 'bot\\.main'`). If given, checks the process is still alive — "
+                              "the status file alone cannot always tell you the acceptance run stopped "
+                              "(see module docstring, eighth-pass finding).")
     args = parser.parse_args()
     status_path = _status_path_for_db(args.db)
 
@@ -135,6 +162,10 @@ def main() -> int:
     print("Accounting shadow report (read-only, local SQLite only — no network call, no writes)")
     print(f"Database: {os.path.abspath(args.db)}")
     print(f"Cycle status: {status_path}")
+    process_alive = None
+    if args.pid is not None:
+        process_alive = _process_alive(args.pid)
+        print(f"Process pid={args.pid}: {'ALIVE' if process_alive else 'NOT RUNNING'}")
     print("=" * 70)
 
     total_unlinked = 0
@@ -161,7 +192,20 @@ def main() -> int:
     status = cycle_status.read(status_path)
     max_age_s = cfg.accounting.reconcile_interval_s + cfg.accounting.stale_grace_s
 
-    if status is None:
+    if process_alive is False:
+        # Checked FIRST, ahead of everything the status file says — a
+        # stopped process overrides any file-based verdict, including one
+        # that still looks fresh/PASSED: a behavioral test in this same
+        # review (test_shadow_isolation.py) proved the file alone cannot
+        # always show a failure if what actually broke was the ABILITY to
+        # write it. This is exactly the "process failure" half of "the
+        # acceptance runner checks process failure as well as the status
+        # file".
+        verdict, exit_code = "PROCESS_STOPPED", 6
+        print(f"PROCESS_STOPPED: pid={args.pid} is not running. Whatever the status file above "
+              f"shows — even PASSED — the acceptance run itself has stopped; that content may "
+              f"predate the process exiting and cannot be trusted as current.")
+    elif status is None:
         verdict, exit_code = "NOT_VERIFIED", 4
         print("NOT_VERIFIED: no reconciliation cycle has EVER completed at this status path — "
               "zero unlinked fills above proves nothing by itself; there may simply have been "
