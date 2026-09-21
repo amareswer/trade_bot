@@ -481,26 +481,47 @@ def reconcile(
                        zero_opening_confirmed=zero_opening_confirmed)
 
     wallet_agrees: "bool | None" = None
+    wallet_agreement_blocked_by_ordering = False
     if wallet_balance_at_read is not None:
-        attempts = 0
-        while True:
-            if chain.final_balance == wallet_balance_at_read:
-                wallet_agrees = True
-                break
-            if fetch_more_since is None or attempts >= max_retries:
-                wallet_agrees = False if fetch_more_since is None else None  # None => inconclusive
-                break
-            last_ts = _max_timestamp_entry(working_entries).exchange_timestamp if working_entries else ""
-            new_entries = fetch_more_since(last_ts)
-            attempts += 1
-            if not new_entries:
-                wallet_agrees = None   # exhausted retries with no new evidence — inconclusive
-                if attempts >= max_retries:
+        if chain.final_balance is None:
+            # The chain's own final balance is unavailable (an unsearched tie
+            # group stopped the walk before one could be established) — there
+            # is nothing to compare the wallet balance AGAINST. This is not a
+            # disagreement (comparing None to a real number would silently
+            # evaluate to False in Python, exactly the bug this branch exists
+            # to prevent) and retrying cannot fix it either: more fetched data
+            # does not shrink an already-oversized tie group. Agreement is
+            # UNKNOWN, not disproven.
+            wallet_agrees = None
+            wallet_agreement_blocked_by_ordering = True
+        else:
+            attempts = 0
+            while True:
+                if chain.final_balance == wallet_balance_at_read:
+                    wallet_agrees = True
                     break
-                continue
-            working_entries = _dedup_entries(working_entries + new_entries)
-            chain = walk_chain(working_entries, opening_checkpoint=opening_checkpoint,
-                               zero_opening_confirmed=zero_opening_confirmed)
+                if fetch_more_since is None or attempts >= max_retries:
+                    wallet_agrees = False if fetch_more_since is None else None  # None => inconclusive
+                    break
+                last_ts = _max_timestamp_entry(working_entries).exchange_timestamp if working_entries else ""
+                new_entries = fetch_more_since(last_ts)
+                attempts += 1
+                if not new_entries:
+                    wallet_agrees = None   # exhausted retries with no new evidence — inconclusive
+                    if attempts >= max_retries:
+                        break
+                    continue
+                working_entries = _dedup_entries(working_entries + new_entries)
+                chain = walk_chain(working_entries, opening_checkpoint=opening_checkpoint,
+                                   zero_opening_confirmed=zero_opening_confirmed)
+                if chain.final_balance is None:
+                    # A retry's new entries could, in principle, still leave
+                    # (or newly create) an unresolved tie group — re-check
+                    # rather than let the loop's own comparison silently
+                    # treat None as a disagreement on the next iteration.
+                    wallet_agrees = None
+                    wallet_agreement_blocked_by_ordering = True
+                    break
 
     overall_pass = (
         chain.consistent
@@ -511,7 +532,12 @@ def reconcile(
     )
 
     reason_parts = [chain.reason]
-    if wallet_agrees is None and wallet_balance_at_read is not None:
+    if wallet_agreement_blocked_by_ordering:
+        reason_parts.append(
+            "wallet balance agreement unknown — chain ordering was not resolved, so there is no "
+            "final balance to compare against (not a disagreement, a missing comparison)"
+        )
+    elif wallet_agrees is None and wallet_balance_at_read is not None:
         reason_parts.append("wallet balance agreement inconclusive after bounded retries")
     elif wallet_agrees is False:
         reason_parts.append("wallet balance does not agree with the chain's final balance")

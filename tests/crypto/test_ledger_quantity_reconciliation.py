@@ -510,6 +510,31 @@ def test_p2_oversized_tie_group_blocks_overall_pass():
     assert result.overall_pass is False
 
 
+def test_p2_wallet_agreement_is_unknown_not_disproven_when_ordering_is_unresolved():
+    """Exact review reproduction: seven VALID simultaneous deposits (they
+    would reconcile fine if searchable) whose true total, 7, exactly
+    matches the supplied wallet balance — but the tie group is too large to
+    search, so final_balance is None. An earlier version compared
+    `None == Decimal("7")`, which silently evaluates to False in Python,
+    and reported a definite disagreement — agreement was actually unknown,
+    never disproven. No retry callback is supplied here, matching the
+    exact reproduction (a retry could not fix this anyway: more fetched
+    data doesn't shrink an already-oversized tie group)."""
+    ts = "2026-06-01T00:00:00Z"
+    seven_tied = [
+        _e(f"L{i}", f"R{i}", "trade", "BTC", "1", "0", str(i), ts)
+        for i in range(7, 0, -1)
+    ]
+    result = reconcile(
+        seven_tied, zero_opening_confirmed=True, wallet_balance_at_read=Decimal("7"),
+        wallet_balance_read_at="2026-09-21T00:00:00Z",
+    )
+    assert result.chain.final_balance is None
+    assert result.wallet_balance_agrees_at_read is None    # unknown, NOT False
+    assert "not a disagreement" in result.reason
+    assert result.overall_pass is False
+
+
 def test_the_module_is_not_imported_by_any_production_path():
     import inspect
 
