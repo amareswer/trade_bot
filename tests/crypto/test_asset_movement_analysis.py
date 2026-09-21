@@ -11,11 +11,14 @@ trade rows from logs/trades.db's observed_trades table, and the exact
 deposit record returned by a live, read-only fetch_deposits('BTC') call)
 as fixtures, not synthetic data.
 
-A second review pass (same day) found the first version of this module
-asserted completeness from a bare flag, let a different asset's deposit
-satisfy a shortfall, and silently picked between conflicting duplicate
-records depending on input order. Those three findings are reproduced
-explicitly below, alongside the original properties.
+Two review passes (same day) found real gaps in earlier drafts:
+  - pass 2: a bare completeness flag, no asset separation, order-dependent
+    duplicate-conflict resolution;
+  - pass 3: `coverage_window` checked for presence only (not parsed or
+    enforced), a NaN `closing_balance` silently passing the mismatch check,
+    and different quote currencies (CAD vs USD) netting together into a
+    fabricated "known P&L". All three passes' findings are reproduced
+    explicitly below, on top of the original properties.
 """
 import inspect
 
@@ -66,6 +69,12 @@ REAL_SOL_TRADES = [
        symbol="SOL/CAD"),
 ]
 
+REAL_COVERAGE_WINDOW = ("2026-06-01T00:00:00Z", "2026-07-18T00:00:00Z")
+
+
+def _real_final_qty() -> float:
+    return analyze_with_asset_movements("BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT]).final_qty
+
 
 def test_production_causal_order_still_fails_without_the_deposit():
     """Baseline regression: the REAL production function, on trades alone,
@@ -78,18 +87,12 @@ def test_deposit_resolves_the_inventory_shortfall():
     result = analyze_with_asset_movements("BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT])
     assert result.ok is True
     assert result.unresolved_shortfall_qty == 0.0
-    # Trades + the one deposit close the position out — a tiny
-    # (0.00000044 BTC) pre-existing rounding dust from the earlier trades
-    # remains, nowhere near the ~0.00037766 BTC shortfall the
-    # deposit-less fold produced.
     assert abs(result.final_qty) < 1e-6
 
 
 def test_unknown_deposited_asset_cost_basis_remains_unknown():
     result = analyze_with_asset_movements("BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT])
     sell = next(a for a in result.sell_attributions if a.trade_id == "TEYLVF-3GXRC-N6RME4")
-    # This SELL is (almost entirely) filled from the deposited lot, whose
-    # cost basis is None by construction — never a fabricated number.
     assert sell.cost_basis_status in ("unknown", "mixed")
     assert sell.unknown_qty > 0.0
 
@@ -99,14 +102,7 @@ def test_no_fabricated_profit_or_bot_ownership_introduced():
     sell = next(a for a in result.sell_attributions if a.trade_id == "TEYLVF-3GXRC-N6RME4")
     if sell.known_qty == 0.0:
         assert sell.realized_pnl_known is None
-    # The deposit is represented as its own event kind, never as a trade —
-    # the module's dedup keys are namespaced ("trade:..." / "deposit:...")
-    # specifically so a deposit can never collide with, or be mistaken for,
-    # a bot-executed BUY's trade_id.
     assert REAL_BTC_DEPOSIT.entry_id not in {t.trade_id for t in REAL_BTC_TRADES}
-    # The function is pure: verify it took no DB/exchange handle at all —
-    # its signature only accepts plain data, so it structurally cannot
-    # write a synthetic BUY into any store.
     sig = inspect.signature(analyze_with_asset_movements)
     assert set(sig.parameters) == {
         "asset", "trades", "deposits", "withdrawals", "coverage_window",
@@ -114,74 +110,143 @@ def test_no_fabricated_profit_or_bot_ownership_introduced():
     }
 
 
-# ── Completeness: requires actual evidence, never a bare flag ──────────────
+# ── Three separate verdicts — none may stand in for another ────────────────
 
-def test_completeness_is_false_on_empty_evidence_even_with_no_shortfall():
-    """Review finding #1 reproduced against the FIXED module: an empty
-    trade/deposit list trivially has no shortfall (ok=True), but that must
-    never be conflated with a complete verdict — no withdrawal records, no
-    coverage window, and no closing balance were ever supplied."""
-    result = analyze_with_asset_movements("BTC", [], [])
-    assert result.ok is True
-    assert result.complete is False
-    assert "withdrawal records" in result.reason
-    assert "coverage window" in result.reason
-    assert "closing balance" in result.reason
-
-
-def test_missing_withdrawal_coverage_prevents_a_complete_verdict():
+def test_balance_agreement_unchecked_without_a_closing_balance():
     result = analyze_with_asset_movements("BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT])
-    assert result.ok is True          # the shortfall itself IS explained
-    assert result.complete is False   # but that is not the same as "reconciled"
-    assert "withdrawal records" in result.reason
+    assert result.balance_agreement.checked is False
+    assert result.balance_agreement.agrees is None
 
 
-def test_completeness_requires_all_three_pieces_of_real_evidence():
-    # Withdrawals supplied (even empty — "queried, found none") but still
-    # missing a coverage window and a closing balance.
+def test_balance_agreement_true_when_it_matches():
     result = analyze_with_asset_movements(
-        "BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT], withdrawals=[],
+        "BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT], closing_balance=_real_final_qty(),
     )
-    assert result.complete is False
-    assert "withdrawal records" not in result.reason
-    assert "coverage window" in result.reason
-    assert "closing balance" in result.reason
+    assert result.balance_agreement.checked is True
+    assert result.balance_agreement.agrees is True
 
 
-def test_completeness_achieved_only_with_full_real_evidence_and_matching_balance():
+def test_balance_agreement_false_on_a_real_mismatch():
     result = analyze_with_asset_movements(
-        "BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT], withdrawals=[],
-        coverage_window=("2026-06-01T00:00:00Z", "2026-07-18T00:00:00Z"),
-        closing_balance=result_final_qty_placeholder(),
+        "BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT], closing_balance=0.01,
     )
-    assert result.complete is True
-    assert result.reason == ""
+    assert result.balance_agreement.checked is True
+    assert result.balance_agreement.agrees is False
+    assert "diff" in result.balance_agreement.reason or "0.01" in result.balance_agreement.reason
 
 
-def result_final_qty_placeholder():
-    """The real fold's own final_qty, used as the 'exchange-reported
-    closing balance' for the completeness test above — computed once,
-    independently, so the test above isn't tautological about its own
-    tolerance handling."""
-    baseline = analyze_with_asset_movements("BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT])
-    return baseline.final_qty
+def test_history_coverage_not_declared_without_a_window():
+    result = analyze_with_asset_movements("BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT])
+    assert result.history_coverage.declared is False
+    assert result.history_coverage.independently_verified is False
 
 
-def test_completeness_fails_on_a_real_balance_mismatch():
+def test_history_coverage_declared_but_never_independently_verified():
+    """Even a perfectly valid, evidence-covering window is only ever a
+    caller declaration in this offline tool — never proof."""
     result = analyze_with_asset_movements(
-        "BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT], withdrawals=[],
-        coverage_window=("2026-06-01T00:00:00Z", "2026-07-18T00:00:00Z"),
-        closing_balance=0.01,  # not what the fold actually predicts
+        "BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT], coverage_window=REAL_COVERAGE_WINDOW,
     )
-    assert result.complete is False
-    assert "balance mismatch" in result.reason
+    assert result.history_coverage.declared is True
+    assert result.history_coverage.independently_verified is False
+    assert "not independently verified" in result.history_coverage.reason
 
 
-# ── Asset separation: a different asset can never resolve this shortfall ───
+def test_pnl_availability_false_when_a_sale_has_unknown_basis():
+    result = analyze_with_asset_movements("BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT])
+    assert result.pnl_availability.available is False
+    assert result.pnl_availability.quote_currency == "CAD"
+
+
+def test_pnl_availability_true_when_every_sale_is_fully_known():
+    # Trades alone (no deposit needed) for a clean BUY/SELL pair — every
+    # sale's cost basis is known.
+    result = analyze_with_asset_movements("SOL", REAL_SOL_TRADES, [])
+    assert result.pnl_availability.available is True
+    assert result.pnl_availability.quote_currency == "CAD"
+
+
+def test_pnl_availability_false_with_no_sells_at_all():
+    buy_only = [REAL_BTC_TRADES[0]]
+    result = analyze_with_asset_movements("BTC", buy_only, [])
+    assert result.pnl_availability.available is False
+    assert "no sell events" in result.pnl_availability.reason
+
+
+# ── Review pass 3, finding 1: coverage window presence != validity ─────────
+
+def test_an_unparseable_coverage_window_is_rejected_not_silently_accepted():
+    with pytest.raises(ValueError, match="ISO-8601"):
+        analyze_with_asset_movements(
+            "BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT],
+            coverage_window=("invalid", "invalid"),
+        )
+
+
+def test_a_coverage_window_with_since_after_until_is_rejected():
+    with pytest.raises(ValueError, match="strictly before"):
+        analyze_with_asset_movements(
+            "BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT],
+            coverage_window=("2026-07-18T00:00:00Z", "2026-06-01T00:00:00Z"),
+        )
+
+
+def test_a_coverage_window_that_excludes_supplied_evidence_is_rejected():
+    """A window that doesn't even cover the trades/deposit it was given
+    alongside contradicts the evidence — must not be treated as valid
+    coverage just because it parses."""
+    too_narrow = ("2026-07-01T00:00:00Z", "2026-07-18T00:00:00Z")  # excludes June trades
+    with pytest.raises(ValueError, match="falls outside"):
+        analyze_with_asset_movements(
+            "BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT], coverage_window=too_narrow,
+        )
+
+
+# ── Review pass 3, finding 2: non-finite values must be rejected ───────────
+
+def test_nan_closing_balance_is_rejected_not_silently_passed():
+    with pytest.raises(ValueError, match="finite"):
+        analyze_with_asset_movements(
+            "BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT], closing_balance=float("nan"),
+        )
+
+
+def test_infinite_closing_balance_is_rejected():
+    with pytest.raises(ValueError, match="finite"):
+        analyze_with_asset_movements(
+            "BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT], closing_balance=float("inf"),
+        )
+
+
+def test_nan_trade_amount_is_rejected():
+    bad = _t("BAD-NAN", "buy", "2026-06-12T00:00:05Z", float("nan"), 90000.0, 9.0, 0.01)
+    with pytest.raises(ValueError, match="finite"):
+        analyze_with_asset_movements("BTC", [bad], [])
+
+
+def test_nan_deposit_amount_is_rejected():
+    bad_deposit = LedgerMovement(entry_id="bad-nan-deposit", type="deposit", asset="BTC",
+                                  amount=float("nan"), timestamp="2026-06-26T12:43:35Z")
+    with pytest.raises(ValueError, match="finite"):
+        analyze_with_asset_movements("BTC", [], [bad_deposit])
+
+
+# ── Review pass 3, finding 3: mixed quote currencies must not net together ──
+
+def test_mixed_quote_currencies_are_rejected_not_netted():
+    """Buying 1 BTC for CAD 100 then selling for USD 100 must never produce
+    a numeric 'known P&L = 0' — CAD and USD are not the same number."""
+    buy_cad = _t("BUY-CAD", "buy", "2026-06-01T00:00:00Z", 1.0, 100.0, 100.0, 0.0,
+                 symbol="BTC/CAD", fee_currency="CAD")
+    sell_usd = _t("SELL-USD", "sell", "2026-06-02T00:00:00Z", 1.0, 100.0, 100.0, 0.0,
+                  symbol="BTC/USD", fee_currency="USD")
+    with pytest.raises(ValueError, match="quote currenc"):
+        analyze_with_asset_movements("BTC", [buy_cad, sell_usd], [])
+
+
+# ── Asset separation (review pass 2, finding 2) ─────────────────────────────
 
 def test_a_different_asset_deposit_is_rejected_not_silently_applied():
-    """Review finding #2 reproduced: a SOL-denominated deposit must never
-    be usable to explain a BTC shortfall."""
     wrong_asset_deposit = LedgerMovement(
         entry_id="wrong-asset-deposit", type="deposit", asset="SOL",
         amount=1.0, timestamp="2026-06-26T12:43:35Z",
@@ -223,7 +288,7 @@ def test_sol_trades_alone_already_close_out_no_deposit_needed():
     assert result.unknown_basis_qty_remaining == 0.0
 
 
-# ── Duplicate handling: exact repeats collapse, conflicts are rejected ─────
+# ── Duplicate handling (review pass 2, finding 3) ───────────────────────────
 
 def test_duplicate_deposit_does_not_double_count():
     once = analyze_with_asset_movements("BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT])
@@ -243,9 +308,6 @@ def test_duplicate_trade_does_not_double_count():
 
 
 def test_conflicting_duplicate_deposit_is_rejected_regardless_of_order():
-    """Review finding #3 reproduced: two deposits sharing the same id but
-    DIFFERENT amounts (1 vs 0.1) must be rejected outright, and the
-    rejection must not depend on which one appears first in the input."""
     big = LedgerMovement(entry_id="dup-id", type="deposit", asset="BTC",
                           amount=1.0, timestamp="2026-06-26T12:43:35Z")
     small = LedgerMovement(entry_id="dup-id", type="deposit", asset="BTC",
@@ -275,9 +337,6 @@ def test_repeated_calls_are_reproducible_a_restart_replaying_evidence_is_safe():
 
 
 def test_an_insufficient_deposit_still_fails_closed():
-    """If the supplied deposit evidence does NOT cover the real shortfall,
-    the function must say so explicitly, not silently accept a residual
-    negative position the way a naive fold might."""
     small_deposit = LedgerMovement(
         entry_id="synthetic-too-small", type="deposit", asset="BTC",
         amount=0.0001, timestamp="2026-06-26T12:43:35Z",
@@ -285,7 +344,6 @@ def test_an_insufficient_deposit_still_fails_closed():
     result = analyze_with_asset_movements("BTC", REAL_BTC_TRADES, [small_deposit])
     assert result.ok is False
     assert result.unresolved_shortfall_qty > 0.0
-    assert result.complete is False
 
 
 def test_a_withdrawal_that_exceeds_holdings_also_fails_closed():

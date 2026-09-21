@@ -23,24 +23,27 @@ of a trade's guarantees:
   - A trade is unambiguously bot-attributable evidence once linked to a
     fill. A deposit is external by definition — crediting it to "the bot's
     own trading" would misrepresent where the asset came from.
-  - A "shortfall explained" verdict is not the same as "reconciliation is
-    complete." Completeness additionally requires real withdrawal/transfer
-    evidence, a proven coverage window, and a closing balance to check the
-    fold against — this module requires all three as actual data, never a
-    caller-asserted flag, before it will report `complete=True` (a review
-    finding against an earlier draft of this module: passing an empty
-    trade/deposit list alongside a bare `withdrawals_available=True` flag
-    used to report `complete=True` on zero evidence — fixed below).
+  - "The shortfall is explained" is not one fact, it's at least THREE
+    separate ones that must not be collapsed into a single flag (a review
+    finding against an earlier draft, which had one `complete: bool` that
+    a caller could set to True with `coverage_window=("invalid","invalid")`
+    and empty evidence): whether the fold's own quantity agrees with an
+    independently-read exchange balance, whether the trade/deposit/
+    withdrawal history for the window is actually complete, and whether a
+    numeric P&L is even available at all (a single quote currency, no
+    unknown-cost lots involved). This module reports all three
+    independently — see `BalanceAgreement` / `HistoryCoverage` /
+    `PnlAvailability` below — and never implies one from another.
 
 This module is the offline tool for reasoning about that evidence safely:
 it explains an inventory shortfall when a deposit (or withdrawal) accounts
 for it, while refusing to manufacture a cost basis, a bot-attributed
-profit, mix assets, silently resolve conflicting duplicate records, or
-grant a "fully reconciled" verdict it hasn't earned. It is deliberately a
-separate, pure, no-I/O analysis — not a drop-in replacement for
-engine.causal_order, and not something reconciliation.py calls. Promoting
-any of this into the live path is a separate, explicit decision for later,
-not made here.
+profit, mix assets or quote currencies, silently resolve conflicting
+duplicate records, accept a non-finite number, or grant a "fully
+reconciled" verdict it hasn't earned. It is deliberately a separate, pure,
+no-I/O analysis — not a drop-in replacement for engine.causal_order, and
+not something reconciliation.py calls. Promoting any of this into the live
+path is a separate, explicit decision for later, not made here.
 
 ── Design ───────────────────────────────────────────────────────────────────
 Every trade, deposit, and withdrawal for the single requested `asset`
@@ -55,9 +58,8 @@ cannot say, and this module cannot prove, that the SELL on 2026-06-27
 literally spent the satoshis that arrived in the 2026-06-26 deposit rather
 than some other unit already in the wallet. FIFO is simply the most
 conservative, auditable convention for attributing which lot a sale is
-*deemed* to have drawn from, chosen because it matches how the real cost
-flow would work if the events are taken at face value in time order — it
-is a stated assumption a reader can disagree with, not a proof.
+*deemed* to have drawn from — a stated assumption a reader can disagree
+with, not a proof.
 
 A BUY's lot carries a real `cost_per_unit` (price plus its share of the
 entry fee, mirroring engine.fold_position's own fee-inclusive convention).
@@ -74,15 +76,24 @@ not a sale.
 
 ── Input contracts (all enforced — a caller violating one gets a
    ValueError, never a silently-wrong number) ────────────────────────────
+- Every numeric field on every trade/deposit/withdrawal, plus
+  `closing_balance` and `balance_tolerance` if supplied, must be finite.
+  NaN in particular compares False against everything in Python, so a NaN
+  `closing_balance` used to sail through the balance-mismatch check as a
+  false "no mismatch found" — fixed by rejecting non-finite values up
+  front, before any arithmetic touches them.
 - Every trade's symbol base asset, every deposit's/withdrawal's `.asset`,
   must equal the single `asset` this call is for. A deposit or withdrawal
   in a DIFFERENT asset can never be used to explain a shortfall in this
   one (an earlier draft had no such check at all — a 1 SOL deposit could
   silently "resolve" a 1 BTC shortfall).
-- Every trade's `fee_currency` must equal its own symbol's quote currency
-  (e.g. BTC/CAD's fee must be in CAD) — catches a trade record whose fee
-  is denominated in the base asset itself, which this module's qty-only
-  fold does not account for and must not silently mis-fold.
+- Every trade's `fee_currency` must equal its own symbol's quote currency,
+  AND every trade's symbol must share the SAME quote currency as every
+  other trade in the call. Matching the base asset (BTC) is not enough —
+  an earlier draft let a BTC/CAD buy and a BTC/USD sell net together as if
+  100 CAD and 100 USD were the same number, silently producing a
+  fabricated "known P&L = 0". Mixed quote currencies without independent
+  FX conversion evidence are rejected outright rather than guessed at.
 - Every item in `deposits` must have `type == "deposit"`; every item in
   `withdrawals` must have `type == "withdrawal"` — catches a movement
   record placed in the wrong list.
@@ -91,25 +102,37 @@ not a sale.
   (safe to collapse). If they differ — e.g. the same deposit id reported
   with two different amounts — that is a genuine conflict, not a
   duplicate, and is rejected rather than resolved by whichever one
-  happened to appear first in the input list (an earlier draft picked
-  "whichever appeared first," making the verdict silently order-dependent
-  — fixed below: same-id-different-payload always raises, regardless of
-  input order).
+  happened to appear first in the input list.
+- `coverage_window`, if supplied, must be two parseable ISO-8601
+  timestamps with `since` strictly before `until`, and every supplied
+  trade/deposit/withdrawal timestamp must fall inside that window — a
+  window that doesn't even cover the evidence given to it is a
+  contradiction, not a detail to ignore. An earlier draft only checked
+  that *something* was passed for `coverage_window`, so
+  `("invalid", "invalid")` — or a window that excluded half the real
+  trades — still counted as "coverage present."
 
-── Completeness ─────────────────────────────────────────────────────────
-`AssetMovementResult.complete` requires ALL of:
-  1. no unresolved negative-inventory shortfall (`ok`),
-  2. an actual `withdrawals` list was supplied (not `None` — `None` means
-     "not queried this time," an empty list means "queried, found none"),
-  3. an actual `coverage_window` (since, until) was supplied, proving the
-     deposits/withdrawals given are scoped to a real, stated window rather
-     than "whatever the caller happened to pass,"
-  4. an actual `closing_balance` (the exchange's own fresh balance reading
-     for the window's end) was supplied AND the fold's `final_qty` matches
-     it within `balance_tolerance`.
-Missing any of 2-4, or a balance mismatch, always yields `complete=False`
-with a reason naming exactly what's missing or mismatched — there is no
-way to assert completeness by passing a bare flag.
+── Three separate verdicts, never one flag ─────────────────────────────
+- `BalanceAgreement` — does the fold's own `final_qty` match an
+  independently-supplied `closing_balance` (e.g. a fresh exchange balance
+  read)? `checked=False` (not `agrees=False`) when no closing_balance was
+  given at all — "unknown" and "disagrees" are different facts.
+- `HistoryCoverage` — was a coverage window declared, and is it internally
+  consistent with the supplied evidence? `declared` reflects only that.
+  `independently_verified` is **always False** in this module — an
+  offline, no-network tool cannot itself prove no trade/deposit/withdrawal
+  was missed the way engine.retrieve_with_coverage_proof does (by matching
+  Kraken's own reported record count); the caller declaring a window is
+  not the same claim as that proof, and this module refuses to conflate
+  the two even though nothing here can perform that proof itself.
+- `PnlAvailability` — is a numeric, trustworthy P&L even possible for this
+  call? False whenever any sell drew from an unknown-cost-basis lot, when
+  there were no sells at all, or (structurally impossible after the
+  input-contract check above, but still recorded) when quote currencies
+  were mixed.
+None of these three is inferred from either of the others, and no single
+boolean rolls them up — `.explain()` renders all three so a caller cannot
+accidentally read one as standing in for the rest.
 
 Today, withdrawal-equivalent visibility for this Kraken account is NOT
 permanently blocked the way an earlier draft of this module implied.
@@ -124,12 +147,13 @@ from "Withdraw." Enabling ONLY "Query ledger entries" — never tested in
 this repo yet — may be a safe way to obtain real withdrawal/transfer
 evidence without ever touching the Withdraw toggle. That path is not
 implemented here; this module simply accepts `withdrawals` as an input
-so it is ready to consume that evidence the moment it exists, rather than
-hard-coding an assumption that it never will.
+so it is ready to consume that evidence the moment it exists.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from bot.accounting.engine import LedgerMovement
 from bot.accounting.store import ObservedTrade
@@ -148,6 +172,30 @@ class SellAttribution:
 
 
 @dataclass
+class BalanceAgreement:
+    checked: bool                 # was a closing_balance supplied at all?
+    agrees: "bool | None"         # None if not checked; True/False if it was
+    diff: "float | None"
+    reason: str
+
+
+@dataclass
+class HistoryCoverage:
+    declared: bool                       # a window was supplied AND passed internal-consistency checks
+    since: "str | None"
+    until: "str | None"
+    independently_verified: bool         # always False here — see module docstring
+    reason: str
+
+
+@dataclass
+class PnlAvailability:
+    available: bool
+    quote_currency: "str | None"
+    reason: str
+
+
+@dataclass
 class AssetMovementResult:
     ok: bool                              # no unresolved negative-inventory shortfall remains
     unresolved_shortfall_qty: float        # > 0 only when ok is False
@@ -155,18 +203,20 @@ class AssetMovementResult:
     unknown_basis_qty_remaining: float     # currently-held qty whose cost basis is still unknown
     sell_attributions: "list[SellAttribution]"
     duplicate_ids_collapsed: "list[str]"   # source ids that appeared more than once (identical payload)
-    complete: bool
-    reason: str
+    balance_agreement: BalanceAgreement
+    history_coverage: HistoryCoverage
+    pnl_availability: PnlAvailability
 
     def explain(self) -> str:
         if not self.ok:
             return (f"UNRESOLVED — shortfall of {self.unresolved_shortfall_qty:.10f} remains "
-                    f"even after applying the supplied deposits/withdrawals; {self.reason}")
+                    f"even after applying the supplied deposits/withdrawals")
         parts = [f"inventory explained (final_qty={self.final_qty:.10f})"]
         if self.unknown_basis_qty_remaining > _QTY_EPS:
             parts.append(f"{self.unknown_basis_qty_remaining:.10f} held with unknown cost basis")
-        if not self.complete:
-            parts.append("NOT a complete verdict — " + self.reason)
+        parts.append(f"balance agreement: {self.balance_agreement.reason}")
+        parts.append(f"history coverage: {self.history_coverage.reason}")
+        parts.append(f"P&L availability: {self.pnl_availability.reason}")
         return "; ".join(parts)
 
 
@@ -176,6 +226,23 @@ class _Lot:
     cost_per_unit: "float | None"
     source_id: str
     source_type: str   # "trade" | "deposit"
+
+
+def _require_finite(label: str, value) -> None:
+    if value is None:
+        return
+    if not math.isfinite(value):
+        raise ValueError(f"{label} must be a finite number, got {value!r}")
+
+
+def _parse_iso(label: str, raw: str) -> datetime:
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ValueError(f"{label} must be a parseable ISO-8601 timestamp, got {raw!r}: {exc}")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _dedup_by_id(items, id_fn) -> "tuple[list, list[str]]":
@@ -200,13 +267,33 @@ def _dedup_by_id(items, id_fn) -> "tuple[list, list[str]]":
     return list(seen.values()), duplicates
 
 
-def _validate_inputs(
-    asset: str, trades: "list[ObservedTrade]", deposits: "list[LedgerMovement]",
-    withdrawals: "list[LedgerMovement] | None",
+def _validate_numeric(
+    trades: "list[ObservedTrade]", deposits: "list[LedgerMovement]",
+    withdrawals: "list[LedgerMovement]", closing_balance, balance_tolerance: float,
 ) -> None:
     for t in trades:
+        _require_finite(f"trade {t.trade_id} price", t.price)
+        _require_finite(f"trade {t.trade_id} amount", t.amount)
+        _require_finite(f"trade {t.trade_id} cost", t.cost)
+        _require_finite(f"trade {t.trade_id} fee_cost", t.fee_cost)
+    for d in deposits:
+        _require_finite(f"deposit {d.entry_id} amount", d.amount)
+    for w in withdrawals:
+        _require_finite(f"withdrawal {w.entry_id} amount", w.amount)
+    _require_finite("closing_balance", closing_balance)
+    _require_finite("balance_tolerance", balance_tolerance)
+
+
+def _validate_assets_and_currencies(
+    asset: str, trades: "list[ObservedTrade]", deposits: "list[LedgerMovement]",
+    withdrawals: "list[LedgerMovement]",
+) -> "str | None":
+    """Returns the single shared quote currency across all trades (or None
+    if there are no trades), raising if trades disagree on it."""
+    quote: "str | None" = None
+    for t in trades:
         try:
-            base, quote = t.symbol.split("/")
+            base, this_quote = t.symbol.split("/")
         except ValueError:
             raise ValueError(f"trade {t.trade_id} has an unparseable symbol {t.symbol!r}")
         if base != asset:
@@ -214,11 +301,19 @@ def _validate_inputs(
                 f"trade {t.trade_id} is on {t.symbol} (base {base}), not the requested "
                 f"asset {asset!r} — refusing to mix assets in one analysis"
             )
-        if t.fee_currency and t.fee_currency != quote:
+        if t.fee_currency and t.fee_currency != this_quote:
             raise ValueError(
                 f"trade {t.trade_id}'s fee_currency {t.fee_currency!r} does not match "
-                f"{t.symbol}'s quote currency {quote!r} — this module's quantity-only fold "
-                f"cannot correctly account for a fee denominated differently than expected"
+                f"{t.symbol}'s quote currency {this_quote!r}"
+            )
+        if quote is None:
+            quote = this_quote
+        elif this_quote != quote:
+            raise ValueError(
+                f"trade {t.trade_id} is quoted in {this_quote!r} but an earlier trade in this "
+                f"call was quoted in {quote!r} — mixing quote currencies without independent "
+                f"FX conversion evidence would silently subtract unrelated currencies as if "
+                f"they were equal; require one quote currency per call instead"
             )
     for d in deposits:
         if d.asset != asset:
@@ -228,7 +323,7 @@ def _validate_inputs(
             )
         if d.type != "deposit":
             raise ValueError(f"entry {d.entry_id} in `deposits` has type={d.type!r}, expected 'deposit'")
-    for w in (withdrawals or []):
+    for w in withdrawals:
         if w.asset != asset:
             raise ValueError(
                 f"withdrawal {w.entry_id} is denominated in {w.asset!r}, not the requested "
@@ -236,6 +331,40 @@ def _validate_inputs(
             )
         if w.type != "withdrawal":
             raise ValueError(f"entry {w.entry_id} in `withdrawals` has type={w.type!r}, expected 'withdrawal'")
+    return quote
+
+
+def _build_history_coverage(
+    coverage_window: "tuple[str, str] | None", event_timestamps: "list[str]",
+) -> HistoryCoverage:
+    if coverage_window is None:
+        return HistoryCoverage(
+            declared=False, since=None, until=None, independently_verified=False,
+            reason="no coverage window supplied",
+        )
+    since_raw, until_raw = coverage_window
+    since_dt = _parse_iso("coverage_window[0] (since)", since_raw)
+    until_dt = _parse_iso("coverage_window[1] (until)", until_raw)
+    if not since_dt < until_dt:
+        raise ValueError(
+            f"coverage_window since ({since_raw}) must be strictly before until ({until_raw})"
+        )
+    for ts in event_timestamps:
+        ts_dt = _parse_iso("event timestamp", ts)
+        if not (since_dt <= ts_dt <= until_dt):
+            raise ValueError(
+                f"event timestamp {ts} falls outside the declared coverage_window "
+                f"[{since_raw}, {until_raw}] — the window contradicts the evidence supplied"
+            )
+    return HistoryCoverage(
+        declared=True, since=since_raw, until=until_raw, independently_verified=False,
+        reason=(
+            "window is internally consistent and covers every supplied event, but this is the "
+            "CALLER's declared window, not independently verified against the exchange's own "
+            "reported record count the way engine.retrieve_with_coverage_proof does — true "
+            "completeness of the underlying history is not established by this alone"
+        ),
+    )
 
 
 def analyze_with_asset_movements(
@@ -255,23 +384,28 @@ def analyze_with_asset_movements(
     Never inserts a synthetic trade for a deposit — deposits and
     withdrawals are their own event kinds throughout, distinguishable in
     every lot and every dedup key, so nothing here can be mistaken for a
-    bot-executed BUY or SELL."""
-    _validate_inputs(asset, trades, deposits, withdrawals)
-    withdrawals_were_supplied = withdrawals is not None
+    bot-executed BUY or SELL. Reports three independent verdicts
+    (BalanceAgreement / HistoryCoverage / PnlAvailability) rather than one
+    rolled-up flag — see module docstring."""
+    withdrawals_in = withdrawals if withdrawals is not None else []
+    _validate_numeric(trades, deposits, withdrawals_in, closing_balance, balance_tolerance)
+    quote = _validate_assets_and_currencies(asset, trades, deposits, withdrawals_in)
 
     trades, dup_trade_ids = _dedup_by_id(trades, lambda t: f"trade:{t.trade_id}")
     deposits, dup_deposit_ids = _dedup_by_id(deposits, lambda d: f"deposit:{d.entry_id}")
-    withdrawals, dup_withdrawal_ids = _dedup_by_id(
-        withdrawals or [], lambda w: f"withdrawal:{w.entry_id}"
+    withdrawals_in, dup_withdrawal_ids = _dedup_by_id(
+        withdrawals_in, lambda w: f"withdrawal:{w.entry_id}"
     )
     duplicate_ids = dup_trade_ids + dup_deposit_ids + dup_withdrawal_ids
 
     events = (
         [("trade", t.exchange_timestamp, t) for t in trades]
         + [("deposit", d.timestamp, d) for d in deposits]
-        + [("withdrawal", w.timestamp, w) for w in withdrawals]
+        + [("withdrawal", w.timestamp, w) for w in withdrawals_in]
     )
     events.sort(key=lambda e: e[1])
+
+    history_coverage = _build_history_coverage(coverage_window, [e[1] for e in events])
 
     lots: "list[_Lot]" = []
     sell_attributions: "list[SellAttribution]" = []
@@ -346,32 +480,40 @@ def analyze_with_asset_movements(
     unknown_remaining = sum(l.qty for l in lots if l.cost_per_unit is None)
     ok = shortfall <= _QTY_EPS
 
-    if not ok:
-        reason = (f"{shortfall:.10f} of sold/withdrawn quantity has no explaining trade, deposit, "
-                   f"OR withdrawal — still a genuine data-integrity gap, not resolved by the "
-                   f"supplied evidence")
-        complete = False
+    if closing_balance is None:
+        balance_agreement = BalanceAgreement(
+            checked=False, agrees=None, diff=None, reason="no closing_balance supplied",
+        )
     else:
-        missing = []
-        if not withdrawals_were_supplied:
-            missing.append("withdrawal records (None means not queried this time)")
-        if coverage_window is None:
-            missing.append("a coverage window")
-        if closing_balance is None:
-            missing.append("a closing balance to check the fold against")
-        if missing:
-            reason = "completeness requires " + ", ".join(missing) + " — none supplied"
-            complete = False
-        elif abs(final_qty - closing_balance) > balance_tolerance:
-            reason = (f"closing balance mismatch: fold predicts {final_qty:.10f}, exchange "
-                      f"reports {closing_balance:.10f} (diff {final_qty - closing_balance:.10f})")
-            complete = False
-        else:
-            reason = ""
-            complete = True
+        diff = final_qty - closing_balance
+        agrees = abs(diff) <= balance_tolerance
+        balance_agreement = BalanceAgreement(
+            checked=True, agrees=agrees, diff=diff,
+            reason=("fold matches the supplied closing balance" if agrees else
+                    f"fold predicts {final_qty:.10f}, exchange reports {closing_balance:.10f} "
+                    f"(diff {diff:.10f})"),
+        )
+
+    any_unknown_sale = any(a.unknown_qty > _QTY_EPS for a in sell_attributions)
+    if not sell_attributions:
+        pnl_availability = PnlAvailability(
+            available=False, quote_currency=quote, reason="no sell events to evaluate P&L for",
+        )
+    elif any_unknown_sale:
+        pnl_availability = PnlAvailability(
+            available=False, quote_currency=quote,
+            reason="at least one sale drew from unknown-cost-basis inventory (e.g. a deposit) — "
+                   "P&L is not fully known for that sale",
+        )
+    else:
+        pnl_availability = PnlAvailability(
+            available=True, quote_currency=quote,
+            reason=f"every sale's cost basis is known, all in {quote}",
+        )
 
     return AssetMovementResult(
         ok=ok, unresolved_shortfall_qty=shortfall, final_qty=final_qty,
         unknown_basis_qty_remaining=unknown_remaining, sell_attributions=sell_attributions,
-        duplicate_ids_collapsed=duplicate_ids, complete=complete, reason=reason,
+        duplicate_ids_collapsed=duplicate_ids, balance_agreement=balance_agreement,
+        history_coverage=history_coverage, pnl_availability=pnl_availability,
     )
