@@ -71,6 +71,28 @@ REAL_SOL_TRADES = [
 
 REAL_COVERAGE_WINDOW = ("2026-06-01T00:00:00Z", "2026-07-18T00:00:00Z")
 
+# The real, pagination-verified Kraken ledger's BTC-denominated fee on
+# TDCRFZ-MWTNB-2NVHO6, established via scripts/ledger_reconciliation_audit.py
+# and cross-checked against that trade's CAD leg (see that script and its
+# tests) — an explicit, externally-established fact, not inferred here.
+REAL_BTC_BASE_FEE_QTY = {"TDCRFZ-MWTNB-2NVHO6": 0.00000044}
+
+# The real 4 SOL staking-reward ledger entries (net of Kraken's own staking
+# fee, already applied by Kraken before crediting `amount` here — see
+# scripts/ledger_reconciliation_audit.py's raw dump: amount=0.0000051019,
+# fee=0.0000015305 nets to the SAME balance delta as amount-fee applied
+# once; represented here as the single net credit per entry).
+REAL_SOL_REWARDS = [
+    LedgerMovement(entry_id="ELDY5NC-MWJ4N-ENASSE", type="reward", asset="SOL",
+                   amount=0.0000051019 - 0.0000015305, timestamp="2026-08-28T04:32:39Z"),
+    LedgerMovement(entry_id="ELRMKQS-EEZEM-FOWGRT", type="reward", asset="SOL",
+                   amount=0.0000000021 - 0.0000000006, timestamp="2026-09-04T04:32:38Z"),
+    LedgerMovement(entry_id="ELJDZNW-WLFT6-OZP7PJ", type="reward", asset="SOL",
+                   amount=0.0000000022 - 0.0000000006, timestamp="2026-09-11T04:32:44Z"),
+    LedgerMovement(entry_id="ELSYCZH-O5LB6-GGQLMZ", type="reward", asset="SOL",
+                   amount=0.0000000018 - 0.0000000005, timestamp="2026-09-18T04:32:49Z"),
+]
+
 
 def _real_final_qty() -> float:
     return analyze_with_asset_movements("BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT]).final_qty
@@ -105,9 +127,80 @@ def test_no_fabricated_profit_or_bot_ownership_introduced():
     assert REAL_BTC_DEPOSIT.entry_id not in {t.trade_id for t in REAL_BTC_TRADES}
     sig = inspect.signature(analyze_with_asset_movements)
     assert set(sig.parameters) == {
-        "asset", "trades", "deposits", "withdrawals", "coverage_window",
-        "closing_balance", "balance_tolerance",
+        "asset", "trades", "deposits", "withdrawals", "rewards", "base_currency_fee_qty",
+        "coverage_window", "closing_balance", "balance_tolerance",
     }
+
+
+# ── Review pass 4, finding 1: an unmatched sale must not report "known" ────
+
+def test_a_sell_against_zero_inventory_is_unmatched_not_known():
+    """A SELL with no preceding inventory at all previously fell through to
+    known_qty=0, unknown_qty=0 -> cost_basis_status='known' and
+    pnl_availability.available=True — exactly backwards for a sale this
+    analysis cannot explain at all."""
+    sell_only = _t("SELL-NO-INV", "sell", "2026-06-01T00:00:00Z", 1.0, 100.0, 100.0, 0.0)
+    result = analyze_with_asset_movements("BTC", [sell_only], [])
+    assert result.ok is False
+    sell = result.sell_attributions[0]
+    assert sell.known_qty == 0.0
+    assert sell.unknown_qty == 0.0
+    assert sell.unmatched_qty == 1.0
+    assert sell.cost_basis_status == "unmatched"
+    assert sell.realized_pnl_known is None
+    assert result.pnl_availability.available is False
+
+
+def test_a_partially_unmatched_sell_also_makes_pnl_unavailable():
+    buy = _t("BUY-PARTIAL", "buy", "2026-06-01T00:00:00Z", 0.4, 100.0, 40.0, 0.0)
+    sell = _t("SELL-PARTIAL", "sell", "2026-06-02T00:00:00Z", 1.0, 100.0, 100.0, 0.0)
+    result = analyze_with_asset_movements("BTC", [buy, sell], [])
+    assert result.ok is False
+    attributed = result.sell_attributions[0]
+    assert attributed.known_qty == pytest.approx(0.4)
+    assert attributed.unmatched_qty == pytest.approx(0.6)
+    assert attributed.cost_basis_status == "mixed"
+    assert result.pnl_availability.available is False
+
+
+# ── Review pass 4, finding 2: chronological order must use real UTC instants ─
+
+def test_timezone_offset_timestamps_sort_by_real_utc_instant_not_text():
+    """The exact scenario reported: a BUY written with a -05:00 offset
+    (05:30Z in real time) text-sorts BEFORE a SELL written as 02:00Z, even
+    though the SELL happens almost four hours EARLIER in real time. Sorting
+    by raw text would let the SELL succeed against inventory that, in real
+    time, doesn't exist yet — sorting by parsed UTC instant must correctly
+    detect the shortfall instead."""
+    buy = _t("BUY-TZ", "buy", "2026-06-01T00:30:00-05:00", 1.0, 100.0, 100.0, 0.0)
+    sell = _t("SELL-TZ", "sell", "2026-06-01T02:00:00Z", 1.0, 100.0, 100.0, 0.0)
+    result = analyze_with_asset_movements("BTC", [buy, sell], [])
+    assert result.ok is False
+    assert result.unresolved_shortfall_qty == pytest.approx(1.0)
+
+
+def test_simultaneous_deposit_and_sell_apply_inflow_before_outflow():
+    """Documented, deterministic tie-break for the exact same real instant:
+    inflows (deposits/BUYs) are applied before outflows (SELLs/withdrawals).
+    This is a stated ASSUMPTION, not a proven-safe default — if the true
+    order was actually outflow-before-inflow, this convention would hide
+    a real shortfall rather than reveal one. This test only proves the
+    convention is applied consistently, not that it is always correct."""
+    deposit = LedgerMovement(entry_id="tie-deposit", type="deposit", asset="BTC",
+                              amount=1.0, timestamp="2026-06-01T00:00:00Z")
+    sell = _t("TIE-SELL", "sell", "2026-06-01T00:00:00Z", 1.0, 100.0, 100.0, 0.0)
+    result = analyze_with_asset_movements("BTC", [sell], [deposit])
+    assert result.ok is True
+    assert result.unresolved_shortfall_qty == 0.0
+
+
+def test_malformed_trade_timestamp_is_rejected_even_without_a_coverage_window():
+    """Timestamp parsing for chronological ordering is unconditional now —
+    an earlier draft only parsed timestamps when a coverage_window happened
+    to be supplied, leaving the sort itself always naive-string-based."""
+    bad = _t("BAD-TS", "buy", "not-a-timestamp", 0.0001, 90000.0, 9.0, 0.01)
+    with pytest.raises(ValueError, match="ISO-8601"):
+        analyze_with_asset_movements("BTC", [bad], [])
 
 
 # ── Three separate verdicts — none may stand in for another ────────────────
@@ -354,6 +447,232 @@ def test_a_withdrawal_that_exceeds_holdings_also_fails_closed():
     )
     assert result.ok is False
     assert result.unresolved_shortfall_qty > 0.9
+
+
+# ── Review pass 5: real BTC base-currency-fee correction + SOL rewards ──────
+# (scripts/ledger_reconciliation_audit.py found these via a pagination-
+# proven, Decimal-exact ledger walk — see that script's own tests for the
+# raw evidence and the cross-currency check that ruled out a second,
+# separate CAD fee before this correction was added here.)
+
+def test_base_currency_fee_qty_makes_the_real_btc_chain_reconcile_exactly():
+    result = analyze_with_asset_movements(
+        "BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT],
+        base_currency_fee_qty=REAL_BTC_BASE_FEE_QTY, closing_balance=0.0,
+    )
+    assert result.ok is True
+    assert result.final_qty == pytest.approx(0.0, abs=1e-12)
+    assert result.balance_agreement.agrees is True
+
+
+def test_base_currency_fee_qty_correctly_raises_the_affected_sells_pnl():
+    """A first, buggy draft of this feature assumed fee_cost was still a
+    real cash deduction and silently discarded the fee-consumed quantity's
+    cost basis — understating the real economic loss. The corrected
+    formula (a) stops subtracting fee_cost from proceeds (the CAD leg was
+    never actually debited) and (b) recognizes the fee-consumed quantity's
+    own cost-basis loss — both push TDCRFZ's reported P&L UP relative to
+    the old (wrong) formula, not leave it unchanged."""
+    before = analyze_with_asset_movements("BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT])
+    after = analyze_with_asset_movements(
+        "BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT], base_currency_fee_qty=REAL_BTC_BASE_FEE_QTY,
+    )
+    before_pnl = next(a for a in before.sell_attributions if a.trade_id == "TDCRFZ-MWTNB-2NVHO6")
+    after_pnl = next(a for a in after.sell_attributions if a.trade_id == "TDCRFZ-MWTNB-2NVHO6")
+    assert after_pnl.fee_consumed_qty == pytest.approx(0.00000044)
+    assert after_pnl.fee_consumed_known_qty == pytest.approx(0.00000044)
+    assert after_pnl.fee_unit_basis_unresolved is False
+    assert after_pnl.realized_pnl_known != before_pnl.realized_pnl_known
+
+
+def test_complete_round_trip_pnl_equals_real_cash_change_with_a_base_fee():
+    """The core conservation property this fix exists to satisfy: ending
+    flat, with NO external flows (no deposits/withdrawals/rewards), total
+    reported P&L must equal the actual quote-cash change — not silently
+    discard the fee-consumed quantity's cost basis. BUY 1.0 for $100 cash;
+    SELL reports 0.9 for $90 cash (fee_cost=0, matching the real pattern
+    where the CAD leg is never actually debited); an extra 0.1 units leave
+    as a base-currency fee, drawn from the SAME known-cost BUY lot. Real
+    cash change: -100 + 90 = -10."""
+    buy = _t("RT-BUY", "buy", "2026-06-01T00:00:00Z", 1.0, 100.0, 100.0, 0.0)
+    sell = _t("RT-SELL", "sell", "2026-06-02T00:00:00Z", 0.9, 100.0, 90.0, 0.0)
+    result = analyze_with_asset_movements(
+        "BTC", [buy, sell], [], base_currency_fee_qty={"RT-SELL": 0.1},
+    )
+    assert result.ok is True
+    assert result.final_qty == pytest.approx(0.0, abs=1e-9)   # fully flat
+    total_pnl = sum(a.realized_pnl_known or 0.0 for a in result.sell_attributions)
+    real_cash_change = -100.0 + 90.0
+    assert total_pnl == pytest.approx(real_cash_change)
+    attr = result.sell_attributions[0]
+    assert attr.fee_consumed_known_qty == pytest.approx(0.1)
+    assert attr.fee_unit_basis_unresolved is False
+    assert result.pnl_availability.available is True
+
+
+def test_complete_round_trip_baseline_without_any_fee_override_already_conserves():
+    """Positive baseline: for an ordinary trade (no base-currency-fee
+    override), the existing fee_cost-as-cash-deduction formula already
+    conserves cash exactly — proving this property held before this fix
+    and still holds for the common case untouched by it."""
+    buy = _t("RT2-BUY", "buy", "2026-06-01T00:00:00Z", 1.0, 100.0, 100.0, 2.0)   # $102 cash out
+    sell = _t("RT2-SELL", "sell", "2026-06-02T00:00:00Z", 1.0, 120.0, 120.0, 3.0)  # $117 cash in
+    result = analyze_with_asset_movements("BTC", [buy, sell], [])
+    assert result.final_qty == pytest.approx(0.0, abs=1e-9)
+    total_pnl = sum(a.realized_pnl_known or 0.0 for a in result.sell_attributions)
+    real_cash_change = -(100.0 + 2.0) + (120.0 - 3.0)
+    assert total_pnl == pytest.approx(real_cash_change)
+
+
+def test_real_sol_round_trip_already_conserves_cash_exactly():
+    """The same conservation property, checked against the real SOL/CAD
+    round trip (no override involved) — the $1.085250 net figure reported
+    earlier is not an arbitrary number, it IS the real cash change."""
+    result = analyze_with_asset_movements("SOL", REAL_SOL_TRADES, [])
+    assert result.final_qty == pytest.approx(0.0, abs=1e-9)
+    total_pnl = sum(a.realized_pnl_known or 0.0 for a in result.sell_attributions)
+    buy, sell = REAL_SOL_TRADES
+    real_cash_change = -(buy.cost + buy.fee_cost) + (sell.cost - sell.fee_cost)
+    assert total_pnl == pytest.approx(real_cash_change)
+
+
+def test_fee_consumed_from_an_unknown_cost_lot_stays_explicitly_unresolved():
+    """If the fee-consumed quantity draws from a deposit/reward lot instead
+    of a known BUY, its economic impact must NOT be guessed at, defaulted
+    to zero, or silently folded into the known P&L number."""
+    deposit = LedgerMovement(entry_id="rt3-deposit", type="deposit", asset="BTC",
+                             amount=1.0, timestamp="2026-06-01T00:00:00Z")
+    sell = _t("RT3-SELL", "sell", "2026-06-02T00:00:00Z", 0.9, 100.0, 90.0, 0.0)
+    result = analyze_with_asset_movements(
+        "BTC", [sell], [deposit], base_currency_fee_qty={"RT3-SELL": 0.1},
+    )
+    attr = result.sell_attributions[0]
+    assert attr.fee_consumed_unknown_qty == pytest.approx(0.1)
+    assert attr.fee_unit_basis_unresolved is True
+    assert result.pnl_availability.available is False
+
+
+def test_an_entirely_unmatched_fee_still_makes_pnl_unavailable():
+    """Exact review reproduction: buy 1 unit, sell that entire unit (the
+    main sale is fully known and fully matched), then charge an additional
+    0.01-unit base fee with NO inventory left at all to cover it. Before
+    this fix: ok=False, shortfall=0.01, but pnl_availability.available was
+    STILL True and fee_unit_basis_unresolved was STILL False — the fee's
+    own unmatched portion was counted toward the shortfall but excluded
+    from the P&L-availability check entirely."""
+    buy = _t("UNMFEE-BUY", "buy", "2026-06-01T00:00:00Z", 1.0, 100.0, 100.0, 0.0)
+    sell = _t("UNMFEE-SELL", "sell", "2026-06-02T00:00:00Z", 1.0, 100.0, 100.0, 0.0)
+    result = analyze_with_asset_movements(
+        "BTC", [buy, sell], [], base_currency_fee_qty={"UNMFEE-SELL": 0.01},
+    )
+    assert result.ok is False
+    assert result.unresolved_shortfall_qty == pytest.approx(0.01)
+    attr = result.sell_attributions[0]
+    assert attr.known_qty == pytest.approx(1.0)          # the main sale itself is fully explained
+    assert attr.fee_consumed_unmatched_qty == pytest.approx(0.01)
+    assert attr.fee_unit_basis_unresolved is True
+    assert result.pnl_availability.available is False
+
+
+def test_a_partially_covered_fee_splits_known_and_unmatched_correctly():
+    """A fee that is PARTIALLY covered by remaining inventory and partially
+    not must split cleanly across fee_consumed_known_qty and
+    fee_consumed_unmatched_qty — neither swallowing the other."""
+    buy = _t("PARTFEE-BUY", "buy", "2026-06-01T00:00:00Z", 1.0, 100.0, 100.0, 0.0)
+    sell = _t("PARTFEE-SELL", "sell", "2026-06-02T00:00:00Z", 0.99, 100.0, 99.0, 0.0)
+    # After the main sale consumes 0.99, only 0.01 unit remains in the BUY
+    # lot — a 0.03-unit fee can only be PARTIALLY covered (0.01 known,
+    # 0.02 unmatched).
+    result = analyze_with_asset_movements(
+        "BTC", [buy, sell], [], base_currency_fee_qty={"PARTFEE-SELL": 0.03},
+    )
+    assert result.ok is False
+    assert result.unresolved_shortfall_qty == pytest.approx(0.02)
+    attr = result.sell_attributions[0]
+    assert attr.fee_consumed_known_qty == pytest.approx(0.01)
+    assert attr.fee_consumed_unmatched_qty == pytest.approx(0.02)
+    assert attr.fee_unit_basis_unresolved is True
+    assert result.pnl_availability.available is False
+
+
+def test_base_currency_fee_qty_referencing_an_unknown_trade_id_is_rejected():
+    with pytest.raises(ValueError, match="not in `trades`"):
+        analyze_with_asset_movements(
+            "BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT],
+            base_currency_fee_qty={"NOT-A-REAL-TRADE-ID": 0.0001},
+        )
+
+
+def test_base_currency_fee_qty_must_be_non_negative():
+    with pytest.raises(ValueError, match=">= 0"):
+        analyze_with_asset_movements(
+            "BTC", REAL_BTC_TRADES, [REAL_BTC_DEPOSIT],
+            base_currency_fee_qty={"TDCRFZ-MWTNB-2NVHO6": -0.0001},
+        )
+
+
+def test_a_buys_base_currency_fee_reduces_the_net_lot_not_the_cost():
+    """On a BUY, the true net quantity retained shrinks by the fee, but the
+    TOTAL dollar cost (cost + fee_cost) is unchanged — only its per-unit
+    spread changes, since it's now divided over fewer real units."""
+    buy = _t("BUY-BASEFEE", "buy", "2026-06-01T00:00:00Z", 1.0, 100.0, 100.0, 0.0)
+    sell = _t("SELL-BASEFEE", "sell", "2026-06-02T00:00:00Z", 0.9, 100.0, 90.0, 0.0)
+    result = analyze_with_asset_movements(
+        "BTC", [buy, sell], [], base_currency_fee_qty={"BUY-BASEFEE": 0.1},
+    )
+    # Net lot was 1.0 - 0.1 = 0.9, cost_per_unit = 100/0.9 — the 0.9-unit
+    # sell exactly drains it, entirely from a known-cost lot.
+    sell_attr = result.sell_attributions[0]
+    assert sell_attr.cost_basis_status == "known"
+    assert sell_attr.known_qty == pytest.approx(0.9)
+    assert result.final_qty == pytest.approx(0.0, abs=1e-9)
+
+
+def test_sol_rewards_reconcile_exactly_to_the_real_live_balance():
+    result = analyze_with_asset_movements(
+        "SOL", REAL_SOL_TRADES, [], rewards=REAL_SOL_REWARDS, closing_balance=0.0000035758,
+    )
+    assert result.ok is True
+    assert result.final_qty == pytest.approx(0.0000035758, abs=1e-12)
+    assert result.balance_agreement.agrees is True
+
+
+def test_a_reward_sourced_sell_has_unknown_cost_basis_no_fabricated_ownership():
+    """Rewards carry no acquisition cost and are not bot-attributable —
+    selling from a reward-sourced lot must behave exactly like selling from
+    a deposit-sourced one: unknown cost basis, no fabricated P&L."""
+    reward = LedgerMovement(entry_id="rwd1", type="reward", asset="BTC",
+                            amount=0.0001, timestamp="2026-06-01T00:00:00Z")
+    sell = _t("SELL-REWARD", "sell", "2026-06-02T00:00:00Z", 0.0001, 100.0, 10.0, 0.0)
+    result = analyze_with_asset_movements("BTC", [sell], [], rewards=[reward])
+    assert result.ok is True
+    attr = result.sell_attributions[0]
+    assert attr.cost_basis_status == "unknown"
+    assert attr.realized_pnl_known is None
+    assert result.pnl_availability.available is False
+
+
+def test_a_deposit_typed_entry_in_rewards_is_rejected():
+    mislabeled = LedgerMovement(entry_id="not-a-reward", type="deposit", asset="BTC",
+                                amount=0.0001, timestamp="2026-06-01T00:00:00Z")
+    with pytest.raises(ValueError, match="expected 'reward'"):
+        analyze_with_asset_movements("BTC", [], [], rewards=[mislabeled])
+
+
+def test_a_reward_in_a_different_asset_is_rejected():
+    wrong_asset = LedgerMovement(entry_id="rwd2", type="reward", asset="ETH",
+                                 amount=0.0001, timestamp="2026-06-01T00:00:00Z")
+    with pytest.raises(ValueError, match="ETH"):
+        analyze_with_asset_movements("BTC", [], [], rewards=[wrong_asset])
+
+
+def test_duplicate_reward_does_not_double_count():
+    once = analyze_with_asset_movements("SOL", [], [], rewards=[REAL_SOL_REWARDS[0]])
+    twice = analyze_with_asset_movements(
+        "SOL", [], [], rewards=[REAL_SOL_REWARDS[0], REAL_SOL_REWARDS[0]],
+    )
+    assert once.final_qty == twice.final_qty
+    assert twice.duplicate_ids_collapsed == [f"reward:{REAL_SOL_REWARDS[0].entry_id}"]
 
 
 def test_offline_module_is_not_imported_by_any_production_reconciliation_path():
