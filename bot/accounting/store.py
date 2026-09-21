@@ -49,6 +49,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -98,6 +99,10 @@ CREATE TABLE IF NOT EXISTS fee_adjustments (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_fee_adjustments_adjustment_id
 ON fee_adjustments(adjustment_id) WHERE adjustment_id IS NOT NULL AND adjustment_id != '';
+CREATE TABLE IF NOT EXISTS db_identity (
+    identity   TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -507,3 +512,32 @@ def unlinked_fills(conn: sqlite3.Connection, symbol: str, source_exclude: str = 
     if source_exclude:
         out = [r for r in out if source_exclude not in (r.get("notes") or "")]
     return out
+
+
+def read_db_identity(conn: sqlite3.Connection) -> Optional[str]:
+    """Pure SELECT — never creates anything. This is the read-only half
+    used by scripts/accounting_shadow_report.py (accounting review,
+    seventh pass, 2026-09-21, P1: "status evidence is not tied to the
+    inspected database" — the report must be able to verify a persisted
+    cycle-status file actually corresponds to THIS database, not just
+    trust that whatever --db/--status paths were passed happen to agree)."""
+    row = conn.execute("SELECT identity FROM db_identity LIMIT 1").fetchone()
+    return row[0] if row else None
+
+
+def get_or_create_db_identity(conn: sqlite3.Connection) -> str:
+    """The write-capable half — used only by bot/main.py (a real writer),
+    never by the read-only shadow report. Idempotent: a db_identity row,
+    once created, is permanent for the lifetime of this database file —
+    established the first time this function runs against it, never
+    regenerated or overwritten afterward."""
+    existing = read_db_identity(conn)
+    if existing is not None:
+        return existing
+    identity = str(uuid.uuid4())
+    with conn:
+        conn.execute(
+            "INSERT INTO db_identity (identity, created_at) VALUES (?, ?)",
+            (identity, _now_iso()),
+        )
+    return identity

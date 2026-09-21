@@ -3607,6 +3607,41 @@ def run():
                 _four_way_ran_this_cycle = False
                 _four_way_ready_this_cycle = None
                 _four_way_explain_this_cycle = None
+                _cycle_status_path = os.path.join(_STATE_LOG_DIR, "accounting_cycle_status.json")
+                try:
+                    _accounting_db_identity = accounting_store.get_or_create_db_identity(_accounting_conn)
+                except Exception as _identity_exc:
+                    _accounting_db_identity = None
+                    logger.warning("Accounting db_identity read/create failed: %s", _identity_exc)
+                # Two-phase persistence (accounting review, seventh pass,
+                # 2026-09-21, P1: "a failed status write preserves an
+                # earlier PASSED result"): write an in-progress marker
+                # BEFORE attempting reconciliation, unconditionally
+                # invalidating whatever the last COMPLETED outcome was.
+                # A crash or exception anywhere between here and the final
+                # write() below leaves the file showing in_progress=True —
+                # never a stale PASSED result that predates this attempt.
+                # A failure to even write THIS marker is escalated loudly
+                # (not just logged) — a human overseeing a shadow
+                # acceptance run needs an unmissable signal that the
+                # evidence trail itself can no longer be trusted.
+                try:
+                    accounting_cycle_status.write_in_progress(
+                        _cycle_status_path, requested_symbols=list(executors.keys()),
+                        db_identity=_accounting_db_identity,
+                    )
+                except Exception as _status_start_exc:
+                    logger.error(
+                        "Accounting cycle-status 'in progress' marker failed to persist (%s) — "
+                        "any existing status file may still show a stale prior result; "
+                        "shadow acceptance evidence cannot be trusted until this is resolved.",
+                        _status_start_exc,
+                    )
+                    alerter.error(
+                        f"ACCOUNTING CYCLE-STATUS PERSISTENCE FAILED (in-progress marker): "
+                        f"{_status_start_exc} — treat any shadow acceptance evidence as "
+                        f"unverified until this is resolved."
+                    )
                 try:
                     _accounting_state = accounting_reconciliation.run_cycle(
                         _accounting_adapter, _accounting_conn, trade_log,
@@ -3713,20 +3748,36 @@ def run():
                 # landed nearby in time", and a checkpoint from an earlier
                 # SUCCESSFUL cycle survives unchanged after a later failed
                 # one). Written on EVERY cycle attempt, success or
-                # exception, so a reader always sees the true latest
-                # outcome — never a stale success masking a real failure.
+                # exception, so a reader always sees the true latest,
+                # CONFIRMED-COMPLETE outcome (in_progress=False) — never a
+                # stale success masking a real failure. If THIS write also
+                # fails, the file is left showing the in-progress marker
+                # written above, not a stale PASSED result (seventh pass,
+                # 2026-09-21, P1) — escalated loudly for the same reason.
                 try:
                     accounting_cycle_status.write(
-                        os.path.join(_STATE_LOG_DIR, "accounting_cycle_status.json"),
+                        _cycle_status_path,
                         requested_symbols=list(executors.keys()),
                         block_state_ok=(_accounting_state.explain() == "ok"),
                         block_state_explain=_accounting_state.explain(),
                         four_way_ran=_four_way_ran_this_cycle,
                         four_way_ready=_four_way_ready_this_cycle,
                         four_way_explain=_four_way_explain_this_cycle,
+                        db_identity=_accounting_db_identity,
                     )
                 except Exception as _cycle_status_exc:
-                    logger.warning("Accounting cycle-status persistence failed: %s", _cycle_status_exc)
+                    logger.error(
+                        "Accounting cycle-status FINAL outcome failed to persist (%s) — "
+                        "the in-progress marker written before this cycle will remain, "
+                        "correctly preventing a stale PASSED result from being read as "
+                        "current, but this cycle's real outcome is unrecorded.",
+                        _cycle_status_exc,
+                    )
+                    alerter.error(
+                        f"ACCOUNTING CYCLE-STATUS PERSISTENCE FAILED (final outcome): "
+                        f"{_cycle_status_exc} — treat any shadow acceptance evidence as "
+                        f"unverified until this is resolved."
+                    )
 
         # ── Per-symbol processing ─────────────────────────────────────
         for sym, ss in symbol_state.items():

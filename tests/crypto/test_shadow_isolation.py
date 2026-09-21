@@ -164,6 +164,32 @@ def test_accounting_cycle_status_written_after_every_cycle_attempt():
     assert try_i < except_i < write_i
 
 
+def test_accounting_cycle_status_in_progress_marker_written_before_run_cycle():
+    """External review, seventh pass, 2026-09-21, P1: 'a failed status
+    write preserves an earlier PASSED result' — the in-progress marker
+    must be written BEFORE run_cycle() is even called, so a crash or
+    exception anywhere in the reconciliation attempt leaves in_progress=True
+    on disk rather than a stale prior success."""
+    src = _run_src()
+    in_progress_i = src.index("accounting_cycle_status.write_in_progress(")
+    run_cycle_i = src.index("accounting_reconciliation.run_cycle(")
+    final_write_i = src.index("accounting_cycle_status.write(\n")
+    assert in_progress_i < run_cycle_i < final_write_i
+
+
+def test_db_identity_read_before_both_cycle_status_writes():
+    """Seventh pass, P1, finding 2: both the in-progress marker and the
+    final outcome must carry the same db_identity the shadow report will
+    later validate against — established once via
+    accounting_store.get_or_create_db_identity."""
+    src = _run_src()
+    identity_i = src.index("accounting_store.get_or_create_db_identity(")
+    in_progress_i = src.index("accounting_cycle_status.write_in_progress(")
+    assert identity_i < in_progress_i
+    window = src[in_progress_i:in_progress_i + 300]
+    assert "db_identity=_accounting_db_identity" in window
+
+
 def test_four_way_shadow_balance_fetch_failure_uses_nan_not_zero():
     """A failed real-balance fetch must fail CLOSED (NaN — every comparison
     is False, so diff_position_against_fold's qty_ok deterministically

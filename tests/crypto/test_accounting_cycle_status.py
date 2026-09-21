@@ -1,7 +1,7 @@
 """
 Tests for bot/accounting/cycle_status.py — the persisted last-cycle-outcome
 record scripts/accounting_shadow_report.py's verdict is built on
-(accounting review, sixth pass, 2026-09-21, P1).
+(accounting review, sixth + seventh passes, 2026-09-21, P1).
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ def test_write_then_read_roundtrips(tmp_path):
     cycle_status.write(
         path, requested_symbols=["SOL/CAD", "BTC/CAD"], block_state_ok=True,
         block_state_explain="ok", four_way_ran=True, four_way_ready=True, four_way_explain="ok",
+        db_identity="db-abc",
     )
     status = cycle_status.read(path)
     assert status is not None
@@ -24,6 +25,8 @@ def test_write_then_read_roundtrips(tmp_path):
     assert status.block_state_ok is True
     assert status.four_way_ran is True
     assert status.four_way_ready is True
+    assert status.db_identity == "db-abc"
+    assert status.in_progress is False
     assert status.ready is True
 
 
@@ -73,3 +76,48 @@ def test_a_later_write_fully_overwrites_an_earlier_one(tmp_path):
     assert status.four_way_ran is False
     assert status.four_way_ready is None
     assert status.ready is False
+
+
+# ============================================================================
+# Two-phase write (seventh pass, 2026-09-21, P1): "a failed status write
+# preserves an earlier PASSED result"
+# ============================================================================
+
+def test_write_in_progress_marks_not_ready(tmp_path):
+    path = str(tmp_path / "status.json")
+    cycle_status.write_in_progress(path, requested_symbols=["BTC/CAD"], db_identity="db-abc")
+    status = cycle_status.read(path)
+    assert status.in_progress is True
+    assert status.ready is False
+
+
+def test_write_in_progress_invalidates_a_prior_passing_result(tmp_path):
+    """The exact scenario this two-phase design closes: a cycle STARTS
+    (invalidating the old PASSED result immediately) and then — simulating
+    a crash before the final write() ever runs — the file is left showing
+    in_progress=True, never the stale prior PASSED content."""
+    path = str(tmp_path / "status.json")
+    cycle_status.write(
+        path, requested_symbols=["BTC/CAD"], block_state_ok=True, block_state_explain="ok",
+        four_way_ran=True, four_way_ready=True, four_way_explain="ok", db_identity="db-abc",
+    )
+    assert cycle_status.read(path).ready is True   # sanity: it really was PASSED before
+
+    cycle_status.write_in_progress(path, requested_symbols=["BTC/CAD"], db_identity="db-abc")
+    # Simulated crash: the final write() that would normally follow never happens.
+
+    status = cycle_status.read(path)
+    assert status.in_progress is True
+    assert status.ready is False   # never reads as the old PASSED result
+
+
+def test_final_write_clears_in_progress(tmp_path):
+    path = str(tmp_path / "status.json")
+    cycle_status.write_in_progress(path, requested_symbols=["BTC/CAD"], db_identity="db-abc")
+    cycle_status.write(
+        path, requested_symbols=["BTC/CAD"], block_state_ok=True, block_state_explain="ok",
+        four_way_ran=True, four_way_ready=True, four_way_explain="ok", db_identity="db-abc",
+    )
+    status = cycle_status.read(path)
+    assert status.in_progress is False
+    assert status.ready is True

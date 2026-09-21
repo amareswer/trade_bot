@@ -2,20 +2,26 @@
 Tests for scripts/accounting_shadow_report.py.
 
 Sixth-pass finding (2026-09-21, P1): checkpoint existence/freshness alone
-was still not enough evidence — a fresh account-wide CAD cash checkpoint
-could exist while a REQUESTED symbol's own reconciliation never completed,
-or a four-way verification never ran, or an earlier successful checkpoint
-simply survived a LATER failed cycle unchanged. The script's verdict now
-comes entirely from bot/accounting/cycle_status.py's persisted last-cycle
-outcome — every test here proves a specific way that outcome record can
-be missing, stale, symbol-mismatched, or failing, and that none of those
-can produce PASSED.
+was not enough evidence — the verdict now comes entirely from
+bot/accounting/cycle_status.py's persisted last-cycle outcome.
+
+Seventh-pass findings (2026-09-21, P1), both covered explicitly here:
+1. "A failed status write preserves an earlier PASSED result" — proven at
+   the cycle_status.py level (test_accounting_cycle_status.py); here we
+   prove the REPORT's own reaction to in_progress=True.
+2. "Status evidence is not tied to the inspected database" — --status no
+   longer exists as an independent argument (removed entirely — the path
+   is always derived from --db's directory), and a status file's
+   db_identity must match the database's own persisted identity or the
+   report refuses to call it PASSED, however the mismatch happened.
 """
 from __future__ import annotations
 
+import io
 import os
 import sqlite3
 import sys
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -28,17 +34,23 @@ from bot.data.trade_log import TradeLog  # noqa: E402
 from config import cfg  # noqa: E402
 
 
-def _iso(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+def _prep_db(tmp_path) -> "tuple[str, str]":
+    """Real db + fills table + an established db_identity, matching what a
+    real reconciliation cycle would have produced. Returns (db_path, identity)."""
+    db_path = str(tmp_path / "trades.db")
+    store.init_db(db_path)
+    TradeLog(db_path=db_path)   # creates the `fills` table this script also queries
+    conn = store.connect(db_path)
+    identity = store.get_or_create_db_identity(conn)
+    conn.close()
+    return db_path, identity
 
 
-def _run(db_path: str, status_path: str, symbols: "list[str]") -> "tuple[int, str]":
-    import io
-    from contextlib import redirect_stdout
+def _run(db_path: str, symbols: "list[str]") -> "tuple[int, str]":
     old_argv = sys.argv
     buf = io.StringIO()
     try:
-        sys.argv = ["accounting_shadow_report.py", "--db", db_path, "--status", status_path, *symbols]
+        sys.argv = ["accounting_shadow_report.py", "--db", db_path, *symbols]
         with redirect_stdout(buf):
             exit_code = report.main()
     finally:
@@ -46,11 +58,9 @@ def _run(db_path: str, status_path: str, symbols: "list[str]") -> "tuple[int, st
     return exit_code, buf.getvalue()
 
 
-def _prep_db(tmp_path):
-    db_path = str(tmp_path / "trades.db")
-    store.init_db(db_path)
-    TradeLog(db_path=db_path)   # creates the `fills` table this script also queries
-    return db_path
+def _write_status(db_path: str, identity: str, **kwargs) -> None:
+    status_path = report._status_path_for_db(db_path)
+    cycle_status.write(status_path, db_identity=identity, **kwargs)
 
 
 # ============================================================================
@@ -71,38 +81,142 @@ def test_readonly_connect_never_creates_a_missing_database(tmp_path):
 
 def test_main_reports_not_verified_on_missing_db(tmp_path):
     missing_db = str(tmp_path / "trades.db")
-    status_path = str(tmp_path / "status.json")
-    exit_code, out = _run(missing_db, status_path, ["BTC/CAD"])
+    exit_code, out = _run(missing_db, ["BTC/CAD"])
     assert exit_code == 3
     assert not os.path.exists(missing_db)
     assert "NOT_VERIFIED" in out
 
 
 # ============================================================================
-# Cycle-status-driven verdict
+# No --status argument — the path is always derived from --db
+# ============================================================================
+
+def test_status_path_is_derived_from_db_directory(tmp_path):
+    db_path = str(tmp_path / "sub" / "trades.db")
+    expected = str(tmp_path / "sub" / "accounting_cycle_status.json")
+    assert report._status_path_for_db(db_path) == expected
+
+
+def test_status_cli_argument_no_longer_exists(tmp_path):
+    """The seventh-pass fix for finding 2 removed --status entirely — a
+    caller can no longer point it at an unrelated file even by accident."""
+    import argparse
+    db_path, _ = _prep_db(tmp_path)
+    old_argv = sys.argv
+    try:
+        sys.argv = ["accounting_shadow_report.py", "--db", db_path, "--status", "/tmp/somewhere.json"]
+        try:
+            report.main()
+            assert False, "expected argparse to reject the removed --status flag"
+        except SystemExit:
+            pass
+    finally:
+        sys.argv = old_argv
+
+
+# ============================================================================
+# db_identity validation (seventh pass, P1, finding 2)
+# ============================================================================
+
+def test_database_with_no_identity_yet_is_not_verified(tmp_path):
+    """A database no real reconciliation cycle has ever touched has no
+    db_identity row at all — even a status file sitting alongside it (by
+    whatever means) cannot be trusted to correspond to it."""
+    db_path = str(tmp_path / "trades.db")
+    store.init_db(db_path)
+    TradeLog(db_path=db_path)
+    # No get_or_create_db_identity() call — this db has never been used by
+    # a real cycle.
+    status_path = report._status_path_for_db(db_path)
+    cycle_status.write(
+        status_path, requested_symbols=["BTC/CAD"], block_state_ok=True, block_state_explain="ok",
+        four_way_ran=True, four_way_ready=True, four_way_explain="ok", db_identity="whatever",
+    )
+    exit_code, out = _run(db_path, ["BTC/CAD"])
+    assert exit_code == 4
+    assert "NOT_VERIFIED" in out
+    assert "PASSED" not in out
+
+
+def test_mismatched_db_identity_is_not_verified_not_passed(tmp_path):
+    """The exact reproduction: an (effectively) unrelated database paired
+    with a fresh, otherwise-fully-passing status for matching symbol names
+    must not report PASSED — the identities don't match."""
+    db_path, real_identity = _prep_db(tmp_path)
+    assert real_identity  # sanity
+    _write_status(
+        db_path, "a-completely-different-identity",
+        requested_symbols=["BTC/CAD"], block_state_ok=True, block_state_explain="ok",
+        four_way_ran=True, four_way_ready=True, four_way_explain="ok",
+    )
+    exit_code, out = _run(db_path, ["BTC/CAD"])
+    assert exit_code == 4
+    assert "NOT_VERIFIED" in out
+    assert "PASSED" not in out
+
+
+def test_matching_db_identity_can_pass(tmp_path):
+    db_path, identity = _prep_db(tmp_path)
+    _write_status(
+        db_path, identity,
+        requested_symbols=["BTC/CAD"], block_state_ok=True, block_state_explain="ok",
+        four_way_ran=True, four_way_ready=True, four_way_explain="ok",
+    )
+    exit_code, out = _run(db_path, ["BTC/CAD"])
+    assert exit_code == 0
+    assert "PASSED" in out
+
+
+# ============================================================================
+# in_progress / interrupted publication (seventh pass, P1, finding 1)
+# ============================================================================
+
+def test_in_progress_status_is_not_verified_even_after_a_prior_pass(tmp_path):
+    """Interrupted-publication reproduction: a fully passing cycle
+    persisted successfully, then a NEW cycle attempt started (writing the
+    in-progress marker) and never completed (simulated crash). The report
+    must show NOT_VERIFIED, never the old PASSED result."""
+    db_path, identity = _prep_db(tmp_path)
+    _write_status(
+        db_path, identity,
+        requested_symbols=["BTC/CAD"], block_state_ok=True, block_state_explain="ok",
+        four_way_ran=True, four_way_ready=True, four_way_explain="ok",
+    )
+    exit_code, out = _run(db_path, ["BTC/CAD"])
+    assert exit_code == 0 and "PASSED" in out   # sanity: it really was passing
+
+    status_path = report._status_path_for_db(db_path)
+    cycle_status.write_in_progress(status_path, requested_symbols=["BTC/CAD"], db_identity=identity)
+
+    exit_code, out = _run(db_path, ["BTC/CAD"])
+    assert exit_code == 4
+    assert "NOT_VERIFIED" in out
+    assert "PASSED" not in out
+
+
+# ============================================================================
+# The rest of the verdict chain (staleness / coverage / failures) —
+# unchanged in spirit from the sixth pass, re-verified against the
+# now-identity-checked interface
 # ============================================================================
 
 def test_no_cycle_status_file_is_not_verified_even_with_zero_unlinked(tmp_path):
-    """The exact 'silence is not evidence' case: a clean, empty database
-    with no persisted cycle outcome at all must not be reported PASSED."""
-    db_path = _prep_db(tmp_path)
-    status_path = str(tmp_path / "status.json")   # never written
-    exit_code, out = _run(db_path, status_path, ["BTC/CAD"])
+    db_path, _ = _prep_db(tmp_path)   # status file never written
+    exit_code, out = _run(db_path, ["BTC/CAD"])
     assert exit_code == 4
     assert "NOT_VERIFIED" in out
     assert "PASSED" not in out
 
 
 def test_stale_cycle_status_reports_stale(tmp_path):
-    db_path = _prep_db(tmp_path)
-    status_path = str(tmp_path / "status.json")
-    cycle_status.write(
-        status_path, requested_symbols=["BTC/CAD"], block_state_ok=True, block_state_explain="ok",
+    db_path, identity = _prep_db(tmp_path)
+    _write_status(
+        db_path, identity,
+        requested_symbols=["BTC/CAD"], block_state_ok=True, block_state_explain="ok",
         four_way_ran=True, four_way_ready=True, four_way_explain="ok",
     )
-    # Backdate it past the staleness window — cycle_status.write always
-    # stamps "now", so age it directly the same way the four_way tests do.
     import json
+    status_path = report._status_path_for_db(db_path)
     with open(status_path) as f:
         data = json.load(f)
     stale_at = datetime.now(timezone.utc) - timedelta(
@@ -111,106 +225,83 @@ def test_stale_cycle_status_reports_stale(tmp_path):
     with open(status_path, "w") as f:
         json.dump(data, f)
 
-    exit_code, out = _run(db_path, status_path, ["BTC/CAD"])
+    exit_code, out = _run(db_path, ["BTC/CAD"])
     assert exit_code == 5
     assert "STALE" in out
 
 
 def test_cycle_status_for_a_different_symbol_set_is_not_verified(tmp_path):
-    """A fresh, fully-passing cycle for SOL/CAD alone says nothing about
-    BTC/CAD — the exact 'account-wide checkpoint, no per-symbol evidence'
-    shape from the sixth-pass finding."""
-    db_path = _prep_db(tmp_path)
-    status_path = str(tmp_path / "status.json")
-    cycle_status.write(
-        status_path, requested_symbols=["SOL/CAD"], block_state_ok=True, block_state_explain="ok",
+    db_path, identity = _prep_db(tmp_path)
+    _write_status(
+        db_path, identity,
+        requested_symbols=["SOL/CAD"], block_state_ok=True, block_state_explain="ok",
         four_way_ran=True, four_way_ready=True, four_way_explain="ok",
     )
-    exit_code, out = _run(db_path, status_path, ["BTC/CAD"])
+    exit_code, out = _run(db_path, ["BTC/CAD"])
     assert exit_code == 4
     assert "NOT_VERIFIED" in out
     assert "PASSED" not in out
 
 
 def test_block_state_failure_is_failed_not_passed(tmp_path):
-    db_path = _prep_db(tmp_path)
-    status_path = str(tmp_path / "status.json")
-    cycle_status.write(
-        status_path, requested_symbols=["BTC/CAD"], block_state_ok=False,
+    db_path, identity = _prep_db(tmp_path)
+    _write_status(
+        db_path, identity,
+        requested_symbols=["BTC/CAD"], block_state_ok=False,
         block_state_explain="account cash unreconciled", four_way_ran=False,
     )
-    exit_code, out = _run(db_path, status_path, ["BTC/CAD"])
+    exit_code, out = _run(db_path, ["BTC/CAD"])
     assert exit_code == 2
     assert "FAILED" in out
 
 
 def test_four_way_never_ran_is_failed_not_passed(tmp_path):
-    """block_state_ok=True but four_way_ran=False must not be read as
-    'not applicable, therefore fine' — see cycle_status.CycleStatus.ready's
-    own docstring for why this is a real failure, not a skip."""
-    db_path = _prep_db(tmp_path)
-    status_path = str(tmp_path / "status.json")
-    cycle_status.write(
-        status_path, requested_symbols=["BTC/CAD"], block_state_ok=True, block_state_explain="ok",
+    db_path, identity = _prep_db(tmp_path)
+    _write_status(
+        db_path, identity,
+        requested_symbols=["BTC/CAD"], block_state_ok=True, block_state_explain="ok",
         four_way_ran=False,
     )
-    exit_code, out = _run(db_path, status_path, ["BTC/CAD"])
+    exit_code, out = _run(db_path, ["BTC/CAD"])
     assert exit_code == 2
     assert "FAILED" in out
 
 
 def test_four_way_not_ready_is_failed_not_passed(tmp_path):
-    db_path = _prep_db(tmp_path)
-    status_path = str(tmp_path / "status.json")
-    cycle_status.write(
-        status_path, requested_symbols=["BTC/CAD"], block_state_ok=True, block_state_explain="ok",
+    db_path, identity = _prep_db(tmp_path)
+    _write_status(
+        db_path, identity,
+        requested_symbols=["BTC/CAD"], block_state_ok=True, block_state_explain="ok",
         four_way_ran=True, four_way_ready=False, four_way_explain="position-fold [BTC/CAD]: qty diff",
     )
-    exit_code, out = _run(db_path, status_path, ["BTC/CAD"])
+    exit_code, out = _run(db_path, ["BTC/CAD"])
     assert exit_code == 2
     assert "FAILED" in out
 
 
-def test_fresh_fully_passing_cycle_status_with_zero_unlinked_is_passed(tmp_path):
-    db_path = _prep_db(tmp_path)
-    status_path = str(tmp_path / "status.json")
-    cycle_status.write(
-        status_path, requested_symbols=["BTC/CAD"], block_state_ok=True, block_state_explain="ok",
-        four_way_ran=True, four_way_ready=True, four_way_explain="ok",
-    )
-    exit_code, out = _run(db_path, status_path, ["BTC/CAD"])
-    assert exit_code == 0
-    assert "PASSED" in out
-
-
-def test_fresh_passing_cycle_status_with_unlinked_fill_is_failed(tmp_path):
-    """A REAL, currently-relevant residual on top of an otherwise-passing
-    cycle must still be FAILED, not PASSED."""
-    db_path = _prep_db(tmp_path)
+def test_fresh_passing_status_with_unlinked_fill_is_failed(tmp_path):
+    db_path, identity = _prep_db(tmp_path)
     tl = TradeLog(db_path=db_path)
     tl.log_fill(side="BUY", symbol="BTC/CAD", quantity=0.001, price=90_000.0,
                 fee_cost=0.09, fee_currency="CAD", exec_key="uuid-unlinked")
-    status_path = str(tmp_path / "status.json")
-    cycle_status.write(
-        status_path, requested_symbols=["BTC/CAD"], block_state_ok=True, block_state_explain="ok",
+    _write_status(
+        db_path, identity,
+        requested_symbols=["BTC/CAD"], block_state_ok=True, block_state_explain="ok",
         four_way_ran=True, four_way_ready=True, four_way_explain="ok",
     )
-    exit_code, out = _run(db_path, status_path, ["BTC/CAD"])
+    exit_code, out = _run(db_path, ["BTC/CAD"])
     assert exit_code == 2
     assert "FAILED" in out
     assert "NOT_VERIFIED" not in out
 
 
 def test_requesting_a_subset_of_the_cycles_symbols_still_passes(tmp_path):
-    """Checking fewer symbols than the last cycle actually covered is
-    fine — the missing-coverage check is one-directional (every symbol
-    THIS run asks about must be in the cycle's own requested set)."""
-    db_path = _prep_db(tmp_path)
-    status_path = str(tmp_path / "status.json")
-    cycle_status.write(
-        status_path, requested_symbols=["BTC/CAD", "SOL/CAD"], block_state_ok=True,
+    db_path, identity = _prep_db(tmp_path)
+    _write_status(
+        db_path, identity,
+        requested_symbols=["BTC/CAD", "SOL/CAD"], block_state_ok=True,
         block_state_explain="ok", four_way_ran=True, four_way_ready=True, four_way_explain="ok",
     )
-    exit_code, out = _run(db_path, status_path, ["BTC/CAD"])
+    exit_code, out = _run(db_path, ["BTC/CAD"])
     assert exit_code == 0
     assert "PASSED" in out
