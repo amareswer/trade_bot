@@ -66,6 +66,7 @@ from __future__ import annotations
 import itertools
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Callable, Optional
 
@@ -115,11 +116,14 @@ class OpeningCheckpoint:
 @dataclass
 class ChainWalkResult:
     consistent: bool                          # True only if every transition (incl. resolved ties) checks out
-    ambiguous_tie_groups: "list[list[str]]" = field(default_factory=list)   # groups of ledger_ids, >1 valid order
+    ambiguous_tie_groups: "list[list[str]]" = field(default_factory=list)   # groups of ledger_ids, >1 valid order FOUND
+    unsearched_tie_groups: "list[list[str]]" = field(default_factory=list)  # groups too large to search AT ALL —
+                                                                            # distinct from ambiguous: no search was
+                                                                            # ever attempted, order is simply unknown
     failing_ledger_ids: "list[str]" = field(default_factory=list)          # entries with NO valid reconciling order
     opening_balance_verified: bool = False
     opening_balance: "Decimal | None" = None
-    final_balance: "Decimal | None" = None
+    final_balance: "Decimal | None" = None    # None if the walk stopped early on an unsearched tie group
     ordered_ledger_ids: "list[str]" = field(default_factory=list)
     reason: str = ""
 
@@ -139,6 +143,104 @@ def _require_decimal(label: str, raw: str) -> Decimal:
         return Decimal(raw)
     except (InvalidOperation, TypeError):
         raise ValueError(f"{label} is not a valid decimal string: {raw!r}")
+
+
+def _parse_timestamp(label: str, raw: str) -> datetime:
+    """Timezone-aware instant, never a raw-string comparison. Two ISO-8601
+    UTC timestamps that differ only in whether they carry fractional
+    seconds — e.g. "2026-01-01T00:00:00.1Z" (100ms past the second) vs
+    "2026-01-01T00:00:00Z" (exactly on the second) — sort BACKWARDS as
+    plain strings ('.' sorts before 'Z'), even though both are already UTC
+    with no offset ambiguity at all. This is a distinct failure mode from
+    the timezone-offset bug already fixed in asset_movement_analysis.py's
+    own _parse_iso, and is fixed here the same way: parse first, sort by
+    the parsed instant, never by the raw text."""
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ValueError(f"{label} is not a parseable ISO-8601 timestamp, got {raw!r}: {exc}")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _require_finite(label: str, value: Decimal) -> None:
+    if not value.is_finite():
+        raise ValueError(f"{label} must be a finite decimal, got {value}")
+
+
+def _validate_entry(e: LedgerEntry) -> None:
+    _parse_timestamp(f"entry {e.ledger_id!r} exchange_timestamp", e.exchange_timestamp)
+    amount = _require_decimal(f"entry {e.ledger_id!r} amount_raw", e.amount_raw)
+    fee = _require_decimal(f"entry {e.ledger_id!r} fee_raw", e.fee_raw)
+    balance = _require_decimal(f"entry {e.ledger_id!r} balance_raw", e.balance_raw)
+    _require_finite(f"entry {e.ledger_id!r} amount", amount)
+    _require_finite(f"entry {e.ledger_id!r} fee", fee)
+    _require_finite(f"entry {e.ledger_id!r} balance", balance)
+    if fee < 0:
+        raise ValueError(f"entry {e.ledger_id!r} fee must be >= 0, got {fee}")
+
+
+def _validate_single_scope(entries: "list[LedgerEntry]") -> None:
+    account_ids = {e.account_id for e in entries}
+    assets = {e.asset for e in entries}
+    if len(account_ids) > 1:
+        raise ValueError(
+            f"entries span more than one account: {sorted(account_ids)} — a single call must "
+            f"cover exactly one account_id"
+        )
+    if len(assets) > 1:
+        raise ValueError(
+            f"entries span more than one asset: {sorted(assets)} — a single call must cover "
+            f"exactly one asset"
+        )
+
+
+def _validate_opening_checkpoint(checkpoint: "OpeningCheckpoint | None") -> None:
+    if checkpoint is None:
+        return
+    _require_finite("opening checkpoint balance", checkpoint.balance)
+    if not checkpoint.evidence or not checkpoint.evidence.strip():
+        raise ValueError(
+            "OpeningCheckpoint.evidence must be a non-blank description of how this balance "
+            "was independently verified — a blank string is not evidence"
+        )
+
+
+def _exchange_payload(e: LedgerEntry) -> tuple:
+    """The fields that actually describe what the exchange reported.
+    Deliberately excludes `observed_at` — purely local bookkeeping (when
+    OUR system happened to fetch this row), never part of the exchange's
+    own event data. Two LedgerEntry objects for the same real event
+    re-observed at different times must compare equal here even though the
+    dataclass's own default equality (which includes observed_at) would
+    say they differ — this is the ONE canonical definition of "the same
+    observation", shared by every place that needs to tell a legitimate
+    re-observation apart from a genuine conflict."""
+    return (e.reference_id, e.type, e.asset, e.amount_raw, e.fee_raw, e.balance_raw,
+            e.exchange_timestamp)
+
+
+def _dedup_entries(entries: "list[LedgerEntry]") -> "list[LedgerEntry]":
+    """Collapses exact re-observations (same (account_id, ledger_id), same
+    _exchange_payload) to one entry. A DIFFERENT exchange payload for an
+    already-seen key is a genuine conflict, raised immediately — never
+    silently picked between. Used both to dedup a caller's raw input list
+    before it is ever walked (an initial [A, A] must not double-apply A's
+    delta) and to merge newly-fetched retry evidence with what was already
+    on hand."""
+    by_key: "dict[tuple[str, str], LedgerEntry]" = {}
+    for e in entries:
+        key = (e.account_id, e.ledger_id)
+        if key in by_key:
+            if _exchange_payload(by_key[key]) != _exchange_payload(e):
+                raise ValueError(
+                    f"conflicting ledger entry for {key!r}: "
+                    f"{by_key[key]!r} vs {e!r} — not a duplicate, a genuine data conflict"
+                )
+            continue
+        by_key[key] = e
+    return list(by_key.values())
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -165,19 +267,19 @@ def upsert_ledger_entry(conn: sqlite3.Connection, entry: LedgerEntry) -> bool:
     re-observation is a silent no-op (returns False). A DIFFERENT payload
     for the same key raises — never silently overwritten."""
     row = conn.execute(
-        "SELECT reference_id, type, asset, amount_raw, fee_raw, balance_raw, exchange_timestamp "
-        "FROM ledger_entries WHERE account_id = ? AND ledger_id = ?",
+        "SELECT ledger_id, reference_id, account_id, type, asset, amount_raw, fee_raw, "
+        "balance_raw, exchange_timestamp, observed_at FROM ledger_entries "
+        "WHERE account_id = ? AND ledger_id = ?",
         (entry.account_id, entry.ledger_id),
     ).fetchone()
     if row is not None:
-        existing = (row[0], row[1], row[2], row[3], row[4], row[5], row[6])
-        incoming = (entry.reference_id, entry.type, entry.asset, entry.amount_raw,
-                    entry.fee_raw, entry.balance_raw, entry.exchange_timestamp)
-        if existing != incoming:
+        existing_entry = LedgerEntry(*row)
+        if _exchange_payload(existing_entry) != _exchange_payload(entry):
             raise ValueError(
                 f"conflicting ledger entry for (account_id={entry.account_id!r}, "
-                f"ledger_id={entry.ledger_id!r}): existing={existing!r} vs incoming={incoming!r} — "
-                f"not a duplicate, a genuine data conflict that must be resolved by the caller"
+                f"ledger_id={entry.ledger_id!r}): existing={_exchange_payload(existing_entry)!r} "
+                f"vs incoming={_exchange_payload(entry)!r} — not a duplicate, a genuine data "
+                f"conflict that must be resolved by the caller"
             )
         return False
     conn.execute(
@@ -201,14 +303,31 @@ def load_ledger_entries(conn: sqlite3.Connection, account_id: str, asset: str) -
 
 
 def _group_by_timestamp(entries: "list[LedgerEntry]") -> "list[list[LedgerEntry]]":
-    sorted_entries = sorted(entries, key=lambda e: e.exchange_timestamp)
+    """Groups by the PARSED UTC instant, never the raw string — see
+    _parse_timestamp's own docstring for why a raw-string sort silently
+    mis-orders even two already-UTC timestamps that merely differ in
+    fractional-second formatting."""
+    decorated = [(_parse_timestamp(f"entry {e.ledger_id!r} exchange_timestamp", e.exchange_timestamp), e)
+                 for e in entries]
+    decorated.sort(key=lambda pair: pair[0])
     groups: "list[list[LedgerEntry]]" = []
-    for e in sorted_entries:
-        if groups and groups[-1][0].exchange_timestamp == e.exchange_timestamp:
+    last_instant = None
+    for instant, e in decorated:
+        if groups and last_instant == instant:
             groups[-1].append(e)
         else:
             groups.append([e])
+        last_instant = instant
     return groups
+
+
+def _max_timestamp_entry(entries: "list[LedgerEntry]") -> LedgerEntry:
+    """Same parsed-instant discipline as _group_by_timestamp — the retry
+    cursor must never be chosen by comparing raw ISO strings."""
+    return max(
+        entries,
+        key=lambda e: _parse_timestamp(f"entry {e.ledger_id!r} exchange_timestamp", e.exchange_timestamp),
+    )
 
 
 def walk_chain(
@@ -223,6 +342,12 @@ def walk_chain(
     Every transition is checked individually — a chain with two offsetting
     errors that happen to cancel by the last entry still fails here, it does
     not silently pass because the final total matches."""
+    _validate_opening_checkpoint(opening_checkpoint)   # run even when entries is empty
+    for e in entries:
+        _validate_entry(e)
+    entries = _dedup_entries(entries)   # an initial [A, A] must not double-apply A's own delta
+    _validate_single_scope(entries)
+
     if not entries:
         return ChainWalkResult(
             consistent=True, opening_balance_verified=(opening_checkpoint is not None or zero_opening_confirmed),
@@ -241,9 +366,11 @@ def walk_chain(
         opening_verified = zero_opening_confirmed
 
     ambiguous_tie_groups: "list[list[str]]" = []
+    unsearched_tie_groups: "list[list[str]]" = []
     failing_ledger_ids: "list[str]" = []
     ordered_ledger_ids: "list[str]" = []
     consistent = True
+    stopped_early = False
 
     for group in _group_by_timestamp(entries):
         if len(group) == 1:
@@ -261,13 +388,20 @@ def walk_chain(
             continue
 
         if len(group) > _MAX_TIE_GROUP_SIZE_FOR_PERMUTATION_SEARCH:
-            ambiguous_tie_groups.append([e.ledger_id for e in group])
-            # Can't search all permutations safely — advance running balance to the
-            # group's own claimed final state (best-effort) and keep going, but the
-            # group stays flagged ambiguous regardless.
-            running = group[-1].balance
-            ordered_ledger_ids.extend(e.ledger_id for e in group)
-            continue
+            # A full permutation search was never attempted (too large to search
+            # safely) — this group's true order, and therefore the running balance
+            # coming out of it, is genuinely UNKNOWN, not "ambiguous" in the sense
+            # the branch below means (which only applies after an exhaustive search
+            # found >1 valid order). An earlier version of this function picked
+            # group[-1]'s own claimed balance as a guess and kept walking — every
+            # transition checked AFTER that guess was being validated against a
+            # number this function had no basis for, which produced exactly the
+            # false "downstream entry is broken" report this fix exists to remove.
+            # Correct behavior: stop here. Do not guess. Do not validate anything
+            # after this point against an unresolved balance.
+            unsearched_tie_groups.append([e.ledger_id for e in group])
+            stopped_early = True
+            break
 
         working_perms: "list[tuple[LedgerEntry, ...]]" = []
         for perm in itertools.permutations(group):
@@ -301,6 +435,12 @@ def walk_chain(
             ordered_ledger_ids.extend(e.ledger_id for e in working_perms[0])
 
     reason_parts = []
+    if stopped_early:
+        reason_parts.append(
+            f"ordering unresolved: search limit exceeded ({len(unsearched_tie_groups[-1])} entries tied "
+            f"at one instant, exceeding the {_MAX_TIE_GROUP_SIZE_FOR_PERMUTATION_SEARCH}-entry search "
+            f"limit) — stopped without validating any transition after this point against a guessed balance"
+        )
     if failing_ledger_ids:
         reason_parts.append(f"{len(failing_ledger_ids)} entries have no reconciling transition")
     if ambiguous_tie_groups:
@@ -311,8 +451,9 @@ def walk_chain(
 
     return ChainWalkResult(
         consistent=consistent, ambiguous_tie_groups=ambiguous_tie_groups,
+        unsearched_tie_groups=unsearched_tie_groups,
         failing_ledger_ids=failing_ledger_ids, opening_balance_verified=opening_verified,
-        opening_balance=opening_balance, final_balance=running,
+        opening_balance=opening_balance, final_balance=(None if stopped_early else running),
         ordered_ledger_ids=ordered_ledger_ids, reason=reason,
     )
 
@@ -332,6 +473,9 @@ def reconcile(
     tests pass a fixture-backed fake) used only for the bounded retry when
     `wallet_balance_at_read` disagrees with the chain's own final balance —
     never used to silently paper over a chain-consistency failure."""
+    if wallet_balance_at_read is not None:
+        _require_finite("wallet_balance_at_read", wallet_balance_at_read)
+
     working_entries = list(entries)
     chain = walk_chain(working_entries, opening_checkpoint=opening_checkpoint,
                        zero_opening_confirmed=zero_opening_confirmed)
@@ -346,7 +490,7 @@ def reconcile(
             if fetch_more_since is None or attempts >= max_retries:
                 wallet_agrees = False if fetch_more_since is None else None  # None => inconclusive
                 break
-            last_ts = max((e.exchange_timestamp for e in working_entries), default="")
+            last_ts = _max_timestamp_entry(working_entries).exchange_timestamp if working_entries else ""
             new_entries = fetch_more_since(last_ts)
             attempts += 1
             if not new_entries:
@@ -354,13 +498,14 @@ def reconcile(
                 if attempts >= max_retries:
                     break
                 continue
-            working_entries = working_entries + new_entries
+            working_entries = _dedup_entries(working_entries + new_entries)
             chain = walk_chain(working_entries, opening_checkpoint=opening_checkpoint,
                                zero_opening_confirmed=zero_opening_confirmed)
 
     overall_pass = (
         chain.consistent
         and not chain.ambiguous_tie_groups
+        and not chain.unsearched_tie_groups
         and chain.opening_balance_verified
         and wallet_agrees is True
     )
