@@ -93,6 +93,10 @@ class LedgerEntry:
     balance_raw: str       # Decimal string — Kraken's own running balance after this entry
     exchange_timestamp: str
     observed_at: str
+    batch_id: str = ""    # which fetch batch produced this row — OUR bookkeeping, never part of
+                            # what the exchange reported, so excluded from _exchange_payload below,
+                            # exactly like observed_at. "" means "no batch tracked" (unit tests that
+                            # construct entries directly, not through the batch-persistence path).
 
     @property
     def amount(self) -> Decimal:
@@ -105,6 +109,46 @@ class LedgerEntry:
     @property
     def balance(self) -> Decimal:
         return Decimal(self.balance_raw)
+
+
+def parse_raw_ledger_entry(
+    ledger_id: str, raw: dict, *, account_id: str, batch_id: str, observed_at: str,
+) -> LedgerEntry:
+    """Parses ONE raw entry exactly as Kraken's private Ledgers endpoint
+    actually shapes it: the real response envelope is
+    `result["ledger"] = {"<ledger_id>": {"refid": ..., "type": ..., "asset":
+    ..., "amount": ..., "fee": ..., "balance": ..., "time": <epoch seconds
+    float>}, ...}` — the ledger id is the DICTIONARY KEY, never a field
+    inside the entry itself (confirmed by scripts/ledger_reconciliation_
+    audit.py's own working `fetch_all_ledger_entries`, which iterates
+    `all_entries.items()` for exactly this reason). An earlier version of
+    this function wrongly required `raw["id"]`, which does not exist on a
+    real per-entry dict — that was never actually verified against Kraken's
+    real response shape despite a docstring here once claiming it was.
+
+    The caller (real fetch code or a test) must supply `ledger_id`
+    explicitly, exactly as it obtained it from the envelope — never invent
+    or embed an "id" field on the entry dict to paper over this boundary.
+    Raises on a missing/malformed required field rather than guessing."""
+    try:
+        ledger_id = str(ledger_id)
+        reference_id = str(raw["refid"])
+        type_ = str(raw["type"])
+        asset = str(raw["asset"])
+        amount_raw = str(raw["amount"])
+        fee_raw = str(raw["fee"])
+        balance_raw = str(raw["balance"])
+        epoch_seconds = float(raw["time"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"malformed raw ledger entry {ledger_id!r}: {raw!r}: {exc}")
+    exchange_timestamp = datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ"
+    )
+    return LedgerEntry(
+        ledger_id=ledger_id, reference_id=reference_id, account_id=account_id, type=type_,
+        asset=asset, amount_raw=amount_raw, fee_raw=fee_raw, balance_raw=balance_raw,
+        exchange_timestamp=exchange_timestamp, observed_at=observed_at, batch_id=batch_id,
+    )
 
 
 @dataclass
@@ -243,6 +287,12 @@ def _dedup_entries(entries: "list[LedgerEntry]") -> "list[LedgerEntry]":
     return list(by_key.values())
 
 
+_ENTRY_COLUMNS = (
+    "ledger_id, reference_id, account_id, type, asset, amount_raw, fee_raw, "
+    "balance_raw, exchange_timestamp, observed_at, batch_id"
+)
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS ledger_entries (
@@ -256,20 +306,41 @@ def init_db(conn: sqlite3.Connection) -> None:
             balance_raw TEXT NOT NULL,
             exchange_timestamp TEXT NOT NULL,
             observed_at TEXT NOT NULL,
+            batch_id TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (account_id, ledger_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ledger_batches (
+            account_id TEXT NOT NULL,
+            asset TEXT NOT NULL,
+            batch_id TEXT NOT NULL,
+            expected_count INTEGER NOT NULL,
+            committed_at TEXT NOT NULL,
+            PRIMARY KEY (account_id, asset, batch_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ledger_batch_members (
+            account_id TEXT NOT NULL,
+            asset TEXT NOT NULL,
+            batch_id TEXT NOT NULL,
+            ledger_id TEXT NOT NULL,
+            PRIMARY KEY (account_id, asset, batch_id, ledger_id)
         )
     """)
     conn.commit()
 
 
-def upsert_ledger_entry(conn: sqlite3.Connection, entry: LedgerEntry) -> bool:
-    """Idempotent upsert keyed on (account_id, ledger_id). An identical
-    re-observation is a silent no-op (returns False). A DIFFERENT payload
-    for the same key raises — never silently overwritten."""
+def _upsert_ledger_entry_nocommit(conn: sqlite3.Connection, entry: LedgerEntry) -> bool:
+    """Same idempotent-upsert logic as upsert_ledger_entry, but never opens
+    its own transaction — for a caller (persist_batch) that needs to
+    compose several of these into ONE larger atomic commit. Mirrors the
+    exact nocommit/committing-wrapper convention bot/accounting/store.py
+    already established for observed_trades, for the same reason: Python's
+    sqlite3 `with conn:` is not a nested savepoint."""
     row = conn.execute(
-        "SELECT ledger_id, reference_id, account_id, type, asset, amount_raw, fee_raw, "
-        "balance_raw, exchange_timestamp, observed_at FROM ledger_entries "
-        "WHERE account_id = ? AND ledger_id = ?",
+        f"SELECT {_ENTRY_COLUMNS} FROM ledger_entries WHERE account_id = ? AND ledger_id = ?",
         (entry.account_id, entry.ledger_id),
     ).fetchone()
     if row is not None:
@@ -283,19 +354,182 @@ def upsert_ledger_entry(conn: sqlite3.Connection, entry: LedgerEntry) -> bool:
             )
         return False
     conn.execute(
-        "INSERT INTO ledger_entries VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO ledger_entries VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (entry.ledger_id, entry.reference_id, entry.account_id, entry.type, entry.asset,
          entry.amount_raw, entry.fee_raw, entry.balance_raw, entry.exchange_timestamp,
-         entry.observed_at),
+         entry.observed_at, entry.batch_id),
     )
-    conn.commit()
     return True
+
+
+def upsert_ledger_entry(conn: sqlite3.Connection, entry: LedgerEntry) -> bool:
+    """Idempotent upsert keyed on (account_id, ledger_id), own transaction.
+    An identical re-observation is a silent no-op (returns False). A
+    DIFFERENT payload for the same key raises — never silently overwritten.
+    A caller composing several writes into one larger atomic operation
+    (e.g. persist_batch) must use _upsert_ledger_entry_nocommit instead,
+    inside its own `with conn:` block."""
+    with conn:
+        return _upsert_ledger_entry_nocommit(conn, entry)
+
+
+@dataclass
+class BatchCompletenessResult:
+    complete: bool
+    checked_batches: int                # batches with a completion marker for this account/asset — 0 means
+                                          # NO confirmed observation has ever happened, never treated as "complete"
+    incomplete_batches: "list[str]"      # batch_id -> its own claimed members didn't fully land
+    unmanifested_ledger_ids: "list[str]" # rows in ledger_entries that NO batch's manifest ever claimed at
+                                          # all — checked by ledger_id membership, not the row's own batch_id
+                                          # column, so a row inserted with the default blank batch_id (bypassing
+                                          # persist_batch entirely) cannot slip through uncounted
+    reason: str
+
+
+def persist_batch(
+    conn: sqlite3.Connection, *, account_id: str, asset: str, batch_id: str,
+    entries: "list[LedgerEntry]", committed_at: str,
+) -> None:
+    """Persists an ENTIRE fetched batch plus a completion marker recording
+    how many rows this batch was supposed to contain, in ONE transaction.
+    This is the fix for a real finding: chain arithmetic alone cannot
+    prove complete delivery — a crash after writing only a PREFIX of a
+    real chain can leave a self-consistent-looking, wallet-agreeing partial
+    chain with no internal evidence anything is missing (e.g. deposits
+    +5, +2, -2 truncated to just +5 both "reconcile" on their own AND can
+    coincidentally match a wallet balance the full sequence would also
+    produce). If the process is interrupted anywhere during this call,
+    SQLite's transaction atomicity ensures NONE of it survives — never a
+    partial batch with no way to detect it's partial."""
+    with conn:
+        for e in entries:
+            _upsert_ledger_entry_nocommit(conn, e)
+            # Recorded even when the upsert above was a no-op (the row already
+            # existed from an earlier, overlapping batch) — completeness for
+            # THIS batch must be checkable independently of which batch's
+            # stamp currently sits on the shared row.
+            conn.execute(
+                "INSERT OR IGNORE INTO ledger_batch_members VALUES (?,?,?,?)",
+                (account_id, asset, batch_id, e.ledger_id),
+            )
+        conn.execute(
+            "INSERT OR REPLACE INTO ledger_batches VALUES (?,?,?,?,?)",
+            (account_id, asset, batch_id, len(entries), committed_at),
+        )
+
+
+def verify_batch_completeness(conn: sqlite3.Connection, account_id: str, asset: str) -> BatchCompletenessResult:
+    """The required companion check before ANY reconciliation result may be
+    called trusted. Two independent things must both hold:
+
+    1. At least one batch has ever been successfully, atomically committed
+       for this (account_id, asset) — zero completed batches is NEVER
+       reported as complete, even if there happen to be zero (or zero
+       reconciling) rows. A freshly initialized database, or an account
+       whose every fetch attempt failed before persist_batch ever ran, has
+       produced no evidence of anything — that is a "never observed" state,
+       not a vacuously satisfied one. (Real gap fixed here: the previous
+       version's `not incomplete and not unrecorded` was trivially True
+       when `batches` was empty, so an untouched database reported
+       complete=True.)
+    2. Every row actually sitting in ledger_entries for this (account_id,
+       asset) is claimed by SOME batch's manifest (ledger_batch_members) —
+       checked by ledger_id membership, not by the row's own batch_id
+       column. This closes two different bypass routes: a row inserted
+       directly via upsert_ledger_entry with a real batch_id stamp but no
+       matching ledger_batches marker (already caught before), AND a row
+       inserted with the DEFAULT blank batch_id (which the previous
+       `batch_id != ''` filter silently excluded from any check at all,
+       regardless of what amount/fee/balance it carried)."""
+    batches = conn.execute(
+        "SELECT batch_id, expected_count FROM ledger_batches WHERE account_id = ? AND asset = ?",
+        (account_id, asset),
+    ).fetchall()
+    incomplete: "list[str]" = []
+    for batch_id, expected_count in batches:
+        actual = conn.execute(
+            "SELECT COUNT(*) FROM ledger_batch_members m "
+            "JOIN ledger_entries e ON e.account_id = m.account_id AND e.ledger_id = m.ledger_id "
+            "WHERE m.account_id = ? AND m.asset = ? AND m.batch_id = ?",
+            (account_id, asset, batch_id),
+        ).fetchone()[0]
+        if actual != expected_count:
+            incomplete.append(batch_id)
+
+    unmanifested = [row[0] for row in conn.execute(
+        "SELECT e.ledger_id FROM ledger_entries e WHERE e.account_id = ? AND e.asset = ? "
+        "AND NOT EXISTS ("
+        "  SELECT 1 FROM ledger_batch_members m "
+        "  WHERE m.account_id = e.account_id AND m.asset = e.asset AND m.ledger_id = e.ledger_id"
+        ")",
+        (account_id, asset),
+    ).fetchall()]
+
+    no_confirmed_batch = len(batches) == 0
+    complete = not no_confirmed_batch and not incomplete and not unmanifested
+    reason_parts = []
+    if no_confirmed_batch:
+        reason_parts.append(
+            "no completed batch has ever been recorded for this account/asset — a fresh "
+            "reconciliation must first successfully persist at least one batch (even an empty "
+            "one) before its result can be trusted"
+        )
+    if incomplete:
+        reason_parts.append(f"{len(incomplete)} batch(es) have a row-count mismatch: {incomplete}")
+    if unmanifested:
+        reason_parts.append(f"{len(unmanifested)} row(s) belong to no batch's manifest at all: {unmanifested}")
+    reason = "; ".join(reason_parts) if reason_parts else "every row is manifested by a completed batch"
+
+    return BatchCompletenessResult(
+        complete=complete, checked_batches=len(batches), incomplete_batches=incomplete,
+        unmanifested_ledger_ids=unmanifested, reason=reason,
+    )
+
+
+def batch_is_complete(conn: sqlite3.Connection, account_id: str, asset: str, batch_id: str) -> bool:
+    """Whether ONE specific, NAMED observation attempt has its own
+    confirmed completion evidence: a ledger_batches marker recorded for
+    exactly this batch_id, whose claimed members (via
+    ledger_batch_members) all actually landed in ledger_entries.
+
+    This answers a genuinely different question from
+    verify_batch_completeness(), which is an AGGREGATE over every batch
+    ever recorded for the account/asset — and an aggregate is exactly
+    what let a real bug through: if observation batch-1 succeeds and a
+    LATER batch-2 attempt fails outright (the exchange call itself raises,
+    nothing is ever written), verify_batch_completeness() still reports
+    complete=True, because it only ever asked "is everything currently
+    PERSISTED internally consistent" — batch-1 alone answers that
+    truthfully. It was never asked, and cannot answer, "did the SPECIFIC
+    observation I just attempted (batch-2) succeed." A caller that wants
+    to trust the freshness of one particular fetch attempt must bind its
+    trust decision to that attempt's own batch_id via this function —
+    an older, unrelated successful batch can never substitute for it,
+    regardless of whether a wallet-balance comparison happens to agree
+    (an unchanged balance, or two unseen offsetting movements, can make a
+    failed fetch look harmless purely by coincidence — see
+    _COVERAGE_NOTE). verify_batch_completeness() remains meaningful and
+    correct as its own separate, aggregate fact; this function does not
+    replace it, it adds the missing per-observation binding."""
+    row = conn.execute(
+        "SELECT expected_count FROM ledger_batches WHERE account_id = ? AND asset = ? AND batch_id = ?",
+        (account_id, asset, batch_id),
+    ).fetchone()
+    if row is None:
+        return False
+    expected_count = row[0]
+    actual = conn.execute(
+        "SELECT COUNT(*) FROM ledger_batch_members m "
+        "JOIN ledger_entries e ON e.account_id = m.account_id AND e.ledger_id = m.ledger_id "
+        "WHERE m.account_id = ? AND m.asset = ? AND m.batch_id = ?",
+        (account_id, asset, batch_id),
+    ).fetchone()[0]
+    return actual == expected_count
 
 
 def load_ledger_entries(conn: sqlite3.Connection, account_id: str, asset: str) -> "list[LedgerEntry]":
     rows = conn.execute(
-        "SELECT ledger_id, reference_id, account_id, type, asset, amount_raw, fee_raw, "
-        "balance_raw, exchange_timestamp, observed_at FROM ledger_entries "
+        f"SELECT {_ENTRY_COLUMNS} FROM ledger_entries "
         "WHERE account_id = ? AND asset = ?",
         (account_id, asset),
     ).fetchall()
