@@ -185,11 +185,33 @@ class CapitalPool:
     def is_allocated(self, symbol: str) -> bool:
         return symbol in self._slots
 
-    def allocate(self, symbol: str) -> float:
+    def allocate(self, symbol: str, amount: "float | None" = None) -> float:
         """
         Reserve a slot for symbol on confirmed BUY fill.
-        Returns cash allocated (slot_cash_for(symbol)). No-op if already allocated.
+        Returns cash allocated. No-op if already allocated.
         Returns 0 if pool is exhausted.
+
+        amount (2026-09-22 review finding, P1): the ordinary caller (a
+        FRESH BUY fill) omits this — the slot is sized by slot_cash_for(),
+        an equal (or capped) division of the pool, exactly as before this
+        parameter existed. A RESTART recovering a position that was
+        already open before this process started must pass its OWN
+        actual current value explicitly (typically executor.cash +
+        executor.position * a price) instead: slot_cash_for() computes a
+        THEORETICAL fresh-slot size from the pool's current total_capital,
+        which has no relationship to what this specific position is
+        actually worth right now (it may have been sized against a
+        different total_capital at a different time, or grown/shrunk via
+        price movement or partial fills since). Reproduced: shared free
+        cash $135, one symbol already holding a position worth $165
+        (equity $300 total). Passing no amount reserved a generic ~$67
+        theoretical slot for it — unrelated to the $165 it's actually
+        holding — silently losing $55 of real equity from every
+        downstream accounting read (available_cash, _compute_account_
+        value) with no economic event to explain it. Passing amount=165
+        (or the executor's own cash+position*price) reserves exactly what
+        this position is actually worth, keeping the pool's own books
+        internally consistent from the moment it's constructed.
         """
         if symbol in self._slots:
             return self._slots[symbol]
@@ -199,7 +221,7 @@ class CapitalPool:
                 symbol, len(self._slots), self._max_conc,
             )
             return 0.0
-        cash = self.slot_cash_for(symbol)
+        cash = self.slot_cash_for(symbol) if amount is None else amount
         self._slots[symbol] = cash
         logger.info(
             "CapitalPool: allocated %.2f to %s  (%d/%d slots used)",

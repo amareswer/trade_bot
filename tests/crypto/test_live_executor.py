@@ -709,9 +709,17 @@ def test_state_save_failure_blocks_new_buys_not_sells(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_sync_cash_uses_exchange_free_balance(tmp_path):
+    """Cash-ownership review finding (2026-09-22): the exchange-observed
+    balance must NEVER be assigned to .cash — that field is always this
+    symbol's own economic history (here, a fresh symbol's starting_cash,
+    since nothing was persisted yet). The real exchange balance is
+    captured separately, in exchange_cash_observed, exactly where a
+    multi-symbol-aware caller (bot.main._reconcile_shared_account_cash)
+    reads it from for drift detection — never into .cash itself."""
     ex, mock_ex = _make(dry_run=False, starting_cash=100.0, balance={"free": {"CAD": 150.75}}, tmp_path=tmp_path)
-    # After __init__, cash should be the exchange balance (_sync_cash + _sync_position both call fetch_balance)
-    assert abs(ex.cash - 150.75) < 0.01
+    assert abs(ex.cash - 100.0) < 0.01
+    assert abs(ex.exchange_cash_observed - 150.75) < 0.01
+    assert ex.startup_sync_healthy is True
     assert mock_ex.fetch_balance.call_count >= 1
 
 
@@ -1740,6 +1748,15 @@ def test_restart_recovery_of_settled_buy_does_not_double_deduct_cash(tmp_path):
             starting_cash=1000.0, dry_run=False, state_path=state_path,
         )
 
+    # Cash-ownership review finding (2026-09-22, round 3): LiveExecutor no
+    # longer assigns the exchange balance to .cash automatically (that
+    # would be exactly the bug a sibling review round found — see
+    # bot.main._reconcile_shared_account_cash). This test's own scenario
+    # (a single standalone executor, no multi-symbol sharing) is exactly
+    # the case adopt_exchange_cash_as_own() exists for: an explicit,
+    # caller-confirmed decision that the exchange balance IS this
+    # symbol's own cash, made here instead of assumed automatically.
+    assert ex2.adopt_exchange_cash_as_own() is True
     assert ex2.cash == pytest.approx(910.0)       # NOT 820.0 — no double deduction
     assert ex2.position == pytest.approx(0.001)
     assert "buy" not in ex2.pending_submissions   # confirmed terminal — resolved
@@ -1786,6 +1803,9 @@ def test_restart_recovery_of_settled_sell_does_not_double_apply(tmp_path):
             starting_cash=1000.0, dry_run=False, state_path=state_path,
         )
 
+    # See adopt_exchange_cash_as_own()'s own docstring / the sibling BUY
+    # test above for why this explicit call replaced an automatic one.
+    assert ex2.adopt_exchange_cash_as_own() is True
     assert ex2.cash == pytest.approx(1095.0)      # established by the exchange sync alone
     assert ex2.position == pytest.approx(0.0)
     assert "sell" not in ex2.pending_submissions
@@ -2283,6 +2303,10 @@ def test_ordinary_partial_fill_crash_before_save_loses_nothing(mock_cfg, mock_sl
 
     # Startup reconciliation (2026-09-19 PASS-5 fix) recovers the fill
     # immediately at construction — exactly once, not lost to the crash.
+    # Cash-ownership review (2026-09-22, round 3): .cash is no longer
+    # auto-set from the exchange balance — this single-executor test's
+    # own scenario is exactly what adopt_exchange_cash_as_own() is for.
+    assert ex2.adopt_exchange_cash_as_own() is True
     assert ex2.position == pytest.approx(0.001)
     assert ex2.cash == pytest.approx(1000.0 - 90.0 - 0.18)
     assert len(ex2.pending_journal_entries) == 1
@@ -2900,6 +2924,10 @@ def test_native_stop_fee_only_update_restart_between_fill_and_settlement(tmp_pat
             native_stop_loss_enabled=True,
         )
 
+    # Cash-ownership review (2026-09-22, round 3): .cash is no longer
+    # auto-set from the exchange balance — see adopt_exchange_cash_as_own()'s
+    # own docstring for why this single-executor test now opts in explicitly.
+    assert ex2.adopt_exchange_cash_as_own() is True
     assert ex2._fees_paid == pytest.approx(0.36)
     assert (cash_before_restart - ex2.cash) == pytest.approx(0.36)   # applied exactly once
     assert not ex2.has_resting_stop
@@ -3242,10 +3270,26 @@ def test_native_stop_startup_position_closed_externally_clears_stale_id(tmp_path
     PASS-7 review finding (P0): the flat-position startup branch no longer
     calls the LIVE _cancel_native_stop() (which would re-apply the fill's
     cash effect on top of the already-synced exchange balance and compute
-    P&L against the by-then-zeroed cost_basis) — it recovers cash-free via
+    P&L against the by-then-zeroed cost_basis) — it recovers via
     _recover_flat_native_stop_at_startup(), using the PRESERVED pre-sync
     cost basis. An already-CLOSED order has nothing left to cancel, so
-    cancel_order is correctly never called at all."""
+    cancel_order is correctly never called at all.
+
+    CASH-OWNERSHIP INVARIANT UPDATE (2026-09-22, corrected same day): this
+    test used to assert cash stayed at the persisted $89.88 ("exchange-
+    authoritative, not double-applied") on the premise that the exchange's
+    raw free balance is trustworthy for this symbol's own cash. That
+    premise is now known to be wrong in general — a second review round
+    found it silently misattributes a SHARED account's other symbols' cash
+    (reproduced: $59.60 own cash + $100 unrelated idle cash read back as
+    $209.10 instead of the correct $109.10, no timeout needed). The only
+    cash source LiveExecutor ever trusts now is THIS order's own reported
+    fill data — here, a confirmed "closed" order with filled=0.001 @
+    88,000 is a real, trustworthy fill on THIS symbol, so its proceeds
+    ($88.00, zero fee) are added directly to the persisted $89.88, giving
+    $177.88. fetch_balance is updated to a realistic, consistent value
+    (still exercises "exchange shows 0 BTC" for the position path — cash
+    plays no role in that check)."""
     state_path = str(tmp_path / "state.json")
     json.dump({
         "symbol": "BTC/CAD", "cash": 89.88, "position": 0.001,
@@ -3257,7 +3301,7 @@ def test_native_stop_startup_position_closed_externally_clears_stale_id(tmp_path
     mock_ex = MagicMock()
     mock_ex.load_markets.return_value = _DEFAULT_MARKETS
     mock_ex.fetch_balance.return_value = {
-        "free": {"CAD": 89.88, "BTC": 0.0}, "total": {"CAD": 89.88, "BTC": 0.0},
+        "free": {"CAD": 177.88, "BTC": 0.0}, "total": {"CAD": 177.88, "BTC": 0.0},
     }
     # Realistic outcome for "closed while the bot was down": the stop
     # itself is what closed it — confirmed terminal (closed) with the
@@ -3278,7 +3322,9 @@ def test_native_stop_startup_position_closed_externally_clears_stale_id(tmp_path
     assert ex.position == 0.0
     assert not ex.has_resting_stop
     mock_ex.cancel_order.assert_not_called()   # already closed — nothing to cancel
-    assert ex.cash == pytest.approx(89.88)     # exchange-authoritative, not double-applied
+    # Symbol-scoped: persisted $89.88 + this order's OWN reported proceeds
+    # ($88.00, zero fee) — never the shared exchange balance.
+    assert ex.cash == pytest.approx(177.88)
     # The missed execution's P&L is still recovered and journaled:
     # (88,000 - 88,870) * 0.001 = -0.87
     assert ex._portfolio.realized_pnl == pytest.approx(-0.87)

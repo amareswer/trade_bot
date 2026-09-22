@@ -1219,6 +1219,170 @@ def _compute_account_value(capital_pool: CapitalPool, executors: dict, symbol_st
     return total
 
 
+def _reconcile_shared_account_cash(
+    capital_pool: CapitalPool, executors: dict, *, alerter, drift_tolerance: float = 1.0,
+) -> "float | None":
+    """
+    Multiple LiveExecutor instances (fixed roster + any dynamically
+    admitted symbols) share ONE real exchange account/quote-currency.
+    LiveExecutor never lets the exchange's whole-account balance touch a
+    symbol's own .cash (see the cash-ownership invariant documented in
+    LiveExecutor.__init__, above its _load_state() call) — each
+    executor's .cash is always its own, correct, trade-history-derived
+    figure, and exchange_cash_observed is the separate, purely
+    observational whole-account reading _sync_cash() made at startup.
+
+    This function's ONLY job is a genuine DRIFT CHECK, never a
+    restoration (there is nothing to restore — .cash was never wrong):
+    does (capital_pool.available_cash + the sum of every currently
+    ALLOCATED symbol's own .cash) roughly match what the exchange
+    actually reported for the whole account at startup? A mismatch beyond
+    drift_tolerance means something happened outside the bot's own trade
+    history (a manual trade, a deposit, a withdrawal, or a real
+    accounting bug) — loudly alerted, never silently corrected by
+    trusting either number blindly.
+
+    Skips the check (does not alert) if no real executor's startup sync
+    actually succeeded (startup_sync_healthy) — there is no trustworthy
+    exchange figure to compare against in that case, and a fallback
+    starting_cash number would produce a meaningless "drift". A bare
+    FakeExecutor/PaperExecutor in tests has no exchange_cash_observed
+    attribute and is safely skipped — this reconciliation only applies to
+    real, exchange-backed executors. Returns the raw exchange-wide figure
+    used for the check (or None if no healthy real observation existed),
+    primarily for tests/logging.
+    """
+    real_executors = {s: e for s, e in executors.items() if hasattr(e, "exchange_cash_observed")}
+    if not real_executors:
+        return None
+
+    exchange_wide_cash = None
+    for _executor in real_executors.values():
+        if getattr(_executor, "startup_sync_healthy", False) and _executor.exchange_cash_observed is not None:
+            exchange_wide_cash = _executor.exchange_cash_observed
+            break
+    if exchange_wide_cash is None:
+        alerter.error(
+            "SHARED-ACCOUNT CASH RECONCILIATION SKIPPED: no executor reported a healthy "
+            "exchange balance sync at startup — drift cannot be checked this cycle. "
+            "Investigate the underlying sync failure directly."
+        )
+        return None
+
+    expected_total = capital_pool.available_cash + sum(
+        _executor.cash for _sym, _executor in real_executors.items()
+        if capital_pool.is_allocated(_sym)
+    )
+    drift = abs(exchange_wide_cash - expected_total)
+    if drift > drift_tolerance:
+        _n_allocated = sum(1 for _sym in real_executors if capital_pool.is_allocated(_sym))
+        alerter.error(
+            f"SHARED-ACCOUNT CASH DRIFT: exchange reports ${exchange_wide_cash:.2f} free, "
+            f"but the bot's own bookkeeping expects ${expected_total:.2f} "
+            f"(pool.available_cash=${capital_pool.available_cash:.2f} + {_n_allocated} "
+            f"allocated symbol(s)' own tracked cash) — drift ${drift:.2f} exceeds "
+            f"${drift_tolerance:.2f} tolerance. This means something happened outside the "
+            f"bot's own trade history (a manual trade, deposit, withdrawal) or a real "
+            f"accounting bug. Investigate before trusting account-value-derived risk checks."
+        )
+    return exchange_wide_cash
+
+
+def _initialize_capital_pool(executors: dict, cfg) -> "tuple[CapitalPool, dict, float, float, dict]":
+    """
+    Builds the CapitalPool for a startup's roster of `executors`, and
+    funds each GENUINELY FRESH (no persisted position) one with its own
+    slot allowance. A symbol already holding a position is left
+    completely untouched — its own state-file-derived cash is trusted,
+    never overwritten with a fresh slot amount. This is the exact same
+    fabrication bug already found and fixed in _admit_dynamic_symbol's
+    own recovery branch (that fix's docstring has the full $20+$80-became-
+    $100+$80 reproduction) — this is that bug's fixed-roster-STARTUP
+    sibling, found in the same 2026-09-22 review: it affects the ALREADY-
+    LIVE production roster (BTC/CAD + SOL/CAD), not only dynamically
+    admitted symbols, whenever a restart happens while either already
+    holds a position.
+
+    For REAL live trading (not paper/dry-run): the pool's total_capital
+    comes from the first executor's exchange_cash_observed (the raw, real
+    FREE-CASH balance its own _sync_cash() call already made at
+    construction — NEVER from .cash, per LiveExecutor's own cash-ownership
+    invariant) PLUS the current value of every symbol ALREADY holding a
+    position (2026-09-22 second review finding, P1). exchange_cash_observed
+    is free cash only — it excludes whatever is presently invested in an
+    open position (that value sits in the base asset, not the quote
+    currency, so it never shows up in a CAD free-balance read). Total
+    capital under this pool's management is free cash PLUS those holdings'
+    value, not free cash alone: reproduced with $135 free cash + one
+    symbol already holding a position worth $165 (true equity $300) — the
+    old code initialized the pool to $135 alone, and the later
+    allocate(_rsym) call (see the "Restart recovery" section of run())
+    then reserved a generic ~$67 theoretical slot for it (slot_cash_for()
+    against that too-small total), unrelated to what it's actually
+    holding — silently losing $55 of real equity from every downstream
+    accounting read (available_cash, _compute_account_value) with no
+    economic event to explain it.
+
+    Uses avg_entry (cost basis, already loaded via _load_state() — no
+    network call) rather than a live market price for this valuation,
+    DELIBERATELY matching the amount= this same holding symbol's later
+    allocate() call in "Restart recovery" must ALSO use (see that call
+    site's own comment) — using a live price in one place and avg_entry in
+    the other would leave a live-vs-cost-basis mismatch permanently baked
+    into available_cash, since nothing later reconciles that gap. Marking
+    to market is _compute_account_value's job, run continuously — it's
+    not needed for the pool's own OWN internal bookkeeping to be
+    self-consistent at construction time, only for the SAME basis to be
+    used everywhere within this one startup sequence.
+
+    Returns (capital_pool, per_symbol_slots, pool_total, slot_cap,
+    slot_caps_by_symbol) — everything the caller needs for both the
+    CapitalPool itself and its own display/logging.
+
+    Extracted to module level (was inline in run()) purely for direct
+    unit testability against the ACTUAL startup sequence, not just its
+    constituent helpers in isolation — same "extract for testability"
+    convention as every other function in this section (e.g.
+    _compute_account_value, _reconcile_shared_account_cash).
+    """
+    _max_conc = cfg.portfolio.max_concurrent_positions
+    if cfg.exchange.live_trading and not cfg.paper.paper_mode and not cfg.exchange.dry_run:
+        _first_exec = next(iter(executors.values()))
+        _existing_holdings_value = sum(
+            _e.position * _e.avg_entry for _e in executors.values() if _e.position > 1e-9
+        )
+        _pool_total = _first_exec.exchange_cash_observed + _existing_holdings_value
+    else:
+        _pool_total = cfg.portfolio.starting_cash
+    _slot_cap = cfg.portfolio.max_slot_cash_cad
+    # Per-symbol overrides (MAX_SLOT_CASH_CAD_<BASE>, e.g. MAX_SLOT_CASH_CAD_SOL) —
+    # keyed by base asset in config, remapped here to the full symbol strings
+    # CapitalPool actually tracks. A symbol with no override falls back to the
+    # shared _slot_cap above — added 2026-08-24, no-op when .env only sets the
+    # old single MAX_SLOT_CASH_CAD (the dict below is then empty).
+    _slot_caps_by_symbol = {
+        _sym: cfg.portfolio.max_slot_cash_cad_by_base[_sym.split("/")[0].upper()]
+        for _sym in executors
+        if _sym.split("/")[0].upper() in cfg.portfolio.max_slot_cash_cad_by_base
+    }
+    capital_pool = CapitalPool(
+        total_capital=_pool_total, max_concurrent=_max_conc, slot_cap=_slot_cap,
+        slot_caps=_slot_caps_by_symbol,
+    )
+    _per_symbol_slots: dict[str, float] = {}
+    for _sym, _exc in executors.items():
+        _slot = capital_pool.slot_cash_for(_sym)
+        _per_symbol_slots[_sym] = _slot
+        if _exc.position <= 1e-9:
+            _exc._portfolio.cash = _slot
+            if cfg.exchange.live_trading:
+                try:
+                    _exc._save_state()
+                except Exception as e:
+                    logger.warning("State save after pool init failed [%s]: %s", _sym, e)
+    return capital_pool, _per_symbol_slots, _pool_total, _slot_cap, _slot_caps_by_symbol
+
+
 def _persist_accounting_cycle_start(
     path: str, *, requested_symbols: "list[str]", db_identity: "str | None",
     shadow_mode: bool, alerter,
@@ -2193,23 +2357,55 @@ def _admit_dynamic_symbol(
         strat = build_strategy()
         last_ts = _warmup_strategy(strat, live_exchange, timeframe, symbol=sym)
         executor = _make_dynamic_executor(sym)
-        executor._portfolio.cash = capital_pool.slot_cash_for(sym)
-        try:
-            executor._save_state()
-        except Exception as _save_exc:
-            logger.warning("Dynamic symbol %s: state save after funding failed: %s", sym, _save_exc)
+
+        if executor.position <= 1e-9:
+            # Fresh candidate — no persisted position, so there is no
+            # existing economic claim on this slot's cash yet. Fund it
+            # with its sizing allowance for this tick's trade decision.
+            executor._portfolio.cash = capital_pool.slot_cash_for(sym)
+            try:
+                executor._save_state()
+            except Exception as _save_exc:
+                logger.warning("Dynamic symbol %s: state save after funding failed: %s", sym, _save_exc)
+
         sm = TradingStateMachine(cooldown_ticks=cfg.risk.cooldown_ticks)
         pm = PositionManager()
         ss = _new_symbol_state_dict(strategy=strat, sm=sm, pm=pm, executor=executor, last_ts_ms=last_ts)
 
         if executor.position > 1e-9:
+            # Recovery — a restart re-admitting a symbol that was already
+            # trading. The executor's OWN persisted cash already reflects
+            # what's genuinely left after this position was bought; it
+            # must NEVER be overwritten here. A prior version of this
+            # function funded cash unconditionally, BEFORE this check,
+            # which fabricated up to a full slot's worth of account value
+            # on every restart that recovered a dynamic symbol's position
+            # (e.g. real $20 cash + $80 holdings became $100 cash + $80
+            # holdings — a straight $80 of value that never existed).
+            #
+            # No restoration is needed here for a REAL executor either
+            # (an earlier round of this fix DID need one, since
+            # LiveExecutor used to overwrite .cash with the exchange's
+            # whole-account balance internally): LiveExecutor now never
+            # lets that figure touch .cash in the first place — see the
+            # cash-ownership invariant documented in LiveExecutor.
+            # __init__, above its _load_state() call, and
+            # exchange_cash_observed / _reconcile_shared_account_cash for
+            # where that observation is actually used (read-only drift
+            # detection, never treated as any one symbol's own cash).
             pm.seed(
                 quantity=executor.position, avg_entry=executor.avg_entry,
                 realized_pnl=executor.portfolio.realized_pnl,
             )
             sm.recover_long(executor.avg_entry)
             ss['native_stop_price'], ss['native_stop_is_trailing'] = _seed_native_stop_state(executor)
-            capital_pool.allocate(sym)
+            # amount= (2026-09-22 second review finding, P1 — same fix as
+            # run()'s own restart-recovery block, see its comment there):
+            # a bare allocate(sym) reserves a generic slot_cash_for(sym)
+            # slice of the pool, unrelated to what this recovered position
+            # is actually worth — silently losing (or fabricating) equity
+            # with no economic event. Reserve its own actual value instead.
+            capital_pool.allocate(sym, amount=executor.cash + executor.position * executor.avg_entry)
             logger.warning(
                 "Dynamic symbol %s admitted WITH an existing position"
                 " (qty=%.6f @ %.2f) — restart-recovery seeding applied",
@@ -2846,37 +3042,10 @@ def run():
     # STARTING_CASH path as paper_mode — the persisted per-symbol state file
     # is not a trustworthy whole-account total in either case.
     _max_conc = cfg.portfolio.max_concurrent_positions
-    if cfg.exchange.live_trading and not cfg.paper.paper_mode and not cfg.exchange.dry_run:
-        _first_exec = next(iter(executors.values()))
-        _pool_total = _first_exec.cash   # real Kraken CAD balance
-    else:
-        _pool_total = cfg.portfolio.starting_cash
-    _slot_cap = cfg.portfolio.max_slot_cash_cad
-    # Per-symbol overrides (MAX_SLOT_CASH_CAD_<BASE>, e.g. MAX_SLOT_CASH_CAD_SOL) —
-    # keyed by base asset in config, remapped here to the full symbol strings
-    # CapitalPool actually tracks. A symbol with no override falls back to the
-    # shared _slot_cap above — added 2026-08-24, no-op when .env only sets the
-    # old single MAX_SLOT_CASH_CAD (the dict below is then empty).
-    _slot_caps_by_symbol = {
-        _sym: cfg.portfolio.max_slot_cash_cad_by_base[_sym.split("/")[0].upper()]
-        for _sym in executors
-        if _sym.split("/")[0].upper() in cfg.portfolio.max_slot_cash_cad_by_base
-    }
-    capital_pool = CapitalPool(
-        total_capital=_pool_total, max_concurrent=_max_conc, slot_cap=_slot_cap,
-        slot_caps=_slot_caps_by_symbol,
+    capital_pool, _per_symbol_slots, _pool_total, _slot_cap, _slot_caps_by_symbol = (
+        _initialize_capital_pool(executors, cfg)
     )
     _uncapped_slot = _pool_total / _max_conc
-    _per_symbol_slots: dict[str, float] = {}
-    for _sym, _exc in executors.items():
-        _slot = capital_pool.slot_cash_for(_sym)
-        _per_symbol_slots[_sym] = _slot
-        _exc._portfolio.cash = _slot
-        if cfg.exchange.live_trading:
-            try:
-                _exc._save_state()
-            except Exception as e:
-                logger.warning("State save after pool init failed [%s]: %s", _sym, e)
     if _slot_caps_by_symbol:
         # Multi-symbol per-symbol-cap case — report each slot individually
         # rather than the single "X per symbol" line, since slots now differ.
@@ -3343,7 +3512,36 @@ def run():
                 # for fixed mode: with exactly max_concurrent fixed symbols,
                 # allocating both/all of them still leaves can_open_position()
                 # returning the same answer it always effectively did.
-                capital_pool.allocate(_rsym)
+                #
+                # amount= (2026-09-22 second review finding, P1): passing
+                # NO amount here (the pre-fix code) reserved a generic
+                # slot_cash_for(_rsym) — an equal division of the pool's
+                # total_capital — completely unrelated to what this
+                # position is actually worth. Must pass this position's
+                # OWN current value explicitly instead: cash left over
+                # after buying it, plus the position's value AT THE SAME
+                # avg_entry basis _initialize_capital_pool used when it
+                # folded this same holding into total_capital above — using
+                # a live price here instead would leave a live-vs-cost-
+                # basis gap permanently baked into available_cash (see
+                # CapitalPool.allocate's own docstring for the full
+                # reproduction and why the two call sites must agree).
+                capital_pool.allocate(
+                    _rsym, amount=_rexc.cash + _rexc.position * _rexc.avg_entry,
+                )
+
+        # Multi-executor-sharing-one-account fix (2026-09-22): every
+        # executor's own _sync_cash() (inside LiveExecutor.__init__,
+        # already run for each of them above) independently overwrote its
+        # .cash with the exchange's WHOLE-ACCOUNT free balance — correct
+        # only for a lone single-symbol deployment. With the fixed roster
+        # (and any symbols recovered above) sharing ONE real account, this
+        # restores each one's own state-file-derived cash and cross-checks
+        # the aggregate against the real exchange balance once, for every
+        # executor at once, now that every recovered position has already
+        # claimed its capital_pool slot above (see _reconcile_shared_
+        # account_cash's own docstring for the full reproduction).
+        _reconcile_shared_account_cash(capital_pool, executors, alerter=alerter)
 
     # Aliases for _render_dashboard closure and display.stopped()
     state_machine    = symbol_state[_active_symbol]['sm']

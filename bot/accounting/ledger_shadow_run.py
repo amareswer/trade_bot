@@ -74,6 +74,42 @@ batch_is_complete — all reused UNCHANGED, never reimplemented here):
    every failure path) carries its own evidence_mode, so a published
    status is always self-labeling.
 
+7. history_path (optional, additive) — the fix for another real review
+   finding: publish_status()'s status_path, by design, only ever shows
+   the LATEST outcome, so after several real observation cycles only the
+   last one's full detail survived anywhere; an earlier untrusted result
+   (e.g. "opening balance not verified") was silently gone once a later
+   cycle published its own result. When given, every result this
+   function ever produces — in-progress placeholders and terminal
+   outcomes alike — is additionally appended (never overwritten) to
+   history_path via append_observation_history(), so a complete record
+   of every run survives regardless of what any later cycle reports.
+   Omitted by default: existing callers are unaffected.
+
+8. The zero_opening_confirmed conditional-labeling note (fixed after a
+   review caught a real overclaim in a human-facing report, not in this
+   code — the code's own trust check was always correctly gated on this
+   flag). zero_opening_confirmed=True is a BARE ASSERTION from the
+   caller — it carries no evidence string and is not independently
+   checked for truth by anything in this module or in
+   ledger_quantity_reconciliation.py. Chain self-consistency starting
+   from an assumed zero (every transition's own arithmetic checking out)
+   is real evidence of something narrower than "the account started at
+   zero": it only shows that the OLDEST entry a given fetch retrieved
+   implies a zero balance immediately before it. It does not, on its
+   own, confirm that entry was the account's true first-ever activity in
+   this asset, or rule out earlier history outside whatever window the
+   ledger API actually returned (retention limits, an earlier funding
+   path never exposed via this endpoint, etc.) — precisely the
+   distinction opening_checkpoint's own required `evidence` field exists
+   to force a caller to think through and write down, rather than
+   silently wave through a bare flag. When zero_opening_confirmed is used
+   without an opening_checkpoint, every terminal ShadowCycleResult now
+   carries an explicit NOTE to this effect in its own `reason` field —
+   including when the result is otherwise trusted=True — so this
+   qualification survives into the published artifact itself, not just a
+   verbal caveat easy to drop from a later summary.
+
 Storage is fully caller-specified (db_path / status_path are required
 arguments, never a hardcoded production path) — this module has no
 opinion about where shadow state lives beyond "wherever the caller says,"
@@ -86,6 +122,7 @@ sqlite3.connect() raise before any of the above logic ever ran.
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import uuid
@@ -159,6 +196,53 @@ def publish_status(status_path: str, result: ShadowCycleResult) -> None:
     atomic_write_json(status_path, asdict(result))
 
 
+def append_observation_history(history_path: "str | None", result: ShadowCycleResult) -> None:
+    """Appends ONE line of this result's full JSON to history_path (JSONL,
+    append-only). This exists because publish_status()'s status_path is
+    deliberately the OPPOSITE kind of record — it always reflects only
+    the CURRENT/latest outcome, by design, so a failure can never be
+    masked by an older success sitting on disk. That is the right
+    property for "what should I trust right now," but it means every
+    earlier result is destroyed the moment a newer one is published — a
+    real reviewed gap: after several real observation cycles, only the
+    last one's full detail survived anywhere. history_path is the
+    separate, additive record: every result ever produced (in-progress
+    placeholders and terminal outcomes alike, trusted or not) is kept,
+    in order, so a full account of every run remains inspectable
+    regardless of what any later cycle reports.
+
+    A no-op when history_path is None (the default) — this is additive
+    and opt-in, not a change to run_shadow_cycle's core trust logic.
+    Uses a plain append, not atomic_write_json's tmp+replace (which is
+    for whole-file REPLACEMENT and would not fit an append-only log): a
+    torn last line from a crash mid-append is the one accepted risk
+    here, exactly like any ordinary JSONL audit log, and never affects
+    any earlier line's integrity."""
+    if history_path is None:
+        return
+    dirpath = os.path.dirname(os.path.abspath(history_path))
+    os.makedirs(dirpath, exist_ok=True)
+    with open(history_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(asdict(result)) + "\n")
+
+
+def read_observation_history(history_path: str) -> "list[dict]":
+    """Reads back every record append_observation_history has ever
+    written, in order, as plain dicts (not reconstructed ShadowCycleResult
+    objects — this is a read-only inspection helper, not something
+    run_shadow_cycle itself consumes). Returns an empty list if the file
+    has never been created."""
+    if not os.path.exists(history_path):
+        return []
+    records = []
+    with open(history_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
+
+
 def is_shadow_enabled() -> bool:
     """Off by default. Deliberately not consulted inside run_shadow_cycle
     itself — this is the entry point's own responsibility, so the cycle
@@ -224,6 +308,7 @@ def run_shadow_cycle(
     read_wallet_balance_fn=None,
     opening_checkpoint=None,
     zero_opening_confirmed: bool = False,
+    history_path: "str | None" = None,
     now: "datetime | None" = None,
 ) -> ShadowCycleResult:
     """Runs exactly one observation cycle end to end and publishes its
@@ -281,9 +366,22 @@ def run_shadow_cycle(
     started_at = _iso_now(now)
     observation_id = new_observation_id(now=now)
 
+    def _publish(result: ShadowCycleResult) -> None:
+        # Both calls record the SAME result; publish_status's status_path
+        # always reflects only this (the latest) outcome, while
+        # history_path (opt-in, additive) accumulates every one ever
+        # produced — see append_observation_history's own docstring for
+        # why these are deliberately two different kinds of record.
+        # Order matters: status_path first, matching this function's own
+        # documented "if a publish raises, propagate — see docstring"
+        # contract at every call site below; history_path is best-effort
+        # additional fidelity, not the primary trust signal.
+        publish_status(status_path, result)
+        append_observation_history(history_path, result)
+
     # Published before any database or fetch work. If this raises, abort
     # entirely — see the docstring above.
-    publish_status(status_path, _in_progress_result(observation_id, evidence_mode, started_at))
+    _publish(_in_progress_result(observation_id, evidence_mode, started_at))
 
     conn = None
     try:
@@ -298,7 +396,7 @@ def run_shadow_cycle(
                 observation_id, evidence_mode, started_at, _iso_now(now), fetch_succeeded=False,
                 reason=f"evidence mode conflict for observation {observation_id!r}: {exc}", error=str(exc),
             )
-            publish_status(status_path, result)   # if this raises, propagate — see docstring
+            _publish(result)   # if this raises, propagate — see docstring
             return result
 
         try:
@@ -310,7 +408,7 @@ def run_shadow_cycle(
                 observation_id, evidence_mode, started_at, _iso_now(now), fetch_succeeded=False,
                 reason=f"fetch failed for observation {observation_id!r}: {exc}", error=str(exc),
             )
-            publish_status(status_path, result)   # if this raises, propagate — see docstring
+            _publish(result)   # if this raises, propagate — see docstring
             return result
 
         try:
@@ -334,7 +432,7 @@ def run_shadow_cycle(
                 reason=f"cycle failed after a successful fetch for observation {observation_id!r}: {exc}",
                 error=str(exc),
             )
-            publish_status(status_path, result)   # if this raises, propagate — see docstring
+            _publish(result)   # if this raises, propagate — see docstring
             return result
 
         trusted = chain_result.overall_pass and completeness.complete and this_observation_complete
@@ -343,6 +441,27 @@ def run_shadow_cycle(
             reason_parts.append(f"completeness: {completeness.reason}")
         if not this_observation_complete:
             reason_parts.append(f"observation {observation_id!r} has no completed manifest")
+        if zero_opening_confirmed and opening_checkpoint is None:
+            # Review finding: a bare zero_opening_confirmed=True flag was
+            # being treated (in at least one prior report to a human) as
+            # if it were independent confirmation of the account's true
+            # opening balance. It is not — it is only the caller's own
+            # assertion. All it can honestly mean, EVEN WHEN the chain
+            # below is fully self-consistent, is that the OLDEST entry
+            # this specific fetch retrieved implies a zero balance
+            # immediately before it; that does not independently confirm
+            # this was the account's actual first-ever activity in this
+            # asset, or rule out earlier offsetting history outside the
+            # fetched/retained ledger window. Labeled explicitly here,
+            # inside the trusted result itself, rather than left as a
+            # verbal caveat that's easy to drop when the result is later
+            # summarized. A caller with genuine independent evidence
+            # should use opening_checkpoint (which requires a written
+            # evidence string) instead of this bare flag.
+            reason_parts.append(
+                "NOTE: opening balance was ASSERTED zero via the bare zero_opening_confirmed flag, "
+                "not independently verified — see this note's own explanation in the module docstring"
+            )
         result = ShadowCycleResult(
             observation_id=observation_id, evidence_mode=evidence_mode, started_at=started_at,
             completed_at=_iso_now(now), in_progress=False, fetch_succeeded=True, trusted=trusted,
@@ -350,7 +469,7 @@ def run_shadow_cycle(
             completeness_complete=completeness.complete, this_observation_complete=this_observation_complete,
             reason="; ".join(reason_parts), error=None,
         )
-        publish_status(status_path, result)
+        _publish(result)
         return result
     finally:
         if conn is not None:

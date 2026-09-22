@@ -30,7 +30,8 @@ import pytest
 
 from bot.accounting.ledger_quantity_reconciliation import LedgerEntry, load_ledger_entries
 from bot.accounting.ledger_shadow_run import (
-    EvidenceModeConflict, is_shadow_enabled, new_observation_id, publish_status, run_shadow_cycle,
+    EvidenceModeConflict, append_observation_history, is_shadow_enabled, new_observation_id,
+    publish_status, read_observation_history, run_shadow_cycle,
 )
 
 ACCOUNT = "kraken:shadow-test"
@@ -575,6 +576,139 @@ def test_evidence_mode_field_labels_every_published_status(tmp_path):
     )
     assert result.evidence_mode == "fixture"
     assert json.loads(open(status_path).read())["evidence_mode"] == "fixture"
+
+
+# ── 3e. Observation history: an append-only record, separate from status ──────
+# (review finding: publish_status's status_path always shows only the LATEST
+# outcome by design — so after several real cycles, an earlier untrusted
+# result, e.g. "opening balance not verified", was silently lost the moment a
+# later cycle published its own result. history_path is the separate,
+# additive record that never overwrites anything.)
+
+def test_history_is_not_recorded_when_history_path_is_omitted(tmp_path):
+    """Default behavior for every existing caller is unaffected."""
+    run_shadow_cycle(
+        fetch_fn=_ok_fetch([_entry("L1", "1", "1", "placeholder")]),
+        account_id=ACCOUNT, asset=ASSET, evidence_mode="test",
+        db_path=str(tmp_path / "obs.db"), status_path=str(tmp_path / "status.json"),
+        wallet_balance_at_read=Decimal("1"), wallet_balance_read_at="2026-01-01T00:00:01Z",
+        zero_opening_confirmed=True,
+    )
+    assert not os.path.exists(str(tmp_path / "history.jsonl"))
+
+
+def test_history_accumulates_every_cycles_terminal_result_without_losing_earlier_ones(tmp_path):
+    """The exact property requested: an earlier untrusted result must
+    still be readable after a later cycle succeeds — status.json alone
+    cannot show this (it only ever holds the latest), history.jsonl must."""
+    db_path = str(tmp_path / "obs.db")
+    status_path = str(tmp_path / "status.json")
+    history_path = str(tmp_path / "history.jsonl")
+
+    untrusted = run_shadow_cycle(
+        fetch_fn=_ok_fetch([_entry("L1", "0.0001", "0.0001", "placeholder")]),
+        account_id=ACCOUNT, asset=ASSET, evidence_mode="test",
+        db_path=db_path, status_path=status_path, history_path=history_path,
+        wallet_balance_at_read=Decimal("0.0001"), wallet_balance_read_at="2026-01-01T00:00:01Z",
+        zero_opening_confirmed=False,   # deliberately NOT asserted — mirrors the real live run's first cycle
+    )
+    assert untrusted.trusted is False
+    assert "opening balance not verified" in untrusted.reason
+
+    trusted = run_shadow_cycle(
+        fetch_fn=_ok_fetch([_entry("L1", "0.0001", "0.0001", "placeholder")]),
+        account_id=ACCOUNT, asset=ASSET, evidence_mode="test",
+        db_path=db_path, status_path=status_path, history_path=history_path,
+        wallet_balance_at_read=Decimal("0.0001"), wallet_balance_read_at="2026-01-01T00:00:02Z",
+        zero_opening_confirmed=True,
+    )
+    assert trusted.trusted is True
+
+    # status.json now shows ONLY the second (trusted) outcome — the first
+    # is gone from it, exactly the documented, deliberate behavior.
+    published = json.loads(open(status_path).read())
+    assert published["observation_id"] == trusted.observation_id
+    assert published["trusted"] is True
+
+    # history.jsonl, in contrast, still has BOTH — nothing was lost.
+    history = read_observation_history(history_path)
+    terminal_records = [r for r in history if not r["in_progress"]]
+    assert [r["observation_id"] for r in terminal_records] == [
+        untrusted.observation_id, trusted.observation_id,
+    ]
+    assert terminal_records[0]["trusted"] is False
+    assert "opening balance not verified" in terminal_records[0]["reason"]
+    assert terminal_records[1]["trusted"] is True
+
+
+def test_history_also_records_in_progress_and_failed_observations_not_just_successes(tmp_path):
+    db_path = str(tmp_path / "obs.db")
+    status_path = str(tmp_path / "status.json")
+    history_path = str(tmp_path / "history.jsonl")
+
+    failure = run_shadow_cycle(
+        fetch_fn=_failing_fetch(), account_id=ACCOUNT, asset=ASSET, evidence_mode="test",
+        db_path=db_path, status_path=status_path, history_path=history_path,
+        wallet_balance_at_read=Decimal("0"), wallet_balance_read_at="2026-01-01T00:00:01Z",
+        zero_opening_confirmed=True,
+    )
+    history = read_observation_history(history_path)
+    # One in-progress placeholder, then the terminal failure — both for
+    # the SAME observation_id, both preserved.
+    assert len(history) == 2
+    assert history[0]["in_progress"] is True
+    assert history[0]["observation_id"] == failure.observation_id
+    assert history[1]["in_progress"] is False
+    assert history[1]["observation_id"] == failure.observation_id
+    assert history[1]["fetch_succeeded"] is False
+
+
+def test_read_observation_history_returns_empty_list_for_a_never_created_file(tmp_path):
+    assert read_observation_history(str(tmp_path / "nonexistent_history.jsonl")) == []
+
+
+def test_append_observation_history_is_a_no_op_when_history_path_is_none():
+    """Direct unit test of the primitive itself — never raises, never
+    creates anything, when the caller hasn't opted in."""
+    append_observation_history(None, _in_progress_result_for_test())
+
+
+def _in_progress_result_for_test():
+    from bot.accounting.ledger_shadow_run import _in_progress_result
+    return _in_progress_result("obs-1", "test", "2026-01-01T00:00:00Z")
+
+
+def test_history_creates_a_nonexistent_nested_directory(tmp_path):
+    history_path = str(tmp_path / "nested" / "dir" / "history.jsonl")
+    run_shadow_cycle(
+        fetch_fn=_ok_fetch([_entry("L1", "1", "1", "placeholder")]),
+        account_id=ACCOUNT, asset=ASSET, evidence_mode="test",
+        db_path=str(tmp_path / "obs.db"), status_path=str(tmp_path / "status.json"),
+        history_path=history_path,
+        wallet_balance_at_read=Decimal("1"), wallet_balance_read_at="2026-01-01T00:00:01Z",
+        zero_opening_confirmed=True,
+    )
+    assert os.path.exists(history_path)
+
+
+def test_cli_live_and_fixture_modes_pass_through_a_mode_specific_history_path(tmp_path, monkeypatch):
+    """The CLI's own wiring for this — mode-specific default history
+    files, matching the same fixture/live separation as --db/--status."""
+    monkeypatch.setenv("LEDGER_SHADOW_ENABLED", "true")
+    import scripts.ledger_shadow_run as cli_module
+
+    assert "history" in cli_module._MODE_DEFAULTS["fixture"]
+    assert "history" in cli_module._MODE_DEFAULTS["live"]
+    assert cli_module._MODE_DEFAULTS["fixture"]["history"] != cli_module._MODE_DEFAULTS["live"]["history"]
+
+    db_path = str(tmp_path / "obs.db")
+    status_path = str(tmp_path / "status.json")
+    history_path = str(tmp_path / "history.jsonl")
+    exit_code = cli_module.main([
+        "--fixture", "--db", db_path, "--status", status_path, "--history", history_path,
+    ])
+    assert exit_code == 0
+    assert len(read_observation_history(history_path)) == 2   # in-progress + terminal
 
 
 # ── 4. Isolation, off-by-default, no trading-path relationship ────────────────

@@ -65,11 +65,13 @@ _MODE_DEFAULTS = {
     "fixture": {
         "db": os.path.join(_SHADOW_ROOT, "fixture", "observations.db"),
         "status": os.path.join(_SHADOW_ROOT, "fixture", "status.json"),
+        "history": os.path.join(_SHADOW_ROOT, "fixture", "history.jsonl"),
         "account_id": "shadow-fixture",
     },
     "live": {
         "db": os.path.join(_SHADOW_ROOT, "live", "observations.db"),
         "status": os.path.join(_SHADOW_ROOT, "live", "status.json"),
+        "history": os.path.join(_SHADOW_ROOT, "live", "history.jsonl"),
         "account_id": "kraken:trade_bot_local",
     },
 }
@@ -102,8 +104,13 @@ def main(argv=None) -> int:
                                                      "path under logs/shadow/ledger_reconciliation/ — never "
                                                      "production trades.db, and never shared between modes "
                                                      "even if you override this (see EvidenceModeConflict).")
-    parser.add_argument("--status", default=None, help="Isolated shadow status JSON path. Same mode-specific "
-                                                         "default behavior as --db.")
+    parser.add_argument("--status", default=None, help="Isolated shadow status JSON path (latest outcome "
+                                                         "only). Same mode-specific default behavior as --db.")
+    parser.add_argument("--history", default=None, help="Append-only JSONL log of EVERY result ever produced "
+                                                          "(never overwritten, unlike --status) — read it back "
+                                                          "with bot.accounting.ledger_shadow_run."
+                                                          "read_observation_history(). Same mode-specific "
+                                                          "default behavior as --db.")
     parser.add_argument("--account-id", default=None, help="Defaults to a mode-specific identity.")
     parser.add_argument("--asset", default="XXBT",
                          help="Any recognized alias or raw Kraken code (BTC, XBT, and XXBT are all "
@@ -141,18 +148,29 @@ def main(argv=None) -> int:
     defaults = _MODE_DEFAULTS[mode]
     db_path = args.db if args.db is not None else defaults["db"]
     status_path = args.status if args.status is not None else defaults["status"]
+    history_path = args.history if args.history is not None else defaults["history"]
     account_id = args.account_id if args.account_id is not None else defaults["account_id"]
+
+    zero_opening_confirmed = args.zero_opening_confirmed if args.live else True
+    if zero_opening_confirmed:
+        print(
+            "NOTE: running with a zero opening balance ASSERTED, not independently verified — "
+            "this only means the oldest fetched entry implies zero immediately before it, not "
+            "confirmed proof this is the account's true first-ever activity in this asset. "
+            "The published result's own `reason` field carries this same caveat."
+        )
 
     result = run_shadow_cycle(
         fetch_fn=fetch_fn, account_id=account_id, asset=persistence_asset,
         db_path=db_path, status_path=status_path, evidence_mode=mode,
         wallet_balance_at_read=wallet_balance, wallet_balance_read_at=wallet_read_at,
         read_wallet_balance_fn=read_wallet_balance_fn,
-        zero_opening_confirmed=args.zero_opening_confirmed if args.live else True,
+        zero_opening_confirmed=zero_opening_confirmed, history_path=history_path,
     )
     print(f"mode={mode} observation_id={result.observation_id} fetch_succeeded={result.fetch_succeeded} "
           f"trusted={result.trusted} reason={result.reason}")
     print(f"status published to {status_path}")
+    print(f"history appended to {history_path}")
     return 0 if result.trusted else 1
 
 

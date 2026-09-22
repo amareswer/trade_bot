@@ -1119,3 +1119,852 @@ def test_fixed_mode_buy_still_executes_immediately_not_queued():
     section = src[idx:end]
     assert "if approval and _dynamic_mode_active and final_signal == Signal.BUY:" in section
     assert "elif approval:" in section
+
+
+# ── Missing-coverage review (2026-09-22): fixed-roster + dynamic sharing ──
+# one bankroll, and multi-coin partial-fill/fee/restart reconciliation.
+# Every scenario below combines TWO coins against the SAME shared
+# CapitalPool instance — every existing test above exercises either
+# dynamic-vs-dynamic contention (fresh pool, no fixed-roster involvement)
+# or exactly one symbol at a time for fills/fees/restart recovery. No
+# code was changed to write these; DYNAMIC_UNIVERSE_ENABLED stays false
+# and no live call or production write happens anywhere here.
+
+def test_fixed_roster_consumed_slot_limits_dynamic_ranked_execution():
+    """Missing coverage: every existing ranked-execution test starts from
+    a FRESH pool contested only among DYNAMIC candidates. This proves the
+    actual claim in CLAUDE.md's own design doc — 'the fixed roster and
+    every dynamically admitted symbol compete for this ONE pool of slots'
+    — end to end: a FIXED-roster symbol (BTC/CAD) fills via the immediate-
+    execute path EARLIER in the same tick (exactly bot.main.run()'s
+    section 9 'elif approval:' branch), consuming one of two total slots.
+    TWO dynamic candidates then compete for the ONE remaining slot. Total
+    allocated positions across BOTH categories must never exceed
+    max_concurrent, BTC/CAD's own fixed allocation must never be displaced
+    or double-counted, and the dynamic winner must still be chosen by the
+    same ranking rule as a dynamic-only contest."""
+    pool = CapitalPool(total_capital=300.0, max_concurrent=2)   # 2 total slots, SHARED
+    risk = FakeRisk(approve=True)
+
+    btc_executor = FakeExecutor(symbol="BTC/CAD", starting_cash=100.0)
+    btc_executor.queue_order(_filled_order(OrderSide.BUY, price=50000.0, qty=0.002))
+    btc_ss = _new_ss(executor=btc_executor)
+    bot_main._execute_approved_signal(
+        "BTC/CAD", btc_ss, Signal.BUY, 50000.0, 0.002, Signal.BUY, "",
+        capital_pool=pool, risk=risk, alerter=MagicMock(), trade_log=MagicMock(),
+        stuck_detector=MagicMock(), is_indicator=True,
+    )
+    assert pool.is_allocated("BTC/CAD")
+    assert pool.free_slots == 1   # only ONE slot left for dynamic candidates this tick
+
+    exec_a = FakeExecutor(symbol="A/CAD", starting_cash=100.0)
+    exec_a.queue_order(_filled_order(OrderSide.BUY, price=10.0, qty=1.0))
+    exec_b = FakeExecutor(symbol="B/CAD", starting_cash=100.0)
+    exec_b.queue_order(_filled_order(OrderSide.BUY, price=10.0, qty=1.0))
+    ss_a = _new_ss(executor=exec_a, strategy_adx=15.0)
+    ss_b = _new_ss(executor=exec_b, strategy_adx=35.0)   # higher ADX — should win the last slot
+    queue = [
+        dict(sym="A/CAD", ss=ss_a, final_signal=Signal.BUY, price=10.0, trade_qty=1.0,
+             raw_signal=Signal.BUY, filter_reason="", adx=15.0, quote_volume=1_000_000),
+        dict(sym="B/CAD", ss=ss_b, final_signal=Signal.BUY, price=10.0, trade_qty=1.0,
+             raw_signal=Signal.BUY, filter_reason="", adx=35.0, quote_volume=1_000_000),
+    ]
+
+    filled, blocked = bot_main._execute_ranked_dynamic_buys(
+        queue, capital_pool=pool, risk=risk, account_value_fn=lambda: 300.0,
+        alerter=MagicMock(), trade_log=MagicMock(), stuck_detector=MagicMock(),
+        is_indicator=True, max_concurrent=2,
+    )
+
+    assert filled == ["B/CAD"]
+    assert blocked == {"A/CAD": "capital_pool"}
+    # The critical invariant: total allocated across FIXED + DYNAMIC never
+    # exceeds max_concurrent, and BTC/CAD's fixed position is untouched.
+    assert set(pool.allocated_symbols) == {"BTC/CAD", "B/CAD"}
+    assert len(pool.allocated_symbols) == 2
+    assert exec_a.execute_calls == []   # A/CAD never even attempted
+
+
+def test_two_coin_restart_recovery_allocates_both_slots_independently(monkeypatch):
+    """Missing coverage: existing restart-recovery tests
+    (test_admit_dynamic_symbol_with_existing_position_seeds_recovery_state,
+    test_run_restart_recovery_reallocates_capital_pool_slot) each cover
+    exactly ONE symbol recovering. This proves TWO symbols recovering
+    open positions against the SAME shared pool, in the same restart,
+    don't corrupt each other's allocation, PnL basis, or the aggregate
+    account-value computation."""
+    pool = CapitalPool(total_capital=300.0, max_concurrent=3)
+
+    eth_executor = FakeExecutor(symbol="ETH/CAD", starting_cash=20.0, starting_position=4.0, avg_entry=25.0)
+    sol_executor = FakeExecutor(symbol="SOL/CAD", starting_cash=15.0, starting_position=10.0, avg_entry=140.0)
+    executors_by_symbol = {"ETH/CAD": eth_executor, "SOL/CAD": sol_executor}
+
+    monkeypatch.setattr(bot_main, "build_strategy", lambda: MagicMock(_highs=[], _lows=[], _closes=[]))
+    monkeypatch.setattr(bot_main, "_warmup_strategy", lambda strat, ex, tf, symbol: 1)
+    monkeypatch.setattr(bot_main, "_make_dynamic_executor", lambda sym: executors_by_symbol[sym])
+
+    eth_ss, eth_err = bot_main._admit_dynamic_symbol("ETH/CAD", "ex", "4h", pool)
+    sol_ss, sol_err = bot_main._admit_dynamic_symbol("SOL/CAD", "ex", "4h", pool)
+
+    assert eth_err is None and sol_err is None
+    # Both recovered positions correctly seeded, independently.
+    assert eth_ss['pm'].quantity == 4.0 and eth_ss['pm'].avg_entry == 25.0
+    assert sol_ss['pm'].quantity == 10.0 and sol_ss['pm'].avg_entry == 140.0
+    assert eth_ss['sm'].state.value == "LONG"
+    assert sol_ss['sm'].state.value == "LONG"
+    # Both slots independently claimed — neither overwrote the other.
+    assert set(pool.allocated_symbols) == {"ETH/CAD", "SOL/CAD"}
+    assert pool.free_slots == 1   # 3 total slots, 2 consumed
+
+    # Cash conservation through recovery (P1 fix, 2026-09-22): a restart
+    # recovering an EXISTING position must never re-fund cash to a fresh
+    # slot_cash_for() — the executor's own persisted cash already
+    # reflects what's genuinely left after that position was bought.
+    # Reproduced against the pre-fix code: both executors' cash was
+    # incorrectly reset to slot_cash_for()=100.0 regardless of their real
+    # $20/$15 remaining balances, fabricating $80+$85=$165 of account
+    # value that never existed. Each executor's cash must be UNCHANGED
+    # from its own pre-admission value.
+    assert eth_executor.cash == pytest.approx(20.0)
+    assert sol_executor.cash == pytest.approx(15.0)
+
+    # Account value aggregates BOTH recovered positions correctly, and —
+    # the actual conservation property — equals the true, independently-
+    # known $300 bankroll marked at the recovery-time prices (no fresh
+    # deposit, no trade, no price change occurred anywhere in this test):
+    # unallocated $100 (pool: 300 - 100(ETH slot) - 100(SOL slot)) + ETH
+    # ($20 cash + 4@$30=$120) + SOL ($15 cash + 10@$150=$1500) = $1755.
+    # This number is written independently of _compute_account_value's
+    # own arithmetic, not re-derived from it.
+    symbol_state = {"ETH/CAD": {"last_price": 30.0}, "SOL/CAD": {"last_price": 150.0}}
+    total = bot_main._compute_account_value(pool, executors_by_symbol, symbol_state)
+    assert total == pytest.approx(1755.0)
+
+
+def test_partial_fills_and_fees_across_two_coins_do_not_cross_contaminate():
+    """Missing coverage: existing partial-fill/fee tests
+    (test_execute_partial_sell_leaves_residual_position_resyncs_stop,
+    test_execute_buy_fill_updates_all_state_and_fees) each exercise
+    exactly ONE symbol. This proves two DIFFERENT coins, each getting
+    their own fill (one full BUY, one PARTIAL SELL) with their own,
+    DIFFERENT fee, processed through _execute_approved_signal against
+    the SAME shared pool, keep fully independent state — a bug in one
+    coin's own bookkeeping cannot bleed into the other's quantity, fee
+    total, native-stop resync, or the shared capital-pool allocation.
+
+    Scope, stated plainly (review finding, 2026-09-22): this proves
+    ORCHESTRATION independence (each coin's own pm/trade_log/pool-slot
+    updates don't cross-contaminate). It does NOT prove real fee
+    conservation in cash — FakeExecutor.execute() below moves cash by
+    gross order.total_value only, the same simplification every other
+    fake-executor test in this file already relies on, and never
+    subtracts fee_cost the way the REAL LiveExecutor does. The
+    fee_cost assertions here only confirm the value is threaded through
+    to trade_log correctly. See
+    test_dynamic_symbol_recovery_conserves_real_cash_after_close_reopen_with_real_fees
+    below for the real-fee, real-persistence version of this claim."""
+    pool = CapitalPool(total_capital=300.0, max_concurrent=3)
+
+    eth_executor = FakeExecutor(symbol="ETH/CAD", starting_cash=100.0)
+    eth_executor.queue_order(_filled_order(OrderSide.BUY, price=20.0, qty=5.0, fee_cost=0.40))
+    eth_ss = _new_ss(executor=eth_executor)
+
+    sol_executor = FakeExecutor(symbol="SOL/CAD", starting_cash=0.0, starting_position=10.0, avg_entry=140.0)
+    sol_executor.queue_order(_filled_order(OrderSide.SELL, price=150.0, qty=2.0, fee_cost=0.60))
+    sol_ss = _new_ss(executor=sol_executor)
+    sol_ss['pm'].seed(quantity=10.0, avg_entry=140.0)
+    sol_ss['native_stop_price'] = 130.0
+    sol_ss['native_stop_is_trailing'] = False
+    pool.allocate("SOL/CAD")   # already holding, before this tick
+
+    risk = FakeRisk(approve=True)
+    eth_trade_log, sol_trade_log = MagicMock(), MagicMock()
+
+    bot_main._execute_approved_signal(
+        "ETH/CAD", eth_ss, Signal.BUY, 20.0, 5.0, Signal.BUY, "",
+        capital_pool=pool, risk=risk, alerter=MagicMock(), trade_log=eth_trade_log,
+        stuck_detector=MagicMock(), is_indicator=True,
+    )
+    bot_main._execute_approved_signal(
+        "SOL/CAD", sol_ss, Signal.SELL, 150.0, 2.0, Signal.SELL, "",
+        capital_pool=pool, risk=risk, alerter=MagicMock(), trade_log=sol_trade_log,
+        stuck_detector=MagicMock(), is_indicator=True,
+    )
+
+    # ETH: fully independent — its own qty, fee, and allocation.
+    assert eth_ss['pm'].quantity == 5.0
+    assert eth_trade_log.log_fill.call_args.kwargs["fee_cost"] == 0.40
+    assert pool.is_allocated("ETH/CAD")
+
+    # SOL: fully independent — 8 remaining (10 - 2 partial), its OWN fee,
+    # still allocated (partial close, not full), native stop resynced at
+    # its OWN level — none of this was disturbed by ETH's own fill above.
+    assert sol_ss['pm'].quantity == 8.0
+    assert sol_trade_log.log_fill.call_args.kwargs["fee_cost"] == 0.60
+    assert pool.is_allocated("SOL/CAD")
+    assert sol_executor.sync_calls[-1] == (130.0, None)
+
+    # Both slots correctly, independently tracked in the ONE shared pool.
+    assert set(pool.allocated_symbols) == {"ETH/CAD", "SOL/CAD"}
+    assert pool.free_slots == 1
+
+
+def test_dynamic_symbol_recovery_conserves_real_cash_after_close_reopen_with_real_fees(tmp_path, monkeypatch):
+    """The rigorous version of the P1 cash-conservation fix above (review
+    finding, 2026-09-22): uses a REAL LiveExecutor (mocked ccxt exchange,
+    no network) against a REAL on-disk state file — not an in-memory
+    FakeExecutor reused across calls — so this genuinely exercises
+    save-then-reload persistence, and a REAL fee actually deducted from
+    cash by LiveExecutor.execute() itself (FakeExecutor's simplified cash
+    math never subtracts fee_cost at all, so it cannot prove fee
+    conservation — see the note on the test above this one). Every
+    expected total below is computed independently by hand, not
+    re-derived from the code under test."""
+    from unittest.mock import patch as _patch
+    import bot.execution.live_executor as le_mod
+    from bot.execution.live_executor import LiveExecutor
+
+    state_path = str(tmp_path / "eth_live_state.json")
+    starting_cash = 100.0
+
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = {}
+    mock_ex.fetch_balance.return_value = {"free": {"CAD": starting_cash}}
+    mock_ex.fetch_open_orders.return_value = []
+    mock_ex.price_to_precision.return_value = "0.0"
+    mock_ex.create_order.return_value = {
+        "id": "order-1", "status": "closed", "filled": 2.0, "average": 20.0,
+        "fee": {"cost": 0.40, "currency": "CAD"},
+    }
+    mock_ex.fetch_order.return_value = mock_ex.create_order.return_value
+
+    with _patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = mock_ex
+        original_executor = LiveExecutor(
+            exchange_id="kraken", symbol="ETH/CAD", api_key="k", api_secret="s",
+            starting_cash=starting_cash, dry_run=False, state_path=state_path,
+        )
+
+    order = original_executor.execute(Signal.BUY, 20.0, 2.0)
+    assert order is not None and order.status == OrderStatus.FILLED
+
+    # Independently computed: 100 - (20.0 * 2.0) - 0.40 fee = 59.60.
+    expected_cash_after_buy = 59.60
+    assert original_executor.cash == pytest.approx(expected_cash_after_buy)
+    assert original_executor.position == pytest.approx(2.0)
+
+    del original_executor   # "close" — the original process/object is gone
+
+    # "Reopen" — a BRAND NEW LiveExecutor instance, same state_path, must
+    # load its cash/position from the REAL file on disk written above,
+    # not from the (deliberately WRONG, to prove it's ignored)
+    # starting_cash argument passed here again.
+    fresh_mock_ex = MagicMock()
+    fresh_mock_ex.load_markets.return_value = {}
+    fresh_mock_ex.fetch_balance.return_value = {
+        "free": {"CAD": expected_cash_after_buy, "ETH": 2.0},
+        "total": {"CAD": expected_cash_after_buy, "ETH": 2.0},
+    }
+    fresh_mock_ex.fetch_open_orders.return_value = []
+    fresh_mock_ex.price_to_precision.return_value = "0.0"
+    with _patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = fresh_mock_ex
+        reopened_executor = LiveExecutor(
+            exchange_id="kraken", symbol="ETH/CAD", api_key="k", api_secret="s",
+            starting_cash=999.0,   # WRONG on purpose — proves recovery ignores it
+            dry_run=False, state_path=state_path,
+        )
+    assert reopened_executor.cash == pytest.approx(expected_cash_after_buy)
+    assert reopened_executor.position == pytest.approx(2.0)
+
+    # Now run the reopened, real, fee-adjusted executor through the
+    # ACTUAL dynamic-admission recovery path (the exact function the P1
+    # fix above was made in).
+    pool = CapitalPool(total_capital=300.0, max_concurrent=3)
+    monkeypatch.setattr(bot_main, "build_strategy", lambda: MagicMock(_highs=[], _lows=[], _closes=[]))
+    monkeypatch.setattr(bot_main, "_warmup_strategy", lambda strat, ex, tf, symbol: 1)
+    monkeypatch.setattr(bot_main, "_make_dynamic_executor", lambda sym: reopened_executor)
+
+    ss, err = bot_main._admit_dynamic_symbol("ETH/CAD", "ex", "4h", pool)
+
+    assert err is None
+    # Cash conserved through admission too — the real, fee-adjusted
+    # balance, never reset to a fresh slot_cash_for().
+    assert reopened_executor.cash == pytest.approx(expected_cash_after_buy)
+    assert pool.is_allocated("ETH/CAD")
+    assert ss['pm'].quantity == pytest.approx(2.0)
+
+    # Independently-derived total account value: unallocated pool cash
+    # (300 - 100 for ETH's claimed slot = 200) + ETH's own real,
+    # fee-adjusted cash (59.60) + its 2 units marked at a fresh $22 = $44.
+    symbol_state = {"ETH/CAD": {"last_price": 22.0}}
+    total = bot_main._compute_account_value(pool, {"ETH/CAD": reopened_executor}, symbol_state)
+    assert total == pytest.approx(200.0 + 59.60 + 44.0)
+
+
+# ── Multi-executor-sharing-one-account (review finding, 2026-09-22) ───────
+# The test above uses exactly ONE real LiveExecutor, so it could not catch
+# a deeper bug: LiveExecutor.__init__ calls _sync_cash(), which queries
+# the exchange's WHOLE-ACCOUNT free balance and assigns it directly to
+# .cash — correct for a single executor alone on an account, WRONG the
+# moment a second executor shares the same account (fixed roster + any
+# dynamically admitted symbol, exactly bot.main's CapitalPool model):
+# fetch_balance() returns the SAME real number to every executor querying
+# it, so each one believes it alone owns the entire balance, and
+# _compute_account_value() (which correctly sums each ALLOCATED symbol's
+# .cash on top of pool.available_cash) then counts that one real number
+# once per allocated symbol. The tests below build TWO REAL LiveExecutor
+# instances sharing one mocked exchange account throughout.
+
+def _build_and_fill_real_executor(symbol, base, starting_cash, buy_price, buy_qty, fee):
+    """Constructs a real LiveExecutor (mocked ccxt, no network) with its
+    own real on-disk state file, executes one real BUY with a real fee,
+    and returns (state_path, cash_after_fill) — the executor itself is
+    discarded (simulating the process ending) since every test below
+    reopens fresh instances from the resulting state file."""
+    from unittest.mock import patch as _patch
+    import bot.execution.live_executor as le_mod
+    from bot.execution.live_executor import LiveExecutor
+
+    state_path = str(_tempfile_dir() / f"{base}_state.json")
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = {}
+    mock_ex.fetch_balance.return_value = {"free": {"CAD": starting_cash}, "total": {"CAD": starting_cash}}
+    mock_ex.fetch_open_orders.return_value = []
+    mock_ex.price_to_precision.return_value = "0.0"
+    mock_ex.create_order.return_value = {
+        "id": f"{base}-buy", "status": "closed", "filled": buy_qty, "average": buy_price,
+        "fee": {"cost": fee, "currency": "CAD"},
+    }
+    mock_ex.fetch_order.return_value = mock_ex.create_order.return_value
+    with _patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = mock_ex
+        ex = LiveExecutor(
+            exchange_id="kraken", symbol=symbol, api_key="k", api_secret="s",
+            starting_cash=starting_cash, dry_run=False, state_path=state_path,
+        )
+    order = ex.execute(Signal.BUY, buy_price, buy_qty)
+    assert order is not None and order.status == OrderStatus.FILLED
+    return state_path, ex.cash
+
+
+def _reopen_real_executor(symbol, base, position, state_path, account_free_cad, sell_fill=None):
+    """'Restarts' a real LiveExecutor from its own state_path, backed by a
+    mocked exchange reporting `account_free_cad` — the ONE shared,
+    whole-account balance every executor on this account independently
+    sees. `sell_fill`, if given, is (price, qty, fee) for a create_order
+    mock so the reopened executor can immediately execute a real SELL
+    against the SAME mocked exchange connection."""
+    from unittest.mock import patch as _patch
+    import bot.execution.live_executor as le_mod
+    from bot.execution.live_executor import LiveExecutor
+
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = {}
+    mock_ex.fetch_balance.return_value = {
+        "free": {"CAD": account_free_cad, base: position},
+        "total": {"CAD": account_free_cad, base: position},
+    }
+    mock_ex.fetch_open_orders.return_value = []
+    mock_ex.price_to_precision.return_value = "0.0"
+    if sell_fill is not None:
+        sell_price, sell_qty, sell_fee = sell_fill
+        mock_ex.create_order.return_value = {
+            "id": f"{base}-sell", "status": "closed", "filled": sell_qty, "average": sell_price,
+            "fee": {"cost": sell_fee, "currency": "CAD"},
+        }
+        mock_ex.fetch_order.return_value = mock_ex.create_order.return_value
+    with _patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = mock_ex
+        ex = LiveExecutor(
+            exchange_id="kraken", symbol=symbol, api_key="k", api_secret="s",
+            starting_cash=999_999.0, dry_run=False, state_path=state_path,
+        )
+    return ex
+
+
+def _tempfile_dir():
+    import pathlib
+    import tempfile
+    return pathlib.Path(tempfile.mkdtemp())
+
+
+def test_two_real_executors_sharing_one_account_conserve_cash_after_restart():
+    """The core reproduction + fix, rewritten for the cash-ownership
+    redesign (review round 2, 2026-09-22): LiveExecutor now NEVER lets the
+    exchange's whole-account balance touch a symbol's own .cash — not
+    even transiently — so there is nothing left for a caller to
+    "restore". Each executor's .cash is correct immediately after
+    construction, before _reconcile_shared_account_cash() is ever called;
+    that function's only remaining job is a genuine drift check using the
+    SEPARATE exchange_cash_observed field."""
+    eth_state_path, eth_cash_after_fill = _build_and_fill_real_executor(
+        "ETH/CAD", "ETH", starting_cash=100.0, buy_price=20.0, buy_qty=2.0, fee=0.40,
+    )
+    sol_state_path, sol_cash_after_fill = _build_and_fill_real_executor(
+        "SOL/CAD", "SOL", starting_cash=200.0, buy_price=8.0, buy_qty=15.0, fee=0.60,
+    )
+    assert eth_cash_after_fill == pytest.approx(59.60)    # 100 - 40 - 0.40
+    assert sol_cash_after_fill == pytest.approx(79.40)    # 200 - 120 - 0.60
+
+    pool = CapitalPool(total_capital=300.0, max_concurrent=3)   # 100/slot, ETH+SOL each claimed one
+    pool.allocate("ETH/CAD")
+    pool.allocate("SOL/CAD")
+    # The ONE real, shared account balance right now: genuinely
+    # unallocated pool cash + each coin's own real remaining cash — this
+    # is what a real Kraken fetch_balance() would actually report.
+    real_account_free_cad = pool.available_cash + eth_cash_after_fill + sol_cash_after_fill
+
+    eth = _reopen_real_executor("ETH/CAD", "ETH", 2.0, eth_state_path, real_account_free_cad)
+    sol = _reopen_real_executor("SOL/CAD", "SOL", 15.0, sol_state_path, real_account_free_cad)
+
+    # Correct IMMEDIATELY, before any caller-side reconciliation runs —
+    # this is the whole point of the redesign: there is no window,
+    # however brief, where .cash holds the wrong (whole-account) figure.
+    assert eth.cash == pytest.approx(eth_cash_after_fill)
+    assert sol.cash == pytest.approx(sol_cash_after_fill)
+    # The raw, shared observation lives in a completely separate field.
+    assert eth.exchange_cash_observed == pytest.approx(real_account_free_cad)
+    assert sol.exchange_cash_observed == pytest.approx(real_account_free_cad)
+    assert eth.startup_sync_healthy is True
+    assert sol.startup_sync_healthy is True
+
+    executors = {"ETH/CAD": eth, "SOL/CAD": sol}
+    alerter = MagicMock()
+    raw = bot_main._reconcile_shared_account_cash(pool, executors, alerter=alerter)
+
+    assert raw == pytest.approx(real_account_free_cad)
+    # Unchanged by the call — there was never anything to fix.
+    assert eth.cash == pytest.approx(eth_cash_after_fill)
+    assert sol.cash == pytest.approx(sol_cash_after_fill)
+    assert not alerter.error.called   # everything is genuinely self-consistent — no drift
+
+    symbol_state = {"ETH/CAD": {"last_price": 22.0}, "SOL/CAD": {"last_price": 9.0}}
+    total = bot_main._compute_account_value(pool, executors, symbol_state)
+    # Independently computed, not re-derived from the code under test:
+    # unallocated (300-100-100=100) + ETH(59.60 + 2*22=44) + SOL(79.40 + 15*9=135).
+    assert total == pytest.approx(100.0 + (59.60 + 44.0) + (79.40 + 135.0))
+
+
+def test_shared_account_reconciliation_alerts_on_genuine_drift_without_removing_sync():
+    """Exchange synchronization must NOT simply be removed — a genuine
+    mismatch between the bot's own bookkeeping and the real exchange
+    balance (an external withdrawal, a manual trade, a real accounting
+    bug) must still be loudly alerted, using the SAME real sync call
+    exchange_cash_observed is built from. This is what makes the function
+    a reconciliation, not a blind trust of either number — and, per the
+    redesign, .cash is correct throughout regardless of what the drift
+    check finds, since nothing ever needed to overwrite it."""
+    eth_state_path, eth_cash_after_fill = _build_and_fill_real_executor(
+        "ETH/CAD", "ETH", starting_cash=100.0, buy_price=20.0, buy_qty=2.0, fee=0.40,
+    )
+    pool = CapitalPool(total_capital=100.0, max_concurrent=1)
+    pool.allocate("ETH/CAD")
+
+    # Someone withdrew $30 from the account while the bot was down — the
+    # real exchange balance no longer matches what the bot's own
+    # bookkeeping expects (eth_cash_after_fill + pool.available_cash).
+    genuinely_drifted_balance = pool.available_cash + eth_cash_after_fill - 30.0
+
+    eth = _reopen_real_executor("ETH/CAD", "ETH", 2.0, eth_state_path, genuinely_drifted_balance)
+    assert eth.cash == pytest.approx(eth_cash_after_fill)   # correct regardless of the drift below
+    executors = {"ETH/CAD": eth}
+    alerter = MagicMock()
+
+    raw = bot_main._reconcile_shared_account_cash(pool, executors, alerter=alerter)
+
+    assert raw == pytest.approx(genuinely_drifted_balance)
+    assert alerter.error.called
+    msg = alerter.error.call_args[0][0]
+    assert "DRIFT" in msg
+    assert f"{genuinely_drifted_balance:.2f}" in msg
+    assert eth.cash == pytest.approx(eth_cash_after_fill)   # still correct — nothing to restore
+
+
+def test_shared_account_reconciliation_skips_check_when_no_sync_was_healthy():
+    """If every real executor's own startup balance sync failed, there is
+    no trustworthy exchange figure to compare against — the function must
+    skip the check (and say so) rather than compute a meaningless "drift"
+    against a starting_cash fallback."""
+    eth_state_path, eth_cash_after_fill = _build_and_fill_real_executor(
+        "ETH/CAD", "ETH", starting_cash=100.0, buy_price=20.0, buy_qty=2.0, fee=0.40,
+    )
+    pool = CapitalPool(total_capital=100.0, max_concurrent=1)
+    pool.allocate("ETH/CAD")
+
+    from unittest.mock import patch as _patch
+    import bot.execution.live_executor as le_mod
+    from bot.execution.live_executor import LiveExecutor
+
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = {}
+    mock_ex.fetch_balance.side_effect = ConnectionError("exchange unreachable")
+    mock_ex.fetch_open_orders.return_value = []
+    mock_ex.price_to_precision.return_value = "0.0"
+    with _patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = mock_ex
+        eth = LiveExecutor(
+            exchange_id="kraken", symbol="ETH/CAD", api_key="k", api_secret="s",
+            starting_cash=999.0, dry_run=False, state_path=eth_state_path,
+        )
+    assert eth.startup_sync_healthy is False
+    assert eth.cash == pytest.approx(eth_cash_after_fill)   # still correct — sync failure never touches it
+
+    alerter = MagicMock()
+    raw = bot_main._reconcile_shared_account_cash(pool, {"ETH/CAD": eth}, alerter=alerter)
+
+    assert raw is None
+    assert alerter.error.called
+    assert "SKIPPED" in alerter.error.call_args[0][0]
+
+
+def test_interruption_before_caller_reconciliation_does_not_corrupt_persisted_symbol_cash():
+    """The exact crash-window reproduction a review round found against
+    the PRIOR version of this fix: persisted symbol cash $59.60, exchange
+    account cash $159.60, construct the executor, simulate the process
+    being killed BEFORE any caller-side reconciliation code ever runs,
+    then construct again and read the persisted cash directly off disk
+    (not through the Python object, which a crash wouldn't leave running
+    anyway). The prior "restore in memory, then re-save" approach failed
+    this exact test — the corruption happened INSIDE __init__ itself
+    before any caller ever got control. The redesign closes it: nothing
+    inside LiveExecutor ever writes the whole-account figure into .cash
+    (or therefore into anything _save_state() persists) in the first
+    place, so there is no window for a crash to land in."""
+    import json
+
+    eth_state_path, eth_cash_after_fill = _build_and_fill_real_executor(
+        "ETH/CAD", "ETH", starting_cash=100.0, buy_price=20.0, buy_qty=2.0, fee=0.40,
+    )
+    assert eth_cash_after_fill == pytest.approx(59.60)
+
+    # Construct with a shared-account balance ($159.60) wildly different
+    # from the persisted $59.60 — then do NOTHING further (no caller
+    # reconciliation call at all), simulating the process being killed
+    # the instant __init__ returns.
+    eth = _reopen_real_executor("ETH/CAD", "ETH", 2.0, eth_state_path, 159.60)
+    del eth   # the "process" ends here — no _reconcile_shared_account_cash ever ran
+
+    with open(eth_state_path) as f:
+        persisted = json.load(f)
+    assert persisted["cash"] == pytest.approx(59.60)   # NEVER corrupted, regardless of the missing caller step
+
+    # Constructing again confirms the same thing from the object's own
+    # perspective too.
+    eth_again = _reopen_real_executor("ETH/CAD", "ETH", 2.0, eth_state_path, 159.60)
+    assert eth_again.cash == pytest.approx(59.60)
+    assert eth_again.exchange_cash_observed == pytest.approx(159.60)
+
+
+def test_cash_ownership_holds_across_a_second_restart():
+    """Verification across a SECOND restart, not just one: a real BUY,
+    restart #1 (with the shared-account balance already reflecting it),
+    a real PARTIAL sell, then restart #2 — .cash must still be exactly
+    this symbol's own economic history at every step, and
+    exchange_cash_observed must independently reflect whatever the
+    (possibly different, since real activity happened) exchange balance
+    is at THAT specific restart, never a stale carryover from the first."""
+    eth_state_path, eth_cash_after_buy = _build_and_fill_real_executor(
+        "ETH/CAD", "ETH", starting_cash=100.0, buy_price=20.0, buy_qty=2.0, fee=0.40,
+    )
+    assert eth_cash_after_buy == pytest.approx(59.60)
+
+    pool = CapitalPool(total_capital=200.0, max_concurrent=2)
+    pool.allocate("ETH/CAD")
+
+    # ── Restart #1 ──────────────────────────────────────────────────────
+    account_balance_at_restart_1 = pool.available_cash + eth_cash_after_buy   # = 159.60
+    eth_r1 = _reopen_real_executor("ETH/CAD", "ETH", 2.0, eth_state_path, account_balance_at_restart_1)
+    assert eth_r1.cash == pytest.approx(59.60)
+    assert eth_r1.exchange_cash_observed == pytest.approx(159.60)
+    alerter_1 = MagicMock()
+    bot_main._reconcile_shared_account_cash(pool, {"ETH/CAD": eth_r1}, alerter=alerter_1)
+    assert not alerter_1.error.called
+
+    # A real partial sell happens between the two restarts.
+    eth_ss = _new_ss(executor=eth_r1)
+    eth_ss['pm'].seed(quantity=2.0, avg_entry=20.0)
+    eth_r1_for_sell = _reopen_real_executor(
+        "ETH/CAD", "ETH", 2.0, eth_state_path, account_balance_at_restart_1,
+        sell_fill=(21.0, 1.0, 0.11),
+    )
+    eth_ss['executor'] = eth_r1_for_sell
+    bot_main._execute_approved_signal(
+        "ETH/CAD", eth_ss, Signal.SELL, 21.0, 1.0, Signal.SELL, "",
+        capital_pool=pool, risk=FakeRisk(True), alerter=MagicMock(), trade_log=MagicMock(),
+        stuck_detector=MagicMock(), is_indicator=True,
+    )
+    eth_cash_after_partial_sell = 59.60 + 1.0 * 21.0 - 0.11   # = 80.49
+    assert eth_r1_for_sell.cash == pytest.approx(eth_cash_after_partial_sell)
+    assert pool.is_allocated("ETH/CAD")   # partial — still held
+
+    # ── Restart #2 — a DIFFERENT exchange balance (real activity happened
+    # in between), must not carry over anything stale from restart #1 ──
+    account_balance_at_restart_2 = pool.available_cash + eth_cash_after_partial_sell   # = 180.49
+    assert account_balance_at_restart_2 != pytest.approx(account_balance_at_restart_1)
+    eth_r2 = _reopen_real_executor("ETH/CAD", "ETH", 1.0, eth_state_path, account_balance_at_restart_2)
+
+    assert eth_r2.cash == pytest.approx(eth_cash_after_partial_sell)   # still this symbol's own history
+    assert eth_r2.exchange_cash_observed == pytest.approx(account_balance_at_restart_2)   # fresh, not stale
+    alerter_2 = MagicMock()
+    raw_2 = bot_main._reconcile_shared_account_cash(pool, {"ETH/CAD": eth_r2}, alerter=alerter_2)
+    assert raw_2 == pytest.approx(account_balance_at_restart_2)
+    assert not alerter_2.error.called   # still genuinely self-consistent after two restarts
+
+
+def test_equity_conservation_across_restart_fees_partial_and_full_exit_with_pool_release():
+    """The full requested lifecycle in one walk-through, sharing ONE real
+    account throughout: restart -> fees already paid survive -> a PARTIAL
+    exit on one coin (with its own new fee) -> a FULL exit on the other
+    (with its own new fee, releasing its capital-pool slot). Account value
+    is checked at every stage against an independently-computed total —
+    a strict, transaction-by-transaction running cash-flow ledger kept by
+    hand, never re-derived from _compute_account_value's own formula or
+    from CapitalPool.release()'s own pnl arithmetic. Both coins' slots are
+    exactly $100 (a $300 pool, max_concurrent=3), matching what each
+    executor is actually funded with — an earlier draft of this test fed
+    one coin $200 in starting_cash while its real CapitalPool slot was
+    only $100, an internally-inconsistent setup that doesn't reflect how
+    slot allocation actually works and made independent verification
+    impossible to get right by hand."""
+    eth_state_path, eth_cash_after_buy = _build_and_fill_real_executor(
+        "ETH/CAD", "ETH", starting_cash=100.0, buy_price=20.0, buy_qty=4.0, fee=0.40,
+    )
+    sol_state_path, sol_cash_after_buy = _build_and_fill_real_executor(
+        "SOL/CAD", "SOL", starting_cash=100.0, buy_price=8.0, buy_qty=10.0, fee=0.60,
+    )
+    assert eth_cash_after_buy == pytest.approx(19.60)     # 100 - 80 - 0.40
+    assert sol_cash_after_buy == pytest.approx(19.40)     # 100 - 80 - 0.60
+
+    pool = CapitalPool(total_capital=300.0, max_concurrent=3)   # a genuinely idle 3rd slot's cash too
+    pool.allocate("ETH/CAD")
+    pool.allocate("SOL/CAD")
+    real_account_free_cad = pool.available_cash + eth_cash_after_buy + sol_cash_after_buy   # = 139.00
+
+    # ── Stage 1: restart, reconcile — conservation across restart + fees ──
+    eth = _reopen_real_executor("ETH/CAD", "ETH", 4.0, eth_state_path, real_account_free_cad)
+    sol = _reopen_real_executor("SOL/CAD", "SOL", 10.0, sol_state_path, real_account_free_cad)
+    executors = {"ETH/CAD": eth, "SOL/CAD": sol}
+    alerter = MagicMock()
+    bot_main._reconcile_shared_account_cash(pool, executors, alerter=alerter)
+    assert not alerter.error.called
+    assert eth.cash == pytest.approx(eth_cash_after_buy)
+    assert sol.cash == pytest.approx(sol_cash_after_buy)
+
+    eth_ss = _new_ss(executor=eth)
+    eth_ss['pm'].seed(quantity=4.0, avg_entry=20.0)
+    sol_ss = _new_ss(executor=sol)
+    sol_ss['pm'].seed(quantity=10.0, avg_entry=8.0)
+
+    symbol_state = {"ETH/CAD": {"last_price": 20.0}, "SOL/CAD": {"last_price": 8.0}}
+    total_after_restart = bot_main._compute_account_value(pool, executors, symbol_state)
+    # Independent running-ledger check: both positions marked at their OWN
+    # cost basis (no price movement yet) means the only real value ever
+    # lost is the two buy-side fees — 300 - 0.40 - 0.60 = 299.00.
+    assert total_after_restart == pytest.approx(300.0 - 0.40 - 0.60)
+
+    # ── Stage 2: PARTIAL exit on ETH (2 of 4 units), its own new fee ──────
+    eth_reopened_for_sell = _reopen_real_executor(
+        "ETH/CAD", "ETH", 4.0, eth_state_path, real_account_free_cad,
+        sell_fill=(22.0, 2.0, 0.22),
+    )
+    # No restoration needed — .cash is already correct immediately after
+    # this construction, exactly like every earlier one in this test.
+    assert eth_reopened_for_sell.cash == pytest.approx(19.60)
+    eth_ss['executor'] = eth_reopened_for_sell
+    bot_main._execute_approved_signal(
+        "ETH/CAD", eth_ss, Signal.SELL, 22.0, 2.0, Signal.SELL, "",
+        capital_pool=pool, risk=FakeRisk(True), alerter=MagicMock(), trade_log=MagicMock(),
+        stuck_detector=MagicMock(), is_indicator=True,
+    )
+    # Independently computed: 19.60 (pre-sell cash) + 2*22 proceeds - 0.22 fee = 63.38.
+    expected_eth_cash_after_partial = 19.60 + 2.0 * 22.0 - 0.22
+    assert eth_reopened_for_sell.cash == pytest.approx(expected_eth_cash_after_partial)
+    assert eth_ss['pm'].quantity == pytest.approx(2.0)   # 2 remaining
+    assert pool.is_allocated("ETH/CAD")   # partial — slot NOT released
+
+    # ── Stage 3: FULL exit on SOL (all 10 units), its own new fee ─────────
+    sol_reopened_for_sell = _reopen_real_executor(
+        "SOL/CAD", "SOL", 10.0, sol_state_path, real_account_free_cad,
+        sell_fill=(9.0, 10.0, 0.34),
+    )
+    assert sol_reopened_for_sell.cash == pytest.approx(19.40)
+    sol_ss['executor'] = sol_reopened_for_sell
+    bot_main._execute_approved_signal(
+        "SOL/CAD", sol_ss, Signal.SELL, 9.0, 10.0, Signal.SELL, "strategy sell",
+        capital_pool=pool, risk=FakeRisk(True), alerter=MagicMock(), trade_log=MagicMock(),
+        stuck_detector=MagicMock(), is_indicator=True,
+    )
+    # Independently computed: 19.40 (pre-sell cash) + 10*9 proceeds - 0.34 fee = 109.06.
+    expected_sol_cash_after_full = 19.40 + 10.0 * 9.0 - 0.34
+    assert sol_reopened_for_sell.cash == pytest.approx(expected_sol_cash_after_full)
+    assert not sol_ss['pm'].has_position
+    assert not pool.is_allocated("SOL/CAD")   # slot RELEASED
+
+    # ── Final: independently-computed total equity across the whole lifecycle ──
+    final_executors = {"ETH/CAD": eth_reopened_for_sell, "SOL/CAD": sol_reopened_for_sell}
+    final_symbol_state = {"ETH/CAD": {"last_price": 22.0}, "SOL/CAD": {"last_price": 9.0}}
+    final_total = bot_main._compute_account_value(pool, final_executors, final_symbol_state)
+    # Independent check: a strict, transaction-by-transaction running cash
+    # ledger, kept entirely separately from CapitalPool/LiveExecutor code —
+    #   300.00 start
+    #   - 80.40  ETH buy (4@20 + 0.40 fee)      -> 219.60
+    #   - 80.60  SOL buy (10@8 + 0.60 fee)       -> 139.00
+    #   + 43.78  ETH partial sell (2@22 - 0.22)  -> 182.78
+    #   + 89.66  SOL full sell (10@9 - 0.34)     -> 272.44  (all real cash now)
+    # plus ETH's still-held 2 units marked at the latest price (22 each):
+    #   272.44 + 2*22 = 316.44
+    real_cash_ledger = 300.0 - (4 * 20.0 + 0.40) - (10 * 8.0 + 0.60) + (2 * 22.0 - 0.22) + (10 * 9.0 - 0.34)
+    expected_final_equity = real_cash_ledger + 2 * 22.0
+    assert expected_final_equity == pytest.approx(316.44)
+    assert final_total == pytest.approx(expected_final_equity)
+
+
+# ── The ACTUAL startup sequence (review round 3, 2026-09-22, P1 #2) ───────
+# Every test above exercises _reconcile_shared_account_cash and
+# _compute_account_value directly, with hand-built CapitalPool instances —
+# proving those functions are individually correct, but not that run()'s
+# OWN startup wiring actually calls them in an order that stays correct.
+# The review's exact finding: run()'s pool-initialization code used to
+# read _first_exec.cash for the pool's total BEFORE .cash meant what it
+# means now — then its own slot-forcing loop overwrote every executor's
+# .cash (including that same _first_exec) with a SLOT ALLOWANCE, so by
+# the time _reconcile_shared_account_cash ran later in startup, its own
+# "raw exchange-wide" reading came from the wrong place: a symbol's slot
+# ($100), not the real account balance ($159.60). This is only visible by
+# testing the REAL sequence — pool init, in order, then reconciliation —
+# not the two functions in isolation. _initialize_capital_pool() (was
+# inline in run()) is extracted here for exactly this reason.
+
+class _FakeCfgForPoolInit:
+    """Minimal cfg surface _initialize_capital_pool actually reads —
+    real Config dataclasses have far more fields; only these matter here."""
+    def __init__(self, *, live_trading, paper_mode=False, dry_run=False,
+                 max_concurrent_positions=2, max_slot_cash_cad=0.0,
+                 max_slot_cash_cad_by_base=None, starting_cash=0.0):
+        from types import SimpleNamespace
+        self.exchange = SimpleNamespace(live_trading=live_trading, dry_run=dry_run)
+        self.paper = SimpleNamespace(paper_mode=paper_mode)
+        self.portfolio = SimpleNamespace(
+            max_concurrent_positions=max_concurrent_positions,
+            max_slot_cash_cad=max_slot_cash_cad,
+            max_slot_cash_cad_by_base=max_slot_cash_cad_by_base or {},
+            starting_cash=starting_cash,
+        )
+
+
+def test_actual_startup_sequence_pool_init_then_reconcile_uses_the_real_exchange_balance():
+    """The exact P1 #2 reproduction, using the REAL sequence run() itself
+    follows: construct real executors sharing one account (one fresh, one
+    already holding a recovered position) -> _initialize_capital_pool() ->
+    (restart recovery calls capital_pool.allocate() for the recovering
+    symbol only) -> _reconcile_shared_account_cash(). Before this fix,
+    reconciliation's own "raw exchange-wide" reading would have come from
+    BTC's slot allowance, not the real account balance, because the
+    slot-forcing loop had already overwritten the very executor
+    reconciliation reads from.
+
+    Deriving a self-consistent real_account_free_cad: _initialize_capital_pool
+    calls slot_cash_for() for EVERY symbol before any restart-recovery
+    allocate() has happened, so with max_concurrent=2 both BTC and SOL get
+    real_account_free_cad/2 as their (informational, in SOL's case unused)
+    slot size. Only SOL is ever actually allocate()'d (it's recovering a
+    position; BTC is fresh and unallocated until it first fills). So at
+    reconciliation time: pool.available_cash == real_account_free_cad/2
+    (SOL's slot reserved, BTC's slot never claimed) and
+    expected_total == pool.available_cash + sol.cash. For that to equal the
+    real exchange balance with zero drift: real_account_free_cad/2 ==
+    sol_cash_after_buy, i.e. real_account_free_cad == 2 * sol_cash_after_buy.
+    This is not a coincidence to avoid — it's the correct arithmetic for a
+    2-slot pool with exactly one allocated symbol and one fresh/unallocated
+    one; verified independently via bot/portfolio/capital_pool.py before
+    writing these numbers in."""
+    # SOL already holds a recovered position, with its own real,
+    # trade-history-derived cash from before this restart.
+    sol_state_path, sol_cash_after_buy = _build_and_fill_real_executor(
+        "SOL/CAD", "SOL", starting_cash=100.0, buy_price=8.0, buy_qty=10.0, fee=0.60,
+    )
+    assert sol_cash_after_buy == pytest.approx(19.40)
+
+    # A GENUINELY fresh BTC executor — no persisted position at all.
+    btc_state_path = str(_tempfile_dir() / "BTC_state.json")
+
+    # See derivation above: must be exactly 2x SOL's own persisted cash for
+    # this 2-slot (BTC fresh/unallocated, SOL recovering/allocated) scenario
+    # to reconcile with zero drift.
+    real_account_free_cad = 2 * sol_cash_after_buy
+
+    from unittest.mock import patch as _patch
+    import bot.execution.live_executor as le_mod
+    from bot.execution.live_executor import LiveExecutor
+
+    def _make_fresh_or_recovered(symbol, base, position, state_path):
+        mock_ex = MagicMock()
+        mock_ex.load_markets.return_value = {}
+        mock_ex.fetch_balance.return_value = {
+            "free": {"CAD": real_account_free_cad, base: position},
+            "total": {"CAD": real_account_free_cad, base: position},
+        }
+        mock_ex.fetch_open_orders.return_value = []
+        mock_ex.price_to_precision.return_value = "0.0"
+        with _patch.object(le_mod.ccxt, "kraken") as mock_cls:
+            mock_cls.return_value = mock_ex
+            return LiveExecutor(
+                exchange_id="kraken", symbol=symbol, api_key="k", api_secret="s",
+                starting_cash=999_999.0, dry_run=False, state_path=state_path,
+            )
+
+    btc = _make_fresh_or_recovered("BTC/CAD", "BTC", 0.0, btc_state_path)
+    sol = _make_fresh_or_recovered("SOL/CAD", "SOL", 10.0, sol_state_path)
+    assert btc.exchange_cash_observed == pytest.approx(real_account_free_cad)
+    assert sol.cash == pytest.approx(sol_cash_after_buy)   # untouched — SOL is recovering, not fresh
+
+    executors = {"BTC/CAD": btc, "SOL/CAD": sol}
+    cfg = _FakeCfgForPoolInit(live_trading=True, max_concurrent_positions=2)
+
+    capital_pool, per_symbol_slots, pool_total, slot_cap, slot_caps_by_symbol = (
+        bot_main._initialize_capital_pool(executors, cfg)
+    )
+
+    assert pool_total == pytest.approx(real_account_free_cad)   # the real exchange balance, not a slot
+    assert per_symbol_slots["BTC/CAD"] == pytest.approx(real_account_free_cad / 2)
+    assert per_symbol_slots["SOL/CAD"] == pytest.approx(real_account_free_cad / 2)
+    # BTC (fresh) got funded to its slot allowance.
+    assert btc.cash == pytest.approx(real_account_free_cad / 2)
+    # SOL (recovering) was left completely untouched by the slot-forcing loop.
+    assert sol.cash == pytest.approx(sol_cash_after_buy)
+
+    # SOL claims its slot the same way run()'s own "Restart recovery"
+    # section does, right before reconciliation runs — matching the real
+    # sequence exactly (pool init -> restart recovery -> reconciliation).
+    capital_pool.allocate("SOL/CAD")
+
+    alerter = MagicMock()
+    raw = bot_main._reconcile_shared_account_cash(capital_pool, executors, alerter=alerter)
+
+    # The critical assertion this whole test exists for: reconciliation's
+    # own reading is the REAL account balance, not BTC's slot allowance —
+    # reproduced against the pre-fix ordering, this would have been
+    # per_symbol_slots["BTC/CAD"] (real_account_free_cad / 2) instead.
+    assert raw == pytest.approx(real_account_free_cad)
+    assert not alerter.error.called   # genuinely self-consistent — no false drift
+
+
+def test_actual_startup_sequence_paper_and_dry_run_never_touch_exchange_cash_observed():
+    """Source-level confirmation that the paper/dry-run branch of
+    _initialize_capital_pool never reads exchange_cash_observed at all —
+    it uses cfg.portfolio.starting_cash, exactly as before this fix
+    (unaffected; this fix only changed the LIVE-trading branch's source
+    of truth and the slot-forcing loop's fresh-vs-recovering guard)."""
+    executors = {"BTC/CAD": FakeExecutor(symbol="BTC/CAD", starting_cash=0.0, starting_position=1.0)}
+    cfg = _FakeCfgForPoolInit(live_trading=True, paper_mode=True, starting_cash=453.0, max_concurrent_positions=2)
+
+    capital_pool, per_symbol_slots, pool_total, slot_cap, slot_caps_by_symbol = (
+        bot_main._initialize_capital_pool(executors, cfg)
+    )
+
+    assert pool_total == pytest.approx(453.0)   # from starting_cash, never from a FakeExecutor's own .cash
+    # A FakeExecutor holding a position (position=1.0 > 1e-9) is correctly
+    # treated as "recovering" here too — the fresh-vs-recovering guard
+    # applies regardless of executor type.
+    assert executors["BTC/CAD"].cash == pytest.approx(0.0)   # untouched — never funded to its slot

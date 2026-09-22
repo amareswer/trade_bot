@@ -1172,15 +1172,25 @@ def test_adoption_merges_queued_recovery_instead_of_double_booking(mock_cfg, moc
 def test_delayed_lookup_of_offline_fill_does_not_double_apply_checkpoint(mock_cfg, mock_sleep, tmp_path):
     """PASS-10 review finding (P0, finding 1), reproduction A, exact
     reproduction: O1 fills 0.001 BTC @ $78,000 (fee $0.16) and becomes
-    terminal ENTIRELY WHILE OFFLINE — the checkpoint (_sync_cash()/
-    _sync_position() at restart) correctly reads $1,077.84 / 0.001
-    BEFORE O1's own lookup ever succeeds. O1's lookup then times out
-    during startup (queuing it) and only succeeds LATER, via
-    reconcile_pending_orders() on a live tick — with NO further exchange
-    activity in between. The old apply_as_live_fill=True (a tick-context
-    call) would re-apply this already-checkpointed fill on top of itself:
-    $1,155.68 cash / 0 BTC instead of the correct, UNCHANGED
-    $1,077.84 / 0.001."""
+    terminal ENTIRELY WHILE OFFLINE. O1's lookup times out during startup
+    (queuing it) and only succeeds LATER, via reconcile_pending_orders()
+    on a live tick — with NO further exchange activity in between. The old
+    apply_as_live_fill=True (a tick-context call) would re-apply this
+    already-queued fill a SECOND time on top of itself: $1,155.68 cash / 0
+    BTC instead of the correct $1,077.84 / 0.001.
+
+    CASH-OWNERSHIP INVARIANT UPDATE (2026-09-22, corrected same day): cash
+    is genuinely UNRESOLVED right after construction (still $1,000, the
+    persisted pre-crash value) — a since-superseded version of this fix
+    tried resolving it immediately from the exchange's raw observed
+    balance, which a later review round found silently misattributes a
+    SHARED account's other symbols' cash (see
+    _journal_native_stop_execution_at_startup's own docstring for the
+    exact reproduction). The only trustworthy cash source is this order's
+    OWN reported fill data, available only once its lookup actually
+    succeeds — POSITION, unlike cash, is still correctly established
+    immediately by _sync_position() reading the base-asset balance
+    directly, unaffected by this."""
     state_path = str(tmp_path / "state.json")
     fake = FakeExchange(cash=1000.0)
     ex = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
@@ -1206,16 +1216,16 @@ def test_delayed_lookup_of_offline_fill_does_not_double_apply_checkpoint(mock_cf
     # state, but O1's own final-state lookup times out — queued unresolved.
     with patch.object(fake, "fetch_order", side_effect=ccxt.RequestTimeout("timeout")):
         ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
-    assert ex2.cash     == pytest.approx(1_077.84)   # checkpoint already correct
-    assert ex2.position == pytest.approx(0.001)
+    assert ex2.cash     == pytest.approx(1_000.0)   # unresolved — order data not available yet
+    assert ex2.position == pytest.approx(0.001)     # position IS already correct (direct balance sync)
     assert len(ex2._unresolved_stop_recoveries) == 1
 
     # Healthy lookup restored. No further exchange activity occurs — this
-    # is the SAME historical fill the checkpoint above already reflects.
+    # single historical fill resolves via its own order data, exactly once.
     discovered = ex2.reconcile_pending_orders()
 
     assert discovered == []                          # not a new live execution
-    assert ex2.cash     == pytest.approx(1_077.84)    # unchanged — not double-applied
+    assert ex2.cash     == pytest.approx(1_077.84)    # now resolved from the order's own data
     assert ex2.position == pytest.approx(0.001)       # unchanged
     assert ex2._unresolved_stop_recoveries == []       # terminal, resolved
     assert len(ex2.pending_journal_entries) == 1       # still journaled, exactly once
@@ -1262,13 +1272,22 @@ def test_adoption_merge_does_not_double_apply_checkpoint_covered_fill(mock_cfg, 
     with patch.object(fake, "fetch_open_orders", return_value=[]), \
          patch.object(fake, "fetch_order", side_effect=ccxt.RequestTimeout("timeout")):
         ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
-    assert ex2.cash     == pytest.approx(1_077.84)
+    # CASH-OWNERSHIP INVARIANT UPDATE (2026-09-22, corrected same day):
+    # unresolved right after construction — no order data is available at
+    # all yet (both fetch_open_orders and fetch_order failed/empty this
+    # restart). See test_delayed_lookup_of_offline_fill_does_not_double_
+    # apply_checkpoint's own docstring for the full reasoning.
+    assert ex2.cash     == pytest.approx(1_000.0)
     assert ex2.position == pytest.approx(0.001)
     assert len(ex2._unresolved_stop_recoveries) == 1
 
     # Restart #2: open-order discovery succeeds (O1 still genuinely
     # resting for its unfilled remainder) and adopts it, while O1's own
-    # direct lookup (used by the queue's own retry) still times out.
+    # direct lookup (used by the queue's own retry) still times out. The
+    # LISTING itself (fetch_open_orders) already carries this order's own
+    # real filled/cost/fee data — the merge below resolves cash from THAT
+    # (order-derived, symbol-scoped), independent of the separate direct
+    # fetch_order() lookup that's still failing.
     with patch.object(fake, "fetch_order", side_effect=ccxt.RequestTimeout("timeout")):
         ex3 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
     assert ex3._native_stop_order_id == o1["id"]
@@ -1296,8 +1315,12 @@ def test_unresolved_stop_delta_straddling_checkpoint_splits_correctly(mock_cfg, 
     queued (lookup times out at startup), it fills a FURTHER 0.0005 BTC
     purely during this live run before its lookup finally succeeds. A
     single reconcile_pending_orders() call must split the combined
-    0.0015 delta: 0.001 checkpoint-covered (cash-free) and 0.0005
-    genuinely new (live, returned to the caller)."""
+    0.0015 delta: 0.001 checkpoint-covered (still applies its own cash,
+    via the order's own data, just through the startup-side journal
+    helper rather than the live-fill helper — see checkpoint_qty_cap's
+    own docstring for why the split still matters for POSITION even
+    though cash math is now identical either way) and 0.0005 genuinely
+    new (live, returned to the caller)."""
     state_path = str(tmp_path / "state.json")
     fake = FakeExchange(cash=1000.0)
     ex = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
@@ -1319,7 +1342,11 @@ def test_unresolved_stop_delta_straddling_checkpoint_splits_correctly(mock_cfg, 
     with patch.object(fake, "fetch_open_orders", return_value=[]), \
          patch.object(fake, "fetch_order", side_effect=ccxt.RequestTimeout("timeout")):
         ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
-    assert ex2.cash     == pytest.approx(1_077.84)
+    # CASH-OWNERSHIP INVARIANT UPDATE (2026-09-22, corrected same day):
+    # unresolved right after construction — no order data available yet.
+    # See test_delayed_lookup_of_offline_fill_does_not_double_apply_
+    # checkpoint's own docstring for the full reasoning.
+    assert ex2.cash     == pytest.approx(1_000.0)
     assert ex2.position == pytest.approx(0.001)
     assert ex2._unresolved_stop_recoveries[0]["checkpoint_qty_cap"] == pytest.approx(0.001)
 
@@ -1389,7 +1416,11 @@ def test_stale_checkpoint_cap_is_refreshed_across_a_second_restart(mock_cfg, moc
     with patch.object(fake, "fetch_open_orders", return_value=[]), \
          patch.object(fake, "fetch_order", side_effect=ccxt.RequestTimeout("timeout")):
         ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
-    assert ex2.cash     == pytest.approx(1_078.0)
+    # CASH-OWNERSHIP INVARIANT UPDATE (2026-09-22, corrected same day):
+    # unresolved right after construction — no order data available yet.
+    # See test_delayed_lookup_of_offline_fill_does_not_double_apply_
+    # checkpoint's own docstring for the full reasoning.
+    assert ex2.cash     == pytest.approx(1_000.0)
     assert ex2.position == pytest.approx(0.002)
     assert ex2._unresolved_stop_recoveries[0]["checkpoint_qty_cap"] == pytest.approx(0.001)
 
@@ -1474,17 +1505,35 @@ def test_stale_checkpoint_cap_refreshed_across_restart_before_adoption(mock_cfg,
 @patch("bot.execution.live_executor.cfg")
 def test_checkpoint_split_with_varying_prices_is_estimated_and_alerted(mock_cfg, mock_sleep, tmp_path):
     """PASS-11 review finding (P1, finding 2), exact reproduction: the
-    first 0.001 BTC executes offline at $78,000 (checkpoint correctly
-    syncs $1,078); after startup, a second 0.001 executes live at
-    $82,000. A single read reports cumulative 0.002 @ average $80,000,
-    cost $160, zero fees. The exact quantity split (0.001 checkpoint-
-    covered / 0.001 live) is not in question — but crediting the live
-    portion at the blended $80,000 average (giving executor cash
-    $1,158) instead of its own true $82,000 (which would give $1,160)
-    is a real, bounded estimation error given ccxt exposes no per-fill
-    breakdown. This is expected, documented behavior — asserted here
-    specifically so a future change to the estimate's formula doesn't
-    silently drift — and must be loudly alerted, not silent."""
+    first 0.001 BTC executes offline at $78,000; after startup, a second
+    0.001 executes live at $82,000. A single read reports cumulative
+    0.002 @ average $80,000, cost $160, zero fees.
+
+    CASH-OWNERSHIP INVARIANT UPDATE (2026-09-22, corrected same day): the
+    ORIGINAL version of this test (pre-dating the cash-ownership fix)
+    demonstrated a genuine $2 discrepancy — the checkpoint-covered portion
+    used to get its TRUE $78,000 price for free (from the now-removed
+    exchange-balance-trust shortcut), while only the LIVE portion was
+    priced at the $80,000 blend, giving $1,158 against a true $1,160. That
+    discrepancy was an ARTIFACT of mixing two different pricing sources
+    (balance-derived truth + order-derived estimate) for one order, not an
+    inherent property of blending. Now that BOTH the covered_qty and
+    live_qty portions resolve from the SAME single order read (nothing
+    else ever establishes cash), they necessarily share the SAME blended
+    delta_price — and multiplying a blended per-unit price by the FULL
+    delta quantity is mathematically identical to multiplying each
+    sub-portion by that same price and summing (blended_price × total_qty
+    ≡ sum(sub_qty × blended_price) ≡ total_cost, by the very definition of
+    "blended"). So the split no longer changes the CASH total at all —
+    the exact quantity split (0.001 checkpoint-covered / 0.001 live)
+    still matters for POSITION handling and for which portion is returned
+    to the caller as a discovered Order, but cash converges to the
+    order's own true reported total ($1,000 + $160 = $1,160) either way.
+    The "ESTIMATE" alert still fires and is still asserted below — a
+    genuinely differing per-segment FEE allocation (not exercised here,
+    since fees are zero throughout) could still be imprecise, so the
+    warning remains warranted even though this specific numeric example
+    no longer demonstrates a cash gap."""
     state_path = str(tmp_path / "state.json")
     fake = FakeExchange(cash=1000.0)
     ex = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
@@ -1506,7 +1555,8 @@ def test_checkpoint_split_with_varying_prices_is_estimated_and_alerted(mock_cfg,
     with patch.object(fake, "fetch_open_orders", return_value=[]), \
          patch.object(fake, "fetch_order", side_effect=ccxt.RequestTimeout("timeout")):
         ex2 = _build_executor(fake, state_path=state_path, native_stop_loss_enabled=True)
-    assert ex2.cash == pytest.approx(1_078.0)
+    # Unresolved right after construction — no order data available yet.
+    assert ex2.cash == pytest.approx(1_000.0)
     assert ex2._unresolved_stop_recoveries[0]["checkpoint_qty_cap"] == pytest.approx(0.001)
 
     # Live, a further 0.001 fills at a DIFFERENT price ($82,000) — the
@@ -1517,10 +1567,10 @@ def test_checkpoint_split_with_varying_prices_is_estimated_and_alerted(mock_cfg,
     ex2._alerter = mock_alerter
     discovered = ex2.reconcile_pending_orders()
 
-    # The known, documented estimation result (blended $80,000 applied to
-    # the live 0.001) — NOT the true $1,160 a per-fill reconstruction
-    # would give. This pins the current approximation's exact behavior.
-    assert ex2.cash == pytest.approx(1_078.0 + 0.001 * 80_000.0)   # == 1,158.0
+    # Both the covered and live portions resolve from this SAME order
+    # read, at the SAME blended $80,000 price — the split doesn't change
+    # the cash total (see docstring): $1,000 + $160 = $1,160 exactly.
+    assert ex2.cash == pytest.approx(1_000.0 + 0.002 * 80_000.0)   # == 1,160.0
     assert len(discovered) == 1
     assert discovered[0].quantity == pytest.approx(0.001)
     assert discovered[0].price    == pytest.approx(80_000.0)

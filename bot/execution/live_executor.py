@@ -376,9 +376,44 @@ class LiveExecutor:
             logger.error("load_markets() failed (dry-run, continuing without validation): %s", exc)
 
         # State restore + balance reconciliation.
-        # In live mode: load saved state (position/cost_basis) then override cash
-        # with the actual exchange balance to detect restart drift.
-        # In dry-run: load saved state only (no API call for balance).
+        #
+        # CASH-OWNERSHIP INVARIANT (rewritten 2026-09-22 after a two-round
+        # review finding): self._portfolio.cash is ALWAYS this symbol's
+        # OWN economic history — whatever _load_state() just loaded, later
+        # updated only by this executor's own real trades in execute().
+        # It is NEVER assigned the exchange's whole-account free-balance
+        # figure, not even transiently in memory, and NEVER as a "then
+        # corrected later by the caller" two-step.
+        #
+        # Why: an earlier version of this fix DID assign the whole-account
+        # balance into self._portfolio.cash here (to detect restart drift
+        # for a single-symbol deployment), relying on a multi-symbol-aware
+        # caller (bot.main._reconcile_shared_account_cash) to restore the
+        # correct value and re-save afterward. Reproduced exactly why that
+        # is insufficient: _sync_position() below can itself call
+        # _save_state() (e.g. on external-holdings detection) BEFORE the
+        # caller's restoration ever runs — persisting the wrong,
+        # whole-account figure to THIS symbol's own state file. If the
+        # process crashes anywhere in that window (a real, not contrived,
+        # risk — startup is exactly when a bot is most likely to be killed
+        # or to fail), the correction never happens, and the NEXT startup
+        # loads the now-permanently-corrupted number right back off disk —
+        # the "restore in memory, then re-save" approach cannot close a
+        # crash window that occurs BEFORE the caller ever gets control.
+        #
+        # The only way to make that crash window not exist is to never let
+        # the wrong value exist anywhere reachable by a save in the first
+        # place. So: self._portfolio.cash is left completely untouched by
+        # the exchange sync below. The observed exchange balance is
+        # captured into a SEPARATE, clash-account_cash_observed field
+        # (never touched by _save_state(), since Portfolio's own
+        # serialization only ever knows about self._portfolio.cash) —
+        # exposed via the exchange_cash_observed property for a
+        # multi-symbol-aware caller to use as read-only drift-detection
+        # evidence, or for a genuinely single-executor deployment to
+        # explicitly adopt if it chooses to. LiveExecutor itself makes
+        # neither choice — it has no way to know whether it is sharing an
+        # account, so it never assumes either way.
         self._load_state()
         # PASS-7 review finding (P0): capture the JUST-LOADED cost basis/
         # position BEFORE _sync_cash()/_sync_position() get any chance to
@@ -428,6 +463,10 @@ class LiveExecutor:
         # syncs run once in __init__, so this reflects THIS process's
         # startup only, not a live health check re-evaluated per tick.
         self._startup_sync_healthy: bool = True
+        # None in dry-run (no _sync_cash() call ever happens) or before
+        # the live-mode block below runs — a caller must treat None as
+        # "no real exchange observation available," never as zero.
+        self._exchange_cash_observed: "float | None" = None
         if not dry_run:
             base  = symbol.split("/")[0]
             quote = symbol.split("/")[1]
@@ -449,7 +488,19 @@ class LiveExecutor:
             # current (already-inclusive) balance double-counts its effect.
             self._reconcile_pending_orders_at_startup()
             exchange_cash, sync_error = self._sync_cash()
-            self._portfolio.cash = exchange_cash
+            # Cash-ownership invariant: self._portfolio.cash is NEVER
+            # assigned here — see the module note above _load_state().
+            # exchange_cash_observed is a purely observational, per-process
+            # field: never touched by _save_state() (Portfolio's own
+            # serialization has no knowledge of it), never treated as this
+            # symbol's own cash by anything inside this class. On a sync
+            # failure, exchange_cash is _sync_cash()'s own starting_cash
+            # FALLBACK, not a real observation — recorded anyway (for the
+            # fallback print line below) but startup_sync_healthy=False is
+            # what actually marks it untrustworthy; a caller (e.g.
+            # bot.main._reconcile_shared_account_cash) must check that
+            # flag before treating exchange_cash_observed as real evidence.
+            self._exchange_cash_observed = exchange_cash
             if sync_error:
                 self._startup_sync_healthy = False
             self._sync_position(symbol)
@@ -458,16 +509,21 @@ class LiveExecutor:
 
             # Unmissable startup line — print() bypasses logging so it always
             # appears in the terminal regardless of log level configuration.
+            # Shows the EXCHANGE-OBSERVED balance (this symbol's own
+            # self._portfolio.cash may legitimately differ when this
+            # account is shared across multiple symbols — see
+            # bot.main._reconcile_shared_account_cash for how that's
+            # reconciled) alongside this symbol's own recovered position.
             if sync_error:
                 print(
-                    f"  LIVE BALANCE: ${self._portfolio.cash:.2f} {quote}"
+                    f"  LIVE BALANCE: ${self._exchange_cash_observed:.2f} {quote}"
                     f" (FALLBACK — fetch_balance FAILED: {sync_error})"
                     f" | position: {self._portfolio.position:.6f} {base}",
                     flush=True,
                 )
             else:
                 print(
-                    f"  LIVE BALANCE: ${self._portfolio.cash:.2f} {quote}"
+                    f"  LIVE BALANCE: ${self._exchange_cash_observed:.2f} {quote}"
                     f" | position: {self._portfolio.position:.6f} {base}"
                     f" | source: {exchange_id} fetch_balance",
                     flush=True,
@@ -483,6 +539,54 @@ class LiveExecutor:
     @property
     def cash(self) -> float:
         return self._portfolio.cash
+
+    @property
+    def exchange_cash_observed(self) -> "float | None":
+        """The raw, whole-account free balance _sync_cash() observed at
+        startup — NEVER assigned to .cash and NEVER persisted via
+        _save_state() (see the cash-ownership invariant documented above
+        _load_state() in __init__). None in dry-run (no sync ever
+        happens) or before the live-mode startup block runs.
+
+        On a sync FAILURE, this holds _sync_cash()'s own starting_cash
+        fallback, not a real observation — check startup_sync_healthy
+        before trusting this as real evidence of the account's actual
+        balance; a caller doing multi-symbol reconciliation (bot.main.
+        _reconcile_shared_account_cash) always checks both."""
+        return self._exchange_cash_observed
+
+    def adopt_exchange_cash_as_own(self) -> bool:
+        """Explicitly adopts exchange_cash_observed as this executor's
+        own .cash, and persists it. This is the ONLY way the exchange's
+        whole-account balance is ever allowed to become this symbol's own
+        cash — LiveExecutor itself never does this automatically (see the
+        cash-ownership invariant in __init__), because it has no way to
+        know whether it is the sole consumer of its quote currency on
+        this account or one of several sharing it.
+
+        Call this ONLY when the caller has confirmed this executor is
+        genuinely the sole consumer of its quote currency on this
+        exchange account — e.g. a real single-symbol deployment, or
+        bot.main._reconcile_shared_account_cash's own single-executor
+        case. For any multi-symbol-sharing deployment, do NOT call this;
+        use exchange_cash_observed for read-only drift detection instead.
+
+        A no-op (returns False) if the startup sync never succeeded
+        (startup_sync_healthy is False) or never ran at all (dry-run,
+        exchange_cash_observed is None) — there is nothing trustworthy to
+        adopt in either case. Returns True on a successful adoption."""
+        if not self.startup_sync_healthy or self._exchange_cash_observed is None:
+            return False
+        self._portfolio.cash = self._exchange_cash_observed
+        try:
+            self._save_state()
+        except Exception as exc:
+            logger.warning(
+                "adopt_exchange_cash_as_own: state save failed for %s: %s"
+                " — adoption applied in memory only for this process.",
+                self.symbol, exc,
+            )
+        return True
 
     @property
     def position(self) -> float:
@@ -548,7 +652,24 @@ class LiveExecutor:
         still genuinely unresolved (a lookup failure, or truly still open)
         is left exactly as persisted, for the normal execute()-time
         reconciliation path (which already handles this correctly for the
-        same-process, no-restart case) to keep retrying later."""
+        same-process, no-restart case) to keep retrying later.
+
+        CASH-OWNERSHIP INVARIANT UPDATE (2026-09-22): this method's own
+        docstring above used to say cash is "deliberately left completely
+        untouched here" because _sync_cash() (called right after, from
+        __init__) would re-baseline it from the exchange's raw free
+        balance. That is no longer true — _sync_cash() only OBSERVES the
+        exchange's balance now (see LiveExecutor.__init__'s own note on
+        exchange_cash_observed); it never assigns .cash, precisely because
+        a shared multi-symbol account's whole-account balance is not any
+        one symbol's own cash. This method is therefore now the ONLY place
+        this recovered delta's cash effect is ever applied — it mirrors
+        the exact cash mutation reconcile_pending_orders() (the ordinary,
+        same-process tick path) already uses, just run once at startup
+        instead of every tick. Position is still derived the same way as
+        before (both from this delta AND, redundantly but harmlessly,
+        re-confirmed by the _sync_position() call right after — since that
+        one DOES re-derive quantity from the exchange, unlike cash)."""
         quote = self.symbol.split("/")[1]
         _dirty = False
         for role in ("buy", "sell"):
@@ -605,8 +726,8 @@ class LiveExecutor:
 
             if delta_qty <= 0:
                 if delta_fee > 0:
-                    self._record_fee_adjustment_journal_entry(
-                        order_id_str, delta_fee, fee_currency,
+                    self._apply_ordinary_order_fee_only_adjustment(
+                        role, order_id_str, delta_fee, fee_currency,
                     )
                 if is_terminal:
                     self._order_progress.pop(role, None)
@@ -617,7 +738,8 @@ class LiveExecutor:
             pnl = None
             if ccxt_side == "buy":
                 prev_cost = self._portfolio._cost_basis * self._portfolio.position
-                self._portfolio.position += delta_qty
+                self._portfolio.cash        -= delta_cost
+                self._portfolio.position    += delta_qty
                 self._portfolio._cost_basis = (
                     (prev_cost + delta_price * delta_qty) / self._portfolio.position
                     if self._portfolio.position > 0 else 0.0
@@ -626,16 +748,23 @@ class LiveExecutor:
             else:
                 pnl = (delta_price - self._portfolio._cost_basis) * delta_qty
                 self._portfolio.realized_pnl += pnl
+                self._portfolio.cash          += delta_cost
                 self._portfolio.position      = max(0.0, self._portfolio.position - delta_qty)
                 if self._portfolio.position == 0:
                     self._portfolio._cost_basis = 0.0
                     self._bot_opened_position   = False
 
-            if delta_fee > 0 and fee_currency == quote:
-                self._fees_paid += delta_fee
-                # Deliberately NOT deducted from cash here — _sync_cash(),
-                # called right after this method returns, already reflects
-                # the post-fee exchange balance.
+            if delta_fee > 0:
+                if fee_currency != quote:
+                    logger.warning(
+                        "Startup-reconciliation fee currency mismatch "
+                        "[%s/%s]: fee=%.6f %s but quote=%s — not "
+                        "deducting (manual reconciliation needed).",
+                        self.symbol, role, delta_fee, fee_currency, quote,
+                    )
+                else:
+                    self._portfolio.cash -= delta_fee
+                    self._fees_paid      += delta_fee
 
             order = Order(
                 order_id     = order_id_str,
@@ -654,9 +783,10 @@ class LiveExecutor:
             self._record_pending_journal_entry(order)
             logger.warning(
                 "STARTUP RECONCILIATION [%s/%s]: recovered a %s fill of "
-                "%.8f @ %.2f (order %s) — journaled; cash left for the "
-                "upcoming exchange sync to establish, not double-applied "
-                "here.", self.symbol, role, ccxt_side, delta_qty, delta_price, order_id_str,
+                "%.8f @ %.2f (order %s) — journaled and applied to cash "
+                "directly (the exchange balance sync never assigns .cash, "
+                "so this is the only place that happens).",
+                self.symbol, role, ccxt_side, delta_qty, delta_price, order_id_str,
             )
             if is_terminal:
                 self._order_progress.pop(role, None)
@@ -680,12 +810,14 @@ class LiveExecutor:
         exchange.
 
         Unlike _reconcile_pending_orders_at_startup() (which runs BEFORE
-        _sync_cash()/_sync_position() re-baseline cash/position from the
-        exchange's current balance, and so must NEVER apply a cash/
-        position delta itself — see that method's own docstring), this is
-        the ordinary SAME-PROCESS case: nothing else re-baselines cash/
-        position between ticks, so a genuinely new delta is applied
-        through the EXACT same portfolio-mutation logic execute() uses.
+        _sync_position() re-derives position from the exchange's current
+        balance — its own position mutation is therefore redundant,
+        immediately overwritten by that fresher read, though its cash
+        mutation is NOT redundant, since nothing else ever re-derives
+        cash — see that method's own docstring), this is the ordinary
+        SAME-PROCESS case: nothing else re-baselines cash OR position
+        between ticks, so a genuinely new delta is applied through the
+        EXACT same portfolio-mutation logic execute() uses.
 
         Returns every fill Order discovered this way (empty list if
         nothing changed) — callers must route each through the SAME
@@ -1071,23 +1203,53 @@ class LiveExecutor:
     def has_resting_stop(self) -> bool:
         return self._native_stop_order_id is not None
 
-    def _journal_native_stop_execution_without_cash_effect(
+    def _journal_native_stop_execution_at_startup(
         self, order_id: str, filled_qty: float, fill_price: float,
         fee_cost: float, fee_currency: str, cost_basis: "float | None" = None,
     ) -> Order:
         """PASS-6 review finding (P1): the startup-safe counterpart to
         _record_stop_triggered_fill. That method is for the LIVE, mid-run
         case where NOTHING else has yet applied the fill's cash/position
-        effect. At startup, _sync_cash()/_sync_position() (which always
-        run before any native-stop startup reconciliation) ALREADY
-        reflect every execution that happened on the exchange, including
-        one this executor never got to record locally before a crash —
-        re-applying cash/position here would double-count it. But
-        realized P&L and fees_paid are NOT established by the exchange
-        sync (Kraken's free balance doesn't report "realized P&L"), and
-        the execution itself still needs a journal entry — skipping those
-        is exactly PASS-6 finding 1: a real fill and its loss disappearing
-        entirely from the recovery journal, even though cash converged.
+        effect. At startup, _sync_position() (which always runs before any
+        native-stop startup reconciliation) ALREADY reflects every
+        execution that happened on the exchange, including one this
+        executor never got to record locally before a crash — re-applying
+        a POSITION delta here would double-count it, so position is left
+        untouched (matching whatever _sync_position() already established).
+
+        CASH-OWNERSHIP INVARIANT UPDATE (2026-09-22, corrected same day
+        after a second review round): this method used to be named
+        "..._without_cash_effect" and skip cash too, on the premise that
+        _sync_cash() (also run before this) already reflected the fill via
+        the exchange's raw free balance. That premise is false —
+        _sync_cash() only OBSERVES the exchange's balance, it never
+        assigns .cash. An intermediate version of this fix then tried
+        assigning cash from exchange_cash_observed directly in this
+        method's own callers instead — ALSO wrong, and for the exact same
+        underlying reason: exchange_cash_observed is the WHOLE shared
+        account's free balance, which can include OTHER symbols' entirely
+        unrelated cash (reproduced: $59.60 own cash + $100 unrelated idle
+        cash elsewhere in the same account + a genuine $49.50 net stop
+        proceeds got recorded as $209.10 instead of the correct $109.10 —
+        no timeout or concurrency needed, just ordinary cash sharing).
+        The only cash source this method (or any native-stop recovery
+        path) may ever use is THIS ORDER's OWN reported fill data
+        (fill_price × filled_qty, minus its own fee) — intrinsically
+        scoped to this one order on this one symbol, safe regardless of
+        whatever else the shared account holds. Applied unconditionally,
+        added to whatever this symbol's OWN cash already is — never
+        assigned from, or reconciled against, the account-wide balance.
+        Position, unlike cash, genuinely IS re-derived independently by
+        _sync_position() (which reads the base-asset balance directly) —
+        that distinction is why this method applies cash but still
+        deliberately leaves position/cost_basis-on-close alone.
+
+        realized P&L and fees_paid were NEVER established by the exchange
+        sync either way (Kraken's free balance doesn't report "realized
+        P&L"), and the execution itself still needs a journal entry —
+        skipping those was PASS-6 finding 1: a real fill and its loss
+        disappearing entirely from the recovery journal, even though cash
+        converged.
 
         cost_basis (PASS-7 review finding, P0): defaults to the CURRENT
         self._portfolio._cost_basis, but the caller may pass the
@@ -1100,8 +1262,10 @@ class LiveExecutor:
         +$156 "profit" on a real $14 loss)."""
         quote = self.symbol.split("/")[1]
         _cost_basis = self._portfolio._cost_basis if cost_basis is None else cost_basis
+        total_value = fill_price * filled_qty
         pnl = (fill_price - _cost_basis) * filled_qty
         self._portfolio.realized_pnl += pnl
+        self._portfolio.cash         += total_value
         if fee_cost > 0:
             if fee_currency and fee_currency != quote:
                 logger.warning(
@@ -1110,7 +1274,8 @@ class LiveExecutor:
                     "reconciliation needed)", self.symbol, fee_cost, fee_currency, quote,
                 )
             else:
-                self._fees_paid += fee_cost
+                self._portfolio.cash -= fee_cost
+                self._fees_paid      += fee_cost
         order = Order(
             order_id     = f"native-stop:{order_id}",
             symbol       = self.symbol,
@@ -1129,8 +1294,9 @@ class LiveExecutor:
         logger.warning(
             "STARTUP RECONCILIATION [%s/protect]: recovered a stop-"
             "triggered exit of %.8f @ %.2f (order %s) that happened "
-            "before this restart — journaled; cash/position already "
-            "reflected via the exchange sync.",
+            "before this restart — journaled and applied to cash "
+            "directly from this order's own data (position left alone; "
+            "already reflected via the exchange's own position sync).",
             self.symbol, filled_qty, fill_price, order_id,
         )
         return order
@@ -1140,17 +1306,19 @@ class LiveExecutor:
         fee_cost: float, fee_currency: str, cost_basis: "float | None" = None,
     ) -> Order:
         """PASS-9 review finding (P1, finding 1): the LIVE counterpart to
-        _journal_native_stop_execution_without_cash_effect above — used
-        when a queued historical order's delta is discovered AFTER the
+        _journal_native_stop_execution_at_startup above — used when a
+        queued historical order's delta is discovered AFTER the
         executor's own one-time startup balance sync has already run
         (during an ordinary tick's reconcile_pending_orders(), not
-        _verify_resting_stop_on_startup()). Nothing else re-syncs cash/
-        position between ticks, so this delta's cash effect has never
-        been applied anywhere and must be booked here — through the exact
-        same mutation _record_stop_triggered_fill uses for a live-
-        discovered fill — then returned so the caller can route it
-        through the normal PositionManager/state-machine/capital-pool
-        consumer, exactly like any other discovered fill.
+        _verify_resting_stop_on_startup()). Nothing else re-syncs
+        position between ticks, so this delta's POSITION effect (unlike
+        cash, which the startup counterpart above now also applies
+        directly — see its docstring) has never been applied anywhere and
+        must be booked here — through the exact same mutation
+        _record_stop_triggered_fill uses for a live-discovered fill — then
+        returned so the caller can route it through the normal
+        PositionManager/state-machine/capital-pool consumer, exactly like
+        any other discovered fill.
 
         cost_basis: the historical order's OWN frozen basis (captured
         when it was queued for recovery), never the current shared
@@ -1241,23 +1409,27 @@ class LiveExecutor:
         recovering a DIFFERENT, already-detached historical order.
 
         cost_basis_override (PASS-7 review finding, P0): see
-        _journal_native_stop_execution_without_cash_effect's own
-        docstring — required whenever _sync_position() may already have
-        zeroed self._portfolio._cost_basis before this runs.
+        _journal_native_stop_execution_at_startup's own docstring —
+        required whenever _sync_position() may already have zeroed
+        self._portfolio._cost_basis before this runs.
 
-        apply_as_live_fill (PASS-9 review finding, P1, finding 1; scope
-        narrowed by PASS-10 finding 1 — see checkpoint_qty_cap below):
-        governs ONLY a FEE-ONLY correction (no accompanying new quantity)
-        now. True (an ordinary tick's reconcile_pending_orders()) applies
-        it as a live cash deduction — a fee finalizing after the one-time
-        startup sync is a real, not-yet-applied cash movement. False (the
-        default — a call happening as part of the executor's own one-time
-        startup sync window) keeps it cash-free, matching the exchange
-        balance the just-completed sync already read. A caller-mode
-        boolean CANNOT decide this for fee-only corrections either way
-        with certainty — it is a pragmatic default for a dimension this
-        file has no exact way to bound (see checkpoint_qty_cap for why
-        quantity, unlike fee, CAN be bounded exactly).
+        apply_as_live_fill: historically governed whether a FEE-ONLY
+        correction (no accompanying new quantity) was applied as a cash
+        deduction (True — an ordinary tick's reconcile_pending_orders())
+        or left cash-free (False — the startup window, on the premise
+        that the just-completed _sync_cash() balance read already
+        reflected it). CASH-OWNERSHIP INVARIANT UPDATE (2026-09-22): that
+        premise is now false — _sync_cash() never assigns .cash (see
+        LiveExecutor.__init__'s own note) — so a fee-only correction's
+        cash effect must be applied identically regardless of when it's
+        discovered; both branches below now do the same thing.
+        **This parameter is now VESTIGIAL — unused anywhere in this
+        method's body.** Left in the signature (not removed) in this pass
+        purely to keep the surrounding call sites and
+        _reconcile_historical_stop_order's own pass-through signature
+        stable while the cash-ownership fix is reviewed; safe to delete
+        in a follow-up cleanup along with its callers' now-meaningless
+        `live=`/`apply_as_live_fill=` arguments.
 
         checkpoint_qty_cap (PASS-10 review finding, P0, finding 1): PASS-9
         chose cash-free vs. live for a QUANTITY delta using the SAME
@@ -1370,7 +1542,7 @@ class LiveExecutor:
                     f"differed; verify against Kraken's trade history."
                 )
             if covered_qty > 0:
-                self._journal_native_stop_execution_without_cash_effect(
+                self._journal_native_stop_execution_at_startup(
                     order_id_str, covered_qty, delta_price, covered_fee, fee_currency,
                     cost_basis=cost_basis_override,
                 )
@@ -1386,22 +1558,15 @@ class LiveExecutor:
             # offline, with the FILLED QUANTITY unchanged, used to just
             # advance the baseline below with no journal entry at all —
             # the correction was silently "consumed" (the baseline now
-            # matches it) without ever reaching TradeLog. Cash-free, same
-            # discipline as the quantity-delta branch above — never
-            # fabricates a zero-quantity execution row. PASS-9 finding 1:
-            # cash-free is only correct pre-startup-sync; a fee finalizing
-            # DURING a live tick is a real, not-yet-applied cash movement.
-            if apply_as_live_fill:
-                self._apply_native_stop_fee_only_adjustment(
-                    order_id_str, delta_fee, fee_currency,
-                )
-            else:
-                _quote = self.symbol.split("/")[1]
-                if fee_currency == _quote:
-                    self._fees_paid += delta_fee
-                self._record_fee_adjustment_journal_entry(
-                    f"native-stop:{order_id_str}", delta_fee, fee_currency,
-                )
+            # matches it) without ever reaching TradeLog. CASH-OWNERSHIP
+            # INVARIANT UPDATE (2026-09-22): both branches now apply the
+            # fee's cash effect identically — _sync_cash() never assigns
+            # .cash, so there is no "already reflected via the exchange
+            # sync" case left to special-case. checkpoint_qty_cap-covered
+            # or not, this fee was never applied anywhere else.
+            self._apply_native_stop_fee_only_adjustment(
+                order_id_str, delta_fee, fee_currency,
+            )
 
         if advance_tracked_baseline:
             self._native_stop_last_recorded_filled = cumulative_filled
@@ -1418,9 +1583,11 @@ class LiveExecutor:
         outcome sat unresolved indefinitely (nothing else re-checks a
         pending 'protect' submission independently of a position-changing
         event). Resolves it the same way _find_untracked_entry_order-based
-        reconciliation always does, but WITHOUT applying cash/position
-        (already reflected via the exchange sync that runs before this),
-        journaling any discovered fill through the cash-free helper above."""
+        reconciliation always does, applying cash directly (via
+        _journal_native_stop_execution_at_startup below — see its own
+        docstring for the 2026-09-22 cash-ownership update) while leaving
+        POSITION untouched (already reflected via _sync_position(), which
+        runs before this)."""
         entry = self._pending_submissions.get("protect")
         if entry is None:
             return
@@ -1477,7 +1644,7 @@ class LiveExecutor:
         # _native_stop_order_id). Reproduced exactly: cash correct at
         # $1,155.68, but gross P&L fabricated at +$156 instead of the
         # real -$14.
-        self._journal_native_stop_execution_without_cash_effect(
+        self._journal_native_stop_execution_at_startup(
             order_id, filled, fill_price, fee_cost, fee_currency,
             cost_basis=self._startup_recovery_cost_basis,
         )
@@ -1676,10 +1843,14 @@ class LiveExecutor:
         the real -$14.
 
         Fixed: query the tracked order directly and recover any missed
-        delta cash-free, using self._startup_recovery_cost_basis (captured
-        immediately after _load_state(), before any sync could zero it) —
-        never the LIVE _cancel_native_stop() path, and never the current
-        (by now zeroed) self._portfolio._cost_basis.
+        delta via _journal_native_stop_execution_at_startup (below), using
+        self._startup_recovery_cost_basis (captured immediately after
+        _load_state(), before any sync could zero it) — never the LIVE
+        _cancel_native_stop() path, and never the current (by now zeroed)
+        self._portfolio._cost_basis. (2026-09-22: that helper used to be
+        cash-free too, on the premise this docstring's own next paragraph
+        states — _sync_cash() no longer holds that premise; see the
+        helper's own docstring for the current cash-ownership design.)
 
         PASS-8 review finding (P1, finding 2): a FLAT local position does
         NOT establish that the order's own, independent life on the
@@ -1706,6 +1877,20 @@ class LiveExecutor:
                 "reference for a later retry instead of discarding it.",
                 order_id, self.symbol, exc,
             )
+            # CASH-OWNERSHIP INVARIANT UPDATE (2026-09-22, corrected same
+            # day): the order's own fill data is unavailable (fetch_order
+            # just failed above), so there is genuinely no way to
+            # determine this fill's cash effect yet — it stays UNRESOLVED
+            # (self._portfolio.cash left exactly as _load_state() restored
+            # it) until a later retry's order lookup succeeds. An earlier
+            # version of this fix tried trusting exchange_cash_observed
+            # (this restart's own whole-account balance observation)
+            # here instead — wrong, because that balance can include
+            # OTHER symbols' entirely unrelated cash in a shared account;
+            # see _journal_native_stop_execution_at_startup's own
+            # docstring for the exact reproduction. Only this order's own
+            # reported data, once available, is ever trusted for its cash
+            # effect — see _recover_missed_native_stop_execution.
             self._queue_unresolved_stop_recovery(
                 order_id, self._startup_recovery_cost_basis,
                 self._native_stop_last_recorded_filled,
@@ -1922,15 +2107,19 @@ class LiveExecutor:
             # definition, but PASS-7 review finding (P0): it may have
             # FULLY EXECUTED OFFLINE before going stale, not just been
             # cancelled — _sync_position() zeroing position/cost_basis
-            # reflects the cash effect of exactly that execution, but its
-            # P&L/journal are still missing. The OLD code called the LIVE
-            # _cancel_native_stop() here, which re-applies the fill's cash
-            # effect a SECOND time (already reflected via sync) and
-            # computes P&L against the NOW-ZERO cost_basis, fabricating
-            # profit out of nothing. Reproduced exactly: cash $1,311.36
-            # instead of $1,155.68, reported profit +$156 instead of the
-            # real -$14. Fixed: recover cash-free, using the basis
-            # preserved BEFORE the sync could zero it.
+            # reflects exactly that execution's position effect, but its
+            # cash/P&L/journal are still missing (2026-09-22: cash is no
+            # longer established by any exchange sync at all — see
+            # LiveExecutor.__init__'s cash-ownership note — so recovery
+            # below is the ONLY place this fill's cash effect is applied).
+            # The OLD code called the LIVE _cancel_native_stop() here,
+            # which — under the design at the time — re-applied the fill's
+            # cash effect a SECOND time and computed P&L against the
+            # NOW-ZERO cost_basis, fabricating profit out of nothing.
+            # Reproduced exactly: cash $1,311.36 instead of $1,155.68,
+            # reported profit +$156 instead of the real -$14. Fixed:
+            # recover via _journal_native_stop_execution_at_startup, using
+            # the basis preserved BEFORE the sync could zero it.
             if self._native_stop_order_id:
                 self._recover_flat_native_stop_at_startup()
             return
@@ -2002,10 +2191,12 @@ class LiveExecutor:
             # the next cancel cycle) NOR recovered the execution/P&L for
             # whatever delta occurred before this restart (PASS-6 — a real
             # fill and its realized loss silently disappeared, seeding the
-            # baseline as if that execution never happened). Cash/position
-            # for this delta are ALREADY reflected via _sync_cash()/
-            # _sync_position() (this method runs after both) — only the
-            # journal entry and realized P&L were missing.
+            # baseline as if that execution never happened). POSITION for
+            # this delta is ALREADY reflected via _sync_position() (this
+            # method runs after it) — but CASH is not established by any
+            # sync (2026-09-22 cash-ownership update — see LiveExecutor.
+            # __init__'s own note) and is applied here, alongside the
+            # journal entry and realized P&L that were always missing.
             self._recover_missed_native_stop_execution(matched)
             self._save_state()
             self._reconcile_resting_stop_quantity(matched)
@@ -2017,7 +2208,8 @@ class LiveExecutor:
             # WHICH — a stop that fully executed offline had its final
             # fill/P&L silently discarded, identical in spirit to the
             # still-open case above. Query it directly; a genuine fill
-            # recovers through the same cash-free journal path.
+            # recovers through the same journal-and-apply-cash path
+            # (_journal_native_stop_execution_at_startup).
             _final_order = None
             _lookup_failed = False
             _order_id = self._native_stop_order_id
@@ -2052,6 +2244,15 @@ class LiveExecutor:
                 # too (see _refresh_unresolved_recovery_caps) — a cap
                 # frozen at THIS restart's own delta would go stale the
                 # moment a later restart's fresh sync absorbs still more.
+                # CASH-OWNERSHIP INVARIANT UPDATE (2026-09-22, corrected
+                # same day): same reasoning as the flat-position except
+                # branch above — the order's own data is unavailable, so
+                # this delta's cash effect stays UNRESOLVED until a later
+                # retry's order lookup succeeds. Never trust
+                # exchange_cash_observed here — see
+                # _journal_native_stop_execution_at_startup's own
+                # docstring for why an earlier version of this fix that
+                # did was itself a real bug in a shared account.
                 self._queue_unresolved_stop_recovery(
                     _order_id, self._portfolio._cost_basis,
                     self._native_stop_last_recorded_filled,
