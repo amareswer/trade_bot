@@ -55,6 +55,17 @@ The job must run **on the machine the bot runs on** — it reads the bot's log a
 state files directly. launchd runs a missed job at next wake if the Mac was
 asleep at 17:30 Monday.
 
+**macOS privacy block — required one-time step if the repo is under `~/Desktop`,
+`~/Documents` or `~/Downloads`.** macOS (TCC) refuses launchd-started processes
+access to those folders. The job then fails silently every week: `logs/weekly_monitor_
+launchd.err` shows `weekly_monitor.sh: Operation not permitted`, and no new
+`logs/weekly_monitor_<date>.md` appears. (This happened 2026-09-14 → 09-21 — three
+missed Mondays before anyone noticed.) Fix: System Settings → Privacy & Security →
+Full Disk Access → `+` → press ⌘⇧G, type `/bin/bash`, add it, make sure it's toggled
+on. Then test with `launchctl kickstart gui/$(id -u)/com.tradebot.weeklymonitor` and
+check that `logs/weekly_monitor_cron.log` gained a new entry. (Alternative: keep the repo
+outside those protected folders, which needs no permission at all.)
+
 ### Moving to a new machine
 
 The monitor logic lives in the repo (`stock_bot/analysis/weekly_monitor.py`).

@@ -198,6 +198,9 @@ class LiveExecutor:
         adopt_external_holdings:  bool  = False,
         native_stop_loss_enabled: bool  = False,
         max_slippage_pct:         float = 0.0,
+        simulated_maker_fee_pct:  float = 0.0,
+        simulated_taker_fee_pct:  float = 0.0,
+        simulate_maker_fills:     bool  = False,
     ):
         self.symbol                    = symbol
         self.dry_run                   = dry_run
@@ -207,6 +210,28 @@ class LiveExecutor:
         self._adopt_external_holdings  = adopt_external_holdings
         self._native_stop_loss_enabled = native_stop_loss_enabled
         self._max_slippage_pct         = max_slippage_pct
+        # Simulated fees (2026-09-22, tenth round review — "the zero-fee-
+        # simulation gap" this whole subsystem had been carrying as a
+        # known, explicitly-flagged prerequisite before any acceptance
+        # measurement). Only ever consulted from execute()'s dry_run
+        # branch — a REAL (dry_run=False) fill always uses the
+        # exchange's own reported fee, unchanged. Default 0.0 here (NOT
+        # this class's problem to pick a realistic default) — the
+        # REAL default lives in config.py's ExchangeConfig, which every
+        # production call site below reads from; a caller constructing
+        # a LiveExecutor directly (as most existing tests do) gets the
+        # old zero-fee dry-run behavior unless it explicitly opts in,
+        # so nothing already asserting exact zero-fee dry-run fills
+        # breaks silently.
+        self._simulated_maker_fee_pct  = simulated_maker_fee_pct
+        self._simulated_taker_fee_pct  = simulated_taker_fee_pct
+        # 2026-09-22, eleventh round review, P2: "attempting a maker
+        # order is treated as guaranteed maker execution... the real
+        # limit path can fall back to market; the simulation can
+        # understate entry costs." Default False (both here and in
+        # config.py's ExchangeConfig) is the conservative choice — see
+        # execute()'s own comment for how this is applied.
+        self._simulate_maker_fills     = simulate_maker_fills
         self._portfolio                = Portfolio(cash=starting_cash)
         self._fills:      list[Order]  = []
         self._rejects:    list[Order]  = []
@@ -4431,6 +4456,79 @@ class LiveExecutor:
             fill_price   = price
             filled_qty   = quantity
             order_id_str = "dry_run"
+            # Simulated fee (2026-09-22, tenth round review — "the zero-
+            # fee-simulation gap"): mirrors the SAME maker/taker
+            # condition the real (non-dry-run) entry path uses just
+            # below to decide whether to attempt a post-only limit at
+            # all (`self._order_type == "limit" and side == BUY and not
+            # urgent`) — a dry-run BUY that would have gone through the
+            # maker limit-chase pays the maker rate; anything else
+            # (urgent SL/TP, a plain market order, any SELL) pays the
+            # taker rate. Both rates default to 0.0 on this class itself
+            # (see __init__'s own comment) — a caller must explicitly
+            # opt in via simulated_maker/taker_fee_pct, which every
+            # PRODUCTION construction site does via cfg.exchange.*.
+            #
+            # ELEVENTH-ROUND correction (external review, 2026-09-22, P2):
+            # "attempting a maker order is treated as guaranteed maker
+            # execution... the real limit path can fall back to market;
+            # the simulation can understate entry costs." self._simulate_
+            # maker_fills gates the maker branch entirely — False (the
+            # conservative default, both here and in config.py) means
+            # EVERY dry-run fill pays the taker rate regardless of
+            # order_type/urgency/side, never understating cost. True
+            # (opt-in only, never for an acceptance-measurement run)
+            # restores the original "every eligible maker attempt
+            # succeeds" best-case assumption.
+            _dry_run_is_maker = (
+                self._simulate_maker_fills
+                and self._order_type == "limit" and side == OrderSide.BUY and not urgent
+            )
+            _dry_run_fee_pct = (
+                self._simulated_maker_fee_pct if _dry_run_is_maker
+                else self._simulated_taker_fee_pct
+            )
+            if _dry_run_fee_pct > 0:
+                fee_cost = fill_price * filled_qty * _dry_run_fee_pct
+
+            # ELEVENTH-ROUND finding, P1: "dry-run BUYs can spend more
+            # cash than available — adds fees without checking
+            # affordability." Reproduced: $100 cash, $100 market BUY,
+            # $0.80 simulated fee -> FILLED with -$0.80 cash. bot/main.py
+            # 's own sizing already reserves a 2% buffer specifically for
+            # this, but a caller bypassing that sizing (a direct test, or
+            # a configured fee rate exceeding 2%) has no other backstop —
+            # a REAL exchange would reject an unaffordable order outright
+            # (insufficient funds); dry-run had nothing playing that
+            # role. Rejected here, mirroring _validate_order's own
+            # reject-Order pattern exactly, rather than silently resizing
+            # the quantity down (which would size a fill the caller never
+            # actually asked for). SELL is never checked — its fee can
+            # only reduce a sale's proceeds, never make cash go MORE
+            # negative than before the sell (fee_pct is capped at 5% in
+            # config.py, far below 100% of any real sale's own proceeds).
+            if side == OrderSide.BUY:
+                _required_cash = fill_price * filled_qty + fee_cost
+                if _required_cash > self._portfolio.cash + 1e-9:
+                    _afford_msg = (
+                        f"dry-run BUY requires {_required_cash:.8f} {quote} "
+                        f"(notional {fill_price * filled_qty:.8f} + simulated "
+                        f"fee {fee_cost:.8f}) but only {self._portfolio.cash:.8f} "
+                        f"{quote} is available"
+                    )
+                    logger.error("ORDER REJECTED: %s", _afford_msg)
+                    order = Order(
+                        order_id      = "rejected",
+                        symbol        = self.symbol,
+                        side          = side,
+                        quantity      = quantity,
+                        price         = price,
+                        status        = OrderStatus.REJECTED,
+                        created_at    = ts,
+                        reject_reason = _afford_msg,
+                    )
+                    self._rejects.append(order)
+                    return order
 
         else:
             # A resting native stop reserves 100% of the base asset on the
@@ -4961,8 +5059,12 @@ class LiveExecutor:
                 self._portfolio._cost_basis   = 0.0
                 self._bot_opened_position     = False
 
-        # Deduct exchange fee (live only). If fee is in a non-quote currency
-        # (e.g. Kraken fee tokens), skip and log — do not silently mis-account.
+        # Deduct exchange fee — the real exchange's own reported fee for a
+        # live fill, or the simulated maker/taker fee computed above for a
+        # dry-run one (2026-09-22, tenth round). If fee is in a non-quote
+        # currency (e.g. Kraken fee tokens; never the case for a simulated
+        # fee, which is always computed in quote), skip and log — do not
+        # silently mis-account.
         if fee_cost > 0:
             if fee_currency != quote:
                 logger.warning(

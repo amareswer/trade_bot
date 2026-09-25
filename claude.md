@@ -166,9 +166,9 @@ A robust crypto trading system that:
 The detailed, dated session-by-session log (research runs, incidents, audits, ops
 changes — everything that explains *why* the current config/whitelist/rules look the
 way they do) lives in **`CLAUDE_HISTORY.md`** (split out 2026-07-25; this file was
-trimmed again 2026-09-01 and 2026-09-15 when it re-crossed 150k chars — incident
+trimmed again 2026-09-01, 2026-09-15 and 2026-09-25 when it re-crossed 150k chars — incident
 narratives and multi-pass review write-ups moved to `CLAUDE_HISTORY.md` under "CLAUDE.md
-trim, 2026-09-01" and "CLAUDE.md trim, 2026-09-15").
+trim, 2026-09-01", "CLAUDE.md trim, 2026-09-15" and "CLAUDE.md trim, 2026-09-25").
 This file holds only current, actionable state. Consult the history file for the full
 narrative behind any decision below, and `.memory/decisions/*.md` for the deepest trails.
 
@@ -176,22 +176,21 @@ narrative behind any decision below, and `.memory/decisions/*.md` for the deepes
 
 ## Test Suite Manifest
 
-**Expected total: 1051 tests** (`pytest --collect-only -q`). If the count disagrees: a file
-has an import error, was deleted, was added without a manifest bump, or was excluded from the
-runner — investigate before trusting a green suite. Suite runtime ~9–48s; minutes means a
-test is reading live `.env` config. The per-row table sum below lags the header total by ~22
-(pre-existing row-vs-total drift; `--collect-only` and this header agree). Full count-delta
-history: `CLAUDE_HISTORY.md` → "CLAUDE.md trim, 2026-09-01" → "count-delta history"; +45 for the
-2026-09-13 paper-only dynamic-universe build (964→1009), +30 for the same-day live-engine
-integration (1009→1039), +7 for the same-day second-pass review fixes (1039→1047), +4 for the
-same-day third-pass fixes (1047→1051, see "Dynamic Crypto Universe" section below).
+**Expected total: 1717 tests** (`pytest --collect-only -q`, re-counted 2026-09-25). If the count
+disagrees: a file has an import error, was deleted, was added without a manifest bump, or was
+excluded from the runner — investigate before trusting a green suite. Suite runtime ~85s; many
+minutes means a test is reading live `.env` config. **The per-row counts in the table below are
+stale** (last reconciled at 1051; the ~666 tests added since — mostly the dynamic-universe,
+accounting and ledger-observer work of 2026-09-13 → 09-24 — were not bumped row-by-row). Treat the
+table as a map of what each file covers, and `--collect-only` as the source of truth for counts.
+Count-delta history: `CLAUDE_HISTORY.md` → "CLAUDE.md trim, 2026-09-01" → "count-delta history".
 
-Run: `python -m pytest --tb=short -q` — must show **1051 passed**.
+Run: `python -m pytest --tb=short -q` — must show **1717 passed**.
 
 | File | Tests | What it covers |
 |------|-------|----------------|
 | `tests/shared/test_indicators.py` | 30 | RSI, EMA, ADX, MACD, ATR; regime-classification self-referential-ATR-baseline regression |
-| `tests/crypto/test_live_executor.py` | 70 | LiveExecutor: dry-run, market/limit orders, urgent-exit bypass, fee deduction, state save/load, min-size guard, restart recovery, native static + trailing stop-loss backstop (placement/cancel/resync/failure-alert/restart reconciliation/quantity reconciliation/untracked-order adoption/multi-stop ambiguity), `native_stop_price` property, slippage guard, maker→taker silent-fallback alert, native-stop pre-cancel-on-SELL (2026-08-27 deadlock incident), **duplicate-order guards (2026-09-11)**: submission-exception reconciliation adopts an untracked resting order instead of market-ordering on top of it, cancel-timeout retry blocked unless the post-cancel status is confirmed terminal, **clientOrderId reconciliation (2026-09-12)**: a fresh UUID per attempt lets post-exception recovery check both open AND closed orders, catching the "already fully filled" case fetch_open_orders alone can't see |
+| `tests/crypto/test_live_executor.py` | 70 | LiveExecutor: dry-run (incl. simulated maker/taker fees + affordability reject), market/limit orders, urgent-exit bypass, fees, state save/load, min-size guard, restart recovery, native static/trailing stop backstop, slippage guard, maker-fallback alert, stop pre-cancel-on-SELL, duplicate-order guards + clientOrderId reconciliation |
 | `tests/crypto/test_capital_pool.py` | 37 | CapitalPool: slot allocation, slot cap, per-symbol slot caps (`slot_caps`, `slot_cash_for()`), release, edge cases; `config._slot_caps_by_base()` env scanner; `PortfolioConfig.max_slot_cash_cad_by_base` validation |
 | `tests/crypto/test_correlation.py` | 17 | Pearson correlation, pct_returns, fetch_correlation |
 | `tests/stock/test_stock_correlation.py` | 5 | `stock_bot/risk/correlation.py`: `fetch_correlation_from_closes` — no-network wrapper reusing the crypto pearson/pct_returns |
@@ -215,7 +214,7 @@ Run: `python -m pytest --tb=short -q` — must show **1051 passed**.
 | `tests/crypto/test_orphaned_positions.py` | 5 | Startup orphan check: open position outside this run's symbol list alerts |
 | `tests/crypto/test_universe.py` | 4 | Universe screener: scoring, momentum filter, fallback |
 | `tests/crypto/test_main_strategy.py` | 2 | Strategy builder: full config wiring, incl. **`atr_volatile_multiplier` (2026-09-14)** — live `build_strategy()` was omitting it entirely, silently trading `IndicatorConfig`'s hardcoded 1.5 default regardless of `ATR_VOLATILE_MULTIPLIER` in `.env`, while the backtest config builder already passed it correctly |
-| `tests/crypto/test_backtest_engine_execution_model.py` | 3 | `bot/backtest/engine.run()` direct execution-model tests (2026-09-14/15) — the first unit tests of `run()` itself, not just its config-builder wiring or `metrics.compute()`: **threshold-mode BUY crash** (the fill-snapshot block accessed `strategy.last_atr`/`._closes`/`.config.*_ema_period`, all indicator-only attributes, unconditionally — `ThresholdStrategy` has none of them), **gap-through stop-loss fills** (a candle whose open already gapped past the stop level filled at the stale theoretical level instead of the realistic open price — mirrors the already-tested `min(open, sl_price)` pattern in `stock_bot/backtest/engine.py`), and **trailing-stop same-candle activate-then-trigger (2026-09-15)** — a candle that activates or raises the trail using its own high could not also be stopped out by that same candle's low (the trail wasn't resting yet at the candle's open); the check now uses the peak as of before the candle's own update, deferring the exit to the next candle |
+| `tests/crypto/test_backtest_engine_execution_model.py` | 3 | `bot/backtest/engine.run()` execution model: threshold-mode BUY crash, gap-through SL fills at the open, trailing stop can't activate-and-trigger on the same candle |
 | `tests/stock/test_fast_validator_exits.py` | 6 | FastValidator exits: MAX_HOLD live-price fallback, corruption guard, SL regression |
 | `tests/stock/test_paper_report.py` | 10 | Expectancy math: IBKR commission model, net-of-cost flip, merged paper+IBKR book, IBKR account section, live-cash-snapshot precedence (row parsing is now `_row_to_trade`, tested separately) |
 | `tests/stock/test_exit_policy.py` | 11 | Stock asymmetric exit bars: single-verdict exit, 2-strike SELL streak, streak resets, AC.TO incident regression |
@@ -223,7 +222,7 @@ Run: `python -m pytest --tb=short -q` — must show **1051 passed**.
 | `tests/stock/test_stock_rules.py` | 5 | Rule signals: live==backtest replay parity, drop_last, determinism, validated-parameter pin |
 | `tests/crypto/test_audit_scheduler.py` | 14 | REAL `_audit_due()` — daily catch-up, once-per-day, Mon-anchored weekly, monthly 1st-anchored re-screen, missed-run catch-up |
 | `tests/crypto/test_limit_chase_recovery.py` | 6 | 2026-07-15 unrecorded-fill regression: market-fallback polling, actual-type amount inference, cancel-race double-fill guard |
-| `tests/stock/test_ibkr_executor.py` | 90 | IBKRExecutor (hermetic FakeIB): live-port/paper-account guards, contract mapping, broker-price fills, timeout rejection, cancel-race fill recording, realized-PnL persistence, try_reconnect probe, FX/margin-minimum guard (**checks NET-LIQ, not free cash** — 2026-08-31 fix), sector-concentration gate, weekly/drawdown-halt/kill-switch tiers, per-position ATR stop-pct override, projected-exposure check, LiveTradingGate enforcement (incl. Gate 2 SKIPPED-when-AI-disabled bypass, 2026-09-10), TWS-query resilience (last-good cache, incl. **disconnected-but-no-exception preserves cache** — 2026-09-11 fix), `ibkr_trades.csv` write buffer/retry, Error 10349 slow-resubmit fill (20s grace + `tif="DAY"`), daily-loss calendar-day anchoring, **partial-fill tracking to completion or confirmed cancel** (2026-09-12 fix), **concurrent-sell serialization** (2026-09-12 fix, overlap-counter proof), **native broker-side protective stop** (2026-09-12: place/no-op/replace/adopt-on-restart, cancel-before-sell, broker-triggered-fill detection, multi-stop ambiguity — hardened across three further review passes: ambiguous-lookup sentinel distinct from "confirmed none", cost basis captured once before any cancel/place operation rather than re-queried afterward, `_cancel_trade_and_wait` returns a tri-state cancelled/filled/unconfirmed outcome — and a still-active PARTIAL fill is `"unconfirmed"`, not `"filled"`, so it can't be recorded twice across sync calls — shared `_record_native_stop_fill` helper, `sync_protective_stop`/`sell()` share one reentrant per-symbol lock), **currency-aware cash check** (2026-09-12 fix: USD-stock affordability now converted to CAD before comparing against CAD cash) |
+| `tests/stock/test_ibkr_executor.py` | 90 | IBKRExecutor (hermetic FakeIB): live-port/paper guards, contract mapping, fills, timeouts, cancel-race, realized PnL, reconnect, FX/NET-LIQ margin guard, sector gate, breaker tiers, ATR stop override, LiveTradingGate enforcement, last-good cache (incl. disconnected-no-exception), CSV retry buffer, Error 10349 grace, partial-fill tracking, concurrent-sell lock, native protective stop (place/replace/adopt/cancel-before-sell/fill detection/ambiguity/tri-state cancel), currency-aware cash check |
 | `tests/stock/test_concurrent_sell.py` | 1 | `StockPaperExecutor` concurrent-sell regression (2026-09-12): two threads racing a full-position sell — proves both the overlap invariant (per-symbol lock) and the actual business outcome (one FILLED, one REJECTED, never both filling the same shares) |
 | `tests/stock/test_intraday_price_guard.py` | 5 | `get_live_price()`'s previous-close corruption guard (2026-09-12): a genuine crash confirmed by today's own day_high/day_low is no longer discarded; a corrupted read outside that range still is; day-range lookup failure fails toward the conservative reject |
 | `tests/stock/test_paper_executor_fill_price.py` | 2 | `StockPaperExecutor.buy()`/`sell()` regression (2026-09-12): `order.price`/`quantity`/`total_value` now reflect the actual slippage-adjusted fill, not the pre-slippage requested price — IBKRExecutor already did this correctly, paper.py did not |
@@ -279,7 +278,7 @@ Run: `python -m pytest --tb=short -q` — must show **1051 passed**.
 | `tests/crypto/test_dynamic_lifecycle.py` | 12 | `DynamicSymbolManager`: admit/warmup wiring, idempotent re-admit, manifest persistence, retire-if-flat vs. keep-if-holding, `sync_to_candidates` retires only flat+dropped symbols, restart recovery from manifest + defensive orphaned-open-position state-file scan |
 | `tests/crypto/test_dynamic_ranking.py` | 4 | `rank_buy_signals`: ADX-descending, volume tiebreak, missing-ADX sorts-last-not-dropped, empty list |
 | `tests/crypto/test_dynamic_paper_isolation.py` | 5 | Source guards on the retired `dynamic_universe_bot.py` paper runner: `dry_run=True` hardcoded (not config-derived), no `logs/HALT` reference in code, no live `live_state_BTC`/`live_state_SOL` reference, isolated state directory, empty API credentials |
-| `tests/crypto/test_dynamic_live_integration.py` | 41 | **LIVE-engine dynamic-universe integration (2026-09-13, +7 second-pass +4 third-pass, same day)** — behavioral tests against real `TradingStateMachine`/`PositionManager`/`CapitalPool` + fake executors/risk (no network, no Telegram, no production state): `_admit_dynamic_symbol` (success, warmup failure, restart-recovery-with-position seeding incl. capital-pool re-allocation), `_retire_dynamic_symbol_if_eligible` (flat/holding/resting-stop), `_sync_dynamic_universe` (admit/skip-present/retire-dropped/never-retire-fixed-roster/never-retire-while-holding/one-bad-admission-doesn't-block-others/discovery-failure-safety), `_execute_approved_signal` (BUY fill state+fees, full-close SELL, partial SELL, rejected order, min-order rejection, executor exception, qty=0 guard), `_execute_ranked_dynamic_buys` (ADX-ranked contested slot, fresh per-candidate risk re-check, HALT-equivalent blocks everyone), completed-candle dedup, fixed-mode-untouched guards, `_compute_account_value` no-inflation-on-admission (Critical #1), `_dynamic_mode_active` requires `LIVE_TRADING` (Critical #2), correlation recheck blocks a correlated pair mid-batch (High #4), an ambiguous `None` order conservatively reserves its capital slot (High #5), an unsupported quote currency disables dynamic mode (High #6), **discovery runs after position management not before (third-pass)**, **ranked execution uses/tolerates/falls-back-on a refreshed price (third-pass)** |
+| `tests/crypto/test_dynamic_live_integration.py` | 41 | Live-engine dynamic-universe integration: admission/retirement/sync, `_execute_approved_signal`, ranked BUYs, equity conservation on restart (live fold + paper replay), replay trust/NaN guards, eligibility gate, shadow isolation, dry-run fee lifecycle, construction-site wiring — see "Review passes 4–15" |
 
 ---
 
@@ -374,29 +373,13 @@ that base over the shared `TAKE_PROFIT_PCT` / `TRAILING_STOP_PCT` / `TRAILING_ST
 - Research: `strategy_exit_sweep.py` + `logs/strategy_exit_sweep_20260902.md`,
   `CLAUDE_HISTORY.md` "Crypto exit-logic research — 2026-09-02".
 
-### Limit-chase duplicate-order guards (crypto — fixed 2026-09-11)
-Code review found two real gaps in `_place_limit_order()` (`bot/execution/live_executor.py`)
-where an ambiguous exchange response could lead to a duplicate live order:
-1. **Submission exception → blind market fallback.** An exception raised by `create_order()`
-   means the *response* was lost (network timeout, connection drop) — it does NOT mean Kraken
-   never received the *request*. The old code fell straight to a market order regardless,
-   risking a double fill if the original limit order had actually gone through. Fixed:
-   `_find_untracked_entry_order()` checks `fetch_open_orders()` for a matching resting order
-   first (same "adopt, don't duplicate" pattern as `_adopt_untracked_stop()`) — if found, it's
-   adopted and polled like a normal placement; only a genuinely empty result falls back to
-   market, same as before.
-2. **Cancel-timeout retry with no terminal-status check.** After a chase timeout, the old code
-   cancelled the order, then only checked whether it had *filled* before allowing a retry — it
-   never checked whether the cancel actually reached a terminal state. An order still reading
-   back `status="open"` (cancel silently ignored, or eventual consistency) let the loop place a
-   **second** live order on top of the still-resting first one. Verified via a regression test
-   run against the pre-fix code: this **placed 5 separate live orders** in one chase (one per
-   retry attempt, `max_retries=3` → 4 total attempts + retries). Fixed: `_CANCELLED_TERMINAL_
-   STATUSES` (`canceled`/`cancelled`/`closed`/`expired`/`rejected`) gates the retry — anything
-   else aborts the chase without re-placing, identical to the existing "unverifiable state"
-   branch.
-+3 tests (each verified to fail against the pre-fix code, reproducing a real duplicate-order
-scenario), suite 911→914. Execution-layer only — no `bot/strategy/` change, fingerprint unaffected.
+### Limit-chase duplicate-order guards (crypto — fixed 2026-09-11/12)
+`_place_limit_order()` (`bot/execution/live_executor.py`): (1) a `create_order()` exception no
+longer blind-falls-back to market — `_find_untracked_entry_order()` adopts a resting order first,
+and a fresh `clientOrderId` per attempt lets recovery check open AND closed orders; (2) a
+chase-timeout retry is only allowed once the cancel reads back a status in
+`_CANCELLED_TERMINAL_STATUSES`, otherwise the chase aborts (pre-fix code placed 5 live orders in
+one chase in a regression test). Full detail: `CLAUDE_HISTORY.md` → "CLAUDE.md trim, 2026-09-25".
 
 ### Native exchange-side stop-loss (crypto — ON since 2026-08-15)
 `NATIVE_STOP_LOSS_ENABLED=true` (config.py default false). `sync_protective_stop()` rests a
@@ -472,35 +455,11 @@ the day's actual range and is still rejected. Fails toward the old conservative 
 wiring tests, 5 price-guard tests), suite 918→935. Both require a stock bot restart.
 
 ### Currency-aware cash check + accurate fill reporting (stock bot — fixed 2026-09-12)
-Two Medium findings from the same code review, same day.
-
-**Currency mismatch in the BUY affordability check:** `IBKRExecutor.buy()` compared
-`shares × price` (the security's OWN currency) directly against `self.cash` (always
-base-currency CAD) — for a USD stock this understated the real CAD cost needed by the
-USD/CAD rate (~1.35-1.40×), so a BUY could pass the cash check yet still be unaffordable in
-CAD terms. `_price_in_cad()` already existed and is used everywhere else this comparison
-matters (`total_value()`) — this was the one spot still comparing mismatched currencies
-directly. Fixed: `est_cost = shares * self._price_in_cad(sym, price)`. +3 tests (USD-short
-rejects, USD-sufficient-after-FX passes, CAD-quoted unaffected by the rate).
-
-**Fill notifications reported the request, not the fill:** `stock_bot/main.py`'s BUY/SELL
-notifier/print/log calls (all three call sites — the main scan loop's BUY, its SELL, and the
-SL/TP watcher's own SELL) used the pre-order signal price and requested share count, not
-`order.price`/`order.quantity` — so a partial fill or slippage between the signal price and
-the real fill made the Telegram alert, console output, and P&L math disagree with what
-actually happened. Root cause ran deeper than main.py: `StockPaperExecutor.buy()`/`sell()`
-set `order.status = FILLED` but never updated `order.price`/`order.quantity`/`order.total_value`
-away from the values passed into `_new_order()` at construction — `IBKRExecutor` already did
-this correctly (`order.quantity = filled_qty; order.price = fill_px`), `paper.py` did not, so
-patching only main.py would have "fixed" IBKR while leaving paper trading subtly wrong in a
-different way (its own slippage model — `_fill_price()`, `_slippage_bps` — was already being
-silently discarded from the returned order). Fixed at the source in both executors (mirroring
-IBKR's existing three-line pattern: quantity, price, and `total_value` recomputed together —
-the dataclass computes `total_value` once in `__post_init__`, so it goes stale too if only
-`price` is updated), then all three `main.py` call sites read `order.quantity`/`order.price`/
-`order.total_value` instead of the request. +2 tests proving the paper-executor fix directly
-(non-zero slippage bps, confirmed to fail against the pre-fix code: old code returned the
-exact pre-slippage request). Suite 935→940. Requires a stock bot restart.
+- `IBKRExecutor.buy()` affordability now uses `shares * self._price_in_cad(sym, price)` (was
+  comparing USD cost against CAD cash).
+- Both executors now set `order.price`/`quantity`/`total_value` to the actual fill (paper.py
+  previously discarded its own slippage); all three `stock_bot/main.py` notifier call sites read
+  `order.*`, not the request. Full detail: `CLAUDE_HISTORY.md` → "CLAUDE.md trim, 2026-09-25".
 
 ### Review passes 2 through 7 (2026-09-12 → 2026-09-15) — native-stop, fee-accounting, kill-switch
 Five more same-week review passes after the initial 2026-09-12 fixes above, each checking the
@@ -752,72 +711,21 @@ every fill, best-effort. `settlement_date` is T+1 skipping weekends only (no hol
 calendar). `fx_rate_at_trade` is `1.0` for CAD symbols, live USD/CAD otherwise. Data capture
 only — no ACB/gain computation, no CRA report (descoped 2026-08-05; still paper trading).
 
-### IBKR executor readiness hardening (stock bot — 2026-08-27, gap closed 2026-09-11)
-`IBKRExecutor._account_value()` / `positions_snapshot()` cache last-good and serve it on a
-transient TWS failure (was a fabricated `0.0`/`{}` → every BUY rejected / SL/TP watcher
-blind). `_note_sync(ok)` flips `executor.sync_healthy` on the edge → edge-triggered
-`ops_alert`. `_record_trade()` CSV append buffers a failed row (`_unwritten_csv_rows`) and
-retries on the next fill; `executor.csv_write_healthy` False while buffered. Order-timeout
-path left as-is (already alerts + the cancel-race grace window records a beating fill).
+### IBKR executor readiness hardening (stock bot — 2026-08-27, gaps closed 2026-09-11/12)
+- `_account_value()`/`positions_snapshot()` serve a last-good cache on transient TWS failure; they
+  also check `self._ib.isConnected()` and raise if not, since ib_async returns empty lists
+  *without raising* on a dead connection (2026-09-11 live incident: ~26 min of `cash=$0.00`).
+- `_note_sync(ok)` → `executor.sync_healthy` edge alert; failed `ibkr_trades.csv` appends buffer
+  in `_unwritten_csv_rows` and retry (`csv_write_healthy`).
+- `_place_market_async()` waits for `trade.isDone()` or the deadline, not the first partial fill;
+  a timed-out live remainder is cancelled and its fate awaited. The Error-10349 resubmit grace
+  window intentionally keeps "any fill resolves it". Full detail: `CLAUDE_HISTORY.md` → "CLAUDE.md trim, 2026-09-25".
 
-**Live gap found + fixed 2026-09-11:** the last-good cache above only guarded a *raised*
-exception. `accountValues()`/`positions()` are local reads of ib_async's own cache, not
-network calls — on a stale/disconnected client they return an empty list *without raising*
-(ib_async clears its local cache on disconnect), which sailed past the `try` as a "successful"
-read and **overwrote the good cache with the empty one**. Live incident: TWS was quit
-(testing IB Gateway/IBC, see below) and relaunched; the running bot's own executor reported
-`cash=$0.00` / 0 positions for ~26 minutes across the reconnect gap despite this exact cache
-existing to prevent that — self-healed the moment the periodic reconnect succeeded, no fills
-missed, but the SL/TP watcher was genuinely blind to all 5 real positions for that window.
-Fixed: both methods now check `self._ib.isConnected()` inside the same async call and raise
-if not, routing a stale-but-non-raising connection through the identical cache-preserving
-path as a thrown exception. +2 tests (each verified to fail against the pre-fix code), suite
-909→911. Requires a stock bot restart to take effect — running process still has the old code.
-
-**Second gap found + fixed 2026-09-12 (code review):** `_place_market_async()`'s wait loop
-exited the instant ANY fill appeared — even a partial one — while the order kept working the
-unfilled remainder on the broker. `_execute()` logged "IBKR PARTIAL FILL" and returned that
-partial quantity as if the trade were complete: no cancellation of the remainder, no
-continued tracking, so a later fill on the same order was never recorded anywhere (a real
-accounting gap between `ibkr_trades.csv` and the broker's actual position). Fixed: the loop
-now only exits on a genuine terminal state (`trade.isDone()`) or the fill deadline, regardless
-of partial-fill amount; a timeout with the order still live — whole or partially filled —
-cancels the remainder and waits for its actual fate, same conservative philosophy as the
-crypto bot's cancel-race handling. The Error-10349 flicker/resubmit grace window (RY/BNS
-incidents) intentionally keeps its original "any fill resolves it" exit — it's narrowly
-watching for a known resubmit-then-fill pattern, not a normal working order, and reusing
-`isDone()` there would trip on the flicker's own leftover 'Cancelled' status before the
-resubmit ever resolved (caught by a regression during this fix — `test_flicker_cancel_
-then_fill_is_recorded` failed until the scoping was corrected). +2 tests (each verified to
-fail against the pre-fix code — old behavior recorded 2 of 4 shares and never called
-`cancelOrder` on the stalled remainder), suite 914→916. Requires a stock bot restart.
-
-### Concurrent-sell race across both stock executors (fixed 2026-09-12, code review)
-The background SL/TP watcher (`stock_bot/main.py:_check_open_positions_sl_tp`, its own thread,
-~30s poll) and the main strategy scan loop can both decide to exit the same symbol at nearly
-the same moment. Neither `StockPaperExecutor.sell()` nor `IBKRExecutor.sell()` had a lock
-around the full read-position → validate → submit-order → update-state sequence — `IBKRExecutor
-._state_lock` only ever protected the realized-P&L increment, a few lines *after* the
-unprotected position check and broker order. Two near-simultaneous exits could both read the
-same held-shares figure, both pass the "enough shares to sell" check, and both submit a sell,
-overselling the real position.
-
-Fixed with a shared `_position_lock(symbol)` helper on `StockExecutorBase` (per-symbol, lazily
-created via `dict.setdefault` — atomic under the GIL, no subclass `__init__` change needed, and
-unrelated symbols never serialize against each other). Both `sell()` implementations now wrap
-their entire body in it; `IBKRExecutor`'s holds the lock across the real broker round-trip in
-`_execute()` on purpose — a second sell on the same symbol must wait for the first to actually
-resolve, not just queue behind an in-memory increment. `buy()` was left unchanged — only one
-code path (the main scan loop) ever calls it, so it has no concurrent-caller risk today.
-
-Verified deterministically, not by timing luck: both new tests wrap the first read inside the
-critical section with an artificial delay and an overlap counter, then run two real threads —
-proving directly that the second call never enters the critical section while the first is
-still inside it (confirmed to fail against the pre-fix code on both executors, overlap counter
-hit 2). The `StockPaperExecutor` test additionally confirms the actual business outcome (one
-FILLED closing the position, one REJECTED, never both filling the same shares) since its
-fully in-memory book — unlike the hermetic IBKR test's static fake position list — genuinely
-updates after a fill. +2 tests, suite 916→918. Requires a stock bot restart.
+### Concurrent-sell race across both stock executors (fixed 2026-09-12)
+The SL/TP watcher thread and the main scan loop could both sell the same shares. Fixed with a
+per-symbol `StockExecutorBase._position_lock(symbol)` (RLock, `dict.setdefault`) wrapping the
+whole `sell()` body in both executors — IBKR's holds it across the broker round-trip. `buy()`
+unchanged (single caller). Verified with overlap-counter thread tests. Full detail: `CLAUDE_HISTORY.md` → "CLAUDE.md trim, 2026-09-25".
 
 ### LiveTradingGate — stock bot IBKR readiness check (repaired + code-enforced 2026-08-20)
 `stock_bot/analysis/accuracy_tracker.py`. `IBKRExecutor.__init__()` on a live port with
@@ -1493,48 +1401,13 @@ docstring (not deleted — its recorded logs/state/backtest report are left in p
 removed, since it's still safe to read/run for inspection (dry_run stays hardcoded) — it just
 proves nothing about performance.
 
-### Tests — 30 new integration tests + updates, suite 1009→1039 (+7 more from the same-day
-second-pass review below, 1039→1047, then +4 from the third-pass review, 1047→1051; 87
-dynamic-universe tests total)
-`tests/crypto/test_dynamic_live_integration.py` (30, new) — all against REAL
-`TradingStateMachine`/`PositionManager`/`CapitalPool` instances (pure, already-tested classes,
-used unmocked) plus hand-built fake executors/risk objects (no ccxt, no network, no Telegram,
-no production file writes):
-- admission success, warmup failure (returns error, never raises), restart-recovery-with-
-  existing-position seeding (pm/sm/capital-pool all correctly seeded)
-- retirement: flat→retired, holding-position→kept, resting-native-stop→kept even if flat
-- `_sync_dynamic_universe`: admits new/skips already-present/retires flat-dropped/never retires
-  the fixed roster/never retires a symbol holding a position even once ineligible/one bad
-  admission doesn't block another's/a raised discovery failure doesn't corrupt existing state
-- `_execute_approved_signal`: BUY fill (state transitions + fees asserted), full-close SELL
-  (capital released, native stop cleared), partial SELL (position retained, stop resynced,
-  slot NOT released), rejected order (alerted, no state mutation), an order-minimum rejection
-  (proves the existing `LiveExecutor` min-size guard's rejection is handled like any other),
-  an executor exception (caught, alerted, returns None), a FILLED-qty-0 guard
-- `_execute_ranked_dynamic_buys`: higher-ADX-ranked candidate wins a single contested slot,
-  the second candidate's risk approval is re-evaluated FRESH (not a stale snapshot) and can be
-  independently rejected, a HALT-equivalent risk rejection blocks EVERY candidate (none execute)
-- completed-candle dedup after dynamic admission (the seeded `last_ts_ms` is honored)
-- fixed-mode: `DynamicUniverseConfig().enabled` defaults `False`; every new `run()` addition is
-  gated behind `cfg.dynamic.enabled`; fixed-mode BUYs take the immediate-execute branch, never
-  the deferred-queue one
-- two supplementary SOURCE guards (explicitly not the sole proof for anything — every claim
-  above has a companion behavioral test) for the two spots irreducibly inline in the ~1800-line
-  `run()` loop: the fixed-roster restart-recovery `capital_pool.allocate()` call, and the
-  dynamic-vs-fixed gating structure itself.
-Plus 1 existing test updated (`test_health_digest.py::test_wired_into_run_loop` — the
-`stuck_detector.record()` call it checked for moved into `_execute_approved_signal`; the test
-now checks both ends of that wiring instead of the old inline text). Full suite: 1039 passed,
-0 failed — includes every prior crypto/stock test, unmodified except that one.
-
-**Not attempted, honestly**: a fully wired, real-network smoke test of `bot/main.py run()` with
-`DYNAMIC_UNIVERSE_ENABLED=true` was deliberately NOT run against the real Kraken account —
-`run()` is the SAME entry point as the actual live/paused bot process, using the same API keys
-and the same `logs/live_state_BTC_CAD.json`/`logs/live_state_SOL_CAD.json`; running a second
-instance concurrently with the real running bot risks a file-write race and duplicate
-authenticated API activity regardless of HALT. Verification instead relied entirely on the
-hermetic tests above plus source guards — exactly what point 7 of the request asked for
-("verify without real orders... mocked exchange responses and controlled signals").
+### Tests
+`tests/crypto/test_dynamic_live_integration.py` — behavioral tests against real
+`TradingStateMachine`/`PositionManager`/`CapitalPool` + fake executors/risk (no network, no
+Telegram, no production writes), plus a few source guards for the parts irreducibly inline in
+`run()`. Per-test inventory: see the manifest row above and `CLAUDE_HISTORY.md` → "CLAUDE.md trim, 2026-09-25". **No real-network smoke test
+of `run()` with dynamic mode on** — deliberately not run, since `run()` is the same entry point
+as the live bot and shares its keys/state files.
 
 ### Evaluation (`dynamic_universe_backtest.py`) — result: does NOT support expanding today
 **Still describes independent single-symbol backtests only — it does NOT evaluate the dynamic
@@ -1658,8 +1531,200 @@ immediately before execution, skipping the candidate if it's moved beyond `MAX_S
 since gather time. +11 tests (suite 1040→1051). Full bug table + reproduction detail:
 `CLAUDE_HISTORY.md` → "CLAUDE.md trim, 2026-09-15".
 
+### Review passes 4–15 (2026-09-22 → 2026-09-24) — current-state summary
+Full pass-by-pass write-ups (reproductions, numbers, test lists): `CLAUDE_HISTORY.md` → "CLAUDE.md trim, 2026-09-25". **Ten consecutive
+same-day passes each found a real gap in the previous pass's own fix — treat any single-pass
+fix in this subsystem as provisional until a pass finds nothing.** Current state:
+- **Restart equity, live mode:** `_admit_dynamic_symbol`'s recovery branch folds only
+  `position × avg_entry` into `total_capital` (the fresh exchange balance already includes the
+  symbol's cash), matching `_initialize_capital_pool`'s fixed-roster rule. This path runs for
+  orphan recovery **regardless of `cfg.dynamic.enabled`** whenever `live_trading` is on.
+- **Restart equity, paper/dry-run mode:** account-level `_replay_paper_realized_pnl(state_dir)`
+  sums `realized_pnl - fees_paid` over EVERY `live_state_*.json` (roster, open, flat, retired);
+  `pool_total = starting_cash + sum`. The per-symbol paper bump was removed (would double-count).
+  Flat symbols still get `slot_cash_for()` from the corrected total (shared-pool design).
+- **Replay trust:** returns `(total, ok)`; `ok=False` on unreadable/non-dict/missing-field/
+  non-numeric/non-finite files → `paper_accounting_ok=False`, fresh slots not funded, alert, and
+  gate "7a1" blocks all new BUYs (`BlockReason.PAPER_ACCOUNTING_INCOMPLETE`). `CapitalPool`
+  rejects non-finite totals; `release()` validates before mutating (a rejected call changes nothing).
+- **BUY eligibility in dynamic mode:** gate "7a2" `_dynamic_buy_eligible()` blocks a new BUY on
+  ANY symbol (fixed roster too) unless the latest discovery (`_dynamic_last_screen`) is fresh
+  (≤ 2 × `DYNAMIC_REFRESH_HOURS`) and lists it eligible (`BlockReason.DYNAMIC_INELIGIBLE`). Exits unaffected.
+- **Dry-run fee simulation:** `SIMULATED_MAKER_FEE_PCT`/`SIMULATED_TAKER_FEE_PCT` (0.40%/0.80%)
+  flow through the normal `fee_cost` path; `SIMULATE_MAKER_FILLS=false` default → every dry-run
+  fill pays taker. Unaffordable dry-run BUYs (notional + fee > cash) are REJECTED. `LiveExecutor`'s
+  own constructor defaults the rates to 0.0 (old behavior for direct construction). All 4
+  production construction sites pass all three settings (tested via the real `_make_dynamic_executor`).
+- **Shadow isolation:** `_compute_shadow_mode()` = `live_trading and not paper_mode and dry_run`.
+  State, dashboard, `risk_state.json`, `trades.db` AND `_HALT_FLAG_PATH` all route via
+  `_STATE_LOG_DIR` → a shadow run uses `logs/shadow/HALT`, independent of the real `logs/HALT`.
+  `PAPER_MODE=true` is NOT isolated — never use it for the shadow run.
+- **Shadow Telegram control:** `_resolve_telegram_control_credentials()` refuses the two-way
+  poller in shadow mode unless `SHADOW_TELEGRAM_CONTROL_BOT_TOKEN`/`_CHAT_ID` are both set AND the
+  (whitespace-normalized) token differs from `TELEGRAM_BOT_TOKEN` — one token = one poller.
+- **Multi-coin one-bankroll lifecycle test** (discover → rank → allocate → execute → restart →
+  exit, three coins, exact equity conservation) is the regression net for all of the above.
+
+### Bounded paper/shadow acceptance criteria (set 2026-09-22/23 — corrected multiple times by the fifth through ninth review passes; criterion 1's fee caveat closed by the tenth pass, corrected by the eleventh, wiring gap closed by the twelfth; replaces the vague pointer that used to sit here as "Activation step 6")
+Mirrors the discipline already applied to the BTC/SOL profitability question in the 2026-09-12
+review-deadline decision: a fixed bar and a fixed date, decided now, so this doesn't get
+deferred indefinitely every time a review pass finds one more thing to fix (fifteen passes have,
+so far — including several that found the acceptance criteria's OWN text, or the prior pass's
+OWN fix, were themselves wrong). This does NOT authorize activation by itself — it defines what
+evidence WOULD have to exist before activation is even a live question.
+
+**Before `DYNAMIC_UNIVERSE_ENABLED` is ever set true in the live `.env` with real capital, ALL
+of the following must hold:**
+1. **A genuine forward paper/shadow run, not a backtest substitute, on an ACTUALLY runnable AND
+   storage-isolated configuration.** This section originally named `LIVE_TRADING=false` as the
+   harness — WRONG (third round, P2): `_dynamic_mode_active` requires `live_trading=True`, so
+   that combo never runs any dynamic-universe code at all. It was then corrected to name
+   `PAPER_MODE=true` as an interchangeable alternative to `DRY_RUN=true` — ALSO WRONG (sixth
+   round, P1): `bot/main.py`'s own shadow-mode isolation (`_compute_shadow_mode`) is
+   `live_trading and not paper_mode and dry_run` — `paper_mode` is deliberately EXCLUDED, so a
+   `PAPER_MODE=true` run's executors/`risk_state.json`/`trades.db` would resolve to the ordinary
+   PRODUCTION `logs/` directory, at real risk of colliding with (or overwriting) genuine
+   production state. **The only supported, storage-isolated combination is `LIVE_TRADING=true`
+   WITH `DRY_RUN=true` AND `PAPER_MODE=false`.** Never launch `PAPER_MODE=true` for this purpose,
+   "wired or not." `_make_dynamic_executor` builds every dynamic-universe executor with
+   `dry_run=cfg.paper.paper_mode or cfg.exchange.dry_run`, and `LiveExecutor.execute()`'s own
+   dry_run branch simulates every fill locally, never calling `create_order`/`cancel_order`/
+   `fetch_balance`. Both the pipeline AND the storage isolation are proven end-to-end (not just
+   asserted in prose), in `tests/crypto/test_dynamic_live_integration.py`:
+   `test_paper_shadow_harness_exercises_full_pipeline_with_zero_real_orders` (discover → filter →
+   rank → allocate → execute → restart-recover, then asserting the mocked exchange's
+   `create_order`/`cancel_order`/`fetch_balance` were never called) and the `_compute_shadow_mode`
+   tests (proving `PAPER_MODE=true` genuinely resolves outside the isolated directory, not just
+   claiming it). Run continuously for at least **60 calendar days**, observing real discovery/
+   admission/retirement/ranking behavior against live market data with zero simulated capital
+   risk.
+   **Fee caveat — closed by the tenth pass (2026-09-22/23), corrected by the eleventh (same day),
+   still not independently reviewed beyond that:** `LiveExecutor`'s dry_run fills used to always
+   use `fee_cost=0.0`, making criterion 3 (net-of-fee PF) unmeasurable from this harness. Fixed:
+   `simulated_maker_fee_pct`/`simulated_taker_fee_pct` (new `ExchangeConfig` fields, defaulting to
+   Kraken's documented real 0.40%/0.80%) now compute a fee on every dry-run fill, flowing through
+   the same `fee_cost`/`trade_log.log_fill()` path a real fill already uses. The eleventh pass
+   then found and fixed two real gaps in that same-day code: a BUY could be filled without
+   checking it could actually afford the notional plus the fee (now rejected, not silently
+   overspent); and every non-urgent limit BUY was assumed to guarantee a maker fill (now gated
+   behind `simulate_maker_fills`, defaulting **False** — every fill pays the conservative taker
+   rate unless explicitly opted into the more optimistic assumption). Verified with a full
+   shared-bankroll lifecycle test (BUY → partial SELL → restart → full exit, two coins, exact
+   conservation with fees included at every stage, using the conservative default) — see
+   "Eleventh pass" above for detail. `PaperExecutor` (the classic single-symbol paper mode,
+   unrelated to the dynamic-universe harness) still models no fees at all — irrelevant to this
+   harness, since `_make_dynamic_executor` never constructs one. A twelfth pass then found
+   `simulate_maker_fills` itself was never wired to any of the 4 production construction sites
+   (parsed by config, zero effect when set) — fixed, with a construction-level test that calls
+   the real `_make_dynamic_executor` rather than a monkeypatched stand-in, since that's the only
+   way this class of bug can be caught at all. **This is now SEVEN consecutive same-day passes
+   where a real, previously-uncaught gap was found in the immediately-prior pass's own work in
+   this subsystem — none of the tenth/eleventh/twelfth passes has itself been independently
+   reviewed. Do not assume this is finally the last one.**
+2. **At least 15 completed round-trips across the DYNAMICALLY-ADMITTED symbols combined** (not
+   the fixed roster) during that window — the same sample-size floor already used for BTC/CAD's
+   and SOL/CAD's own capital-tier gates, applied here to a NEW population of symbols rather than
+   assumed to transfer from BTC/SOL's track record.
+3. **Net-of-fee PF ≥ 1.2 on those round-trips**, using the SAME fee-accounting fix already
+   applied fleet-wide (see "⚠️ PF/win-rate are NET of fees" above) — no gross-PF shortcut. The
+   harness's own fills now carry a conservative simulated fee (criterion 1's caveat, closed by
+   the tenth pass, corrected by the eleventh) rather than zero, so this number is at least
+   MEASURABLE now — still needs the fee-simulation code (both passes) to survive independent
+   review before trusting it as accurate, not just present.
+4. **A genuine multi-symbol, shared-capital, chronological portfolio replay** — not the
+   independent single-symbol backtests `dynamic_universe_backtest.py` already produces (that
+   tool answers "does ANY candidate coin have edge in isolation," not "does the ranking +
+   shared-slot-contention process itself perform," and was never built to). This is a real,
+   currently-missing piece of tooling — building it is itself a prerequisite, not optional.
+5. **The independent, already-answered profitability question for BTC/USDT and SOL/USDT (the
+   2026-09-12 review-deadline decision) must ALSO have been resolved by then** — dynamic-universe
+   activation is not a way to route around that gate; if the FIXED roster's strategy itself
+   hasn't cleared its own bar by the time this section's criteria are otherwise met, dynamic mode
+   stays off regardless.
+6. **Decide the position-limit tradeoff and tune `DYNAMIC_*` thresholds** (Activation steps 1-2
+   below) explicitly, in writing, before the paper run starts — not adjusted mid-run to chase a
+   result.
+
+**Review date: 2027-03-12** (same date as the 2026-09-12 review-deadline decision, so both
+questions get judged together rather than on staggered clocks). If the 60-day paper run hasn't
+even STARTED by some meaningfully earlier point, that's its own signal this isn't a current
+priority — no obligation to rush it just because a deadline exists.
+
+**Failure handling:** if the paper run's own criteria (2-4 above) aren't met by the review date,
+dynamic-universe mode is retired (code and tests may stay, matching the "leave it, don't delete"
+convention elsewhere in this file) rather than re-extended on request, mirroring the exact
+"retire, don't keep patching" rule the 2026-09-12 decision already set for the fixed roster.
+
+### Shadow-acceptance run — recorded configuration, launch command, and pass/fail checklist (prepared 2026-09-23/24, NOT started)
+Written so that whenever a human actually decides to start the 60-day clock, there's one
+concrete reference — not a re-derivation from scattered prose — for exactly what to set, how to
+launch it, and exactly how the result will be judged. **Writing this down does not start the
+clock.** Starting it is a separate, deliberate action a human takes.
+
+**Launch command — explicit, no separate `.env` file needed:** `config.py` calls plain
+`load_dotenv()` (no path argument), which reads the working directory's existing `.env` but —
+critically — **never overrides a variable already present in the process environment.** Exporting
+the shadow-specific keys inline on the command itself therefore reliably wins over whatever the
+ambient `.env` says for those SAME keys, with zero risk of editing (or forgetting to revert) a
+second file:
+```bash
+LIVE_TRADING=true \
+DRY_RUN=true \
+PAPER_MODE=false \
+DYNAMIC_UNIVERSE_ENABLED=true \
+SIMULATED_MAKER_FEE_PCT=0.0040 \
+SIMULATED_TAKER_FEE_PCT=0.0080 \
+SIMULATE_MAKER_FILLS=false \
+TELEGRAM_CONTROL_ENABLED=false \
+.venv/bin/python -m bot.main
+```
+`TELEGRAM_CONTROL_ENABLED=false` (fourteenth pass) is belt-and-suspenders here — `run()` itself
+now REFUSES to start the two-way control poller for a shadow process unless a dedicated
+`SHADOW_TELEGRAM_CONTROL_BOT_TOKEN`/`SHADOW_TELEGRAM_CONTROL_CHAT_ID` pair is separately
+configured, so this inherited-from-ambient-`.env` value can't actually corrupt the real bot's own
+Telegram control channel either way — but setting it explicitly here removes any ambiguity about
+intent. Run from the same directory/venv as always. Every OTHER key (`EXCHANGE`, `SYMBOL`, API
+credentials, `UNIVERSE_WHITELIST`, `MAX_CONCURRENT_POSITIONS`, `STARTING_CASH`, `DYNAMIC_*`
+thresholds, ...) is inherited unchanged from whatever `.env` already has — `DRY_RUN=true` is
+what makes this safe regardless of those, not a separate credential set. Because of the
+thirteenth pass's fix above, this process's own `logs/shadow/HALT` is completely independent
+of the real bot's `logs/HALT` — the shadow run can trade, and can be independently halted
+(`touch logs/shadow/HALT`), while the real bot's own halt (or lack of one) is untouched either
+way. It can run concurrently with the real (halted) bot process without file collisions —
+every state/dashboard/risk-state/trade-log/halt path shadow-isolates.
+
+Before starting: also decide and record (per criterion 6/"Activation step 6") the position-limit
+tradeoff (`MAX_CONCURRENT_POSITIONS`/`STARTING_CASH`) and any `DYNAMIC_*` threshold tuning — in
+writing, in this file, not adjusted mid-run.
+
+**What gets recorded, and from where:** every fill's `fee_cost` (now real, per the tenth/eleventh
+passes) flows into `trade_log`'s CSV rows automatically — no separate reporting step needed. At
+the end of the 60 days, read directly from that log: total completed round-trips (dynamically-
+admitted symbols only, not the fixed roster), net-of-fee PF and win rate over those round-trips,
+and the raw discovery/admission/retirement event history (for a qualitative read on whether the
+screener behaved sensibly, independent of the PF number).
+
+**Pass/fail checklist (restates criteria 1-5 above as literal go/no-go items — ALL required):**
+- [ ] Ran continuously for ≥60 calendar days on the exact configuration/command above, unmodified mid-run
+- [ ] ≥15 completed round-trips across dynamically-admitted symbols combined (only possible at all
+      because of the thirteenth pass's halt-isolation fix — confirm that fix is still in place)
+- [ ] Net-of-fee PF ≥ 1.2 on those round-trips
+- [ ] The multi-symbol shared-capital chronological portfolio replay tool exists and has been run
+      against this run's own data (criterion 4 — not yet built as of 2026-09-24)
+- [ ] The independent BTC/USDT + SOL/USDT profitability question (2026-09-12 review-deadline
+      decision) has ALSO been separately resolved — a passing shadow run does not substitute for it
+- [ ] The fee-simulation AND shadow-isolation code (tenth through fifteenth passes) has survived
+      at least one independent review pass with zero new findings, so its numbers and its ability
+      to run at all — and to not interfere with the real bot's own controls — can be trusted, not
+      merely present
+
+**Any unchecked box at the review date (2027-03-12) or whenever the run concludes → retire, per
+the failure-handling rule above — do not extend or re-scope the checklist after the fact to fit
+whatever the run actually produced.**
+
 ### Activation & rollback (for later review — not done as part of this build)
-**Activation steps** (a human decision, deliberately not taken here):
+**Activation steps** (a human decision, deliberately not taken here — see the bounded acceptance
+criteria immediately above for what must be true FIRST):
 1. Decide the real position-limit tradeoff: raise `MAX_CONCURRENT_POSITIONS` (and `STARTING_CASH`
    together, per the existing capital-sizing rule) if dynamic symbols should get room WITHOUT
    displacing BTC/CAD+SOL/CAD's current 2 slots; leave it at 2 if dynamic symbols should simply
@@ -1673,10 +1738,8 @@ since gather time. +11 tests (suite 1040→1051). Full bug table + reproduction 
    enabled and HALT being engaged are fully independent; leaving HALT engaged after step 4 is a
    safe way to first confirm (via logs / the dashboard card) that discovery/admission is behaving
    as expected with zero risk of a real order, before ever lifting it.
-6. Before actually trading real dynamic capital: get at least one credible answer to the
-   shared-capital-portfolio-replay gap above, or accept running it forward-only (no real capital)
-   for a defined period first — the same "set a review deadline now" discipline already applied
-   to the BTC/SOL question in the 2026-09-12 review-deadline decision.
+6. Real capital only follows once the bounded acceptance criteria above are actually met — not
+   before.
 
 **Rollback steps** (fast, low-risk, always available):
 1. `DYNAMIC_UNIVERSE_ENABLED=false` in `.env`, restart the crypto bot — fixed mode resumes

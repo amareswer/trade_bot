@@ -440,3 +440,161 @@ def test_help_crypto_lists_all_commands():
     text = bot_main._help_crypto_text()
     for cmd in ("/status_crypto", "/pause_crypto", "/resume_crypto", "/status_stock"):
         assert cmd in text
+
+
+# ---------------------------------------------------------------------------
+# _resolve_telegram_control_credentials (external review, 2026-09-24,
+# fourteenth round P1): "the [shadow acceptance] command inherits
+# TELEGRAM_CONTROL_ENABLED and production Telegram credentials... starts
+# another command poller with the same token... the repository's
+# single-poller constraint explicitly forbids this." A shadow process
+# must never start a getUpdates poller against the SAME token as the
+# real, currently-halted crypto bot — enforced here in code, not left to
+# a human remembering the right launch-command flag every time.
+# ---------------------------------------------------------------------------
+
+def test_control_disabled_entirely_returns_none_regardless_of_mode():
+    assert bot_main._resolve_telegram_control_credentials(
+        shadow_mode=False, control_enabled=False,
+        main_bot_token="main-tok", main_chat_id="main-chat",
+        shadow_bot_token="", shadow_chat_id="",
+    ) is None
+    assert bot_main._resolve_telegram_control_credentials(
+        shadow_mode=True, control_enabled=False,
+        main_bot_token="main-tok", main_chat_id="main-chat",
+        shadow_bot_token="shadow-tok", shadow_chat_id="shadow-chat",
+    ) is None
+
+
+def test_live_mode_control_enabled_uses_the_main_token_unchanged():
+    """The genuinely-live case (shadow_mode=False) must behave EXACTLY as
+    before this fix — the existing, already-safe single-poller-against-
+    the-real-token behavior."""
+    result = bot_main._resolve_telegram_control_credentials(
+        shadow_mode=False, control_enabled=True,
+        main_bot_token="main-tok", main_chat_id="main-chat",
+        shadow_bot_token="", shadow_chat_id="",
+    )
+    assert result == ("main-tok", "main-chat")
+
+
+def test_shadow_mode_control_enabled_with_no_dedicated_token_is_blocked():
+    """The exact reproduction: a shadow launch command that simply
+    inherits TELEGRAM_CONTROL_ENABLED=true from the ambient .env, with no
+    SHADOW_TELEGRAM_CONTROL_BOT_TOKEN/CHAT_ID configured, must be refused
+    — never falling back to the shared main token."""
+    result = bot_main._resolve_telegram_control_credentials(
+        shadow_mode=True, control_enabled=True,
+        main_bot_token="main-tok", main_chat_id="main-chat",
+        shadow_bot_token="", shadow_chat_id="",
+    )
+    assert result is None
+
+
+def test_shadow_mode_control_enabled_with_a_half_configured_pair_is_still_blocked():
+    """Only bot_token set, or only chat_id set — either half-configured
+    case is treated the same as 'not configured', never silently falling
+    back to the main token for the missing half."""
+    assert bot_main._resolve_telegram_control_credentials(
+        shadow_mode=True, control_enabled=True,
+        main_bot_token="main-tok", main_chat_id="main-chat",
+        shadow_bot_token="shadow-tok-only", shadow_chat_id="",
+    ) is None
+    assert bot_main._resolve_telegram_control_credentials(
+        shadow_mode=True, control_enabled=True,
+        main_bot_token="main-tok", main_chat_id="main-chat",
+        shadow_bot_token="", shadow_chat_id="shadow-chat-only",
+    ) is None
+
+
+def test_shadow_mode_control_enabled_with_a_dedicated_token_uses_it_not_the_main_one():
+    """The explicit escape hatch: a genuinely separate shadow control
+    bot, fully configured, is allowed to run — and uses ITS OWN
+    credentials, never the shared main token."""
+    result = bot_main._resolve_telegram_control_credentials(
+        shadow_mode=True, control_enabled=True,
+        main_bot_token="main-tok", main_chat_id="main-chat",
+        shadow_bot_token="shadow-tok", shadow_chat_id="shadow-chat",
+    )
+    assert result == ("shadow-tok", "shadow-chat")
+    assert "main-tok" not in result
+
+
+# ---------------------------------------------------------------------------
+# Fifteenth-round finding, 2026-09-24: the presence check above ("both
+# shadow_bot_token and shadow_chat_id non-empty") did not confirm the
+# shadow token is actually DIFFERENT from the production one — a
+# copy-paste mistake setting SHADOW_TELEGRAM_CONTROL_BOT_TOKEN to the
+# SAME value as TELEGRAM_BOT_TOKEN passed the check and started a second
+# poller against the shared token anyway, reintroducing the exact
+# getUpdates-offset conflict this function exists to prevent.
+# ---------------------------------------------------------------------------
+
+def test_shadow_token_equal_to_main_token_is_rejected_even_with_same_chat():
+    """Exact reproduction #1: identical token, identical chat — the
+    shared-token conflict is fully present; must be blocked."""
+    result = bot_main._resolve_telegram_control_credentials(
+        shadow_mode=True, control_enabled=True,
+        main_bot_token="shared-tok", main_chat_id="same-chat",
+        shadow_bot_token="shared-tok", shadow_chat_id="same-chat",
+    )
+    assert result is None
+
+
+def test_shadow_token_equal_to_main_token_is_rejected_even_with_different_chat():
+    """Exact reproduction #2: identical token, DIFFERENT chat — a
+    different chat_id does not isolate polling at all (the conflict is
+    entirely about which token's getUpdates queue is shared, not who is
+    authorized to send commands); must still be blocked."""
+    result = bot_main._resolve_telegram_control_credentials(
+        shadow_mode=True, control_enabled=True,
+        main_bot_token="shared-tok", main_chat_id="main-chat",
+        shadow_bot_token="shared-tok", shadow_chat_id="different-chat",
+    )
+    assert result is None
+
+
+def test_shadow_token_distinct_from_main_is_accepted_even_with_same_chat():
+    """A genuinely different token is the actual safety property that
+    matters — using the SAME chat_id as production (e.g. the same human
+    recipient, a different bot) is fine and must NOT be rejected."""
+    result = bot_main._resolve_telegram_control_credentials(
+        shadow_mode=True, control_enabled=True,
+        main_bot_token="main-tok", main_chat_id="shared-chat",
+        shadow_bot_token="genuinely-different-tok", shadow_chat_id="shared-chat",
+    )
+    assert result == ("genuinely-different-tok", "shared-chat")
+
+
+def test_shadow_token_equal_to_main_after_whitespace_normalization_is_rejected():
+    """Tokens are compared after stripping surrounding whitespace (a
+    trailing newline from a pasted .env value is a realistic way for
+    two otherwise-identical tokens to look 'different' as raw strings)
+    — never lowercased, since Telegram tokens are case-sensitive."""
+    result = bot_main._resolve_telegram_control_credentials(
+        shadow_mode=True, control_enabled=True,
+        main_bot_token="shared-tok", main_chat_id="main-chat",
+        shadow_bot_token="  shared-tok\n", shadow_chat_id="shadow-chat",
+    )
+    assert result is None
+
+
+def test_run_source_gates_the_poller_on_resolve_telegram_control_credentials():
+    """Source guard: run() must decide whether/how to start the poller
+    via _resolve_telegram_control_credentials's return value — not the
+    raw cfg.alerts.telegram_control_enabled flag alone, and must
+    construct the TelegramCommandPoller using the RESOLVED token/chat
+    (which could be the shadow pair), never cfg.alerts.telegram_bot_token
+    directly."""
+    import inspect
+    src = inspect.getsource(bot_main.run)
+    idx = src.index("_tg_control_creds = _resolve_telegram_control_credentials(")
+    end = src.index("start_telegram_control_thread(_tg_control_poller")
+    section = src[idx:end]
+    assert "shadow_mode      = _SHADOW_MODE" in section
+    assert "control_enabled  = cfg.alerts.telegram_control_enabled" in section
+    assert "shadow_bot_token = cfg.alerts.shadow_control_bot_token" in section
+    assert "bot_token = _tg_control_bot_token" in section
+    # Never constructs the poller directly from the raw main token/chat.
+    assert "bot_token = cfg.alerts.telegram_bot_token" not in section
+    assert "chat_id   = cfg.alerts.telegram_chat_id" not in section

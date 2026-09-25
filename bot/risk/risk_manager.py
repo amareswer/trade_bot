@@ -81,6 +81,28 @@ class BlockReason(Enum):
     # ApprovalResult/BlockReason type every other gate uses, rather than a
     # parallel ad-hoc block representation.
     ACCOUNTING      = "ACCOUNTING"
+    # Not set by RiskManager.evaluate() either — bot/main.py constructs an
+    # ApprovalResult with this reason when dynamic-universe mode is active
+    # (cfg.dynamic.enabled) and a candidate (fixed roster OR dynamically
+    # admitted — both compete for the same BUY gate once dynamic mode is
+    # on) is not currently listed as eligible by the most recent screener
+    # result, or that result is missing/stale/too old to trust (external
+    # review, 2026-09-22, second round P1: "fixed-roster coins bypass
+    # market-screen eligibility ... the ranked BUY path does not require
+    # current eligibility"). Never blocks a SELL/exit.
+    DYNAMIC_INELIGIBLE = "DYNAMIC_INELIGIBLE"
+    # Not set by RiskManager.evaluate() either — bot/main.py constructs an
+    # ApprovalResult with this reason when _initialize_capital_pool()'s
+    # paper/dry-run account-level P&L reconstruction was incomplete at
+    # startup (an unreadable state file, one missing required fields, or
+    # a non-finite value — see _replay_paper_realized_pnl's own
+    # docstring, external review 2026-09-22, eighth round P1: "mark
+    # reconstruction incomplete and prevent simulated BUY funding until
+    # the history is recovered"). Applies to every symbol, fixed roster
+    # or dynamic, for the remainder of that process's run — resolved
+    # only by fixing the underlying file(s) and restarting. Never blocks
+    # a SELL/exit or affects live-mode trading at all.
+    PAPER_ACCOUNTING_INCOMPLETE = "PAPER_ACCOUNTING_INCOMPLETE"
 
 
 @dataclass

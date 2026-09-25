@@ -108,13 +108,22 @@ def test_severity_ordering_worst_wins():
 
 # ─────────────────────────── log scan ────────────────────────────────────────
 
+def _recent_ts(hours_ago=1):
+    # Relative to now — _scan_log's window is "last N days from now", so a
+    # hardcoded date silently ages out of it (these tests broke 7 days after
+    # they were written, 2026-09-14).
+    from datetime import datetime, timedelta
+    return (datetime.now() - timedelta(hours=hours_ago)).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def test_scan_log_buckets_faults_vs_noise(tmp_path):
     log = tmp_path / "stock_bot.log"
+    ts = _recent_ts()
     log.write_text(
-        "2026-09-07 09:00:00,000 x INFO API connection failed: ConnectionRefusedError\n"
-        "2026-09-07 09:01:00,000 x ERROR STUCK LOOP: buy:PLTR\n"
-        "2026-09-07 09:02:00,000 x WARNING CORRELATION GATE: AMD blocked\n"
-        "2026-09-07 09:03:00,000 x ERROR nvidia_nim FULL ERROR for HOOD: APITimeoutError\n"
+        f"{ts},000 x INFO API connection failed: ConnectionRefusedError\n"
+        f"{ts},000 x ERROR STUCK LOOP: buy:PLTR\n"
+        f"{ts},000 x WARNING CORRELATION GATE: AMD blocked\n"
+        f"{ts},000 x ERROR nvidia_nim FULL ERROR for HOOD: APITimeoutError\n"
     )
     out = wm._scan_log(days=7, log_file=str(log))
     assert out["available"] is True
@@ -128,7 +137,7 @@ def test_scan_log_respects_time_window(tmp_path):
     log = tmp_path / "stock_bot.log"
     log.write_text(
         "2000-01-01 00:00:00,000 x ERROR STUCK LOOP: ancient\n"
-        "2026-09-07 09:00:00,000 x ERROR STUCK LOOP: recent\n"
+        f"{_recent_ts()},000 x ERROR STUCK LOOP: recent\n"
     )
     out = wm._scan_log(days=7, log_file=str(log))
     assert out["faults"].get("Stuck loop detected") == 1

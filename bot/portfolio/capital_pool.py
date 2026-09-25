@@ -37,6 +37,7 @@ no per-symbol overrides) is untouched by this feature's existence.
 from __future__ import annotations
 
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,18 @@ class CapitalPool:
         slot_cap: float = 0.0,
         slot_caps: dict[str, float] | None = None,
     ) -> None:
+        # External review, 2026-09-22, eighth round P1: "NaN and infinity
+        # become accepted capital — CapitalPool's positive-value check
+        # does not reject them." Both compare False against <= 0
+        # (float('nan') <= 0 is False; float('inf') <= 0 is False too),
+        # so either sailed straight past the check above and got
+        # accepted as a real total. Reproduced via a corrupted
+        # live_state_*.json feeding a NaN/Infinity realized_pnl all the
+        # way through _replay_paper_realized_pnl into here. Checked
+        # BEFORE the <= 0 comparison, which is itself meaningless against
+        # NaN.
+        if not math.isfinite(total_capital):
+            raise ValueError(f"total_capital must be finite, got {total_capital!r}")
         if total_capital <= 0:
             raise ValueError("total_capital must be > 0")
         if max_concurrent < 1:
@@ -107,6 +120,13 @@ class CapitalPool:
 
     @total_capital.setter
     def total_capital(self, value: float) -> None:
+        # Same finite-value guard as __init__ (2026-09-22, eighth round
+        # P1) — every mutation path (the fold-in bumps in bot/main.py,
+        # release()'s own reassignment below) goes through this setter,
+        # so validating here catches a bad value at its point of entry
+        # regardless of which caller produced it.
+        if not math.isfinite(value):
+            raise ValueError(f"total_capital must be finite, got {value!r}")
         self._total = value
 
     @property
@@ -236,12 +256,37 @@ class CapitalPool:
 
         cash_returned should be executor.cash immediately after the SELL fill —
         it equals (slot_initial_cash - buy_cost + sell_proceeds).
+
+        Ninth-round review finding, 2026-09-22, P1: the previous version
+        popped the slot from self._slots FIRST, then computed/assigned
+        the new total_capital — so a non-finite cash_returned raised
+        (via the setter's own guard, added the round before) only AFTER
+        the slot was already gone. The raise then propagated to the
+        caller with the pool left in a corrupted intermediate state:
+        the symbol's reservation vanished from self._slots (so
+        available_cash silently counted it as free) while total_capital
+        was NEVER actually updated to reflect that release — reserved
+        funds became available with no real economic event, from a
+        call that supposedly failed. Fixed: validate the WOULD-BE new
+        total first; only mutate self._slots (and self._total) once
+        that value is confirmed finite. A rejected call therefore
+        changes nothing at all — the slot stays allocated exactly as
+        before, so a caller can fix the bad value and simply call
+        release() again.
         """
         if symbol not in self._slots:
             return
-        allocated = self._slots.pop(symbol)
-        pnl       = cash_returned - allocated
-        self._total = self._total - allocated + cash_returned
+        allocated = self._slots[symbol]
+        new_total = self._total - allocated + cash_returned
+        if not math.isfinite(new_total):
+            raise ValueError(
+                f"release({symbol!r}, cash_returned={cash_returned!r}) would "
+                f"produce a non-finite total_capital ({new_total!r}) — rejected "
+                f"before any state changed; {symbol!r}'s slot remains allocated."
+            )
+        pnl = cash_returned - allocated
+        self._slots.pop(symbol)
+        self.total_capital = new_total   # through the setter — already known-finite, but stays the single source of truth
         logger.info(
             "CapitalPool: released %s  allocated=%.2f  returned=%.2f  pnl=%+.2f"
             "  new_total=%.2f  slots=%d/%d",

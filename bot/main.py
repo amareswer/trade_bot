@@ -106,8 +106,42 @@ from bot.accounting.kraken_adapter import KrakenAccountingAdapter
 # logs/shadow/ whenever this flag is true; real live trading (dry_run=False)
 # and pure paper_mode are both completely unaffected — this is additive,
 # gated behind a combination no other mode uses.
-_SHADOW_MODE = cfg.exchange.live_trading and not cfg.paper.paper_mode and cfg.exchange.dry_run
-_STATE_LOG_DIR = os.path.join(_log_dir, "shadow") if _SHADOW_MODE else _log_dir
+def _compute_shadow_mode(
+    live_trading: bool, paper_mode: bool, dry_run: bool, log_dir: str,
+) -> "tuple[bool, str]":
+    """
+    Pure formula behind _SHADOW_MODE/_STATE_LOG_DIR, extracted to module
+    level (external review, 2026-09-22, fifth+ round P1 — "choose one
+    supported acceptance configuration and test its real path
+    resolution") purely so the exact isolation decision is directly unit-
+    testable with any combination of flags, without needing to reload
+    this ~5000-line module (which runs a great deal more module-level
+    setup than just this) or create a real directory under the project's
+    own logs/ folder just to observe a boolean. Zero behavior change from
+    the inline version this replaces — same formula, same module globals
+    assigned from its return value, same call sites everywhere else in
+    this file unchanged.
+
+    live_trading AND not paper_mode AND dry_run is deliberately narrow —
+    this is the ONLY combination the paper/shadow readiness runbook uses
+    and the ONLY one this isolation covers. paper_mode is explicitly
+    EXCLUDED, not merely untested: paper_mode has its own always-
+    simulated identity and was never wired to redirect under here (a
+    fixed-roster paper_mode=True executor still calls _live_state_path(),
+    which resolves to the ordinary PRODUCTION log_dir whenever shadow_mode
+    is False — risk_state.json and trades.db likewise). A caller wanting
+    an isolated, zero-real-order run must use LIVE_TRADING=true WITH
+    DRY_RUN=true and PAPER_MODE=false — never PAPER_MODE=true for this
+    purpose, "wired or not."
+    """
+    shadow_mode = live_trading and not paper_mode and dry_run
+    state_log_dir = os.path.join(log_dir, "shadow") if shadow_mode else log_dir
+    return shadow_mode, state_log_dir
+
+
+_SHADOW_MODE, _STATE_LOG_DIR = _compute_shadow_mode(
+    cfg.exchange.live_trading, cfg.paper.paper_mode, cfg.exchange.dry_run, _log_dir,
+)
 if _SHADOW_MODE:
     os.makedirs(_STATE_LOG_DIR, exist_ok=True)
 
@@ -1052,7 +1086,26 @@ def _evaluate_blocked_buy_alert(
 # ---------------------------------------------------------------------------
 # Manual halt flag file (extracted for unit-testability)
 # ---------------------------------------------------------------------------
-_HALT_FLAG_PATH = os.path.join(_log_dir, "HALT")
+# External review, 2026-09-23/24, thirteenth round P0: "the documented shadow
+# configuration still reads production logs/HALT — with HALT preserved [for
+# the real, halted crypto bot, per the 2026-09-12 review-deadline decision],
+# the proposed [shadow-acceptance] run cannot accumulate the required trading
+# round-trips." This used to be os.path.join(_log_dir, "HALT") UNCONDITIONALLY
+# — the one path in this whole shadow-isolation effort (sixth pass: state
+# files, dashboard, risk_state.json, trades.db, all already routed through
+# _STATE_LOG_DIR) that was missed. Routing through _STATE_LOG_DIR instead
+# means: for a genuinely LIVE process (_SHADOW_MODE False), _STATE_LOG_DIR ==
+# _log_dir, so this is BYTE-IDENTICAL to before — the real bot's own
+# logs/HALT is completely unaffected, still the same file, still the same
+# full-stop control it always was. For a SHADOW process (LIVE_TRADING=true +
+# DRY_RUN=true + PAPER_MODE=false), this now resolves to logs/shadow/HALT —
+# a genuinely separate, independently-controllable flag: touching the real
+# logs/HALT no longer has ANY effect on a shadow run (which is what makes
+# the 60-day acceptance measurement possible to run AT ALL while the real
+# bot stays halted), and a human can still halt the SHADOW run specifically
+# by touching logs/shadow/HALT, without touching the real bot's control at
+# all. Neither run can ever observe or be controlled by the other's flag.
+_HALT_FLAG_PATH = os.path.join(_STATE_LOG_DIR, "HALT")
 
 
 def _check_halt_flag(
@@ -1083,6 +1136,75 @@ def _check_halt_flag(
         alerter.error(f"Manual HALT lifted — {flag_path} removed. Trading resumed.")
         return False
     return halt_file_active
+
+
+def _resolve_telegram_control_credentials(
+    *,
+    shadow_mode: bool,
+    control_enabled: bool,
+    main_bot_token: str,
+    main_chat_id: str,
+    shadow_bot_token: str,
+    shadow_chat_id: str,
+) -> "tuple[str, str] | None":
+    """
+    Decides whether run()'s Telegram control poller may start at all, and
+    with which token/chat — extracted purely so this decision is directly
+    unit-testable, same "extract for testability" convention as
+    _compute_shadow_mode/_check_halt_flag above.
+
+    External review, 2026-09-24, fourteenth round P1: a shadow-mode launch
+    command (LIVE_TRADING=true + DRY_RUN=true) that simply inherits the
+    ambient .env's TELEGRAM_CONTROL_ENABLED=true (documented as live for
+    the real crypto bot) would start a SECOND TelegramCommandPoller
+    against the SAME bot token as the real, currently-halted bot.
+    telegram_control.py's own module docstring is explicit that this is
+    not survivable: getUpdates' `offset` is server-side PER TOKEN, not
+    per process, so two independent pollers against the same token
+    corrupt each other's command delivery — a /pause_crypto or
+    /status_crypto sent to the real bot could be silently consumed by the
+    shadow process's poller instead, or vice versa, for as long as both
+    run concurrently. This must be enforced in code, not left to a human
+    remembering to pass TELEGRAM_CONTROL_ENABLED=false on every shadow
+    launch command — the exact ask: "prefer enforcing that restriction in
+    shadow mode unless a dedicated control token is explicitly supported."
+
+    Returns None (poller must not start) when: control isn't enabled at
+    all, OR shadow_mode is True and no genuinely distinct shadow token is
+    configured. Otherwise returns (bot_token, chat_id) — the shadow pair
+    when in shadow mode with one configured, the main pair otherwise (the
+    existing, already-safe behavior for a genuinely live process, where
+    _SHADOW_MODE is always False and this reduces to exactly what run()
+    already did before this fix).
+
+    FIFTEENTH-ROUND correction (external review, 2026-09-24, same day):
+    the version above checked only PRESENCE (both shadow_bot_token and
+    shadow_chat_id non-empty) — not that the shadow token is actually
+    DIFFERENT from the production one. Reproduced: setting
+    SHADOW_TELEGRAM_CONTROL_BOT_TOKEN to the SAME value as the real
+    TELEGRAM_BOT_TOKEN (a copy-paste mistake, or someone assuming "just
+    fill in something") passed the presence check and started the
+    poller anyway — the exact shared-getUpdates-offset conflict this
+    function exists to prevent, unblocked by its own "fix." A different
+    shadow_chat_id does NOT help: the conflict is entirely about which
+    TOKEN's getUpdates queue is being polled — chat_id only gates who is
+    authorized to send commands, never which token's offset is shared.
+    Fixed: the shadow token must be both present AND, once whitespace-
+    normalized (.strip() — tokens are case-sensitive, never lowercased),
+    different from the normalized main token. shadow_chat_id being equal
+    to main_chat_id is fine and intentionally NOT checked — using the
+    same human/chat as the recipient for a genuinely different bot is
+    safe and unrelated to the token-sharing hazard.
+    """
+    if not control_enabled:
+        return None
+    if shadow_mode:
+        _shadow_tok = (shadow_bot_token or "").strip()
+        _main_tok = (main_bot_token or "").strip()
+        if _shadow_tok and shadow_chat_id and _shadow_tok != _main_tok:
+            return shadow_bot_token, shadow_chat_id
+        return None
+    return main_bot_token, main_chat_id
 
 
 def _seed_native_stop_state(executor) -> tuple[float | None, bool]:
@@ -1288,7 +1410,162 @@ def _reconcile_shared_account_cash(
     return exchange_wide_cash
 
 
-def _initialize_capital_pool(executors: dict, cfg) -> "tuple[CapitalPool, dict, float, float, dict]":
+def _replay_paper_realized_pnl(state_dir: str) -> "tuple[float, bool]":
+    """
+    Reconstructs the CUMULATIVE (realized_pnl - fees_paid) across EVERY
+    live_state_*.json file found in `state_dir` — regardless of whether
+    that symbol is in the CURRENT roster, currently flat or holding, or
+    was dynamically admitted-and-later-retired (a retired symbol's file
+    is deliberately never deleted — "harmless left in place", see
+    CLAUDE.md "Dynamic Crypto Universe" rollback notes — so it's still
+    right here to be found).
+
+    External review, 2026-09-22, seventh round P1: "_initialize_capital_
+    pool()'s per-symbol fresh-funding step overwrites cash to a generic
+    slot_cash_for() for ANY position<=1e-9 executor, discarding real
+    accumulated P&L for a symbol that traded and is now merely flat (not
+    genuinely fresh) — reconstruct simulated account equity ONCE at the
+    account level, including completed trades and retired symbols, using
+    a complete replay of simulated economic events." Reproduced: a $900
+    paper bankroll, one symbol buys then sells for a $10 gain (zero
+    fees) and ends flat — its saved cash (460) correctly round-trips
+    through a raw reopen, but _initialize_capital_pool then overwrites
+    it to a fresh $450 slot and reports total equity as $900, not $910.
+
+    Why a directory-wide replay, not a per-symbol bump inside
+    _admit_dynamic_symbol (the pattern used for OPEN positions, rounds
+    3-6): that pattern only ever runs for a symbol _admit_dynamic_symbol
+    is actually called for — i.e. one currently holding a position. A
+    symbol that fully closed and is now flat is never routed through
+    that function again (dynamic ones get RETIRED, not re-admitted, the
+    moment they're flat), so nothing would ever apply its bump. A
+    directory-wide scan, done ONCE here before any slot is assigned,
+    naturally covers open positions, flat-but-previously-traded ones,
+    AND retired symbols' leftover files uniformly — the same reasoning
+    the review's own "replay of simulated economic events" phrasing
+    points at.
+
+    Why this doesn't double-count against the per-symbol bump
+    _admit_dynamic_symbol still applies for an OPEN position in the LIVE
+    branch: it doesn't apply there at all — this function is only ever
+    consulted from _initialize_capital_pool's PAPER/DRY-RUN branch. Live
+    mode's baseline (exchange_cash_observed) is a real, current exchange
+    balance that already reflects every historical fee/P&L automatically
+    — this replay is not needed there, and _admit_dynamic_symbol's live
+    bump was never changed. Paper/dry-run mode's _admit_dynamic_symbol
+    recovery branch, however, no longer bumps at all — this account-level
+    replay, run once at startup, has already covered it (see that call
+    site's own comment).
+
+    realized_pnl/fees_paid are LIFETIME CUMULATIVE fields (LiveExecutor
+    only ever adds to them, never resets except a full account wipe) —
+    re-reading the same on-disk files at every restart, with nothing
+    persisted incrementally, makes this naturally idempotent: restarting
+    twice with no new trades in between reads the identical figures and
+    produces the identical total both times, never re-applying or losing
+    anything already accounted for.
+
+    Returns (total, ok). EIGHTH-ROUND correction (external review,
+    2026-09-22, same day): the original version of this function treated
+    ANY problem (unreadable file, missing fields, non-finite values) as
+    "contributes 0.0, keep going" — reproduced as a real, dangerous
+    consequence: a retired symbol with a real -$102 lifetime P&L
+    (-$100 realized, $2 fees) becoming UNREADABLE (corrupted, permission
+    error, truncated write, anything) silently INVENTED that $102 back
+    into the pool at the next startup, because "skip and contribute
+    zero" is indistinguishable from "this symbol never lost anything."
+    Never raises — a missing directory or simply no files at all still
+    returns (0.0, True), since there is genuinely nothing to reconstruct
+    — but from here on:
+      - a file that fails to open/parse as JSON is INCOMPLETE, not zero
+      - a file successfully parsed but missing "realized_pnl" or
+        "fees_paid" entirely is ALSO incomplete — a file this shape can
+        only come from a version of the code that never wrote these
+        fields, or manual/partial editing; either way it needs an
+        explicit migration decision, not a silent assumption of zero
+      - a value that parses but is NaN or +/-Infinity (JSON's non-
+        standard extension that Python's json module accepts by
+        default) is ALSO incomplete — reproduced separately: a
+        corrupted-but-"readable" file containing "realized_pnl": NaN (or
+        Infinity) previously passed straight through as a real float,
+        and CapitalPool's own `total_capital <= 0` guard does not catch
+        either (NaN compares False to everything; Infinity is > 0)
+    ok is False the moment ANY file hits any of these — the caller
+    (_initialize_capital_pool) is responsible for refusing to fund new
+    positions while this is False; this function only ever reports the
+    fact, it never decides what to do about it.
+    """
+    total = 0.0
+    ok = True
+    if not state_dir or not os.path.isdir(state_dir):
+        return total, ok
+    for _path in glob.glob(os.path.join(state_dir, "live_state_*.json")):
+        try:
+            with open(_path) as _fh:
+                _state = json.load(_fh)
+        except Exception as exc:
+            logger.error(
+                "Paper P&L replay: state file %s is unreadable (%s) — "
+                "reconstruction is INCOMPLETE; new BUY funding will be "
+                "refused until this is resolved.", _path, exc,
+            )
+            ok = False
+            continue
+        # Ninth-round review finding, 2026-09-22, P1: valid JSON is not
+        # necessarily a JSON OBJECT — a file containing "null" or "42"
+        # parses successfully (json.load returns None / 42), and the
+        # very next line's "in" check then raises TypeError ("argument
+        # of type 'NoneType'/'int' is not iterable"), UNCAUGHT — this
+        # crashed the entire replay (and therefore startup), not merely
+        # marked one file incomplete. Checked explicitly, in the same
+        # "incomplete, not fatal" bucket as every other bad-input case
+        # here.
+        if not isinstance(_state, dict):
+            logger.error(
+                "Paper P&L replay: state file %s did not contain a JSON "
+                "object (got %s) — reconstruction is INCOMPLETE; new BUY "
+                "funding will be refused until this is resolved.",
+                _path, type(_state).__name__,
+            )
+            ok = False
+            continue
+        if "realized_pnl" not in _state or "fees_paid" not in _state:
+            logger.error(
+                "Paper P&L replay: state file %s is missing realized_pnl "
+                "or fees_paid entirely (needs explicit migration, not a "
+                "silent zero) — reconstruction is INCOMPLETE; new BUY "
+                "funding will be refused until this is resolved.", _path,
+            )
+            ok = False
+            continue
+        try:
+            _rpnl = float(_state["realized_pnl"])
+            _fees = float(_state["fees_paid"])
+        except (TypeError, ValueError) as exc:
+            logger.error(
+                "Paper P&L replay: state file %s has a non-numeric "
+                "realized_pnl/fees_paid (%s) — reconstruction is "
+                "INCOMPLETE; new BUY funding will be refused until this "
+                "is resolved.", _path, exc,
+            )
+            ok = False
+            continue
+        if not (math.isfinite(_rpnl) and math.isfinite(_fees)):
+            logger.error(
+                "Paper P&L replay: state file %s has a non-finite "
+                "realized_pnl/fees_paid (NaN or Infinity) — "
+                "reconstruction is INCOMPLETE; new BUY funding will be "
+                "refused until this is resolved.", _path,
+            )
+            ok = False
+            continue
+        total += _rpnl - _fees
+    return total, ok
+
+
+def _initialize_capital_pool(
+    executors: dict, cfg, state_dir: "str | None" = None,
+) -> "tuple[CapitalPool, dict, float, float, dict, bool]":
     """
     Builds the CapitalPool for a startup's roster of `executors`, and
     funds each GENUINELY FRESH (no persisted position) one with its own
@@ -1323,6 +1600,20 @@ def _initialize_capital_pool(executors: dict, cfg) -> "tuple[CapitalPool, dict, 
     accounting read (available_cash, _compute_account_value) with no
     economic event to explain it.
 
+    For PAPER/DRY-RUN mode: the pool's total_capital is cfg.portfolio.
+    starting_cash PLUS _replay_paper_realized_pnl(state_dir) — the
+    CUMULATIVE (realized_pnl - fees_paid) across every live_state_*.json
+    file on disk, regardless of current roster membership (external
+    review, 2026-09-22, seventh round P1 — see that function's own
+    docstring for the full reproduction and reasoning). Without this, a
+    symbol that traded and is now flat is indistinguishable from one that
+    NEVER traded (both have position<=1e-9) — the loop below overwrites
+    EITHER one's cash to a fresh slot_cash_for(), discarding any real
+    accumulated P&L for the former. state_dir defaults to the module-
+    level _STATE_LOG_DIR (the same shadow-mode-aware directory
+    _live_state_path() itself resolves to) when not given explicitly —
+    tests pass their own tmp directory.
+
     Uses avg_entry (cost basis, already loaded via _load_state() — no
     network call) rather than a live market price for this valuation,
     DELIBERATELY matching the amount= this same holding symbol's later
@@ -1336,8 +1627,19 @@ def _initialize_capital_pool(executors: dict, cfg) -> "tuple[CapitalPool, dict, 
     used everywhere within this one startup sequence.
 
     Returns (capital_pool, per_symbol_slots, pool_total, slot_cap,
-    slot_caps_by_symbol) — everything the caller needs for both the
-    CapitalPool itself and its own display/logging.
+    slot_caps_by_symbol, paper_accounting_ok) — everything the caller
+    needs for both the CapitalPool itself and its own display/logging.
+    paper_accounting_ok (2026-09-22, eighth round P1) is always True for
+    live mode; for paper/dry-run mode it's False whenever the account-
+    level replay hit an unreadable file, a file missing required fields,
+    or a non-finite value — see _replay_paper_realized_pnl's own
+    docstring. The caller (run()) is responsible for refusing new BUY
+    funding while this is False — "mark reconstruction incomplete and
+    prevent simulated BUY funding until the history is recovered" is
+    exactly what NOT overwriting cash below, plus this returned flag,
+    together accomplish: an incomplete reconstruction must never look
+    identical to a healthy one just because the pool still got SOME
+    number.
 
     Extracted to module level (was inline in run()) purely for direct
     unit testability against the ACTUAL startup sequence, not just its
@@ -1346,6 +1648,7 @@ def _initialize_capital_pool(executors: dict, cfg) -> "tuple[CapitalPool, dict, 
     _compute_account_value, _reconcile_shared_account_cash).
     """
     _max_conc = cfg.portfolio.max_concurrent_positions
+    _paper_accounting_ok = True
     if cfg.exchange.live_trading and not cfg.paper.paper_mode and not cfg.exchange.dry_run:
         _first_exec = next(iter(executors.values()))
         _existing_holdings_value = sum(
@@ -1353,7 +1656,28 @@ def _initialize_capital_pool(executors: dict, cfg) -> "tuple[CapitalPool, dict, 
         )
         _pool_total = _first_exec.exchange_cash_observed + _existing_holdings_value
     else:
-        _pool_total = cfg.portfolio.starting_cash
+        _resolved_state_dir = state_dir if state_dir is not None else _STATE_LOG_DIR
+        _replay_sum, _replay_ok = _replay_paper_realized_pnl(_resolved_state_dir)
+        _pool_total = cfg.portfolio.starting_cash + _replay_sum
+        if not _replay_ok or not math.isfinite(_pool_total):
+            _paper_accounting_ok = False
+            logger.error(
+                "PAPER ACCOUNTING RECONSTRUCTION INCOMPLETE: pool_total=%r"
+                " — refusing to fund any fresh symbol's slot this startup."
+                " Existing open positions are still managed normally;"
+                " resolve the underlying state file(s) before any new"
+                " simulated BUY is allowed to proceed.", _pool_total,
+            )
+            # A non-finite _pool_total must never reach CapitalPool() —
+            # its own constructor would (correctly) raise ValueError,
+            # but that would ALSO take down management of every existing
+            # position, a far bigger blast radius than refusing new
+            # funding alone. Fall back to a safe, finite placeholder
+            # (starting_cash alone, ignoring the tainted replay) so the
+            # pool itself still constructs; _paper_accounting_ok is what
+            # actually blocks new BUYs from here on, not this number.
+            if not math.isfinite(_pool_total):
+                _pool_total = cfg.portfolio.starting_cash
     _slot_cap = cfg.portfolio.max_slot_cash_cad
     # Per-symbol overrides (MAX_SLOT_CASH_CAD_<BASE>, e.g. MAX_SLOT_CASH_CAD_SOL) —
     # keyed by base asset in config, remapped here to the full symbol strings
@@ -1373,14 +1697,25 @@ def _initialize_capital_pool(executors: dict, cfg) -> "tuple[CapitalPool, dict, 
     for _sym, _exc in executors.items():
         _slot = capital_pool.slot_cash_for(_sym)
         _per_symbol_slots[_sym] = _slot
-        if _exc.position <= 1e-9:
+        # _paper_accounting_ok guard (2026-09-22, eighth round P1): a
+        # flat executor is left COMPLETELY untouched (not funded at all)
+        # while reconstruction is incomplete — funding it here is
+        # exactly the "simulated BUY funding" the review asked to
+        # prevent, since a funded flat symbol can immediately act on a
+        # signal next tick. Its own last-known cash stays whatever was
+        # already on disk; _paper_accounting_ok itself is what run()
+        # uses to refuse any new BUY regardless of what that number is.
+        if _exc.position <= 1e-9 and _paper_accounting_ok:
             _exc._portfolio.cash = _slot
             if cfg.exchange.live_trading:
                 try:
                     _exc._save_state()
                 except Exception as e:
                     logger.warning("State save after pool init failed [%s]: %s", _sym, e)
-    return capital_pool, _per_symbol_slots, _pool_total, _slot_cap, _slot_caps_by_symbol
+    return (
+        capital_pool, _per_symbol_slots, _pool_total, _slot_cap,
+        _slot_caps_by_symbol, _paper_accounting_ok,
+    )
 
 
 def _persist_accounting_cycle_start(
@@ -2317,6 +2652,9 @@ def _make_dynamic_executor(sym: str, state_path: "str | None" = None) -> LiveExe
         adopt_external_holdings  = cfg.exchange.adopt_external_holdings,
         native_stop_loss_enabled = cfg.exchange.native_stop_loss_enabled,
         max_slippage_pct         = cfg.exchange.max_slippage_pct,
+        simulated_maker_fee_pct  = cfg.exchange.simulated_maker_fee_pct,
+        simulated_taker_fee_pct  = cfg.exchange.simulated_taker_fee_pct,
+        simulate_maker_fills     = cfg.exchange.simulate_maker_fills,
     )
 
 
@@ -2343,10 +2681,20 @@ def _admit_dynamic_symbol(
     already trading, not a genuinely fresh candidate — the exact same
     recovery seeding the fixed roster's restart-recovery block applies
     (pm.seed/sm.recover_long/native-stop mirror) is applied here too, PLUS
-    capital_pool.allocate(sym) — closing the "restart recovery restores
-    executor positions but not capital-pool allocations" gap for dynamic
-    symbols. (The fixed roster gets the equivalent fix in run()'s own
-    restart-recovery block — see the call there.)
+    folding this position's real value into capital_pool.total_capital and
+    reserving that exact amount via capital_pool.allocate(sym, amount=...)
+    — closing the "restart recovery restores executor positions but not
+    capital-pool allocations" gap for dynamic symbols (see that call
+    site's own comment for the full $135/$165/$300 reproduction). (The
+    fixed roster gets the equivalent fix in run()'s own restart-recovery
+    block — see the call there — but doesn't need the total_capital fold,
+    since _initialize_capital_pool() already counts a fixed-roster
+    holding's value before that section ever runs.)
+
+    This function is reachable at startup EVEN WHEN cfg.dynamic.enabled is
+    false: run()'s orphaned-position recovery (a symbol with a persisted
+    position outside the current roster, regardless of dynamic discovery)
+    calls this same function unconditionally whenever live_trading is on.
 
     Never raises: returns (None, error_str) on any failure (most likely a
     warmup network error) so one bad candidate can never prevent the tick
@@ -2399,13 +2747,129 @@ def _admit_dynamic_symbol(
             )
             sm.recover_long(executor.avg_entry)
             ss['native_stop_price'], ss['native_stop_is_trailing'] = _seed_native_stop_state(executor)
-            # amount= (2026-09-22 second review finding, P1 — same fix as
-            # run()'s own restart-recovery block, see its comment there):
-            # a bare allocate(sym) reserves a generic slot_cash_for(sym)
-            # slice of the pool, unrelated to what this recovered position
-            # is actually worth — silently losing (or fabricating) equity
-            # with no economic event. Reserve its own actual value instead.
-            capital_pool.allocate(sym, amount=executor.cash + executor.position * executor.avg_entry)
+            # Fold this position's real value into the pool BEFORE
+            # reserving its slot (external review, 2026-09-22, second
+            # round P1 — corrects the prior comment here, which claimed
+            # this path was inactive because DYNAMIC_UNIVERSE_ENABLED is
+            # false; it is NOT inactive — run()'s orphaned-position
+            # recovery calls this same function UNCONDITIONALLY whenever
+            # live_trading is on, regardless of cfg.dynamic.enabled, so a
+            # stale position outside the roster is recovered through here
+            # on every restart no matter what the dynamic flag says).
+            #
+            # Unlike the FIXED roster's restart-recovery (run()'s own
+            # "Restart recovery" section), whose value is already folded
+            # into total_capital by _initialize_capital_pool() BEFORE that
+            # section ever runs (this symbol's executor was already in the
+            # `executors` dict passed to it) — a symbol admitted THROUGH
+            # THIS function (orphan recovery, or an ordinary dynamic-tick
+            # admission) is, by construction, always admitted AFTER the
+            # pool already exists. Nobody else ever folds its value in, so
+            # this function must do it itself, exactly once.
+            #
+            # The bump is the position's MARKET VALUE ONLY
+            # (position * avg_entry) — never cash + position. total_capital
+            # traces back to a real, freshly-queried exchange free-cash
+            # balance (_initialize_capital_pool's exchange_cash_observed at
+            # startup); that number is a whole-account read, so it ALREADY,
+            # invisibly, includes this symbol's own not-yet-invested cash —
+            # there is no such thing as "this symbol's slice" on the
+            # exchange side, only in the bot's own bookkeeping. Adding
+            # cash again on top would double-count exactly this symbol's
+            # own cash a second time (caught 2026-09-22 by building the
+            # multi-coin one-bankroll restart validation this same review
+            # asked for — a naive cash+position bump passed every
+            # single-symbol test but inflated total_capital by the sum of
+            # every recovered symbol's OWN cash once two coins sharing one
+            # real account were modeled together: $699.20 free cash + two
+            # $449.60 slots should total $899.20 kept together, not
+            # $1598.40). The slot RESERVATION itself is still the position's
+            # full value (cash + position * avg_entry, matching
+            # _initialize_capital_pool's own later "Restart recovery"
+            # allocate() call for the fixed roster) — that correctly draws
+            # down the pool's pre-existing (already cash-inclusive) total
+            # by this symbol's own cash, while separately adding its
+            # position's not-yet-reflected value on top. Reproduced without
+            # this fix (either the original cash+position bump, or no bump
+            # at all): shared free cash $135, this symbol already holding
+            # a position worth $165 (true equity $300) — a bare
+            # allocate(sym) (no bump at all) reserved a generic ~$67
+            # theoretical slot against a pool that still thought its total
+            # was $135, silently losing $55 of real equity with no
+            # economic event. is_allocated() guards against double-bumping
+            # if this ever runs twice for an already-allocated symbol (not
+            # expected under any current caller, but the pool's own total
+            # must never be inflated twice for the same holding).
+            #
+            # THIRD-ROUND correction (external review, 2026-09-22): the
+            # bump above is correct ONLY when total_capital traces back to
+            # a real, freshly-queried exchange balance — i.e. exactly the
+            # condition _initialize_capital_pool itself uses to decide
+            # whether to trust exchange_cash_observed at all:
+            # `cfg.exchange.live_trading and not cfg.paper.paper_mode and
+            # not cfg.exchange.dry_run`. In paper/dry-run mode,
+            # total_capital is `cfg.portfolio.starting_cash` — a STATIC
+            # config constant with no relationship to this symbol's own
+            # historical spending (there is no real exchange to have
+            # already, invisibly, priced this symbol's cash into it).
+            #
+            # FOURTH-ROUND correction (external review, 2026-09-22, same
+            # day): the third round's fix for this ("skip the bump
+            # entirely in paper/dry-run mode, accept a small residual
+            # that self-corrects on release()") was ITSELF wrong — the
+            # residual does NOT self-correct. Reproduced: recovering two
+            # $0.40-fee positions left total_capital at $900 (correct:
+            # $899.20); closing BOTH at unchanged prices with another
+            # $0.40 fee each left it at $899.20 (correct: $898.40) —
+            # release()'s existing formula (total - allocated +
+            # cash_returned) only ever propagates a slot's fees/PnL
+            # RELATIVE TO its own reserved amount; it has no way to also
+            # retroactively fix a baseline that was never adjusted for
+            # this symbol's PRIOR (entry) fees in the first place. The
+            # $0.80 entry-fee gap survives every subsequent close.
+            #
+            # Correctly fixed for LIVE mode: bump total_capital by this
+            # symbol's own (realized_pnl - fees_paid) — the net effect of
+            # every REAL economic event (price-based gains/losses AND
+            # fees) this position has experienced since it was first
+            # funded, using fields LiveExecutor already persists and
+            # restores. For ANY history of fills, cash + position ×
+            # avg_entry == original_fresh_funding + realized_pnl -
+            # fees_paid, so this reconstructs the correct total without
+            # needing to know the original funding amount. Re-verified
+            # against the full reproduction above: recovery bump = -0.40
+            # each for both positions (899.20 = 900 - 0.40 - 0.40,
+            # matching true equity exactly); the already-correct
+            # release() formula then carries this correct baseline
+            # through both subsequent exits to exactly $898.40.
+            #
+            # SEVENTH-ROUND correction (external review, 2026-09-22, same
+            # day): the paper/dry-run half of the fourth-round fix above
+            # is now REMOVED, not merely reworded — it's superseded, and
+            # applying it here too would DOUBLE-COUNT. _initialize_
+            # capital_pool()'s paper/dry-run branch now runs
+            # _replay_paper_realized_pnl() ONCE at startup, scanning EVERY
+            # live_state_*.json file on disk (not just the fixed roster's
+            # own executors) — this already includes THIS symbol's
+            # (realized_pnl - fees_paid), since its file already existed
+            # on disk by the time that replay ran, whether this admission
+            # is an ordinary dynamic-tick pickup or orphan recovery.
+            # Bumping again here, for paper/dry-run, would add it a
+            # second time. Live mode is UNCHANGED — _initialize_capital_
+            # pool's live branch never scans disk (it only knows the
+            # fixed roster's own already-passed executors), so a
+            # dynamically-admitted symbol's live bump is still needed
+            # here, and it alone.
+            _recovered_position_value = executor.position * executor.avg_entry
+            _recovered_slot_amount = executor.cash + _recovered_position_value
+            _pool_is_live = (
+                cfg.exchange.live_trading
+                and not cfg.paper.paper_mode
+                and not cfg.exchange.dry_run
+            )
+            if _pool_is_live and not capital_pool.is_allocated(sym):
+                capital_pool.total_capital = capital_pool.total_capital + _recovered_position_value
+            capital_pool.allocate(sym, amount=_recovered_slot_amount)
             logger.warning(
                 "Dynamic symbol %s admitted WITH an existing position"
                 " (qty=%.6f @ %.2f) — restart-recovery seeding applied",
@@ -2495,6 +2959,51 @@ def _sync_dynamic_universe(
             logger.info("Dynamic universe: retired %s (flat, no longer eligible)", sym)
 
     return admitted, retired, screen
+
+
+def _dynamic_buy_eligible(sym: str, screen, max_age_s: float) -> "tuple[bool, str]":
+    """
+    True only if `sym` is backed by a genuinely current "the market still
+    looks tradeable" read from the dynamic-universe screener — the gate
+    external review (2026-09-22, second round P1) found missing: "the
+    fixed roster (BTC/CAD, SOL/CAD) was NEVER subject to this check at
+    all — once dynamic mode is on, a BUY on ANY symbol should only fire
+    against fresh eligibility data, matching the whole point of running a
+    live market scanner." Reproduced: a screener returning zero eligible
+    candidates (a real liquidity freeze, or discovery repeatedly failing)
+    still let a fixed-roster BUY through unconditionally before this fix.
+
+    This gates NEW BUYS ONLY. A symbol that fails this check is still
+    fully managed for exits (SL/TP, native stop, drift/health checks) by
+    the rest of run()'s per-symbol loop — nothing here ever touches a
+    SELL, and a symbol already holding a position is never "un-managed"
+    by an ineligible read (see _retire_dynamic_symbol_if_eligible, which
+    already refuses to retire a symbol that's still holding).
+
+    `screen` is whatever run() last successfully completed a discovery
+    cycle with (`_dynamic_last_screen` — None before the very first cycle,
+    which runs at the end of tick 1's own "0c." step; see that call
+    site's comment). Three ways this returns False, all fail-CLOSED
+    (block the BUY) rather than fail-open, deliberately mirroring the
+    screener's own "never invent an arbitrary fallback" philosophy:
+      - screen is None:        discovery hasn't completed even once yet
+      - screen.stale:          the LAST discovery attempt itself failed
+                                and this is served from the on-disk cache
+      - too old (> max_age_s): no discovery has succeeded recently enough
+                                to trust for a live BUY decision right now
+                                (covers repeated silent discovery failures
+                                — scanned_at only advances on success)
+    Otherwise: eligible iff `sym` is in this screen's own eligible list.
+    """
+    if screen is None:
+        return False, "no_screen_yet"
+    if screen.stale:
+        return False, "stale_screen_cache"
+    if time.time() - screen.scanned_at > max_age_s:
+        return False, "screen_too_old"
+    if sym not in screen.eligible_symbols:
+        return False, "not_currently_eligible"
+    return True, ""
 
 
 def _write_dynamic_universe_dashboard(
@@ -2951,6 +3460,9 @@ def run():
                     adopt_external_holdings  = cfg.exchange.adopt_external_holdings,
                     native_stop_loss_enabled = cfg.exchange.native_stop_loss_enabled,
                     max_slippage_pct         = cfg.exchange.max_slippage_pct,
+                    simulated_maker_fee_pct  = cfg.exchange.simulated_maker_fee_pct,
+                    simulated_taker_fee_pct  = cfg.exchange.simulated_taker_fee_pct,
+                    simulate_maker_fills     = cfg.exchange.simulate_maker_fills,
                 )
                 for sym in _universe_symbols
             }
@@ -2973,6 +3485,9 @@ def run():
                 adopt_external_holdings  = cfg.exchange.adopt_external_holdings,
                 native_stop_loss_enabled = cfg.exchange.native_stop_loss_enabled,
                 max_slippage_pct         = cfg.exchange.max_slippage_pct,
+                simulated_maker_fee_pct  = cfg.exchange.simulated_maker_fee_pct,
+                simulated_taker_fee_pct  = cfg.exchange.simulated_taker_fee_pct,
+                simulate_maker_fills     = cfg.exchange.simulate_maker_fills,
             )
             # Derive slot_cash for new symbols from the first executor's balance
             # so their "ready" log matches the actual pool slot instead of showing
@@ -3002,6 +3517,9 @@ def run():
                     adopt_external_holdings  = cfg.exchange.adopt_external_holdings,
                     native_stop_loss_enabled = cfg.exchange.native_stop_loss_enabled,
                     max_slippage_pct         = cfg.exchange.max_slippage_pct,
+                    simulated_maker_fee_pct  = cfg.exchange.simulated_maker_fee_pct,
+                    simulated_taker_fee_pct  = cfg.exchange.simulated_taker_fee_pct,
+                    simulate_maker_fills     = cfg.exchange.simulate_maker_fills,
                 )
         executor = executors[_active_symbol]   # alias for pre-loop header/recovery code
         mode_str = "[DRY RUN] " if (cfg.exchange.dry_run or cfg.paper.paper_mode) else ""
@@ -3042,7 +3560,7 @@ def run():
     # STARTING_CASH path as paper_mode — the persisted per-symbol state file
     # is not a trustworthy whole-account total in either case.
     _max_conc = cfg.portfolio.max_concurrent_positions
-    capital_pool, _per_symbol_slots, _pool_total, _slot_cap, _slot_caps_by_symbol = (
+    capital_pool, _per_symbol_slots, _pool_total, _slot_cap, _slot_caps_by_symbol, _paper_accounting_ok = (
         _initialize_capital_pool(executors, cfg)
     )
     _uncapped_slot = _pool_total / _max_conc
@@ -3241,6 +3759,22 @@ def run():
     # specific error string, complementing the per-case counters
     # (exit_fail_count, drift_count, _auth_health).
     stuck_detector = StuckLoopDetector(alerter.error)
+
+    # PAPER_ACCOUNTING_INCOMPLETE alert (2026-09-22, eighth round P1) —
+    # deferred to here, the first point in run() where `alerter` exists;
+    # _initialize_capital_pool() already logged this loudly at the
+    # moment it happened, this just makes it reach a human via Telegram
+    # too. Existing positions are managed normally regardless — only new
+    # BUY funding is affected (see the risk-gate check below).
+    if not _paper_accounting_ok:
+        alerter.error(
+            "⚠️ PAPER ACCOUNTING RECONSTRUCTION INCOMPLETE at startup — "
+            "one or more live_state_*.json files could not be fully "
+            "trusted (unreadable, missing fields, or a non-finite "
+            "value). New simulated BUYs are blocked until this is "
+            "resolved. Existing open positions are still managed "
+            "normally."
+        )
 
     # In live mode: show real Kraken balance, not starting_cash from .env.
     # executor.cash and executor.position are already synced from the exchange
@@ -3729,14 +4263,43 @@ def run():
     # That's a structural property, not a convention: this file's import of
     # TelegramCommandPoller carries no reference to those methods for a
     # handler to even reach.
-    if cfg.alerts.telegram_control_enabled:
+    #
+    # _resolve_telegram_control_credentials (2026-09-24, fourteenth round
+    # P1) — not the raw cfg.alerts.telegram_control_enabled check alone —
+    # decides whether this may start at all: a SHADOW process (_SHADOW_
+    # MODE True) inheriting the ambient TELEGRAM_CONTROL_ENABLED=true
+    # would otherwise start a second poller against the SAME token as the
+    # real, currently-halted bot, corrupting its command delivery (see
+    # that function's own docstring for the full reasoning). Force-
+    # disabled for shadow mode unless a genuinely separate
+    # SHADOW_TELEGRAM_CONTROL_BOT_TOKEN/CHAT_ID pair is explicitly
+    # configured.
+    _tg_control_creds = _resolve_telegram_control_credentials(
+        shadow_mode      = _SHADOW_MODE,
+        control_enabled  = cfg.alerts.telegram_control_enabled,
+        main_bot_token   = cfg.alerts.telegram_bot_token,
+        main_chat_id     = cfg.alerts.telegram_chat_id,
+        shadow_bot_token = cfg.alerts.shadow_control_bot_token,
+        shadow_chat_id   = cfg.alerts.shadow_control_chat_id,
+    )
+    if cfg.alerts.telegram_control_enabled and _tg_control_creds is None:
+        logger.error(
+            "Two-way Telegram control DISABLED for this run: TELEGRAM_CONTROL_ENABLED=true but "
+            "this is a SHADOW process (_SHADOW_MODE) with no dedicated SHADOW_TELEGRAM_CONTROL_"
+            "BOT_TOKEN/SHADOW_TELEGRAM_CONTROL_CHAT_ID configured. Starting a second getUpdates "
+            "poller against the same token as the real bot would corrupt its command delivery "
+            "(shared, server-side offset — see bot/alerts/telegram_control.py). Configure a "
+            "dedicated shadow control token to enable this for shadow runs."
+        )
+    if _tg_control_creds is not None:
+        _tg_control_bot_token, _tg_control_chat_id = _tg_control_creds
         from bot.alerts.telegram_control import (
             TelegramCommandPoller, start_telegram_control_thread,
         )
 
         _tg_control_poller = TelegramCommandPoller(
-            bot_token = cfg.alerts.telegram_bot_token,
-            chat_id   = cfg.alerts.telegram_chat_id,
+            bot_token = _tg_control_bot_token,
+            chat_id   = _tg_control_chat_id,
             handlers  = {
                 "/status_crypto": lambda: _status_crypto_text(
                     executors, symbol_state, risk,
@@ -4958,6 +5521,53 @@ def run():
                 block_reason = approval.message
                 if not _buy_block_gate:
                     _buy_block_gate = "accounting"
+
+            # ── 7a1. Paper-accounting reconstruction gate ────────────
+            # External review (2026-09-22, eighth round P1): "mark
+            # reconstruction incomplete and prevent simulated BUY
+            # funding until the history is recovered." _paper_
+            # accounting_ok is computed once at startup by
+            # _initialize_capital_pool() (always True for live mode —
+            # a real exchange balance needs no reconstruction). Applies
+            # to EVERY symbol, fixed roster or dynamic, exactly like the
+            # accounting gate above — never touches a SELL/exit.
+            if approval and final_signal == Signal.BUY and not _paper_accounting_ok:
+                approval = ApprovalResult(
+                    approved=False,
+                    message="Paper-accounting reconstruction incomplete at"
+                            " startup — new BUY funding refused until resolved.",
+                    block_reason=BlockReason.PAPER_ACCOUNTING_INCOMPLETE,
+                )
+                block_reason = approval.message
+                if not _buy_block_gate:
+                    _buy_block_gate = "paper_accounting_incomplete"
+
+            # ── 7a2. Dynamic-universe eligibility gate ───────────────
+            # External review (2026-09-22, second round P1): once dynamic
+            # mode is active, EVERY BUY candidate — the fixed roster
+            # included, since the shared ranked queue below deliberately
+            # mixes both — must be backed by the SAME "still currently
+            # tradeable" read the screener already uses to admit/retire
+            # dynamic symbols, not just its own strategy signal. Exit
+            # management is entirely unaffected (see _dynamic_buy_eligible
+            # 's own docstring). max_age_s is a generous 2x the configured
+            # refresh cadence — this is a "has discovery basically stopped
+            # succeeding" check, not a tight per-tick freshness window;
+            # the normal one-refresh-cycle-old screen between scheduled
+            # refreshes is expected and fine.
+            if approval and final_signal == Signal.BUY and _dynamic_mode_active:
+                _dyn_elig_ok, _dyn_elig_reason = _dynamic_buy_eligible(
+                    sym, _dynamic_last_screen, cfg.dynamic.refresh_hours * 3600 * 2,
+                )
+                if not _dyn_elig_ok:
+                    approval = ApprovalResult(
+                        approved=False,
+                        message=f"Dynamic-universe eligibility check failed: {_dyn_elig_reason}",
+                        block_reason=BlockReason.DYNAMIC_INELIGIBLE,
+                    )
+                    block_reason = approval.message
+                    if not _buy_block_gate:
+                        _buy_block_gate = "dynamic_ineligible"
 
             # ── 7b. Candle-close structured log + blocked-BUY CSV ────
             if is_indicator and live_exchange is not None:

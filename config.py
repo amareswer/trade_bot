@@ -168,6 +168,37 @@ class ExchangeConfig:
                                                # 0 = disabled. On by default — alert-only, never changes trading
                                                # behavior, same reasoning as the correlation/macro gates shipping
                                                # active in the stock bot.
+    simulated_maker_fee_pct: float = 0.0040   # SIMULATED_MAKER_FEE_PCT — dry_run=True fills only (no real
+                                               # exchange fee to read). Applied when the fill would have been a
+                                               # post-only LIMIT BUY (the live entry path's own maker attempt —
+                                               # see LiveExecutor.execute()'s `_order_type == "limit" and side ==
+                                               # BUY and not urgent` condition, mirrored exactly for this
+                                               # decision). Default matches Kraken's documented real rate (see
+                                               # CLAUDE.md "round-trip cost ~1.20%": 0.40% maker + 0.80% taker).
+                                               # External review, 2026-09-22, tenth round: a dry-run/paper-mode
+                                               # acceptance run had ZERO simulated fees, making any net-of-fee
+                                               # PF measurement meaningless (net == gross always). Never touches
+                                               # a REAL (dry_run=False) fill — the exchange's own reported fee
+                                               # is always used there, unchanged.
+    simulated_taker_fee_pct: float = 0.0080   # SIMULATED_TAKER_FEE_PCT — dry_run=True fills only. Applied to
+                                               # every fill that ISN'T the maker case above: any urgent SL/TP
+                                               # exit, any plain market order, or a non-BUY side. Also the ONLY
+                                               # rate ever used while simulate_maker_fills is False (the default —
+                                               # see that field's own comment).
+    simulate_maker_fills:    bool  = False    # SIMULATE_MAKER_FILLS — external review, 2026-09-22, eleventh
+                                               # round P2 ("attempting a maker order is treated as guaranteed
+                                               # maker execution... the real limit path can fall back to
+                                               # market; the simulation can understate entry costs"). Default
+                                               # OFF is the intentionally CONSERVATIVE choice for acceptance
+                                               # measurement: every dry-run fill — BUY or SELL, any order_type,
+                                               # urgent or not — pays simulated_taker_fee_pct, never the maker
+                                               # rate, so a paper/shadow run's own reported costs are never
+                                               # UNDER-stated relative to what a real maker-fallback-prone entry
+                                               # would actually cost. Set True only to model a best-case
+                                               # "every maker attempt succeeds" scenario for comparison — never
+                                               # for an acceptance-measurement run itself. This is a documented
+                                               # simplification (a real fallback rate isn't modeled at all,
+                                               # either on or off), not a claim of full realism either way.
 
     def __post_init__(self):
         if self.feed_mode not in ("live", "simulated"):
@@ -200,6 +231,10 @@ class ExchangeConfig:
             raise ValueError("DRIFT_ALERT_THRESHOLD must be >= 1")
         if not 0 <= self.max_slippage_pct <= 0.20:
             raise ValueError("MAX_SLIPPAGE_PCT must be between 0% and 20% (0 = disabled)")
+        if not 0 <= self.simulated_maker_fee_pct <= 0.05:
+            raise ValueError("SIMULATED_MAKER_FEE_PCT must be between 0% and 5%")
+        if not 0 <= self.simulated_taker_fee_pct <= 0.05:
+            raise ValueError("SIMULATED_TAKER_FEE_PCT must be between 0% and 5%")
 
 
 @dataclass
@@ -467,6 +502,24 @@ class AlertConfig:
     # .memory/execution_layer.md for the shared-token/single-poller
     # constraint with the stock bot (same TELEGRAM_BOT_TOKEN/CHAT_ID).
     telegram_control_enabled: bool = False
+    # SHADOW_TELEGRAM_CONTROL_BOT_TOKEN / SHADOW_TELEGRAM_CONTROL_CHAT_ID
+    # (external review, 2026-09-24, fourteenth round P1): a shadow-mode
+    # process (LIVE_TRADING=true + DRY_RUN=true) inheriting the SAME
+    # TELEGRAM_CONTROL_ENABLED=true + TELEGRAM_BOT_TOKEN as the real,
+    # currently-halted crypto bot would start a SECOND getUpdates poller
+    # against the SAME token — telegram_control.py's own documented
+    # single-poller constraint (offset is server-side PER TOKEN, not per
+    # process) means the two pollers would corrupt each other's command
+    # delivery, silently breaking the REAL bot's own /pause_crypto,
+    # /resume_crypto, /status_crypto for as long as the shadow run is
+    # active. Empty (the default) means "no dedicated shadow control
+    # channel configured" — run()'s own startup logic then force-disables
+    # the poller entirely for a shadow process rather than ever starting
+    # it against the shared production token, regardless of
+    # telegram_control_enabled. Set BOTH to enable shadow-run Telegram
+    # control via a genuinely separate bot (create one via @BotFather).
+    shadow_control_bot_token: str = ""
+    shadow_control_chat_id:   str = ""
 
 
 @dataclass
@@ -852,6 +905,9 @@ def _load() -> AppConfig:
             drift_alert_threshold    = _int  ("DRIFT_ALERT_THRESHOLD",    3),
             native_stop_loss_enabled = _bool ("NATIVE_STOP_LOSS_ENABLED", False),
             max_slippage_pct         = _float("MAX_SLIPPAGE_PCT",         0.01),
+            simulated_maker_fee_pct  = _float("SIMULATED_MAKER_FEE_PCT",  0.0040),
+            simulated_taker_fee_pct  = _float("SIMULATED_TAKER_FEE_PCT",  0.0080),
+            simulate_maker_fills     = _bool ("SIMULATE_MAKER_FILLS",     False),
         ),
         strategy=StrategyConfig(
             mode                    = _str  ("STRATEGY_MODE",           "indicator"),
@@ -934,6 +990,8 @@ def _load() -> AppConfig:
             telegram_bot_token        = _str ("TELEGRAM_BOT_TOKEN",        ""),
             telegram_chat_id          = _str ("TELEGRAM_CHAT_ID",          ""),
             telegram_control_enabled  = _bool("TELEGRAM_CONTROL_ENABLED",  False),
+            shadow_control_bot_token  = _str ("SHADOW_TELEGRAM_CONTROL_BOT_TOKEN", ""),
+            shadow_control_chat_id    = _str ("SHADOW_TELEGRAM_CONTROL_CHAT_ID",   ""),
         ),
         universe=UniverseConfig(
             enabled             = _bool ("UNIVERSE_ENABLED",       False),

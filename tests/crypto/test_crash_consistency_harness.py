@@ -1578,3 +1578,109 @@ def test_checkpoint_split_with_varying_prices_is_estimated_and_alerted(mock_cfg,
     # Loudly alerted as an estimate, not silently trusted as exact.
     assert mock_alerter.error.called
     assert "ESTIMATE" in mock_alerter.error.call_args[0][0]
+
+
+# ---------------------------------------------------------------------------
+# Second review round, 2026-09-22 (P1): an intermediate version of the
+# cash-ownership fix assigned self._portfolio.cash from
+# exchange_cash_observed directly inside native-stop recovery whenever the
+# position was confirmed flat — reintroducing, via a different code path,
+# exactly the whole-account-attribution bug the fix was supposed to
+# eliminate. Reproduced through the REAL startup sequence (a genuine
+# LiveExecutor construction, not a hand-computed unit), across a restart
+# and a subsequent live exit.
+# ---------------------------------------------------------------------------
+
+def test_native_stop_recovery_never_attributes_shared_account_cash_to_this_symbol(tmp_path):
+    """Second review round, P1, exact reproduction: this symbol's own cash
+    before a stop fill is $59.60. The stop sells for $50.00 with a $0.50
+    fee (net $49.50), so this symbol's OWN correct cash afterward is
+    $109.10. A completely UNRELATED $100.00 sits in the same shared
+    account (another symbol's own slot, idle, nothing to do with this
+    one) — the exchange's raw free balance this restart observes is
+    therefore $209.10 (109.10 + 100.00), not this symbol's own $109.10.
+
+    No timeout and no concurrent activity is needed to trigger this —
+    ordinary cash sharing alone does (the order lookup below succeeds
+    immediately, on the very first try). A version of the cash-ownership
+    fix that assigned self._portfolio.cash from exchange_cash_observed
+    ANYWHERE in native-stop recovery (rather than exclusively from this
+    order's own reported fill data) would read back $209.10 here instead
+    of the correct $109.10 — see _journal_native_stop_execution_at_
+    startup's own docstring for the full account of that intermediate bug
+    and its fix. Covers restart (state persists correctly, doesn't drift
+    back toward the shared balance on a second construction) and a later
+    exit (a subsequent real BUY still builds on the correct baseline)."""
+    import json as _json
+
+    state_path = str(tmp_path / "state.json")
+    _json.dump({
+        "symbol": "BTC/CAD", "cash": 59.60, "position": 0.001,
+        "cost_basis": 52_000.0, "realized_pnl": 0.0, "fees_paid": 0.0,
+        "native_stop_order_id": "stop-shared-1", "native_stop_price": 50_000.0,
+        "saved_at": "2026-09-01T00:00:00+00:00",
+    }, open(state_path, "w"))
+
+    def _make_mock_exchange():
+        mock_ex = MagicMock()
+        mock_ex.load_markets.return_value = {}
+        # The account's REAL, whole-shared free balance: this symbol's
+        # own correct $109.10 PLUS a completely unrelated $100.00 that
+        # belongs to some other symbol's own slot.
+        mock_ex.fetch_balance.return_value = {
+            "free": {"CAD": 209.10, "BTC": 0.0}, "total": {"CAD": 209.10, "BTC": 0.0},
+        }
+        mock_ex.fetch_open_orders.return_value = []
+        mock_ex.fetch_order.return_value = {
+            "id": "stop-shared-1", "status": "closed", "filled": 0.001,
+            "average": 50_000.0, "fee": {"cost": 0.50, "currency": "CAD"},
+        }
+        return mock_ex
+
+    mock_ex = _make_mock_exchange()
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = mock_ex
+        ex = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=100.0, dry_run=False, state_path=state_path,
+            native_stop_loss_enabled=True,
+        )
+
+    assert ex.position == 0.0
+    assert not ex.has_resting_stop
+    # The critical assertion: this symbol's OWN cash, never the shared
+    # whole-account balance.
+    assert ex.cash == pytest.approx(109.10)
+    # The whole-account balance WAS observed (available for a pool-level
+    # drift check elsewhere, e.g. bot.main._reconcile_shared_account_cash)
+    # but never adopted as this symbol's own cash.
+    assert ex.exchange_cash_observed == pytest.approx(209.10)
+
+    # Restart: nothing further happens on the exchange. The recovered
+    # $109.10 must survive a second restart unchanged — not drift back
+    # toward the (still-inflated) shared balance.
+    mock_ex2 = _make_mock_exchange()
+    with patch.object(le_mod.ccxt, "kraken") as mock_cls2:
+        mock_cls2.return_value = mock_ex2
+        ex2 = LiveExecutor(
+            exchange_id="kraken", symbol="BTC/CAD", api_key="k", api_secret="s",
+            starting_cash=100.0, dry_run=False, state_path=state_path,
+            native_stop_loss_enabled=True,
+        )
+    assert ex2.cash == pytest.approx(109.10)
+    assert ex2.position == 0.0
+
+    # Later exit: a subsequent real BUY against this same shared account
+    # must build on the correct $109.10 baseline, not the inflated one.
+    mock_ex2.price_to_precision.return_value = "0.0"
+    mock_ex2.create_order.return_value = {
+        "id": "buy-1", "status": "closed", "filled": 0.001, "average": 50_000.0,
+        "fee": {"cost": 0.05, "currency": "CAD"},
+    }
+    mock_ex2.fetch_order.return_value = mock_ex2.create_order.return_value
+    with patch("time.sleep"), patch("bot.execution.live_executor.cfg") as mock_cfg:
+        mock_cfg.exchange.limit_order_enabled = False
+        order = ex2.execute(Signal.BUY, 50_000.0, 0.001)
+    assert order is not None and order.status == OrderStatus.FILLED
+    # 109.10 - (50,000 * 0.001 cost) - 0.05 fee = 59.05
+    assert ex2.cash == pytest.approx(59.05)

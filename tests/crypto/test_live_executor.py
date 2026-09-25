@@ -44,6 +44,9 @@ def _make(
     order_type:     str   = "market",
     native_stop_loss_enabled: bool = False,
     max_slippage_pct: float = 0.0,
+    simulated_maker_fee_pct: float = 0.0,
+    simulated_taker_fee_pct: float = 0.0,
+    simulate_maker_fills: bool = False,
     tmp_path        = None,
 ) -> tuple[LiveExecutor, MagicMock]:
     """
@@ -92,6 +95,9 @@ def _make(
             order_type    = order_type,
             native_stop_loss_enabled = native_stop_loss_enabled,
             max_slippage_pct = max_slippage_pct,
+            simulated_maker_fee_pct = simulated_maker_fee_pct,
+            simulated_taker_fee_pct = simulated_taker_fee_pct,
+            simulate_maker_fills = simulate_maker_fills,
         )
     return ex, mock_ex
 
@@ -143,6 +149,201 @@ def test_dry_run_sell_never_calls_create_order(tmp_path):
     assert order.status == OrderStatus.FILLED
     assert order.side   == OrderSide.SELL
     mock_ex.create_order.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Simulated fees on dry-run fills (2026-09-22, tenth round review — "the
+# zero-fee-simulation gap"). Only ever applies to dry_run=True; a real fill
+# always uses the exchange's own reported fee, covered by other tests.
+# ---------------------------------------------------------------------------
+
+def test_dry_run_buy_via_limit_order_type_pays_the_simulated_maker_fee_when_opted_in(tmp_path):
+    """A non-urgent BUY with order_type='limit' mirrors the real entry
+    path's own maker attempt (LiveExecutor.execute()'s `order_type ==
+    'limit' and side == BUY and not urgent` condition) — pays the
+    MAKER rate, not the taker rate, but ONLY when simulate_maker_fills
+    is explicitly True (eleventh round review, P2 — the conservative
+    DEFAULT is False; see the sibling test right below for that)."""
+    ex, _ = _make(
+        dry_run=True, starting_cash=1000.0, order_type="limit",
+        simulated_maker_fee_pct=0.0040, simulated_taker_fee_pct=0.0080,
+        simulate_maker_fills=True,
+        tmp_path=tmp_path,
+    )
+    price, qty = 90_000.0, 0.001   # notional = $90
+    order = ex.execute(Signal.BUY, price, qty)
+
+    expected_fee = price * qty * 0.0040   # $0.36
+    assert order.fee_cost == pytest.approx(expected_fee)
+    assert ex.fees_paid == pytest.approx(expected_fee)
+    assert ex.cash == pytest.approx(1000.0 - price * qty - expected_fee)
+
+
+def test_dry_run_buy_via_limit_order_type_pays_taker_by_default_not_maker(tmp_path):
+    """External review, 2026-09-22, eleventh round P2: "attempting a
+    maker order is treated as guaranteed maker execution... the
+    simulation can understate entry costs." Without opting into
+    simulate_maker_fills, even a non-urgent order_type='limit' BUY must
+    pay the (higher, conservative) taker rate — the maker branch is
+    gated off entirely by default, not just less likely."""
+    ex, _ = _make(
+        dry_run=True, starting_cash=1000.0, order_type="limit",
+        simulated_maker_fee_pct=0.0040, simulated_taker_fee_pct=0.0080,
+        tmp_path=tmp_path,   # simulate_maker_fills left at its default (False)
+    )
+    price, qty = 90_000.0, 0.001
+    order = ex.execute(Signal.BUY, price, qty)
+
+    expected_fee = price * qty * 0.0080   # taker, NOT the 0.0040 maker rate
+    assert order.fee_cost == pytest.approx(expected_fee)
+
+
+def test_dry_run_buy_via_market_order_type_pays_the_simulated_taker_fee(tmp_path):
+    """A BUY with order_type='market' (no maker attempt at all) pays the
+    TAKER rate, even though it's still the entry side."""
+    ex, _ = _make(
+        dry_run=True, starting_cash=1000.0, order_type="market",
+        simulated_maker_fee_pct=0.0040, simulated_taker_fee_pct=0.0080,
+        tmp_path=tmp_path,
+    )
+    price, qty = 90_000.0, 0.001
+    order = ex.execute(Signal.BUY, price, qty)
+
+    expected_fee = price * qty * 0.0080   # $0.72
+    assert order.fee_cost == pytest.approx(expected_fee)
+    assert ex.fees_paid == pytest.approx(expected_fee)
+
+
+def test_dry_run_urgent_buy_pays_the_simulated_taker_fee_even_with_limit_order_type(tmp_path):
+    """urgent=True forces a plain market order regardless of ORDER_TYPE
+    (see execute()'s own docstring) — the maker condition explicitly
+    excludes urgent fills, so this must pay the taker rate despite
+    order_type='limit'."""
+    ex, _ = _make(
+        dry_run=True, starting_cash=1000.0, order_type="limit",
+        simulated_maker_fee_pct=0.0040, simulated_taker_fee_pct=0.0080,
+        tmp_path=tmp_path,
+    )
+    price, qty = 90_000.0, 0.001
+    order = ex.execute(Signal.BUY, price, qty, urgent=True)
+
+    expected_fee = price * qty * 0.0080
+    assert order.fee_cost == pytest.approx(expected_fee)
+
+
+def test_dry_run_sell_always_pays_the_simulated_taker_fee(tmp_path):
+    """The maker condition is BUY-only (mirroring the real bot's design:
+    entries limit-chase for maker rate, ALL exits — urgent or ordinary
+    strategy SELL — are taker) — a non-urgent SELL still pays taker."""
+    ex, _ = _make(
+        dry_run=True, starting_cash=1000.0, order_type="limit",
+        simulated_maker_fee_pct=0.0040, simulated_taker_fee_pct=0.0080,
+        tmp_path=tmp_path,
+    )
+    price, qty = 90_000.0, 0.001
+    ex.execute(Signal.BUY, price, qty)   # entry fee, unrelated to this assertion either way
+    fees_after_buy = ex.fees_paid
+
+    sell_order = ex.execute(Signal.SELL, price * 1.01, qty)   # ordinary, non-urgent exit
+
+    expected_sell_fee = (price * 1.01) * qty * 0.0080
+    assert sell_order.fee_cost == pytest.approx(expected_sell_fee)
+    assert ex.fees_paid == pytest.approx(fees_after_buy + expected_sell_fee)
+
+
+def test_dry_run_zero_simulated_fee_rates_preserve_old_zero_fee_behavior(tmp_path):
+    """Backward compatibility: the LiveExecutor-level default for both
+    rates is 0.0 (see __init__'s own comment) — a caller that never
+    opts in (every EXISTING test in this file before this round, and
+    any direct construction that doesn't pass these params) still gets
+    the exact old zero-fee dry-run behavior, unchanged."""
+    ex, _ = _make(dry_run=True, starting_cash=1000.0, order_type="market", tmp_path=tmp_path)
+    order = ex.execute(Signal.BUY, 90_000.0, 0.001)
+    assert order.fee_cost == pytest.approx(0.0)
+    assert ex.fees_paid == pytest.approx(0.0)
+
+
+def test_dry_run_configurable_fee_rates_are_actually_read_from_the_passed_values(tmp_path):
+    """A different (non-default) pair of rates is honored exactly —
+    proving these are genuinely configurable, not hardcoded constants
+    that happen to accept a parameter."""
+    ex, _ = _make(
+        dry_run=True, starting_cash=1000.0, order_type="market",
+        simulated_maker_fee_pct=0.0100, simulated_taker_fee_pct=0.0250,
+        tmp_path=tmp_path,
+    )
+    price, qty = 90_000.0, 0.001
+    order = ex.execute(Signal.BUY, price, qty)
+    assert order.fee_cost == pytest.approx(price * qty * 0.0250)   # market BUY -> taker
+
+
+# ---------------------------------------------------------------------------
+# Dry-run BUY affordability (2026-09-22, eleventh round review, P1):
+# "dry-run BUYs can spend more cash than available — adds fees without
+# checking affordability."
+# ---------------------------------------------------------------------------
+
+def test_dry_run_buy_exceeding_cash_plus_fee_is_rejected_not_filled(tmp_path):
+    """Exact reproduction: $100 cash, a $100 notional market BUY, a
+    $0.80 (0.80%) simulated fee — the OLD behavior filled it anyway,
+    leaving cash at -$0.80. A real exchange would reject this outright
+    (insufficient funds); dry-run must now do the same rather than
+    silently going cash-negative."""
+    ex, mock_ex = _make(
+        dry_run=True, starting_cash=100.0, order_type="market",
+        simulated_taker_fee_pct=0.0080, tmp_path=tmp_path,
+    )
+    price, qty = 100.0, 1.0   # notional = $100, exactly all the cash — no room for the fee
+
+    order = ex.execute(Signal.BUY, price, qty)
+
+    assert order is not None
+    assert order.status == OrderStatus.REJECTED
+    assert "insufficient" in order.reject_reason.lower() or "available" in order.reject_reason.lower()
+    # Cash and position both completely untouched by the rejected attempt.
+    assert ex.cash == pytest.approx(100.0)
+    assert ex.position == pytest.approx(0.0)
+    assert ex.fees_paid == pytest.approx(0.0)
+    mock_ex.create_order.assert_not_called()
+
+
+def test_dry_run_buy_exactly_affordable_with_fee_included_still_fills(tmp_path):
+    """The boundary case: a BUY sized to leave EXACTLY enough for the
+    fee (not the naive notional-only sizing that caused the bug) must
+    still fill normally — this is not a blanket rejection of full-cash
+    BUYs, only ones that don't leave room for the fee."""
+    ex, _ = _make(
+        dry_run=True, starting_cash=100.80, order_type="market",
+        simulated_taker_fee_pct=0.0080, tmp_path=tmp_path,
+    )
+    price, qty = 100.0, 1.0   # notional $100 + fee $0.80 = exactly $100.80 available
+
+    order = ex.execute(Signal.BUY, price, qty)
+
+    assert order is not None
+    assert order.status == OrderStatus.FILLED
+    assert ex.cash == pytest.approx(0.0)
+    assert ex.position == pytest.approx(1.0)
+
+
+def test_dry_run_buy_affordability_check_is_never_applied_to_sell(tmp_path):
+    """A SELL's fee only ever reduces the sale's own proceeds (capped
+    well under 100% by config.py's own 5% validation ceiling) — it can
+    never make cash go negative from the fee alone, so no affordability
+    check applies there; a SELL of the full held position must still
+    fill normally regardless of how little cash is on hand."""
+    ex, _ = _make(
+        dry_run=True, starting_cash=0.0, order_type="market",
+        simulated_taker_fee_pct=0.0080, tmp_path=tmp_path,
+    )
+    ex._portfolio.position  = 1.0
+    ex._portfolio._cost_basis = 100.0
+
+    order = ex.execute(Signal.SELL, 100.0, 1.0)
+
+    assert order is not None
+    assert order.status == OrderStatus.FILLED
+    assert ex.cash == pytest.approx(100.0 - 100.0 * 1.0 * 0.0080)   # proceeds net of fee, no rejection
 
 
 # ---------------------------------------------------------------------------

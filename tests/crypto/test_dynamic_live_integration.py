@@ -27,6 +27,10 @@ Covers the point-7 checklist from the live-integration request:
 """
 from __future__ import annotations
 
+import math
+import os
+import tempfile
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -35,6 +39,7 @@ import bot.main as bot_main
 from bot.execution.executor import Order, OrderSide, OrderStatus
 from bot.portfolio.capital_pool import CapitalPool
 from bot.portfolio.position_manager import PositionManager
+from bot.risk.risk_manager import RiskConfig, RiskManager
 from bot.state.trade_state import TradingStateMachine
 from bot.strategy.threshold_strategy import Signal
 
@@ -53,11 +58,13 @@ class FakeExecutor:
     no ccxt, no network, no file I/O."""
 
     def __init__(self, symbol="ETH/CAD", starting_cash=0.0, starting_position=0.0,
-                 avg_entry=0.0, fee_currency="CAD"):
+                 avg_entry=0.0, fee_currency="CAD", fees_paid=0.0, realized_pnl=0.0):
         self.symbol = symbol
         self._portfolio = FakePortfolio(cash=starting_cash)
+        self._portfolio.realized_pnl = realized_pnl
         self.position = starting_position
         self.avg_entry = avg_entry
+        self.fees_paid = fees_paid
         self.has_resting_stop = False
         self._next_order = None
         self._raise_on_execute = None
@@ -123,6 +130,32 @@ def _rejected_order(side, reason="insufficient funds"):
     )
     o.reject_reason = reason
     return o
+
+
+def _force_live_pool_mode(monkeypatch):
+    """_admit_dynamic_symbol's recovery-value fold (external review,
+    2026-09-22, third round) is gated on cfg genuinely representing a
+    live, non-paper, non-dry-run pool — the SAME condition
+    _initialize_capital_pool uses to decide whether to trust
+    exchange_cash_observed. Tests exercising that fold need this forced
+    regardless of whatever the ambient module-level cfg (loaded from
+    whichever .env is present) happens to have — the real crypto .env in
+    this repo currently has DRY_RUN=true (the bot is paused), which would
+    otherwise silently skip the fold and fail these tests for a reason
+    that has nothing to do with the behavior under test."""
+    monkeypatch.setattr(bot_main.cfg.exchange, "live_trading", True)
+    monkeypatch.setattr(bot_main.cfg.paper, "paper_mode", False)
+    monkeypatch.setattr(bot_main.cfg.exchange, "dry_run", False)
+
+
+def _force_paper_pool_mode(monkeypatch):
+    """The paper/dry-run counterpart to _force_live_pool_mode — makes
+    cfg.exchange.dry_run True (paper_mode/live_trading are left at
+    whatever they are; dry_run alone is sufficient to make
+    _initialize_capital_pool's own live-vs-static branch, and therefore
+    _admit_dynamic_symbol's fold gate, take the static-starting_cash
+    path)."""
+    monkeypatch.setattr(bot_main.cfg.exchange, "dry_run", True)
 
 
 def _new_ss(executor=None, strategy_adx=25.0):
@@ -219,6 +252,7 @@ def test_admit_dynamic_symbol_with_existing_position_seeds_recovery_state(monkey
     the capital pool slot must be claimed (the exact gap the review found:
     'restart recovery restores executor positions but not capital-pool
     allocations')."""
+    _force_live_pool_mode(monkeypatch)
     fake_exec = FakeExecutor(starting_cash=50.0, starting_position=2.0, avg_entry=10.0)
     monkeypatch.setattr(bot_main, "build_strategy", lambda: MagicMock(_highs=[], _lows=[], _closes=[]))
     monkeypatch.setattr(bot_main, "_warmup_strategy", lambda strat, ex, tf, symbol: 999)
@@ -232,6 +266,180 @@ def test_admit_dynamic_symbol_with_existing_position_seeds_recovery_state(monkey
     assert ss['pm'].avg_entry == 10.0
     assert ss['sm'].state.value == "LONG"
     assert pool.is_allocated("ETH/CAD")   # capital-pool gap fixed
+    # External review (2026-09-22, second round P1): the slot reserved
+    # must be THIS position's own real value (cash 50 + qty 2 * entry 10
+    # = $70), never a generic equal-split of a pool that never even knew
+    # about this holding. total_capital grows by the POSITION's value
+    # ONLY ($20 = 2*10) — not the full $70 — since the pool's pre-existing
+    # $200 already, implicitly, includes this symbol's own $50 residual
+    # cash (a real, whole-account free-cash figure has no notion of "this
+    # symbol's slice"; only the position's non-cash value is genuinely
+    # new information). See _admit_dynamic_symbol's own comment for the
+    # multi-coin reproduction that caught the cash+position version of
+    # this as a double-count.
+    assert pool.total_capital == pytest.approx(220.0)   # 200 + 20 (position value only)
+    assert pool.available_cash == pytest.approx(150.0)   # 220 total - 70 allocated
+
+
+def test_admit_dynamic_symbol_recovery_folds_real_value_into_pool_not_generic_slot(monkeypatch):
+    """External review (2026-09-22, second round P1), exact reproduction:
+    shared free cash is $135 (pool sized only from what was known at
+    _initialize_capital_pool() time), and THIS symbol is being recovered
+    — through _admit_dynamic_symbol, i.e. either an ordinary dynamic-tick
+    admission or run()'s unconditional orphaned-position recovery — with
+    a real position worth $165 (10 units @ avg_entry 16.5) that the pool
+    never knew about. True equity is $135 + $165 = $300.
+
+    Before this fix: a bare `capital_pool.allocate(sym)` reserved a
+    generic ~$67.50 theoretical half-split of the still-$135 pool for a
+    position actually worth $165 — silently losing $97.50 of real equity
+    (the difference between what was reserved and what the position is
+    actually worth) with no economic event to explain it, and leaving
+    total_capital wrong for every future slot_cash_for() computation too."""
+    _force_live_pool_mode(monkeypatch)
+    fake_exec = FakeExecutor(starting_cash=0.0, starting_position=10.0, avg_entry=16.5)
+    monkeypatch.setattr(bot_main, "build_strategy", lambda: MagicMock(_highs=[], _lows=[], _closes=[]))
+    monkeypatch.setattr(bot_main, "_warmup_strategy", lambda strat, ex, tf, symbol: 1)
+    monkeypatch.setattr(bot_main, "_make_dynamic_executor", lambda sym: fake_exec)
+
+    pool = CapitalPool(total_capital=135.0, max_concurrent=2)
+    ss, err = bot_main._admit_dynamic_symbol("ETH/CAD", "ex", "4h", pool)
+
+    assert err is None
+    assert pool.total_capital == pytest.approx(300.0)          # 135 free + 165 recovered
+    assert pool.is_allocated("ETH/CAD")
+    assert pool._slots["ETH/CAD"] == pytest.approx(165.0)       # exact position value, not a generic split
+    assert pool.available_cash == pytest.approx(135.0)          # 300 - 165, the free cash unaffected
+
+
+def test_admit_dynamic_symbol_recovery_never_double_counts_an_already_allocated_symbol(monkeypatch):
+    """Calling _admit_dynamic_symbol's recovery path twice for a symbol
+    the pool already has a slot for (shouldn't happen under any current
+    caller, but the fold-in must be idempotent regardless) must not
+    inflate total_capital a second time."""
+    _force_live_pool_mode(monkeypatch)
+    fake_exec = FakeExecutor(starting_cash=0.0, starting_position=10.0, avg_entry=16.5)
+    monkeypatch.setattr(bot_main, "build_strategy", lambda: MagicMock(_highs=[], _lows=[], _closes=[]))
+    monkeypatch.setattr(bot_main, "_warmup_strategy", lambda strat, ex, tf, symbol: 1)
+    monkeypatch.setattr(bot_main, "_make_dynamic_executor", lambda sym: fake_exec)
+
+    pool = CapitalPool(total_capital=135.0, max_concurrent=2)
+    bot_main._admit_dynamic_symbol("ETH/CAD", "ex", "4h", pool)
+    assert pool.total_capital == pytest.approx(300.0)
+
+    bot_main._admit_dynamic_symbol("ETH/CAD", "ex", "4h", pool)   # simulate a second call
+    assert pool.total_capital == pytest.approx(300.0)   # unchanged — no double-fold
+
+
+def _write_live_state_json(state_dir, symbol, base, *, cash, position, cost_basis,
+                            realized_pnl=0.0, fees_paid=0.0):
+    import json as _json
+    path = os.path.join(state_dir, f"live_state_{base}_CAD.json")
+    with open(path, "w") as fh:
+        _json.dump({
+            "symbol": symbol, "cash": cash, "position": position,
+            "cost_basis": cost_basis, "realized_pnl": realized_pnl,
+            "fees_paid": fees_paid, "bot_opened": position > 0,
+        }, fh)
+    return path
+
+
+def test_admit_dynamic_symbol_recovery_in_paper_dry_run_mode_conserves_equity_exactly(monkeypatch, tmp_path):
+    """External review (2026-09-22, third, fourth, AND seventh rounds
+    P1), full reproduction through both stages, now via the REAL startup
+    sequence (_initialize_capital_pool's account-level replay, not a bare
+    hand-built pool):
+
+        Stage                                Correct equity   (this test)
+        Restart, two $0.40 ENTRY fees paid           $899.20
+        Both positions EXIT, $0.40 fee each          $898.40
+
+    Third round: the unconditional (pre-fix) position-value bump added
+    both positions' market value on top of the unrelated $900 paper
+    starting bankroll — 900+100+100=1100 instead of 899.20.
+
+    Fourth round (same day): the third round's own fix ("skip the bump
+    in paper/dry-run mode, accept a small residual that self-corrects on
+    release()") was ITSELF wrong — the $0.80 entry-fee gap survives every
+    subsequent close; release()'s formula only propagates a slot's OWN
+    P&L relative to its OWN reserved amount, never the pre-existing
+    baseline.
+
+    Seventh round (same day): a per-symbol bump inside
+    _admit_dynamic_symbol only ever fires for a symbol CURRENTLY holding
+    a position — it does nothing for a symbol that traded and is now
+    FLAT (see the sibling test below), so the review asked for account-
+    level reconstruction instead. Fixed: _initialize_capital_pool's
+    paper/dry-run branch now replays EVERY live_state_*.json file in
+    state_dir via _replay_paper_realized_pnl BEFORE any slot is assigned;
+    _admit_dynamic_symbol's OWN paper-mode bump is removed entirely (it
+    would now double-count, since the account-level replay already
+    covers whatever symbol it would have bumped)."""
+    _force_paper_pool_mode(monkeypatch)
+    state_dir = str(tmp_path)
+    _write_live_state_json(
+        state_dir, "B/CAD", "B", cash=349.60, position=10.0, cost_basis=10.0, fees_paid=0.40,
+    )
+    _write_live_state_json(
+        state_dir, "C/CAD", "C", cash=349.60, position=5.0, cost_basis=20.0, fees_paid=0.40,
+    )
+
+    cfg_fake = _FakeCfgForPoolInit(live_trading=True, dry_run=True, starting_cash=900.0, max_concurrent_positions=2)
+    pool, _slots, pool_total, _cap, _caps, _paper_ok = bot_main._initialize_capital_pool({}, cfg_fake, state_dir=state_dir)
+    # NOT 900 (nothing replayed) — exactly 899.20 = 900 - 0.40(B) - 0.40(C),
+    # reconstructed from the account-level replay alone, before either
+    # symbol is even admitted.
+    assert pool_total == pytest.approx(899.20)
+    assert pool.total_capital == pytest.approx(899.20)
+
+    b_exec = FakeExecutor(
+        symbol="B/CAD", starting_cash=349.60, starting_position=10.0, avg_entry=10.0,
+        fees_paid=0.40, realized_pnl=0.0,
+    )
+    c_exec = FakeExecutor(
+        symbol="C/CAD", starting_cash=349.60, starting_position=5.0, avg_entry=20.0,
+        fees_paid=0.40, realized_pnl=0.0,
+    )
+    executors_by_symbol = {"B/CAD": b_exec, "C/CAD": c_exec}
+    monkeypatch.setattr(bot_main, "build_strategy", lambda: MagicMock(_highs=[], _lows=[], _closes=[]))
+    monkeypatch.setattr(bot_main, "_warmup_strategy", lambda strat, ex, tf, symbol: 1)
+    monkeypatch.setattr(bot_main, "_make_dynamic_executor", lambda sym: executors_by_symbol[sym])
+
+    ss_b, err_b = bot_main._admit_dynamic_symbol("B/CAD", "ex", "4h", pool)
+    ss_c, err_c = bot_main._admit_dynamic_symbol("C/CAD", "ex", "4h", pool)
+
+    assert err_b is None and err_c is None
+    # ── Stage 1: restart ────────────────────────────────────────────────
+    # Admission must NOT bump total_capital again (would double-count
+    # against the account-level replay above) — still exactly 899.20.
+    assert pool.total_capital == pytest.approx(899.20)
+    assert pool._slots["B/CAD"] == pytest.approx(449.60)   # slot amount itself unchanged
+    assert pool._slots["C/CAD"] == pytest.approx(449.60)
+    symbol_state = {"B/CAD": {"last_price": 10.0}, "C/CAD": {"last_price": 20.0}}
+    total_at_restart = bot_main._compute_account_value(pool, executors_by_symbol, symbol_state)
+    assert total_at_restart == pytest.approx(899.20)
+
+    # ── Stage 2: both positions exit at UNCHANGED prices, another $0.40
+    #    fee each — exactly the fourth round's own reproduction ──────────
+    b_exec.cash = 349.60 + (10.0 * 10.0 - 0.40)   # sell proceeds net of this exit's fee
+    b_exec.position = 0.0
+    b_exec.fees_paid = 0.80   # cumulative: 0.40 entry + 0.40 this exit
+    ss_b['pm'].on_sell(10.0, 10.0)   # unchanged price -> zero price-based PnL
+    pool.release("B/CAD", b_exec.cash)
+
+    c_exec.cash = 349.60 + (5.0 * 20.0 - 0.40)
+    c_exec.position = 0.0
+    c_exec.fees_paid = 0.80
+    ss_c['pm'].on_sell(20.0, 5.0)
+    pool.release("C/CAD", c_exec.cash)
+
+    # The core assertion this test exists for: exactly 898.40 = 900 -
+    # 0.40 - 0.40 (entry fees) - 0.40 - 0.40 (exit fees), NOT 899.20 (the
+    # fourth round's "self-correcting residual" that never actually
+    # corrected) and NOT 900 (no correction at all).
+    assert pool.total_capital == pytest.approx(898.40)
+    assert not pool.allocated_symbols
+    assert pool.available_cash == pytest.approx(898.40)   # nothing left allocated
 
 
 def test_admit_dynamic_symbol_is_noop_when_already_admitted_by_caller():
@@ -284,11 +492,12 @@ def test_retire_keeps_symbol_with_resting_native_stop_even_if_flat():
 # ── _sync_dynamic_universe ───────────────────────────────────────────────
 
 class FakeScreenResult:
-    def __init__(self, eligible_symbols):
+    def __init__(self, eligible_symbols, stale=False, scanned_at=None):
         self.eligible_symbols = eligible_symbols
         self.eligible = []
         self.rejected = []
-        self.stale = False
+        self.stale = stale
+        self.scanned_at = scanned_at if scanned_at is not None else time.time()
     def all_candidates(self):
         return self.eligible + self.rejected
 
@@ -447,6 +656,86 @@ def test_sync_discovery_failure_does_not_raise(monkeypatch):
     # per-symbol loop executing regardless; this confirms the position
     # itself was never mutated by the failed sync attempt.
     assert symbol_state["BTC/CAD"]["executor"].position == 1.0
+
+
+# ── _dynamic_buy_eligible (BUY-time eligibility gate, external review ────
+#    2026-09-22, second round P1: "fixed-roster coins bypass market-screen
+#    eligibility ... the ranked BUY path does not require current
+#    eligibility") ────────────────────────────────────────────────────────
+
+def test_dynamic_buy_eligible_true_when_symbol_in_current_screen():
+    screen = FakeScreenResult(["BTC/CAD", "ETH/CAD"])
+    ok, reason = bot_main._dynamic_buy_eligible("BTC/CAD", screen, max_age_s=3600)
+    assert ok is True
+    assert reason == ""
+
+
+def test_dynamic_buy_eligible_false_when_no_screen_yet():
+    """Before the very first discovery cycle completes (screen is None —
+    see run()'s own `_dynamic_last_screen = None` initialization), no BUY
+    should be trusted, fixed-roster included."""
+    ok, reason = bot_main._dynamic_buy_eligible("BTC/CAD", None, max_age_s=3600)
+    assert ok is False
+    assert reason == "no_screen_yet"
+
+
+def test_dynamic_buy_eligible_false_when_symbol_not_in_eligible_list():
+    """The exact reproduction from the external review: the screener
+    currently lists ZERO eligible coins (a real liquidity freeze) — BTC/
+    CAD must be blocked here even though it's the validated fixed-roster
+    symbol, not merely a dynamically-discovered one."""
+    screen = FakeScreenResult([])   # zero eligible candidates
+    ok, reason = bot_main._dynamic_buy_eligible("BTC/CAD", screen, max_age_s=3600)
+    assert ok is False
+    assert reason == "not_currently_eligible"
+
+
+def test_dynamic_buy_eligible_false_when_screen_is_stale_cache():
+    screen = FakeScreenResult(["BTC/CAD"], stale=True)
+    ok, reason = bot_main._dynamic_buy_eligible("BTC/CAD", screen, max_age_s=3600)
+    assert ok is False
+    assert reason == "stale_screen_cache"
+
+
+def test_dynamic_buy_eligible_false_when_screen_too_old():
+    """Discovery has kept failing (scanned_at only advances on success —
+    see the screener's own fail-safe): even a non-stale-flagged screen
+    must not be trusted forever."""
+    screen = FakeScreenResult(["BTC/CAD"], scanned_at=time.time() - 10_000)
+    ok, reason = bot_main._dynamic_buy_eligible("BTC/CAD", screen, max_age_s=3600)
+    assert ok is False
+    assert reason == "screen_too_old"
+
+
+def test_dynamic_buy_eligible_within_max_age_passes():
+    screen = FakeScreenResult(["BTC/CAD"], scanned_at=time.time() - 1000)
+    ok, reason = bot_main._dynamic_buy_eligible("BTC/CAD", screen, max_age_s=3600)
+    assert ok is True
+
+
+def test_run_source_wires_dynamic_eligibility_gate_for_every_buy_candidate():
+    """Source guard: the eligibility gate must sit in the SAME gate chain
+    ('approval'/'_buy_block_gate') as risk_manager/accounting — applying
+    to whichever symbol is currently being processed by the per-symbol
+    loop, fixed-roster included, not scoped to dynamic_admitted members
+    only. This is what makes 'the shared ranked queue already includes
+    fixed and discovered symbols' also true of THIS gate, closing the
+    exact asymmetry the external review flagged."""
+    import inspect
+    src = inspect.getsource(bot_main.run)
+    idx = src.index("# ── 7a2. Dynamic-universe eligibility gate")
+    end = src.index("# ── 7b. Candle-close structured log")
+    section = src[idx:end]
+    assert "_dynamic_buy_eligible(" in section
+    assert "_dynamic_mode_active" in section
+    assert "BlockReason.DYNAMIC_INELIGIBLE" in section
+    # Gated on approval-so-far + BUY signal, exactly like every other gate
+    # in this chain (accounting, risk_manager) — never a SELL/exit path.
+    assert "approval and final_signal == Signal.BUY and _dynamic_mode_active" in section
+    # Must run BEFORE section 9's dynamic-buy-queue population, so a
+    # rejection here is reflected in `approval` before that decision.
+    section9_idx = src.index("# ── 9. Execute")
+    assert idx < section9_idx
 
 
 # ── _execute_approved_signal ─────────────────────────────────────────────
@@ -989,7 +1278,13 @@ def test_run_restart_recovery_reallocates_capital_pool_slot():
     idx = src.index("# ── Restart recovery")
     end = src.index("# Aliases for _render_dashboard closure")
     section = src[idx:end]
-    assert "capital_pool.allocate(_rsym)" in section
+    assert "capital_pool.allocate(" in section
+    # Second review round, 2026-09-22 (P1): must pass this recovered
+    # position's OWN actual value explicitly (cash + position * avg_entry)
+    # — a bare allocate(_rsym) would reserve a generic per-slot split
+    # instead, unrelated to what the position is actually worth (see
+    # CapitalPool.allocate's own docstring for the exact reproduction).
+    assert "_rexc.cash + _rexc.position * _rexc.avg_entry" in section
 
 
 # ── Price refresh before execution (external-review "other improvement") ─
@@ -1104,6 +1399,28 @@ def test_run_source_gates_every_dynamic_addition_behind_dynamic_mode_active():
     assert "_sync_dynamic_universe(" in src
 
 
+def test_orphan_recovery_call_site_is_unconditional_on_dynamic_enabled():
+    """Source guard, external review (2026-09-22, second round P1): a
+    prior version of a nearby comment incorrectly described
+    _admit_dynamic_symbol's recovery branch as inactive whenever
+    DYNAMIC_UNIVERSE_ENABLED is false. It is NOT inactive — run()'s
+    orphaned-position recovery block calls this exact function
+    unconditionally whenever live_trading is on, regardless of
+    cfg.dynamic.enabled, so a real position outside the current roster
+    is recovered through it (fees, capital-pool allocation, and all) on
+    every restart no matter what the dynamic flag says. This guards
+    against a future edit reintroducing a `cfg.dynamic.enabled` check on
+    this call site under the mistaken belief that it would be a no-op
+    change."""
+    import inspect
+    src = inspect.getsource(bot_main.run)
+    idx = src.index("if _orphaned_symbols and cfg.exchange.live_trading:")
+    end = src.index("if is_indicator and cfg.exchange.feed_mode == \"live\":", idx)
+    section = src[idx:end]
+    assert "cfg.dynamic.enabled" not in section
+    assert "_admit_dynamic_symbol(" in section
+
+
 def test_fixed_mode_buy_still_executes_immediately_not_queued():
     """When dynamic mode isn't active, section 9's branch in run() must
     take the immediate _execute_approved_signal() path, never the
@@ -1193,6 +1510,7 @@ def test_two_coin_restart_recovery_allocates_both_slots_independently(monkeypatc
     open positions against the SAME shared pool, in the same restart,
     don't corrupt each other's allocation, PnL basis, or the aggregate
     account-value computation."""
+    _force_live_pool_mode(monkeypatch)
     pool = CapitalPool(total_capital=300.0, max_concurrent=3)
 
     eth_executor = FakeExecutor(symbol="ETH/CAD", starting_cash=20.0, starting_position=4.0, avg_entry=25.0)
@@ -1229,16 +1547,30 @@ def test_two_coin_restart_recovery_allocates_both_slots_independently(monkeypatc
     assert sol_executor.cash == pytest.approx(15.0)
 
     # Account value aggregates BOTH recovered positions correctly, and —
-    # the actual conservation property — equals the true, independently-
-    # known $300 bankroll marked at the recovery-time prices (no fresh
-    # deposit, no trade, no price change occurred anywhere in this test):
-    # unallocated $100 (pool: 300 - 100(ETH slot) - 100(SOL slot)) + ETH
-    # ($20 cash + 4@$30=$120) + SOL ($15 cash + 10@$150=$1500) = $1755.
-    # This number is written independently of _compute_account_value's
-    # own arithmetic, not re-derived from it.
+    # the actual conservation property — equals the true bankroll marked
+    # at the recovery-time prices (no fresh deposit, no trade, no price
+    # change occurred anywhere in this test). Only each recovered
+    # position's MARKET VALUE (external review, 2026-09-22, second round
+    # P1 — see _admit_dynamic_symbol's own recovery-branch comment) is
+    # folded into total_capital at admission time, NOT cash+position:
+    # the pool's pre-recovery $300 already, implicitly, contains ETH's
+    # own $20 and SOL's own $15 (a real free-cash figure has no notion of
+    # "this symbol's slice" — adding their cash again would double-count
+    # it). ETH's position value (4@25=100) and SOL's (10@140=1400) both
+    # get added, making total_capital 300+100+1400=1800. Each symbol's
+    # own SLOT reservation is still its full cash+position (ETH 120, SOL
+    # 1415), so available_cash = 1800-120-1415=265 (= 300 - ETH's own $20
+    # - SOL's own $15, i.e. whatever of the original $300 neither of them
+    # has already claimed). Total account value, marked to the NEW
+    # prices: 265 (available) + ETH's OWN cash+position (20 + 4@30=120 ->
+    # 140) + SOL's (15 + 10@150=1500 -> 1515) = 1920. This number is
+    # written independently of _compute_account_value's own arithmetic,
+    # not re-derived from it.
     symbol_state = {"ETH/CAD": {"last_price": 30.0}, "SOL/CAD": {"last_price": 150.0}}
     total = bot_main._compute_account_value(pool, executors_by_symbol, symbol_state)
-    assert total == pytest.approx(1755.0)
+    assert total == pytest.approx(1920.0)
+    assert pool.total_capital == pytest.approx(1800.0)
+    assert pool.available_cash == pytest.approx(265.0)
 
 
 def test_partial_fills_and_fees_across_two_coins_do_not_cross_contaminate():
@@ -1320,6 +1652,7 @@ def test_dynamic_symbol_recovery_conserves_real_cash_after_close_reopen_with_rea
     conservation — see the note on the test above this one). Every
     expected total below is computed independently by hand, not
     re-derived from the code under test."""
+    _force_live_pool_mode(monkeypatch)
     from unittest.mock import patch as _patch
     import bot.execution.live_executor as le_mod
     from bot.execution.live_executor import LiveExecutor
@@ -1394,12 +1727,22 @@ def test_dynamic_symbol_recovery_conserves_real_cash_after_close_reopen_with_rea
     assert pool.is_allocated("ETH/CAD")
     assert ss['pm'].quantity == pytest.approx(2.0)
 
-    # Independently-derived total account value: unallocated pool cash
-    # (300 - 100 for ETH's claimed slot = 200) + ETH's own real,
-    # fee-adjusted cash (59.60) + its 2 units marked at a fresh $22 = $44.
+    # Independently-derived total account value. Only ETH's position's
+    # MARKET VALUE (external review, 2026-09-22, second round P1 — the
+    # pool's pre-existing $300 already, implicitly, contains ETH's own
+    # $59.60, so folding cash in again would double-count it — see
+    # _admit_dynamic_symbol's own comment for the multi-coin reproduction
+    # that caught this) is folded into total_capital at admission: 2
+    # units @ its own avg_entry 20.0 = 40.0, making total_capital
+    # 300+40=340. ETH's own SLOT is still its full cash+position (99.60),
+    # so available_cash = 340-99.60=240.40 (= the original $300 minus
+    # ETH's own $59.60, i.e. whatever of it ETH hasn't already claimed).
+    # Total, marked to a fresh $22: 240.40 (available) + ETH's own real,
+    # fee-adjusted cash (59.60) + its 2 units marked at $22 = 44 -> 344.
     symbol_state = {"ETH/CAD": {"last_price": 22.0}}
     total = bot_main._compute_account_value(pool, {"ETH/CAD": reopened_executor}, symbol_state)
-    assert total == pytest.approx(200.0 + 59.60 + 44.0)
+    assert total == pytest.approx(344.0)
+    assert pool.total_capital == pytest.approx(340.0)
 
 
 # ── Multi-executor-sharing-one-account (review finding, 2026-09-22) ───────
@@ -1922,22 +2265,34 @@ def test_actual_startup_sequence_pool_init_then_reconcile_uses_the_real_exchange
     executors = {"BTC/CAD": btc, "SOL/CAD": sol}
     cfg = _FakeCfgForPoolInit(live_trading=True, max_concurrent_positions=2)
 
-    capital_pool, per_symbol_slots, pool_total, slot_cap, slot_caps_by_symbol = (
+    capital_pool, per_symbol_slots, pool_total, slot_cap, slot_caps_by_symbol, _paper_ok = (
         bot_main._initialize_capital_pool(executors, cfg)
     )
 
-    assert pool_total == pytest.approx(real_account_free_cad)   # the real exchange balance, not a slot
-    assert per_symbol_slots["BTC/CAD"] == pytest.approx(real_account_free_cad / 2)
-    assert per_symbol_slots["SOL/CAD"] == pytest.approx(real_account_free_cad / 2)
+    # Second review round, 2026-09-22 (P1): total_capital is free cash
+    # PLUS the current value of every symbol already holding a position
+    # (here, SOL's own 10.0 * avg_entry 8.0 = $80.00) — not free cash
+    # alone. Free cash alone would silently lose SOL's holding from every
+    # downstream accounting read (see CapitalPool.allocate's own
+    # docstring for the exact $135/$165/$300 reproduction this mirrors).
+    _sol_holding_value = sol.position * sol.avg_entry   # 10.0 * 8.0 = 80.0
+    _expected_pool_total = real_account_free_cad + _sol_holding_value   # 38.80 + 80.0 = 118.80
+    assert pool_total == pytest.approx(_expected_pool_total)
+    assert per_symbol_slots["BTC/CAD"] == pytest.approx(_expected_pool_total / 2)
+    assert per_symbol_slots["SOL/CAD"] == pytest.approx(_expected_pool_total / 2)
     # BTC (fresh) got funded to its slot allowance.
-    assert btc.cash == pytest.approx(real_account_free_cad / 2)
+    assert btc.cash == pytest.approx(_expected_pool_total / 2)
     # SOL (recovering) was left completely untouched by the slot-forcing loop.
     assert sol.cash == pytest.approx(sol_cash_after_buy)
 
     # SOL claims its slot the same way run()'s own "Restart recovery"
     # section does, right before reconciliation runs — matching the real
     # sequence exactly (pool init -> restart recovery -> reconciliation).
-    capital_pool.allocate("SOL/CAD")
+    # amount= is REQUIRED here (second review round finding): a bare
+    # allocate("SOL/CAD") would reserve the generic per-slot split
+    # ($59.40) instead of what SOL is actually worth ($19.40 cash +
+    # $80.00 holding = $99.40) — see CapitalPool.allocate's own docstring.
+    capital_pool.allocate("SOL/CAD", amount=sol.cash + _sol_holding_value)
 
     alerter = MagicMock()
     raw = bot_main._reconcile_shared_account_cash(capital_pool, executors, alerter=alerter)
@@ -1945,9 +2300,101 @@ def test_actual_startup_sequence_pool_init_then_reconcile_uses_the_real_exchange
     # The critical assertion this whole test exists for: reconciliation's
     # own reading is the REAL account balance, not BTC's slot allowance —
     # reproduced against the pre-fix ordering, this would have been
-    # per_symbol_slots["BTC/CAD"] (real_account_free_cad / 2) instead.
+    # per_symbol_slots["BTC/CAD"] instead. _reconcile_shared_account_cash
+    # compares CASH ONLY (exchange_cash_observed is a free-CAD reading),
+    # so it stays at real_account_free_cad regardless of the position-
+    # value component now folded into pool_total/available_cash — the
+    # position's value cancels out of both sides of that comparison.
     assert raw == pytest.approx(real_account_free_cad)
     assert not alerter.error.called   # genuinely self-consistent — no false drift
+
+
+def test_pool_init_and_restart_recovery_account_for_full_equity_not_free_cash_alone():
+    """Second review round, 2026-09-22 (P1), exact reproduction through
+    the REAL startup sequence: shared free cash on the exchange is
+    $135.00. SOL/CAD already holds a real recovered position worth
+    $165.00 (10 units at avg_entry $16.50, bought with real cash+fee
+    before this restart). True account equity is $135 + $165 = $300 —
+    not $135 alone, since a genuinely open position's value doesn't
+    disappear just because it's not sitting in the free-cash balance.
+
+    Before this fix: _initialize_capital_pool built the pool from free
+    cash alone ($135), and the later capital_pool.allocate("SOL/CAD")
+    call (no amount= override) reserved a generic slot_cash_for() split
+    of that too-small total — unrelated to what SOL is actually holding —
+    silently losing real equity from every downstream read with no
+    economic event to explain it. Covers restart (this IS a restart:
+    both executors are constructed against pre-existing/would-be-existing
+    state) and a later exit (SOL fully closes and its slot is released,
+    proving the pool's own P&L-folding-on-release logic still works
+    against the corrected, real-value allocation)."""
+    from unittest.mock import patch as _patch
+    import bot.execution.live_executor as le_mod
+    from bot.execution.live_executor import LiveExecutor
+
+    # SOL already holds a real recovered position: bought 10 units @
+    # $16.50 (cost $165.00) with zero fee, leaving $35.00 of its own cash.
+    sol_state_path, sol_cash_after_buy = _build_and_fill_real_executor(
+        "SOL/CAD", "SOL", starting_cash=200.0, buy_price=16.5, buy_qty=10.0, fee=0.0,
+    )
+    assert sol_cash_after_buy == pytest.approx(35.0)
+
+    btc_state_path = str(_tempfile_dir() / "BTC_state.json")
+    shared_free_cad = 135.0   # the account's real, whole-shared free balance
+
+    def _make_fresh_or_recovered(symbol, base, position, state_path):
+        mock_ex = MagicMock()
+        mock_ex.load_markets.return_value = {}
+        mock_ex.fetch_balance.return_value = {
+            "free": {"CAD": shared_free_cad, base: position},
+            "total": {"CAD": shared_free_cad, base: position},
+        }
+        mock_ex.fetch_open_orders.return_value = []
+        mock_ex.price_to_precision.return_value = "0.0"
+        with _patch.object(le_mod.ccxt, "kraken") as mock_cls:
+            mock_cls.return_value = mock_ex
+            return LiveExecutor(
+                exchange_id="kraken", symbol=symbol, api_key="k", api_secret="s",
+                starting_cash=999_999.0, dry_run=False, state_path=state_path,
+            )
+
+    btc = _make_fresh_or_recovered("BTC/CAD", "BTC", 0.0, btc_state_path)
+    sol = _make_fresh_or_recovered("SOL/CAD", "SOL", 10.0, sol_state_path)
+    assert sol.cash == pytest.approx(35.0)          # untouched — recovering, not fresh
+    assert sol.position == pytest.approx(10.0)
+    assert sol.avg_entry == pytest.approx(16.5)
+
+    executors = {"BTC/CAD": btc, "SOL/CAD": sol}
+    cfg = _FakeCfgForPoolInit(live_trading=True, max_concurrent_positions=2)
+
+    capital_pool, per_symbol_slots, pool_total, _, _, _paper_ok = bot_main._initialize_capital_pool(executors, cfg)
+
+    # The critical assertion: total equity, not free cash alone.
+    assert pool_total == pytest.approx(300.0)   # 135 (free) + 165 (SOL's holding)
+
+    # SOL claims its slot at its OWN real value (run()'s "Restart recovery"
+    # section's exact call, amount= required per CapitalPool.allocate's
+    # own docstring) — never a generic equal-split of the pool.
+    capital_pool.allocate("SOL/CAD", amount=sol.cash + sol.position * sol.avg_entry)
+    assert capital_pool.allocated_symbols == ["SOL/CAD"]
+    assert capital_pool.available_cash == pytest.approx(100.0)   # 300 - 200 (SOL's real slot)
+
+    symbol_state = {"SOL/CAD": {"last_price": 16.5}, "BTC/CAD": {"last_price": 0.0}}
+    total_equity = bot_main._compute_account_value(capital_pool, executors, symbol_state)
+    # 100 (available) + 35 (SOL cash) + 10*16.5 (SOL position value) = 300.
+    # Before this fix this would have read back $167.50 low (a generic
+    # $67.50 slot reserved instead of SOL's real $200, understating
+    # available_cash by $132.50 — SOL's own cash+position contribution is
+    # unaffected either way, so the shortfall lands entirely here).
+    assert total_equity == pytest.approx(300.0)
+
+    # Later exit: SOL fully closes. release() folds the REAL slot back —
+    # the pool's own P&L math still works correctly downstream of the fix.
+    sol._portfolio.cash = 210.0   # a hypothetical post-sale cash figure
+    capital_pool.release("SOL/CAD", sol.cash)
+    assert capital_pool.allocated_symbols == []
+    # total_capital = 300 - 200 (returned slot) + 210 (actual proceeds) = 310
+    assert capital_pool.total_capital == pytest.approx(310.0)
 
 
 def test_actual_startup_sequence_paper_and_dry_run_never_touch_exchange_cash_observed():
@@ -1959,8 +2406,16 @@ def test_actual_startup_sequence_paper_and_dry_run_never_touch_exchange_cash_obs
     executors = {"BTC/CAD": FakeExecutor(symbol="BTC/CAD", starting_cash=0.0, starting_position=1.0)}
     cfg = _FakeCfgForPoolInit(live_trading=True, paper_mode=True, starting_cash=453.0, max_concurrent_positions=2)
 
-    capital_pool, per_symbol_slots, pool_total, slot_cap, slot_caps_by_symbol = (
-        bot_main._initialize_capital_pool(executors, cfg)
+    # state_dir explicitly isolated to a nonexistent tmp path — without
+    # this, the default falls through to the REAL module-level
+    # _STATE_LOG_DIR (whatever the actual repo's logs/ or logs/shadow/
+    # directory happens to contain right now), making this assertion
+    # depend on real filesystem state instead of the fixed $453 this
+    # test is actually about.
+    import tempfile as _tempfile
+    _empty_dir = _tempfile.mkdtemp()
+    capital_pool, per_symbol_slots, pool_total, slot_cap, slot_caps_by_symbol, _paper_ok = (
+        bot_main._initialize_capital_pool(executors, cfg, state_dir=_empty_dir)
     )
 
     assert pool_total == pytest.approx(453.0)   # from starting_cash, never from a FakeExecutor's own .cash
@@ -1968,3 +2423,1151 @@ def test_actual_startup_sequence_paper_and_dry_run_never_touch_exchange_cash_obs
     # treated as "recovering" here too — the fresh-vs-recovering guard
     # applies regardless of executor type.
     assert executors["BTC/CAD"].cash == pytest.approx(0.0)   # untouched — never funded to its slot
+
+
+# ── Multi-coin, one-bankroll full lifecycle (external review, 2026-09-22, ─
+#    "validate discover -> filter -> rank -> allocate -> execute -> restart
+#    across several coins, using one bankroll") ───────────────────────────
+#
+# End-to-end, no network: three candidates (A/CAD, B/CAD, C/CAD) sharing
+# ONE CapitalPool and ONE mocked exchange account, real LiveExecutor +
+# real CapitalPool + real TradingStateMachine/PositionManager throughout
+# (every unit-tested piece exercised together, not just individually):
+#   discover  -> FakeScreener returns all three as eligible
+#   filter    -> _sync_dynamic_universe admits all three (none already
+#                present in symbol_state)
+#   rank      -> _execute_ranked_dynamic_buys orders by ADX; with only 2
+#                of 3 candidates fitting the shared pool's 2 slots, the
+#                lowest-ADX one is squeezed out by POOL EXHAUSTION, not
+#                by anything specific to that symbol
+#   allocate  -> each filled BUY claims a real slot from the ONE shared
+#                pool; the pool's own bookkeeping (available_cash) drops
+#                to exactly zero once both slots are spent
+#   execute   -> real fills, real fees, via a real (mocked-ccxt) LiveExecutor
+#   restart   -> both holding positions are recovered via
+#                _admit_dynamic_symbol against a FRESH pool (this same
+#                review's P1 fix) — total equity conserves exactly
+#                (900 - two $0.40 fees = 899.20), not $1598.40 (the bug an
+#                earlier, over-corrected version of the fix would have
+#                produced by folding in cash AS WELL AS position value —
+#                caught by this exact test) and not $699.20 either (no
+#                fold at all, the ORIGINAL P1 bug)
+#   + a further exit, after the restart, releasing one coin's slot back
+#     into the SAME shared pool.
+
+def test_multi_coin_one_bankroll_discover_filter_rank_allocate_execute_restart_exit(monkeypatch):
+    _force_live_pool_mode(monkeypatch)   # this scenario is genuinely live (dry_run=False throughout)
+    from unittest.mock import patch as _patch
+    import bot.execution.live_executor as le_mod
+    from bot.execution.live_executor import LiveExecutor
+
+    tmp = _tempfile_dir()
+    ACCOUNT_FREE_CAD = 900.0   # the ONE shared whole-account balance every executor observes
+
+    def _fresh_real_executor(symbol, base, account_free_cad):
+        state_path = str(tmp / f"{base}_state.json")
+        mock_ex = MagicMock()
+        mock_ex.load_markets.return_value = {}
+        mock_ex.fetch_balance.return_value = {"free": {"CAD": account_free_cad}, "total": {"CAD": account_free_cad}}
+        mock_ex.fetch_open_orders.return_value = []
+        mock_ex.price_to_precision.return_value = "0.0"
+        with _patch.object(le_mod.ccxt, "kraken") as mock_cls:
+            mock_cls.return_value = mock_ex
+            ex = LiveExecutor(
+                exchange_id="kraken", symbol=symbol, api_key="k", api_secret="s",
+                starting_cash=0.0, dry_run=False, state_path=state_path,
+            )
+        return ex, mock_ex, state_path
+
+    # ── DISCOVER + FILTER ────────────────────────────────────────────────
+    screener = FakeScreener(["A/CAD", "B/CAD", "C/CAD"])
+    a_ex, a_mock, a_state_path = _fresh_real_executor("A/CAD", "A", ACCOUNT_FREE_CAD)
+    b_ex, b_mock, b_state_path = _fresh_real_executor("B/CAD", "B", ACCOUNT_FREE_CAD)
+    c_ex, c_mock, c_state_path = _fresh_real_executor("C/CAD", "C", ACCOUNT_FREE_CAD)
+    executors_by_symbol = {"A/CAD": a_ex, "B/CAD": b_ex, "C/CAD": c_ex}
+
+    monkeypatch.setattr(bot_main, "build_strategy", lambda: MagicMock(_highs=[], _lows=[], _closes=[]))
+    monkeypatch.setattr(bot_main, "_warmup_strategy", lambda strat, ex, tf, symbol: 1)
+    monkeypatch.setattr(bot_main, "_make_dynamic_executor", lambda sym: executors_by_symbol[sym])
+
+    symbol_state: dict = {}
+    executors: dict = {}
+    dynamic_admitted: set = set()
+    pool = CapitalPool(total_capital=900.0, max_concurrent=2)   # ONE bankroll, 2 slots — 3 candidates compete
+
+    admitted, retired, screen = bot_main._sync_dynamic_universe(
+        symbol_state, executors, dynamic_admitted, screener,
+        live_exchange="ex", timeframe="4h", capital_pool=pool, slot_cash_estimate=450.0,
+    )
+    assert set(admitted) == {"A/CAD", "B/CAD", "C/CAD"}
+    assert retired == []
+    # All three funded from the SAME shared pool's nominal slot allowance
+    # (fresh — no position yet, so no real slot claimed, just a starting
+    # sizing basis for a first trade).
+    assert a_ex.cash == pytest.approx(450.0)
+    assert b_ex.cash == pytest.approx(450.0)
+    assert c_ex.cash == pytest.approx(450.0)
+    assert pool.allocated_symbols == []
+
+    # ── RANK + ALLOCATE + EXECUTE ────────────────────────────────────────
+    symbol_state["A/CAD"]["strategy"].last_adx = 15.0
+    symbol_state["B/CAD"]["strategy"].last_adx = 35.0   # highest — ranked first
+    symbol_state["C/CAD"]["strategy"].last_adx = 25.0
+
+    b_mock.create_order.return_value = {
+        "id": "B-buy", "status": "closed", "filled": 10.0, "average": 10.0,
+        "fee": {"cost": 0.40, "currency": "CAD"},
+    }
+    b_mock.fetch_order.return_value = b_mock.create_order.return_value
+    c_mock.create_order.return_value = {
+        "id": "C-buy", "status": "closed", "filled": 5.0, "average": 20.0,
+        "fee": {"cost": 0.40, "currency": "CAD"},
+    }
+    c_mock.fetch_order.return_value = c_mock.create_order.return_value
+    # A/CAD's mock is deliberately left with NO create_order stub — if it
+    # were ever reached, the test would fail loudly (a MagicMock's default
+    # return doesn't satisfy LiveExecutor.execute()'s real parsing), which
+    # is exactly the point: A must be blocked by pool exhaustion BEFORE
+    # ever attempting a real order.
+
+    buy_queue = [
+        dict(sym="A/CAD", ss=symbol_state["A/CAD"], final_signal=Signal.BUY, price=5.0, trade_qty=90.0,
+             raw_signal=Signal.BUY, filter_reason="", adx=15.0, quote_volume=1_000_000),
+        dict(sym="B/CAD", ss=symbol_state["B/CAD"], final_signal=Signal.BUY, price=10.0, trade_qty=10.0,
+             raw_signal=Signal.BUY, filter_reason="", adx=35.0, quote_volume=2_000_000),
+        dict(sym="C/CAD", ss=symbol_state["C/CAD"], final_signal=Signal.BUY, price=20.0, trade_qty=5.0,
+             raw_signal=Signal.BUY, filter_reason="", adx=25.0, quote_volume=1_500_000),
+    ]
+    risk = FakeRisk(approve=True)
+    alerter, trade_log, stuck = MagicMock(), MagicMock(), MagicMock()
+    filled, blocked = bot_main._execute_ranked_dynamic_buys(
+        buy_queue, capital_pool=pool, risk=risk, account_value_fn=lambda: 900.0,
+        alerter=alerter, trade_log=trade_log, stuck_detector=stuck,
+        is_indicator=True, max_concurrent=2,
+    )
+
+    assert set(filled) == {"B/CAD", "C/CAD"}   # highest two ADX — A squeezed out
+    assert blocked == {"A/CAD": "capital_pool"}   # pool exhaustion, not a per-symbol rejection
+    assert set(pool.allocated_symbols) == {"B/CAD", "C/CAD"}
+    assert pool.available_cash == pytest.approx(0.0)   # both slots spent, nothing spare
+    assert pool.total_capital == pytest.approx(900.0)   # unchanged — no restart-recovery fold yet
+    assert b_ex.cash == pytest.approx(349.60)   # 450 - 10*10 - 0.40
+    assert c_ex.cash == pytest.approx(349.60)   # 450 - 5*20 - 0.40
+    assert a_ex.cash == pytest.approx(450.0)    # never touched — no order ever attempted
+
+    # ── RESTART ───────────────────────────────────────────────────────────
+    # The real, current whole-account free CAD after both fills: exactly
+    # two $0.40 fees spent out of the original $900 free cash (A never
+    # bought anything, so its own $450 "allowance" was purely notional —
+    # never real money the exchange actually set aside).
+    real_account_free_cad = ACCOUNT_FREE_CAD - 100.40 - 100.40   # 699.20
+
+    def _reopen_with_mock(symbol, base, position, state_path, account_free_cad):
+        # _reopen_real_executor() builds and discards its own mock exchange
+        # internally — fine when the reopened executor never trades again,
+        # but this test needs to configure a LATER sell fill on the SAME
+        # mock the reopened LiveExecutor actually holds, so it's inlined
+        # here instead (identical body, just also returning the mock).
+        mock_ex = MagicMock()
+        mock_ex.load_markets.return_value = {}
+        mock_ex.fetch_balance.return_value = {
+            "free": {"CAD": account_free_cad, base: position},
+            "total": {"CAD": account_free_cad, base: position},
+        }
+        mock_ex.fetch_open_orders.return_value = []
+        mock_ex.price_to_precision.return_value = "0.0"
+        with _patch.object(le_mod.ccxt, "kraken") as mock_cls:
+            mock_cls.return_value = mock_ex
+            ex = LiveExecutor(
+                exchange_id="kraken", symbol=symbol, api_key="k", api_secret="s",
+                starting_cash=999_999.0, dry_run=False, state_path=state_path,
+            )
+        return ex, mock_ex
+
+    b_reopened, b_reopened_mock = _reopen_with_mock("B/CAD", "B", 10.0, b_state_path, real_account_free_cad)
+    c_reopened, c_reopened_mock = _reopen_with_mock("C/CAD", "C", 5.0, c_state_path, real_account_free_cad)
+    assert b_reopened.cash == pytest.approx(349.60)   # loaded from its OWN state file, untouched by the shared reading
+    assert c_reopened.cash == pytest.approx(349.60)
+    assert b_reopened.exchange_cash_observed == pytest.approx(real_account_free_cad)
+    assert c_reopened.exchange_cash_observed == pytest.approx(real_account_free_cad)
+
+    # A FRESH pool, as a new process would build BEFORE it has discovered
+    # either orphaned position — total_capital starts at just the real
+    # free-cash reading, exactly like _initialize_capital_pool would
+    # produce for a roster that doesn't yet include B or C at all.
+    pool2 = CapitalPool(total_capital=real_account_free_cad, max_concurrent=2)
+    monkeypatch.setattr(
+        bot_main, "_make_dynamic_executor",
+        lambda sym: {"B/CAD": b_reopened, "C/CAD": c_reopened}[sym],
+    )
+    ss_b, err_b = bot_main._admit_dynamic_symbol("B/CAD", "ex", "4h", pool2)
+    ss_c, err_c = bot_main._admit_dynamic_symbol("C/CAD", "ex", "4h", pool2)
+    assert err_b is None and err_c is None
+    assert ss_b['pm'].quantity == pytest.approx(10.0) and ss_b['pm'].avg_entry == pytest.approx(10.0)
+    assert ss_c['pm'].quantity == pytest.approx(5.0) and ss_c['pm'].avg_entry == pytest.approx(20.0)
+
+    # The core P1 assertion: total equity conserves EXACTLY across the
+    # restart — 900 - 0.40 - 0.40 = 899.20. Not 699.20 (the original bug:
+    # no fold at all, losing both positions' value) and not 1598.40 (an
+    # over-corrected fold that also re-adds each symbol's own cash on top
+    # of a free-cash reading that already contains it — the mistake this
+    # exact multi-coin test caught while being built).
+    assert pool2.total_capital == pytest.approx(899.20)
+    assert pool2.available_cash == pytest.approx(0.0)   # fully committed to B's + C's real slots
+    assert set(pool2.allocated_symbols) == {"B/CAD", "C/CAD"}
+
+    restart_symbol_state = {"B/CAD": {"last_price": 10.0}, "C/CAD": {"last_price": 20.0}}
+    restart_total = bot_main._compute_account_value(
+        pool2, {"B/CAD": b_reopened, "C/CAD": c_reopened}, restart_symbol_state,
+    )
+    assert restart_total == pytest.approx(899.20)   # exact conservation, no price movement since the fills
+
+    # ── FURTHER EXIT ──────────────────────────────────────────────────────
+    # B/CAD sells its full position at a small gain — released back into
+    # the SAME shared pool, which must correctly fold the realized P&L in.
+    # Configured on b_reopened_mock — the exchange mock actually wired to
+    # b_reopened (the ORIGINAL b_mock belongs to the pre-restart executor,
+    # a separate object that's no longer in use).
+    b_reopened_mock.create_order.return_value = {
+        "id": "B-sell", "status": "closed", "filled": 10.0, "average": 11.0,
+        "fee": {"cost": 0.40, "currency": "CAD"},
+    }
+    b_reopened_mock.fetch_order.return_value = b_reopened_mock.create_order.return_value
+    order = bot_main._execute_approved_signal(
+        "B/CAD", ss_b, Signal.SELL, 11.0, 10.0, Signal.SELL, "",
+        capital_pool=pool2, risk=FakeRisk(True), alerter=MagicMock(),
+        trade_log=MagicMock(), stuck_detector=MagicMock(), is_indicator=True,
+    )
+    assert order is not None and order.status == OrderStatus.FILLED
+    assert not ss_b['pm'].has_position
+    assert not pool2.is_allocated("B/CAD")   # slot released
+    assert b_reopened.cash == pytest.approx(459.20)   # 349.60 + 10*11 - 0.40
+
+    # B's realized gain ($9.60 — sold at $11, held at cost basis $10) is
+    # now folded into total_capital; C's slot is completely untouched.
+    assert pool2.total_capital == pytest.approx(908.80)   # 899.20 - 449.60(B's slot) + 459.20(B's real proceeds)
+    assert pool2.available_cash == pytest.approx(459.20)   # B's cash is now genuinely free pool cash
+    assert set(pool2.allocated_symbols) == {"C/CAD"}
+
+    final_symbol_state = {"B/CAD": {"last_price": 11.0}, "C/CAD": {"last_price": 20.0}}
+    final_total = bot_main._compute_account_value(
+        pool2, {"B/CAD": b_reopened, "C/CAD": c_reopened}, final_symbol_state,
+    )
+    # available_cash (459.20, includes B's freed cash) + C's own
+    # cash+position (349.60 + 5*20=100 -> 449.60) = 908.80. B contributes
+    # nothing separately — it's flat, no longer an allocated slot.
+    assert final_total == pytest.approx(908.80)
+
+
+# ── Paper/shadow acceptance harness (external review, 2026-09-22, third ──
+#    round P2): "document and test one concrete, isolated, zero-order
+#    configuration or harness that actually exercises discovery,
+#    eligibility, ranking, and recovery." CLAUDE.md's bounded acceptance
+#    criteria originally named LIVE_TRADING=false as the harness — WRONG:
+#    _dynamic_mode_active = cfg.dynamic.enabled AND cfg.exchange.
+#    live_trading, so LIVE_TRADING=false never runs any of this code at
+#    all. The actual runnable, zero-real-order combo is LIVE_TRADING=true
+#    WITH PAPER_MODE=true (or DRY_RUN=true) — _make_dynamic_executor
+#    already builds every dynamic-universe executor with
+#    `dry_run=cfg.paper.paper_mode or cfg.exchange.dry_run`, and
+#    LiveExecutor.execute()'s own dry_run branch (live_executor.py, above
+#    the real create_order call) simulates the fill locally and returns
+#    before ever reaching the exchange — never calls create_order,
+#    cancel_order, or fetch_balance (dry_run skips _sync_cash() entirely
+#    too). This test proves that combo end-to-end, not just asserts it in
+#    prose.
+
+def test_paper_shadow_harness_exercises_full_pipeline_with_zero_real_orders(monkeypatch):
+    """LIVE_TRADING=true + DRY_RUN=true, two candidates, driven through
+    discover -> filter -> rank -> allocate -> execute -> restart-recover
+    exactly like the real-money multi-coin test above — but every
+    executor is dry_run=True throughout. Asserts BOTH the positive
+    (fills happen, state updates, positions recovered) and the negative
+    (the mocked exchange's create_order/cancel_order/fetch_balance are
+    NEVER called by anything in this run) — the actual proof that this
+    is a genuine zero-order harness, not just a claim."""
+    _force_paper_pool_mode(monkeypatch)
+    from unittest.mock import patch as _patch
+    import bot.execution.live_executor as le_mod
+    from bot.execution.live_executor import LiveExecutor
+
+    tmp = _tempfile_dir()
+
+    def _dry_run_executor(symbol, base):
+        state_path = str(tmp / f"{base}_state.json")
+        mock_ex = MagicMock()
+        mock_ex.load_markets.return_value = {}
+        with _patch.object(le_mod.ccxt, "kraken") as mock_cls:
+            mock_cls.return_value = mock_ex
+            ex = LiveExecutor(
+                exchange_id="kraken", symbol=symbol, api_key="k", api_secret="s",
+                starting_cash=0.0, dry_run=True, state_path=state_path,
+            )
+        return ex, mock_ex, state_path
+
+    screener = FakeScreener(["D/CAD", "E/CAD"])
+    d_ex, d_mock, d_state_path = _dry_run_executor("D/CAD", "D")
+    e_ex, e_mock, e_state_path = _dry_run_executor("E/CAD", "E")
+    executors_by_symbol = {"D/CAD": d_ex, "E/CAD": e_ex}
+
+    monkeypatch.setattr(bot_main, "build_strategy", lambda: MagicMock(_highs=[], _lows=[], _closes=[]))
+    monkeypatch.setattr(bot_main, "_warmup_strategy", lambda strat, ex, tf, symbol: 1)
+    monkeypatch.setattr(bot_main, "_make_dynamic_executor", lambda sym: executors_by_symbol[sym])
+
+    symbol_state: dict = {}
+    executors: dict = {}
+    dynamic_admitted: set = set()
+    pool = CapitalPool(total_capital=500.0, max_concurrent=2)
+
+    # ── DISCOVER + FILTER + fresh ALLOCATE ──────────────────────────────
+    admitted, retired, _screen = bot_main._sync_dynamic_universe(
+        symbol_state, executors, dynamic_admitted, screener,
+        live_exchange="ex", timeframe="4h", capital_pool=pool, slot_cash_estimate=250.0,
+    )
+    assert set(admitted) == {"D/CAD", "E/CAD"}
+    assert d_ex.cash == pytest.approx(250.0) and e_ex.cash == pytest.approx(250.0)
+
+    # ── RANK + EXECUTE (simulated fills, no exchange call) ──────────────
+    symbol_state["D/CAD"]["strategy"].last_adx = 30.0
+    symbol_state["E/CAD"]["strategy"].last_adx = 20.0
+    buy_queue = [
+        dict(sym="D/CAD", ss=symbol_state["D/CAD"], final_signal=Signal.BUY, price=10.0, trade_qty=10.0,
+             raw_signal=Signal.BUY, filter_reason="", adx=30.0, quote_volume=1_000_000),
+        dict(sym="E/CAD", ss=symbol_state["E/CAD"], final_signal=Signal.BUY, price=5.0, trade_qty=10.0,
+             raw_signal=Signal.BUY, filter_reason="", adx=20.0, quote_volume=900_000),
+    ]
+    filled, blocked = bot_main._execute_ranked_dynamic_buys(
+        buy_queue, capital_pool=pool, risk=FakeRisk(True), account_value_fn=lambda: 500.0,
+        alerter=MagicMock(), trade_log=MagicMock(), stuck_detector=MagicMock(),
+        is_indicator=True, max_concurrent=2,
+    )
+    assert set(filled) == {"D/CAD", "E/CAD"}
+    assert blocked == {}
+    # Dry-run fills: filled at the exact requested price/qty, zero fee.
+    assert d_ex.cash == pytest.approx(150.0)   # 250 - 10*10 - 0 fee
+    assert e_ex.cash == pytest.approx(200.0)   # 250 - 10*5 - 0 fee
+    assert d_ex.position == pytest.approx(10.0)
+    assert e_ex.position == pytest.approx(10.0)
+
+    # ── RESTART-RECOVER (paper/dry-run mode — the fix under test) ───────
+    d_reopened, d_reopened_mock, _ = _dry_run_executor("D/CAD", "D")
+    e_reopened, e_reopened_mock, _ = _dry_run_executor("E/CAD", "E")
+    # A LiveExecutor's OWN persisted position/cash still round-trips
+    # correctly through dry-run: _load_state() is unconditional, only
+    # _sync_cash() (the exchange-truth overwrite) is skipped for dry_run.
+    assert d_reopened.position == pytest.approx(10.0) and d_reopened.cash == pytest.approx(150.0)
+    assert e_reopened.position == pytest.approx(10.0) and e_reopened.cash == pytest.approx(200.0)
+
+    monkeypatch.setattr(
+        bot_main, "_make_dynamic_executor",
+        lambda sym: {"D/CAD": d_reopened, "E/CAD": e_reopened}[sym],
+    )
+    pool2 = CapitalPool(total_capital=500.0, max_concurrent=2)
+    ss_d, err_d = bot_main._admit_dynamic_symbol("D/CAD", "ex", "4h", pool2)
+    ss_e, err_e = bot_main._admit_dynamic_symbol("E/CAD", "ex", "4h", pool2)
+    assert err_d is None and err_e is None
+    assert ss_d['pm'].quantity == pytest.approx(10.0) and ss_e['pm'].quantity == pytest.approx(10.0)
+    # The fix under test: total_capital stays at the static $500 starting
+    # figure (paper/dry-run mode) — NOT inflated by adding D's and E's
+    # position values on top (that would give 500+100+50=650).
+    assert pool2.total_capital == pytest.approx(500.0)
+    assert pool2._slots["D/CAD"] == pytest.approx(150.0 + 100.0)   # cash + position*avg_entry
+    assert pool2._slots["E/CAD"] == pytest.approx(200.0 + 50.0)
+
+    # ── THE ACTUAL ZERO-ORDER PROOF ──────────────────────────────────────
+    # Every mocked exchange this run ever touched — never a real write
+    # call, and dry_run means _sync_cash() never even reads the balance.
+    for _m in (d_mock, e_mock, d_reopened_mock, e_reopened_mock):
+        _m.create_order.assert_not_called()
+        _m.cancel_order.assert_not_called()
+        _m.fetch_balance.assert_not_called()
+
+
+# ── Shadow-mode storage isolation (external review, 2026-09-22, fifth+ ───
+#    round P1): "the documented PAPER_MODE=true option is not storage-
+#    isolated ... your test supplies temporary paths and constructs
+#    executors directly; it does not validate the actual startup
+#    routing." The test above proves the PIPELINE (discover/rank/
+#    allocate/execute/recover) works under dry_run=True — it says nothing
+#    about which DIRECTORY a real run's state/trade-log/risk-state files
+#    would land in. This section tests the REAL routing formula
+#    (_compute_shadow_mode, extracted from the module-level _SHADOW_MODE/
+#    _STATE_LOG_DIR computation for exactly this reason) directly, plus
+#    source-guards every dependent path to prove they're wired through
+#    it — the answer bot/main.py's own module-level code actually uses,
+#    not a hand-built substitute.
+
+def test_shadow_mode_is_true_only_for_live_trading_plus_dry_run_without_paper_mode():
+    """The ONE supported, storage-isolated acceptance configuration:
+    LIVE_TRADING=true + DRY_RUN=true + PAPER_MODE=false. State lands
+    under logs/shadow/, never the production logs/ directory."""
+    shadow, state_dir = bot_main._compute_shadow_mode(
+        live_trading=True, paper_mode=False, dry_run=True, log_dir="/tmp/x/logs",
+    )
+    assert shadow is True
+    assert state_dir == "/tmp/x/logs/shadow"
+
+
+def test_shadow_mode_is_false_when_paper_mode_true_even_with_dry_run():
+    """The exact gap the review found: PAPER_MODE=true is NOT storage-
+    isolated, REGARDLESS of dry_run — a paper-mode acceptance run's
+    executors, risk_state.json, and trades.db would all resolve to the
+    ORDINARY PRODUCTION logs/ directory, at risk of colliding with (or
+    overwriting) real state. This is not a bug to silently work around —
+    it's why CLAUDE.md's acceptance criteria names ONLY the DRY_RUN
+    combo above as supported, and explicitly warns against PAPER_MODE=
+    true for this purpose."""
+    shadow, state_dir = bot_main._compute_shadow_mode(
+        live_trading=True, paper_mode=True, dry_run=True, log_dir="/tmp/x/logs",
+    )
+    assert shadow is False
+    assert state_dir == "/tmp/x/logs"   # production path, NOT /tmp/x/logs/shadow
+
+
+def test_shadow_mode_is_false_when_dry_run_false_or_live_trading_false():
+    """The other two ways to land outside isolation — real live trading
+    (dry_run=False, genuinely live, no isolation needed) and
+    live_trading=False (paper/backtest tooling, never touches this path
+    at all)."""
+    shadow_a, dir_a = bot_main._compute_shadow_mode(
+        live_trading=True, paper_mode=False, dry_run=False, log_dir="/tmp/x/logs",
+    )
+    assert shadow_a is False and dir_a == "/tmp/x/logs"
+    shadow_b, dir_b = bot_main._compute_shadow_mode(
+        live_trading=False, paper_mode=False, dry_run=True, log_dir="/tmp/x/logs",
+    )
+    assert shadow_b is False and dir_b == "/tmp/x/logs"
+
+
+def test_module_level_shadow_globals_match_the_extracted_formula():
+    """Source guard: the module-level _SHADOW_MODE/_STATE_LOG_DIR
+    assignment must actually call _compute_shadow_mode with cfg's real
+    fields (not a copy-pasted-and-drifted inline formula) — this is what
+    makes the tests above trustworthy as a proxy for the real module-
+    level computation, not just a parallel implementation that happens
+    to agree today."""
+    import inspect
+    src = inspect.getsource(bot_main)
+    idx = src.index("_SHADOW_MODE, _STATE_LOG_DIR = _compute_shadow_mode(")
+    call_site = src[idx:idx + 300]
+    assert "cfg.exchange.live_trading" in call_site
+    assert "cfg.paper.paper_mode" in call_site
+    assert "cfg.exchange.dry_run" in call_site
+
+
+def test_live_state_path_and_dependent_paths_route_through_state_log_dir():
+    """Source guard proving _live_state_path, risk_state.json, trades.db,
+    and _HALT_FLAG_PATH (the review specifically named: 'trade-log and
+    risk-state routing likewise lose shadow isolation', and — thirteenth
+    round — 'the documented shadow configuration still reads production
+    logs/HALT') are all wired through _STATE_LOG_DIR — the single value
+    _compute_shadow_mode controls — rather than any of them independently
+    referencing the raw, always-production _log_dir."""
+    import inspect
+    src = inspect.getsource(bot_main)
+    fn_src = inspect.getsource(bot_main._live_state_path)
+    assert "_STATE_LOG_DIR" in fn_src
+    assert "_log_dir" not in fn_src.replace("_STATE_LOG_DIR", "")
+    assert '_trade_log_db_path = os.path.join(_STATE_LOG_DIR, "trades.db")' in src
+    assert 'os.path.join(_STATE_LOG_DIR, "risk_state.json")' in src
+    assert '_HALT_FLAG_PATH = os.path.join(_STATE_LOG_DIR, "HALT")' in src
+
+
+# ── Thirteenth pass, same day (2026-09-24) — the shadow-acceptance run's ─
+#    own halt control was still reading the PRODUCTION logs/HALT flag,
+#    which — with the real crypto bot's HALT correctly still engaged per
+#    the 2026-09-12 review-deadline decision — made it structurally
+#    IMPOSSIBLE for the shadow run to ever accumulate a round-trip at
+#    all, not merely an isolation risk like the sixth-pass finding.
+
+def test_halt_flag_path_matches_the_current_process_actual_state_log_dir():
+    """Direct behavioral check (not just a source guard) that the
+    MODULE-LEVEL _HALT_FLAG_PATH this process actually computed at
+    import time is derived from _STATE_LOG_DIR, not the raw _log_dir —
+    proving the fix is live in the running module, not just present in
+    the source text."""
+    assert bot_main._HALT_FLAG_PATH == os.path.join(bot_main._STATE_LOG_DIR, "HALT")
+
+
+def test_shadow_and_production_halt_paths_are_genuinely_independent():
+    """The actual reproduction: a real, currently-engaged production
+    logs/HALT (simulating the crypto bot's own standing 2026-09-12
+    halt) must have ZERO effect on a shadow run's OWN _check_halt_flag
+    result, and vice versa — proving the shadow-acceptance run can
+    accumulate round-trips while the real bot stays halted, which is
+    the entire reason this fix exists. live_trading/dry_run/paper_mode
+    fed through the SAME _compute_shadow_mode the module itself uses,
+    not a hand-rolled substitute."""
+    with tempfile.TemporaryDirectory() as prod_dir:
+        # Production: NOT shadow mode (dry_run=False, genuinely live).
+        prod_shadow, prod_state_dir = bot_main._compute_shadow_mode(
+            live_trading=True, paper_mode=False, dry_run=False, log_dir=prod_dir,
+        )
+        assert prod_shadow is False
+        prod_halt_path = os.path.join(prod_state_dir, "HALT")
+        assert prod_halt_path == os.path.join(prod_dir, "HALT")   # unchanged production location
+
+        # Shadow: LIVE_TRADING=true + DRY_RUN=true + PAPER_MODE=false.
+        shadow_shadow, shadow_state_dir = bot_main._compute_shadow_mode(
+            live_trading=True, paper_mode=False, dry_run=True, log_dir=prod_dir,
+        )
+        assert shadow_shadow is True
+        shadow_halt_path = os.path.join(shadow_state_dir, "HALT")
+        assert shadow_halt_path == os.path.join(prod_dir, "shadow", "HALT")
+        assert shadow_halt_path != prod_halt_path   # genuinely different files
+
+        # Engage the PRODUCTION halt only (simulating the real crypto
+        # bot's own standing 2026-09-12 halt) — the shadow run's own
+        # check must be completely unaffected by it.
+        os.makedirs(os.path.dirname(prod_halt_path), exist_ok=True)
+        open(prod_halt_path, "w").close()
+
+        prod_risk = RiskManager(RiskConfig())
+        shadow_risk = RiskManager(RiskConfig())
+        alerter = MagicMock()
+
+        prod_active = bot_main._check_halt_flag(prod_risk, prod_halt_path, False, alerter)
+        shadow_active = bot_main._check_halt_flag(shadow_risk, shadow_halt_path, False, alerter)
+
+        assert prod_active is True and prod_risk.config.halt is True     # production correctly halted
+        assert shadow_active is False and shadow_risk.config.halt is False   # shadow run unaffected — can trade
+
+        # And the reverse: halting the SHADOW run specifically must not
+        # touch the production flag/risk manager at all.
+        os.makedirs(os.path.dirname(shadow_halt_path), exist_ok=True)
+        open(shadow_halt_path, "w").close()
+        shadow_active2 = bot_main._check_halt_flag(shadow_risk, shadow_halt_path, shadow_active, alerter)
+        assert shadow_active2 is True and shadow_risk.config.halt is True
+        assert prod_risk.config.halt is True   # still halted, untouched by the shadow-side change
+        assert os.path.exists(prod_halt_path)   # production flag itself untouched
+
+
+def test_paper_mode_fixed_roster_executor_construction_uses_live_state_path():
+    """Source guard confirming the review's exact repro location: the
+    fixed-roster executor construction under `if cfg.paper.paper_mode:`
+    (inside the `if cfg.exchange.live_trading:` branch) calls
+    _live_state_path(sym) — which resolves to the ordinary production
+    directory whenever paper_mode is True (see the two tests above) —
+    proving PAPER_MODE=true genuinely is unisolated in the CURRENT code,
+    not a hypothetical concern."""
+    import inspect
+    src = inspect.getsource(bot_main.run)
+    idx = src.index("if cfg.paper.paper_mode:")
+    end = src.index("else:", idx)
+    section = src[idx:end]
+    assert "state_path" in section and "_live_state_path(sym)" in section
+
+
+# ── Account-level paper/dry-run equity reconstruction (external review, ──
+#    2026-09-22, seventh round P1): "_initialize_capital_pool()'s
+#    per-symbol fresh-funding step overwrites cash to a generic
+#    slot_cash_for() for ANY position<=1e-9 executor, discarding real
+#    accumulated P&L for a symbol that traded and is now merely flat.
+#    Reconstruct simulated account equity ONCE at the account level,
+#    including completed trades and retired symbols, using a complete
+#    replay of simulated economic events." ────────────────────────────────
+
+def test_replay_paper_realized_pnl_sums_across_all_state_files(tmp_path):
+    state_dir = str(tmp_path)
+    _write_live_state_json(state_dir, "B/CAD", "B", cash=0, position=0, cost_basis=0,
+                           realized_pnl=10.0, fees_paid=0.0)
+    _write_live_state_json(state_dir, "C/CAD", "C", cash=0, position=0, cost_basis=0,
+                           realized_pnl=-5.0, fees_paid=0.40)
+    total, ok = bot_main._replay_paper_realized_pnl(state_dir)
+    assert ok is True
+    assert total == pytest.approx(10.0 + (-5.0 - 0.40))   # 4.60
+
+
+def test_replay_paper_realized_pnl_missing_dir_or_no_files_is_ok_and_zero(tmp_path):
+    assert bot_main._replay_paper_realized_pnl(str(tmp_path / "does_not_exist")) == (0.0, True)
+    assert bot_main._replay_paper_realized_pnl(str(tmp_path)) == (0.0, True)   # empty dir, no files
+    assert bot_main._replay_paper_realized_pnl("") == (0.0, True)
+    assert bot_main._replay_paper_realized_pnl(None) == (0.0, True)
+
+
+# ── Eighth review pass, same day (2026-09-22) — "unreadable history ──────
+#    silently restores lost capital" / "NaN and infinity become accepted
+#    capital": _replay_paper_realized_pnl's original version treated ANY
+#    problem (unreadable file, missing fields, non-finite value) as
+#    "contributes 0.0, keep going" — indistinguishable from "this symbol
+#    never lost anything." Fixed to report (total, ok) and refuse to
+#    silently invent a zero contribution for anything it can't fully
+#    trust. ──────────────────────────────────────────────────────────────
+
+def test_replay_paper_realized_pnl_unreadable_file_marks_incomplete_not_zero(tmp_path):
+    """The exact reviewer reproduction: a retired symbol with a real
+    -$102 lifetime P&L (-$100 realized, $2 fees) becomes unreadable —
+    the OLD behavior silently contributed $0 (inventing the $102 back);
+    the fix must report ok=False so the caller refuses to fund anything
+    new, rather than quietly using a wrong-but-plausible-looking number."""
+    state_dir = str(tmp_path)
+    with open(os.path.join(state_dir, "live_state_RETIRED_CAD.json"), "w") as fh:
+        fh.write("{not valid json")
+    total, ok = bot_main._replay_paper_realized_pnl(state_dir)
+    assert ok is False
+    assert total == pytest.approx(0.0)   # the unreadable file contributes nothing — ok=False is what matters
+
+
+def test_replay_paper_realized_pnl_good_file_still_counted_alongside_a_bad_one(tmp_path):
+    """One unreadable file must not silently zero out every OTHER file's
+    real history — the good file's contribution is still summed, but ok
+    still correctly reports the overall reconstruction as incomplete."""
+    state_dir = str(tmp_path)
+    _write_live_state_json(state_dir, "B/CAD", "B", cash=0, position=0, cost_basis=0,
+                           realized_pnl=10.0, fees_paid=0.0)
+    with open(os.path.join(state_dir, "live_state_CORRUPT_CAD.json"), "w") as fh:
+        fh.write("{not valid json")
+    total, ok = bot_main._replay_paper_realized_pnl(state_dir)
+    assert ok is False
+    assert total == pytest.approx(10.0)   # the good file's real contribution is NOT discarded either
+
+
+def test_replay_paper_realized_pnl_missing_required_fields_marks_incomplete():
+    """A file missing realized_pnl or fees_paid entirely (an older
+    format, or partial manual editing) must require explicit migration,
+    not silently default to zero — a missing field is NOT the same claim
+    as a genuine zero."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as state_dir:
+        with open(os.path.join(state_dir, "live_state_B_CAD.json"), "w") as fh:
+            import json as _json
+            _json.dump({"symbol": "B/CAD", "cash": 100.0, "position": 0.0}, fh)   # no realized_pnl/fees_paid at all
+        total, ok = bot_main._replay_paper_realized_pnl(state_dir)
+        assert ok is False
+        assert total == pytest.approx(0.0)
+
+
+def test_replay_paper_realized_pnl_nan_value_marks_incomplete_not_accepted(tmp_path):
+    """Reproduced: Python's json module accepts the non-standard NaN/
+    Infinity literals by default — a corrupted-but-'readable' file
+    containing one previously passed straight through as a real float."""
+    state_dir = str(tmp_path)
+    with open(os.path.join(state_dir, "live_state_B_CAD.json"), "w") as fh:
+        fh.write('{"symbol": "B/CAD", "cash": 0, "position": 0, "realized_pnl": NaN, "fees_paid": 0.0}')
+    total, ok = bot_main._replay_paper_realized_pnl(state_dir)
+    assert ok is False
+    assert total == pytest.approx(0.0)
+
+
+def test_replay_paper_realized_pnl_infinity_value_marks_incomplete_not_accepted(tmp_path):
+    state_dir = str(tmp_path)
+    with open(os.path.join(state_dir, "live_state_B_CAD.json"), "w") as fh:
+        fh.write('{"symbol": "B/CAD", "cash": 0, "position": 0, "realized_pnl": Infinity, "fees_paid": 0.0}')
+    total, ok = bot_main._replay_paper_realized_pnl(state_dir)
+    assert ok is False
+    assert total == pytest.approx(0.0)
+
+
+def test_initialize_capital_pool_paper_mode_reconstructs_flat_symbol_with_real_gain(monkeypatch, tmp_path):
+    """The exact reviewer reproduction: $900 bankroll, one symbol buys
+    $100 then sells for $110 (zero fees) and ends FLAT. Its saved cash
+    (460) and realized_pnl (10) round-trip correctly through a raw
+    reopen (LiveExecutor's own state persistence — already tested
+    elsewhere), but _initialize_capital_pool must not simply discard
+    that history because the symbol is now merely flat, not genuinely
+    fresh: pool_total must be $910, not $900."""
+    _force_paper_pool_mode(monkeypatch)
+    state_dir = str(tmp_path)
+    _write_live_state_json(
+        state_dir, "B/CAD", "B", cash=460.0, position=0.0, cost_basis=0.0,
+        realized_pnl=10.0, fees_paid=0.0,
+    )
+    cfg_fake = _FakeCfgForPoolInit(live_trading=True, dry_run=True, starting_cash=900.0, max_concurrent_positions=2)
+    pool, _slots, pool_total, _cap, _caps, _paper_ok = bot_main._initialize_capital_pool({}, cfg_fake, state_dir=state_dir)
+    assert pool_total == pytest.approx(910.0)
+    assert pool.total_capital == pytest.approx(910.0)
+
+
+def test_initialize_capital_pool_paper_mode_mixed_flat_history_and_open_position(monkeypatch, tmp_path):
+    """Mixed restart: B/CAD is flat with real trading history (bought,
+    sold at a $10 gain, zero fees) and C/CAD is a DYNAMIC symbol still
+    holding an open position (bought, $0.40 entry fee, never sold) —
+    B's file is picked up purely by the account-level replay (B is not
+    even in the fixed roster's executors dict); C's file is picked up
+    by the SAME replay too, and must NOT be bumped again when C is
+    later admitted via _admit_dynamic_symbol (paper mode's per-symbol
+    bump is removed specifically to avoid this double-count)."""
+    _force_paper_pool_mode(monkeypatch)
+    state_dir = str(tmp_path)
+    _write_live_state_json(
+        state_dir, "B/CAD", "B", cash=460.0, position=0.0, cost_basis=0.0,
+        realized_pnl=10.0, fees_paid=0.0,
+    )
+    _write_live_state_json(
+        state_dir, "C/CAD", "C", cash=349.60, position=10.0, cost_basis=10.0,
+        realized_pnl=0.0, fees_paid=0.40,
+    )
+    cfg_fake = _FakeCfgForPoolInit(live_trading=True, dry_run=True, starting_cash=900.0, max_concurrent_positions=2)
+    # Neither B nor C is in the FIXED roster's executors dict — both are
+    # picked up purely by the directory-wide replay, exactly like a
+    # dynamically-admitted or orphaned symbol would be.
+    pool, _slots, pool_total, _cap, _caps, _paper_ok = bot_main._initialize_capital_pool({}, cfg_fake, state_dir=state_dir)
+    # 900 + 10 (B's real gain, zero fees) + (0 - 0.40) (C's entry fee) = 909.60
+    assert pool_total == pytest.approx(909.60)
+
+    c_exec = FakeExecutor(
+        symbol="C/CAD", starting_cash=349.60, starting_position=10.0, avg_entry=10.0,
+        fees_paid=0.40, realized_pnl=0.0,
+    )
+    monkeypatch.setattr(bot_main, "build_strategy", lambda: MagicMock(_highs=[], _lows=[], _closes=[]))
+    monkeypatch.setattr(bot_main, "_warmup_strategy", lambda strat, ex, tf, symbol: 1)
+    monkeypatch.setattr(bot_main, "_make_dynamic_executor", lambda sym: c_exec)
+    ss_c, err_c = bot_main._admit_dynamic_symbol("C/CAD", "ex", "4h", pool)
+    assert err_c is None
+    # Still 909.60 — admitting C must not bump total_capital a second
+    # time; the replay above already covered it.
+    assert pool.total_capital == pytest.approx(909.60)
+    assert pool._slots["C/CAD"] == pytest.approx(349.60 + 10.0 * 10.0)   # 449.60, its real slot
+
+
+def test_initialize_capital_pool_paper_mode_counts_a_retired_symbols_leftover_file():
+    """A dynamically-admitted symbol that fully closed and was RETIRED
+    (removed from symbol_state/executors/dynamic_admitted, per
+    _retire_dynamic_symbol_if_eligible) leaves its own state file on
+    disk untouched — "harmless left in place" per CLAUDE.md's own
+    rollback notes. A LATER restart's account-level replay must still
+    count its historical P&L even though NOTHING in the current roster
+    or dynamic-admission tracking references it any more."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as state_dir:
+        _write_live_state_json(
+            state_dir, "RETIRED/CAD", "RETIRED", cash=0.0, position=0.0, cost_basis=0.0,
+            realized_pnl=25.0, fees_paid=1.20,
+        )
+        cfg_fake = _FakeCfgForPoolInit(
+            live_trading=True, dry_run=True, starting_cash=900.0, max_concurrent_positions=2,
+        )
+        # executors={} — RETIRED/CAD is in NEITHER the fixed roster NOR
+        # any dynamic tracking; only its leftover file on disk exists.
+        pool, _slots, pool_total, _cap, _caps, _paper_ok = bot_main._initialize_capital_pool({}, cfg_fake, state_dir=state_dir)
+        assert pool_total == pytest.approx(900.0 + 25.0 - 1.20)   # 923.80
+
+
+def test_paper_mode_repeated_restarts_do_not_lose_or_reapply_pnl_or_fees(tmp_path):
+    """Idempotency: calling _initialize_capital_pool twice in a row
+    against the SAME on-disk state (simulating two consecutive restarts
+    with no new trades in between — the exact property the review asked
+    to verify) must produce the IDENTICAL total both times, never
+    accumulating or discarding anything just from restarting again."""
+    state_dir = str(tmp_path)
+    _write_live_state_json(
+        state_dir, "B/CAD", "B", cash=460.0, position=0.0, cost_basis=0.0,
+        realized_pnl=10.0, fees_paid=0.40,
+    )
+    cfg_fake = _FakeCfgForPoolInit(live_trading=True, dry_run=True, starting_cash=900.0, max_concurrent_positions=2)
+
+    _pool1, _slots1, total1, _c1, _cp1, _ok1 = bot_main._initialize_capital_pool({}, cfg_fake, state_dir=state_dir)
+    _pool2, _slots2, total2, _c2, _cp2, _ok2 = bot_main._initialize_capital_pool({}, cfg_fake, state_dir=state_dir)
+
+    assert total1 == pytest.approx(total2)
+    assert total1 == pytest.approx(900.0 + 10.0 - 0.40)   # 909.60, both times
+
+
+def test_initialize_capital_pool_flat_fixed_roster_symbol_gets_the_corrected_pool_share():
+    """Design confirmation, not a residual bug: a flat FIXED-ROSTER
+    symbol's own .cash is STILL reset to slot_cash_for() every restart
+    (CapitalPool's own documented design — 'winning pools grow and
+    losing pools shrink', an equal-division-of-the-CURRENT-total pool,
+    not a per-symbol sub-ledger each holds onto forever). The fix above
+    is specifically that slot_cash_for() is now computed against the
+    CORRECTED total (910, reflecting this exact symbol's own prior $10
+    gain) rather than the raw, un-reconstructed $900 — so this symbol's
+    fresh allocation is $455 (a fair share of the grown pool), not $450
+    (the pre-fix amount) and not $460 (its own literal leftover cash,
+    which this design deliberately does NOT preserve 1:1)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as state_dir:
+        b_path = _write_live_state_json(
+            state_dir, "B/CAD", "B", cash=460.0, position=0.0, cost_basis=0.0,
+            realized_pnl=10.0, fees_paid=0.0,
+        )
+        b_exec = FakeExecutor(symbol="B/CAD", starting_cash=460.0, starting_position=0.0)
+        cfg_fake = _FakeCfgForPoolInit(
+            live_trading=True, dry_run=True, starting_cash=900.0, max_concurrent_positions=2,
+        )
+        pool, slots, pool_total, _cap, _caps, _paper_ok = bot_main._initialize_capital_pool(
+            {"B/CAD": b_exec}, cfg_fake, state_dir=state_dir,
+        )
+        assert pool_total == pytest.approx(910.0)
+        assert slots["B/CAD"] == pytest.approx(455.0)   # 910 / 2 slots — NOT 450, NOT 460
+        assert b_exec.cash == pytest.approx(455.0)       # reset to the corrected share
+
+
+def test_initialize_capital_pool_reports_paper_accounting_not_ok_and_refuses_fresh_funding(tmp_path):
+    """External review (2026-09-22, eighth round P1): an incomplete
+    reconstruction must be REPORTED (paper_accounting_ok=False) and must
+    NOT fund any flat/fresh executor's slot — funding it is exactly the
+    'simulated BUY funding' the review asked to prevent until the
+    history is recovered. A currently-open position's own cash is
+    untouched either way (pre-existing behavior), so this specifically
+    checks the FLAT/fresh case, which the pre-fix code always funded."""
+    state_dir = str(tmp_path)
+    with open(os.path.join(state_dir, "live_state_CORRUPT_CAD.json"), "w") as fh:
+        fh.write("{not valid json")
+    fresh_exec = FakeExecutor(symbol="B/CAD", starting_cash=17.0, starting_position=0.0)
+    cfg_fake = _FakeCfgForPoolInit(live_trading=True, dry_run=True, starting_cash=900.0, max_concurrent_positions=2)
+
+    pool, slots, pool_total, _cap, _caps, paper_ok = bot_main._initialize_capital_pool(
+        {"B/CAD": fresh_exec}, cfg_fake, state_dir=state_dir,
+    )
+    assert paper_ok is False
+    # Not funded to slot_cash_for() (which would be ~450) — left exactly
+    # as its own pre-existing cash, since nothing here can be trusted to
+    # size a fresh allowance correctly right now.
+    assert fresh_exec.cash == pytest.approx(17.0)
+
+
+def test_initialize_capital_pool_non_finite_pool_total_falls_back_safely(tmp_path):
+    """A non-finite reconstructed total (NaN/Infinity poisoning the sum)
+    must not be allowed to reach CapitalPool() at all — that would raise
+    and take down management of every EXISTING position too, a bigger
+    blast radius than refusing new funding alone. It falls back to the
+    bare starting_cash (a known-finite value) so the pool itself still
+    constructs; paper_accounting_ok=False is what actually blocks new
+    BUYs from here, not this fallback number."""
+    state_dir = str(tmp_path)
+    with open(os.path.join(state_dir, "live_state_B_CAD.json"), "w") as fh:
+        fh.write('{"symbol": "B/CAD", "cash": 0, "position": 0, "realized_pnl": Infinity, "fees_paid": 0.0}')
+    cfg_fake = _FakeCfgForPoolInit(live_trading=True, dry_run=True, starting_cash=900.0, max_concurrent_positions=2)
+
+    pool, _slots, pool_total, _cap, _caps, paper_ok = bot_main._initialize_capital_pool(
+        {}, cfg_fake, state_dir=state_dir,
+    )
+    assert paper_ok is False
+    assert pool_total == pytest.approx(900.0)   # safe fallback, not Infinity
+    assert math.isfinite(pool.total_capital)
+
+
+def test_run_source_wires_paper_accounting_gate_for_every_buy_candidate():
+    """Source guard (supplementing the behavioral tests above): the
+    paper-accounting gate must sit in the SAME approval-chain pattern as
+    the accounting/dynamic-eligibility gates — applying to every BUY
+    candidate regardless of fixed-roster-vs-dynamic, never touching a
+    SELL, and running BEFORE section 9's execute/queue decision."""
+    import inspect
+    src = inspect.getsource(bot_main.run)
+    idx = src.index("# ── 7a1. Paper-accounting reconstruction gate")
+    end = src.index("# ── 7a2. Dynamic-universe eligibility gate")
+    section = src[idx:end]
+    assert "_paper_accounting_ok" in section
+    assert "BlockReason.PAPER_ACCOUNTING_INCOMPLETE" in section
+    assert "approval and final_signal == Signal.BUY and not _paper_accounting_ok" in section
+    section9_idx = src.index("# ── 9. Execute")
+    assert idx < section9_idx
+
+
+# ── Ninth review pass, same day (2026-09-22) ──────────────────────────────
+#    1. valid JSON of the wrong shape (null, 42, a list, ...) crashed the
+#       replay outright instead of marking that file incomplete.
+#    2. CapitalPool.release() popped the slot BEFORE validating the new
+#       total, so a rejected release() (non-finite cash_returned) left
+#       the pool in a corrupted intermediate state — slot gone, total
+#       never updated, i.e. reserved funds silently made "available".
+
+def test_replay_paper_realized_pnl_null_json_marks_incomplete_not_crash(tmp_path):
+    """Reproduction: a live_state_*.json file containing exactly 'null'
+    is VALID JSON (json.load returns None) — the old code's very next
+    line ('realized_pnl' not in _state) raised an uncaught TypeError,
+    crashing the whole replay (and therefore startup) instead of just
+    marking this one file incomplete."""
+    state_dir = str(tmp_path)
+    with open(os.path.join(state_dir, "live_state_B_CAD.json"), "w") as fh:
+        fh.write("null")
+    total, ok = bot_main._replay_paper_realized_pnl(state_dir)   # must not raise
+    assert ok is False
+    assert total == pytest.approx(0.0)
+
+
+def test_replay_paper_realized_pnl_bare_number_json_marks_incomplete_not_crash(tmp_path):
+    """Same class of bug, a different valid-but-wrong shape: a file
+    containing exactly '42' (json.load returns the int 42)."""
+    state_dir = str(tmp_path)
+    with open(os.path.join(state_dir, "live_state_B_CAD.json"), "w") as fh:
+        fh.write("42")
+    total, ok = bot_main._replay_paper_realized_pnl(state_dir)   # must not raise
+    assert ok is False
+    assert total == pytest.approx(0.0)
+
+
+def test_replay_paper_realized_pnl_json_array_marks_incomplete_not_crash(tmp_path):
+    """A third shape: a JSON array, not an object."""
+    state_dir = str(tmp_path)
+    with open(os.path.join(state_dir, "live_state_B_CAD.json"), "w") as fh:
+        fh.write("[1, 2, 3]")
+    total, ok = bot_main._replay_paper_realized_pnl(state_dir)   # must not raise
+    assert ok is False
+    assert total == pytest.approx(0.0)
+
+
+def test_capital_pool_release_rejects_non_finite_cash_without_mutating_state():
+    """The exact reproduction: releasing with a NaN cash_returned must
+    raise WITHOUT first popping the slot — a rejected call changes
+    nothing at all, so a caller can retry with a corrected value."""
+    pool = CapitalPool(total_capital=200.0, max_concurrent=2)
+    pool.allocate("B/CAD", amount=100.0)
+    pool.allocate("C/CAD", amount=100.0)
+
+    with pytest.raises(ValueError, match="non-finite"):
+        pool.release("B/CAD", float("nan"))
+
+    # State fully preserved — the slot was NEVER removed, and
+    # total_capital was NEVER touched, despite the raise.
+    assert pool.is_allocated("B/CAD")
+    assert pool._slots["B/CAD"] == pytest.approx(100.0)
+    assert pool.total_capital == pytest.approx(200.0)
+    assert pool.available_cash == pytest.approx(0.0)   # NOT 100 — nothing was freed by the failed call
+
+    # A corrected retry succeeds normally afterward.
+    pool.release("B/CAD", 105.0)
+    assert not pool.is_allocated("B/CAD")
+    assert pool.total_capital == pytest.approx(205.0)   # 200 - 100 + 105
+    assert pool.available_cash == pytest.approx(105.0)
+
+
+def test_capital_pool_release_rejects_infinite_cash_without_mutating_state():
+    pool = CapitalPool(total_capital=200.0, max_concurrent=2)
+    pool.allocate("B/CAD", amount=100.0)
+
+    with pytest.raises(ValueError, match="non-finite"):
+        pool.release("B/CAD", float("inf"))
+
+    assert pool.is_allocated("B/CAD")
+    assert pool.total_capital == pytest.approx(200.0)
+
+
+# ── Tenth review pass, same day (2026-09-22) — configurable simulated ────
+#    fees + shared-bankroll conservation through a full BUY -> partial
+#    SELL -> restart -> full-exit lifecycle, across multiple coins,
+#    fees included throughout. "The zero-fee-simulation gap" (open since
+#    round 4) is closed by LiveExecutor's new simulated_maker_fee_pct/
+#    simulated_taker_fee_pct (see test_live_executor.py for the executor-
+#    level unit tests); THIS test proves the fees actually flow correctly
+#    through the shared-pool accounting this whole review sequence has
+#    been hardening, not just that LiveExecutor computes them in isolation.
+
+def test_shared_bankroll_conserves_exactly_through_buy_partial_sell_restart_full_exit_with_fees(monkeypatch):
+    """Two coins, ONE paper/dry-run bankroll, real (now nonzero) simulated
+    fees throughout — the fullest lifecycle any test in this file
+    exercises: B/CAD buys, PARTIALLY sells (still holding afterward), the
+    process restarts (account-level replay + _admit_dynamic_symbol
+    recovery while B is STILL PARTIALLY OPEN and C is untouched-since-
+    entry), then both fully exit. Every stage's expected total is
+    computed independently by hand from the real fee math, not
+    re-derived from the code under test — see the comment at each
+    assertion for the arithmetic.
+
+    Uses the CONSERVATIVE default (simulate_maker_fills left False — see
+    the eleventh round's own finding) — every fill, BUY or SELL, pays
+    the TAKER rate (0.80%), matching what an actual acceptance-
+    measurement run uses by default. order_type='limit' is passed
+    anyway to prove it makes no difference to the fee paid without
+    also opting into simulate_maker_fills."""
+    _force_paper_pool_mode(monkeypatch)
+    from unittest.mock import patch as _patch
+    import bot.execution.live_executor as le_mod
+    from bot.execution.live_executor import LiveExecutor
+
+    tmp = _tempfile_dir()
+    MAKER, TAKER = 0.0040, 0.0080
+
+    def _dry_run_executor(symbol, base, state_path=None):
+        if state_path is None:
+            # Matches _live_state_path()'s real naming convention
+            # (live_state_<SYM_WITH_UNDERSCORE>.json) — required so
+            # _replay_paper_realized_pnl's glob ("live_state_*.json")
+            # actually finds this file at restart time.
+            state_path = str(tmp / f"live_state_{base}_CAD.json")
+        mock_ex = MagicMock()
+        mock_ex.load_markets.return_value = {}
+        with _patch.object(le_mod.ccxt, "kraken") as mock_cls:
+            mock_cls.return_value = mock_ex
+            ex = LiveExecutor(
+                exchange_id="kraken", symbol=symbol, api_key="k", api_secret="s",
+                starting_cash=0.0, dry_run=True, state_path=state_path,
+                order_type="limit",   # irrelevant to the fee without simulate_maker_fills=True
+                simulated_maker_fee_pct=MAKER, simulated_taker_fee_pct=TAKER,
+                # simulate_maker_fills left at its conservative default (False)
+            )
+        return ex, state_path
+
+    b_ex, b_state_path = _dry_run_executor("B/CAD", "B")
+    c_ex, c_state_path = _dry_run_executor("C/CAD", "C")
+    executors_by_symbol = {"B/CAD": b_ex, "C/CAD": c_ex}
+    monkeypatch.setattr(bot_main, "build_strategy", lambda: MagicMock(_highs=[], _lows=[], _closes=[]))
+    monkeypatch.setattr(bot_main, "_warmup_strategy", lambda strat, ex, tf, symbol: 1)
+    monkeypatch.setattr(bot_main, "_make_dynamic_executor", lambda sym: executors_by_symbol[sym])
+
+    # ── DISCOVER + FILTER + fresh ALLOCATE ──────────────────────────────
+    symbol_state: dict = {}
+    executors: dict = {}
+    dynamic_admitted: set = set()
+    pool = CapitalPool(total_capital=900.0, max_concurrent=2)
+    screener = FakeScreener(["B/CAD", "C/CAD"])
+    admitted, _retired, _screen = bot_main._sync_dynamic_universe(
+        symbol_state, executors, dynamic_admitted, screener,
+        live_exchange="ex", timeframe="4h", capital_pool=pool, slot_cash_estimate=450.0,
+    )
+    assert set(admitted) == {"B/CAD", "C/CAD"}
+    assert b_ex.cash == pytest.approx(450.0) and c_ex.cash == pytest.approx(450.0)
+
+    # ── BUY both (taker — the conservative default applies to entries too) ─
+    order_b = bot_main._execute_approved_signal(
+        "B/CAD", symbol_state["B/CAD"], Signal.BUY, 10.0, 10.0, Signal.BUY, "",
+        capital_pool=pool, risk=FakeRisk(True), alerter=MagicMock(),
+        trade_log=MagicMock(), stuck_detector=MagicMock(), is_indicator=True,
+    )
+    order_c = bot_main._execute_approved_signal(
+        "C/CAD", symbol_state["C/CAD"], Signal.BUY, 20.0, 5.0, Signal.BUY, "",
+        capital_pool=pool, risk=FakeRisk(True), alerter=MagicMock(),
+        trade_log=MagicMock(), stuck_detector=MagicMock(), is_indicator=True,
+    )
+    assert order_b.status == OrderStatus.FILLED and order_c.status == OrderStatus.FILLED
+    # B: 450 - 10*10 - (10*10*0.0080 taker fee = 0.80) = 349.20
+    assert b_ex.cash == pytest.approx(349.20)
+    # C: 450 - 5*20 - (5*20*0.0080 = 0.80) = 349.20
+    assert c_ex.cash == pytest.approx(349.20)
+
+    # ── B partially sells (still holding 6 afterward) — a gain, taker fee ─
+    order_b_partial = bot_main._execute_approved_signal(
+        "B/CAD", symbol_state["B/CAD"], Signal.SELL, 11.0, 4.0, Signal.SELL, "",
+        capital_pool=pool, risk=FakeRisk(True), alerter=MagicMock(),
+        trade_log=MagicMock(), stuck_detector=MagicMock(), is_indicator=True,
+    )
+    assert order_b_partial.status == OrderStatus.FILLED
+    assert symbol_state["B/CAD"]['pm'].has_position   # still open — partial, not a full close
+    assert pool.is_allocated("B/CAD")   # the slot is NOT released by a partial sell
+    # 349.20 + (4*11 - 4*11*0.0080 taker fee) = 349.20 + (44 - 0.352) = 392.848
+    assert b_ex.cash == pytest.approx(392.848)
+    assert b_ex.position == pytest.approx(6.0)
+    assert b_ex.fees_paid == pytest.approx(0.80 + 0.352)   # 1.152, cumulative
+    assert b_ex.portfolio.realized_pnl == pytest.approx(4.0)   # (11-10)*4, price-based only
+
+    # ── RESTART: reopen both from their real persisted state ────────────
+    b_reopened, _ = _dry_run_executor("B/CAD", "B", state_path=b_state_path)
+    c_reopened, _ = _dry_run_executor("C/CAD", "C", state_path=c_state_path)
+    assert b_reopened.cash == pytest.approx(392.848) and b_reopened.position == pytest.approx(6.0)
+    assert c_reopened.cash == pytest.approx(349.20) and c_reopened.position == pytest.approx(5.0)
+
+    cfg_fake = _FakeCfgForPoolInit(live_trading=True, dry_run=True, starting_cash=900.0, max_concurrent_positions=2)
+    pool2, _slots, pool2_total, _cap, _caps, paper_ok = bot_main._initialize_capital_pool(
+        {}, cfg_fake, state_dir=str(tmp),
+    )
+    assert paper_ok is True
+    # Account-level replay: B(realized_pnl 4.0 - fees_paid 1.152 = 2.848)
+    # + C(realized_pnl 0 - fees_paid 0.80 = -0.80) = 2.048 -> 900+2.048=902.048
+    assert pool2_total == pytest.approx(902.048)
+
+    monkeypatch.setattr(
+        bot_main, "_make_dynamic_executor",
+        lambda sym: {"B/CAD": b_reopened, "C/CAD": c_reopened}[sym],
+    )
+    ss_b, err_b = bot_main._admit_dynamic_symbol("B/CAD", "ex", "4h", pool2)
+    ss_c, err_c = bot_main._admit_dynamic_symbol("C/CAD", "ex", "4h", pool2)
+    assert err_b is None and err_c is None
+    assert ss_b['pm'].quantity == pytest.approx(6.0) and ss_b['pm'].avg_entry == pytest.approx(10.0)
+    assert ss_c['pm'].quantity == pytest.approx(5.0) and ss_c['pm'].avg_entry == pytest.approx(20.0)
+    # Slots reserved at real cash+position*avg_entry — NOT bumped again
+    # (the account-level replay above already covered both).
+    assert pool2._slots["B/CAD"] == pytest.approx(392.848 + 6 * 10.0)    # 452.848
+    assert pool2._slots["C/CAD"] == pytest.approx(349.20 + 5 * 20.0)     # 449.20
+    assert pool2.total_capital == pytest.approx(902.048)                # unchanged by admission
+    assert pool2.available_cash == pytest.approx(0.0)                   # 902.048 - 452.848 - 449.20
+
+    # ── FULL EXIT: both close out completely, taker fees again ──────────
+    order_b_final = bot_main._execute_approved_signal(
+        "B/CAD", ss_b, Signal.SELL, 10.50, 6.0, Signal.SELL, "",
+        capital_pool=pool2, risk=FakeRisk(True), alerter=MagicMock(),
+        trade_log=MagicMock(), stuck_detector=MagicMock(), is_indicator=True,
+    )
+    order_c_final = bot_main._execute_approved_signal(
+        "C/CAD", ss_c, Signal.SELL, 19.0, 5.0, Signal.SELL, "",
+        capital_pool=pool2, risk=FakeRisk(True), alerter=MagicMock(),
+        trade_log=MagicMock(), stuck_detector=MagicMock(), is_indicator=True,
+    )
+    assert order_b_final.status == OrderStatus.FILLED and order_c_final.status == OrderStatus.FILLED
+    assert not ss_b['pm'].has_position and not ss_c['pm'].has_position
+    assert not pool2.is_allocated("B/CAD") and not pool2.is_allocated("C/CAD")
+
+    # B final cash: 392.848 + (6*10.50 - 6*10.50*0.0080) = 392.848 + (63 - 0.504) = 455.344
+    assert b_reopened.cash == pytest.approx(455.344)
+    # C final cash: 349.20 + (5*19 - 5*19*0.0080) = 349.20 + (95 - 0.76) = 443.44
+    assert c_reopened.cash == pytest.approx(443.44)
+
+    # The core assertion this test exists for: exact conservation across
+    # the ENTIRE lifecycle (BUY -> partial SELL -> restart -> full exit),
+    # for BOTH coins, with real (nonzero) fees included at every fill.
+    # Computed independently, event by event, not re-derived from the
+    # code under test:
+    #   B: -0.80 (entry fee) + 4.0 (partial-sell price gain) - 0.352
+    #      (partial-sell fee) + 3.0 (final-sell price gain, (10.50-10)*6)
+    #      - 0.504 (final-sell fee) = +5.344
+    #   C: -0.80 (entry fee) - 5.0 (final-sell price LOSS, (19-20)*5)
+    #      - 0.76 (final-sell fee) = -6.56
+    #   900 + 5.344 - 6.56 = 898.784
+    assert pool2.total_capital == pytest.approx(898.784)
+    assert pool2.available_cash == pytest.approx(898.784)   # nothing left allocated
+    final_symbol_state = {"B/CAD": {"last_price": 10.50}, "C/CAD": {"last_price": 19.0}}
+    final_total = bot_main._compute_account_value(
+        pool2, {"B/CAD": b_reopened, "C/CAD": c_reopened}, final_symbol_state,
+    )
+    assert final_total == pytest.approx(898.784)
+
+
+# ── Twelfth pass, same day (2026-09-23) — SIMULATE_MAKER_FILLS parsed by ─
+#    config but never actually passed at any of the 4 production
+#    LiveExecutor construction sites, so setting it had zero effect. Every
+#    existing test exercising these sites MONKEYPATCHES _make_dynamic_
+#    executor entirely, which is exactly why this went uncaught — nothing
+#    called the REAL function and inspected what it actually built.
+
+def test_make_dynamic_executor_actually_wires_simulate_maker_fills_from_cfg(monkeypatch):
+    """Calls the REAL _make_dynamic_executor (not monkeypatched away, the
+    way every other test in this file uses it) and inspects the returned
+    LiveExecutor's own internal flag — the only way to catch 'parsed by
+    config but never passed through to construction,' since a test that
+    substitutes a fake executor can never observe this class of bug."""
+    _force_paper_pool_mode(monkeypatch)
+    monkeypatch.setattr(bot_main.cfg.exchange, "simulate_maker_fills", True)
+    monkeypatch.setattr(bot_main.cfg.exchange, "simulated_maker_fee_pct", 0.0040)
+    monkeypatch.setattr(bot_main.cfg.exchange, "simulated_taker_fee_pct", 0.0080)
+
+    from unittest.mock import patch as _patch
+    import bot.execution.live_executor as le_mod
+    mock_ex = MagicMock()
+    mock_ex.load_markets.return_value = {}
+    with _patch.object(le_mod.ccxt, "kraken") as mock_cls:
+        mock_cls.return_value = mock_ex
+        ex = bot_main._make_dynamic_executor("B/CAD", state_path=str(_tempfile_dir() / "b.json"))
+
+    assert ex._simulate_maker_fills is True
+    assert ex._simulated_maker_fee_pct == pytest.approx(0.0040)
+    assert ex._simulated_taker_fee_pct == pytest.approx(0.0080)
+
+    # Flip the cfg value and confirm a NEW construction picks up the change
+    # (not a one-time snapshot cached somewhere else).
+    monkeypatch.setattr(bot_main.cfg.exchange, "simulate_maker_fills", False)
+    mock_ex2 = MagicMock()
+    mock_ex2.load_markets.return_value = {}
+    with _patch.object(le_mod.ccxt, "kraken") as mock_cls2:
+        mock_cls2.return_value = mock_ex2
+        ex2 = bot_main._make_dynamic_executor("B/CAD", state_path=str(_tempfile_dir() / "b2.json"))
+    assert ex2._simulate_maker_fills is False
+
+
+def test_run_source_every_live_executor_construction_site_passes_simulate_maker_fills():
+    """Source guard, supplementing the behavioral test above: the OTHER
+    3 production construction sites (inside run(), not independently
+    callable the way _make_dynamic_executor is) must ALSO pass
+    simulate_maker_fills — catching a future regression where one site
+    is updated and the others are missed, exactly how this bug arose
+    (simulated_maker_fee_pct/simulated_taker_fee_pct were added to all
+    4 sites together; simulate_maker_fills was added later and only
+    reached config.py + LiveExecutor, never these call sites, until
+    this same-day pass)."""
+    import inspect
+    src = inspect.getsource(bot_main)
+    # 1 in _make_dynamic_executor (asserted directly above) + 3 more
+    # inside run()'s own executor-construction blocks = 4 call sites,
+    # each contributing one "simulate_maker_fills = cfg.exchange.
+    # simulate_maker_fills," occurrence.
+    assert src.count("simulate_maker_fills     = cfg.exchange.simulate_maker_fills,") == 4
