@@ -176,7 +176,7 @@ narrative behind any decision below, and `.memory/decisions/*.md` for the deepes
 
 ## Test Suite Manifest
 
-**Expected total: 1717 tests** (`pytest --collect-only -q`, re-counted 2026-09-25). If the count
+**Expected total: 1723 tests** (`pytest --collect-only -q`, re-counted 2026-09-25 after the TWS-reconnect fix). If the count
 disagrees: a file has an import error, was deleted, was added without a manifest bump, or was
 excluded from the runner — investigate before trusting a green suite. Suite runtime ~85s; many
 minutes means a test is reading live `.env` config. **The per-row counts in the table below are
@@ -185,7 +185,7 @@ accounting and ledger-observer work of 2026-09-13 → 09-24 — were not bumped 
 table as a map of what each file covers, and `--collect-only` as the source of truth for counts.
 Count-delta history: `CLAUDE_HISTORY.md` → "CLAUDE.md trim, 2026-09-01" → "count-delta history".
 
-Run: `python -m pytest --tb=short -q` — must show **1717 passed**.
+Run: `python -m pytest --tb=short -q` — must show **1723 passed**.
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -453,6 +453,24 @@ the day's actual range and is still rejected. Fails toward the old conservative 
 
 +17 tests total (9 `IBKRExecutor` native-stop unit tests, 3 `_check_open_positions_sl_tp`
 wiring tests, 5 price-guard tests), suite 918→935. Both require a stock bot restart.
+
+### TWS-restart duplicate stop + CVX short (stock bot — fixed 2026-09-25)
+A mid-session TWS restart (11:58) exposed two IBKR-executor bugs, both "acted on a
+disconnected/cached view":
+- **Duplicate BNS stop:** `openTrades()` on a dropped socket returns `[]` without raising →
+  read as "no stop resting" → the placement step reconnected on its own and placed a 2nd
+  stop. Fixed: `_all_resting_native_stops()` raises when disconnected (→ ambiguous → skip),
+  and `sync_protective_stop()`'s `_place()` never reconnects.
+- **CVX short −3:** `sell()` sized from `positions_snapshot()`'s last-good cache while
+  disconnected, then `_execute()` reconnected and sold shares a broker stop had already sold.
+  Fixed: new `_live_positions()` (None when unconfirmed, never cached) used by `sell()` and
+  `sync_protective_stop()`; `sell()` reconnects first, and rejects unless
+  `_cancel_native_stop()` returns `"clear"` (now also rejects on `"filled"` / `"unconfirmed"` —
+  previously it proceeded "best-effort"). `positions_snapshot()` keeps its cache for
+  display/risk gates only.
+- **Still open:** a stop that fills while the bot isn't tracking it gets no CSV row
+  (CVX + AMZN exits missing from `ibkr_trades.csv`) — broker-execution reconciliation not built.
++6 tests in `test_ibkr_executor.py` (4 fail on the pre-fix code). Needs a stock-bot restart.
 
 ### Currency-aware cash check + accurate fill reporting (stock bot — fixed 2026-09-12)
 - `IBKRExecutor.buy()` affordability now uses `shares * self._price_in_cad(sym, price)` (was

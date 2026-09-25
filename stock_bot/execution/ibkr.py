@@ -785,12 +785,46 @@ class IBKRExecutor(StockExecutorBase):
             # A resting native stop (sync_protective_stop) must never be
             # left live while we place our own sell — the same deadlock
             # class the crypto bot hit 2026-08-27 (a resting protective
-            # order racing this executor's own exit). Best-effort: a
-            # failed cancel here still proceeds with the sell rather than
-            # blocking an exit on a broker-side cleanup step.
-            self._cancel_native_stop(sym)
+            # order racing this executor's own exit).
+            #
+            # Every decision below must be made against the LIVE broker
+            # state (2026-09-25: CVX went short −3 — a stop and a sell both
+            # filled the same 3 shares). So: reconnect first if needed, then
+            # only sell when (a) no stop can still be resting, (b) no stop
+            # just filled, and (c) the share count is broker-confirmed, not
+            # the last-good cache. Anything else is rejected this cycle; the
+            # resting stop still protects the position meanwhile, and the
+            # SL/TP watcher retries 30s later.
+            try:
+                self._call(self._ensure_connected_async(),
+                           timeout=self._connect_timeout_s + 5)
+            except Exception as exc:
+                return self._reject(
+                    sym, OrderSide.SELL, shares, price,
+                    f"IBKR disconnected — sell not attempted ({exc})",
+                )
 
-            held_shares, held_cost = self.positions_snapshot().get(sym, (0.0, 0.0))
+            stop_state = self._cancel_native_stop(sym)
+            if stop_state == "filled":
+                return self._reject(
+                    sym, OrderSide.SELL, shares, price,
+                    "Native stop filled while being cancelled — position already "
+                    "(at least partly) closed by the broker; not selling again",
+                )
+            if stop_state != "clear":
+                return self._reject(
+                    sym, OrderSide.SELL, shares, price,
+                    "Native stop cancellation unconfirmed — not selling while a "
+                    "broker stop may still fill the same shares",
+                )
+
+            live = self._live_positions()
+            if live is None:
+                return self._reject(
+                    sym, OrderSide.SELL, shares, price,
+                    "Live IBKR position unconfirmed — refusing to sell on cached data",
+                )
+            held_shares, held_cost = live.get(sym, (0.0, 0.0))
 
             if shares > held_shares + 1e-9:
                 return self._reject(
@@ -873,7 +907,17 @@ class IBKRExecutor(StockExecutorBase):
                 # the new stop fills immediately. Reading it once up front,
                 # before anything that could itself trigger a fill, has no
                 # such window.
-                held, held_cost = self.positions_snapshot().get(sym, (0.0, 0.0))
+                live = self._live_positions()
+                if live is None:
+                    # Disconnected: neither the position nor the resting
+                    # orders can be confirmed. Any stop already at the
+                    # broker keeps working on its own; retry next cycle.
+                    logger.warning(
+                        "NATIVE STOP sync skipped for %s — IBKR state unconfirmed "
+                        "(disconnected)", sym,
+                    )
+                    return
+                held, held_cost = live.get(sym, (0.0, 0.0))
                 if held <= 0:
                     self._cancel_native_stop(sym)   # nothing open left to protect
                     return
@@ -931,7 +975,13 @@ class IBKRExecutor(StockExecutorBase):
                 order = StopOrder(_NATIVE_STOP_ACTION, int(held), round(stop_price, 2), tif="GTC")
 
                 async def _place():
-                    await self._ensure_connected_async()
+                    # Never reconnect here: the "no stop resting" decision
+                    # above is only valid for the connection it was made on.
+                    # Reconnecting silently inside this step is what turned a
+                    # disconnected empty read into a live duplicate order
+                    # (BNS, 2026-09-25).
+                    if not self._ib.isConnected():
+                        raise ConnectionError("IBKR disconnected between stop check and placement")
                     qualified = await self._ib.qualifyContractsAsync(contract)
                     if not qualified:
                         raise RuntimeError(f"IBKR could not qualify contract for {sym}")
@@ -955,6 +1005,12 @@ class IBKRExecutor(StockExecutorBase):
         list, which is a confirmed zero)."""
         try:
             async def _open():
+                # openTrades() is a local ib_async cache read: on a dropped
+                # socket it returns [] WITHOUT raising, which read as
+                # "confirmed zero stops" and let sync_protective_stop place
+                # a duplicate BNS stop during the 2026-09-25 TWS restart.
+                if not self._ib.isConnected():
+                    raise ConnectionError("IBKR client reports disconnected")
                 return list(self._ib.openTrades())
             trades = self._call(_open(), timeout=10)
         except Exception as exc:
@@ -1068,7 +1124,7 @@ class IBKRExecutor(StockExecutorBase):
             return "unconfirmed"   # includes: partial fill, still active
         return "filled" if float(trade.orderStatus.filled or 0.0) > 0 else "cancelled"
 
-    def _cancel_native_stop(self, symbol: str) -> None:
+    def _cancel_native_stop(self, symbol: str) -> str:
         """Cancel every resting native stop found for this symbol (not just
         the single-match case — 2026-09-12 finding: ahead of an executor-
         initiated sell, an ambiguous multi-stop state must still be cleared
@@ -1079,15 +1135,31 @@ class IBKRExecutor(StockExecutorBase):
         live while we place our own sell is exactly the deadlock class this
         exists to prevent. Reentrant-safe (shares _position_lock with
         sell()/sync_protective_stop — RLock, so a caller that already holds
-        it does not deadlock here)."""
+        it does not deadlock here).
+
+        Returns "clear" (no resting stop left), "filled" (a stop filled
+        instead of cancelling — the position is at least partly closed
+        already), or "unconfirmed" (the lookup failed, or a cancel didn't
+        land — a stop may still be live). sell() must not place its own
+        order on anything but "clear": a stop and a market sell both
+        filling is how CVX ended up short −3 (found 2026-09-25)."""
         sym = symbol.upper()
         with self._position_lock(sym):
-            cached = self._native_stops.pop(sym, None)
+            cached = self._native_stops.get(sym)
             matches = self._all_resting_native_stops(sym)
-            if not matches:
-                return
+            if matches is None:
+                logger.error(
+                    "NATIVE STOP lookup failed for %s — cannot confirm no stop is resting", sym,
+                )
+                return "unconfirmed"
+            self._native_stops.pop(sym, None)
+            result = "clear"
             for m in matches:
                 outcome = self._cancel_trade_and_wait(m)
+                if outcome == "filled":
+                    result = "filled"
+                elif outcome != "cancelled" and result == "clear":
+                    result = "unconfirmed"
                 if outcome == "cancelled":
                     logger.info(
                         "NATIVE STOP CANCELLED [%s] ahead of an executor-initiated sell", sym,
@@ -1111,10 +1183,14 @@ class IBKRExecutor(StockExecutorBase):
                 else:
                     logger.error(
                         "NATIVE STOP CANCEL UNCONFIRMED [%s] ahead of an executor-initiated "
-                        "sell — order may still be resting; proceeding with the sell anyway "
-                        "per this method's best-effort contract, but the position may be "
-                        "briefly exposed to both this sell and the old stop", sym,
+                        "sell — order may still be resting; the sell is aborted this "
+                        "cycle so the stop and the sell can't both fill", sym,
                     )
+            if result == "unconfirmed" and cached is not None:
+                # Keep tracking it so check_native_stop_fills() still records
+                # the stop's real outcome once it resolves.
+                self._native_stops[sym] = cached
+            return result
 
     def _record_native_stop_fill(
         self, sym: str, trade, cached_avg_cost: float | None,
@@ -1329,7 +1405,29 @@ class IBKRExecutor(StockExecutorBase):
         See _account_value()'s docstring: positions() is a local ib_async
         cache read that never raises on its own, so a stale/disconnected
         client must be caught explicitly via isConnected() rather than
-        relying on an exception that will never come."""
+        relying on an exception that will never come.
+
+        Display/risk-gate use only. Anything that places or sizes an ORDER
+        must use _live_positions() instead — acting on a cached share count
+        is how a position that already closed at the broker gets sold a
+        second time (CVX went short −3, found 2026-09-25)."""
+        live = self._live_positions()
+        if live is not None:
+            return live
+        if self._positions_cache_valid:
+            logger.warning(
+                "IBKR positions unavailable — using last-good cache (%d held)",
+                len(self._positions_cache),
+            )
+            return dict(self._positions_cache)
+        logger.warning("IBKR positions unavailable — no cache yet, returning empty")
+        return {}
+
+    def _live_positions(self) -> dict[str, tuple[float, float]] | None:
+        """Broker-confirmed position book, or None when it can't be confirmed
+        right now (disconnected / query failed). Never falls back to the
+        last-good cache — callers that place orders must treat None as
+        'unknown' and not act."""
         try:
             async def _pos():
                 if not self._ib.isConnected():
@@ -1339,16 +1437,8 @@ class IBKRExecutor(StockExecutorBase):
             self._note_sync(True, "positions")
         except Exception as exc:
             self._note_sync(False, "positions")
-            if self._positions_cache_valid:
-                logger.warning(
-                    "IBKR positions unavailable (%s) — using last-good cache (%d held)",
-                    exc, len(self._positions_cache),
-                )
-                return dict(self._positions_cache)
-            logger.warning(
-                "IBKR positions unavailable (%s) — no cache yet, returning empty", exc,
-            )
-            return {}
+            logger.warning("IBKR live positions unavailable (%s)", exc)
+            return None
         snapshot: dict[str, tuple[float, float]] = {}
         for p in rows:
             if p.position == 0:

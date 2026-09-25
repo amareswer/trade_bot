@@ -715,7 +715,7 @@ def test_concurrent_sell_calls_are_serialized_per_symbol(executors):
     same moment. Neither had a lock around the full read-position ->
     validate -> submit sequence, so both could read the same held-shares
     figure and both submit a sell, overselling. Proven directly: wrap
-    positions_snapshot() (the first read inside the critical section) with a
+    _live_positions() (the first read inside the critical section) with a
     delay and an overlap counter — with the fix, the second sell() call must
     block on the lock and never read positions while the first is still
     mid-flight, so the counter must never exceed 1."""
@@ -725,7 +725,7 @@ def test_concurrent_sell_calls_are_serialized_per_symbol(executors):
 
     active = {"count": 0, "max": 0}
     guard = threading.Lock()
-    real_snapshot = ex.positions_snapshot
+    real_snapshot = ex._live_positions   # the order paths' position read
 
     def _slow_snapshot():
         with guard:
@@ -737,7 +737,7 @@ def test_concurrent_sell_calls_are_serialized_per_symbol(executors):
             active["count"] -= 1
         return result
 
-    ex.positions_snapshot = _slow_snapshot
+    ex._live_positions = _slow_snapshot
 
     results: list = []
     def _sell():
@@ -1015,7 +1015,7 @@ def test_sell_and_sync_protective_stop_are_mutually_exclusive(executors):
 
     active = {"count": 0, "max": 0}
     guard = threading.Lock()
-    real_snapshot = ex.positions_snapshot
+    real_snapshot = ex._live_positions   # the order paths' position read
 
     def _slow_snapshot():
         with guard:
@@ -1027,7 +1027,7 @@ def test_sell_and_sync_protective_stop_are_mutually_exclusive(executors):
             active["count"] -= 1
         return result
 
-    ex.positions_snapshot = _slow_snapshot
+    ex._live_positions = _slow_snapshot
 
     t1 = threading.Thread(target=lambda: ex.sell("KO", 10, 58.0, reason="test"))
     t2 = threading.Thread(target=lambda: ex.sync_protective_stop("KO", 55.0))
@@ -1038,6 +1038,113 @@ def test_sell_and_sync_protective_stop_are_mutually_exclusive(executors):
         "sell() and sync_protective_stop() entered their critical sections "
         "concurrently — they must share the same per-symbol lock"
     )
+
+
+def _stop_orders(fake):
+    return [o for _, o, _ in fake.placed if str(o.orderType).upper() in ("STP", "STOP")]
+
+
+def _market_orders(fake):
+    return [o for _, o, _ in fake.placed if str(o.orderType).upper() == "MKT"]
+
+
+def test_sync_protective_stop_never_places_while_disconnected(executors):
+    """2026-09-25 BNS incident: during a TWS restart, openTrades() on the
+    dropped socket returned [] without raising, was read as "no stop
+    resting", and the placement step then reconnected on its own and placed
+    a DUPLICATE stop on top of the one already at the broker."""
+    fake = FakeIB(positions=[_ko_position(10, 60.0)])
+    ex = make_executor(fake)
+    executors.append(ex)
+    ex.sync_protective_stop("KO", 55.0)
+    assert len(_stop_orders(fake)) == 1
+
+    real_open = fake.openTrades
+    fake.openTrades = lambda: real_open() if fake._connected else []   # real ib_async behaviour
+    fake._connected = False    # TWS restarting
+
+    ex.sync_protective_stop("KO", 55.0)
+
+    assert len(_stop_orders(fake)) == 1, "must not place a second stop while disconnected"
+    assert not fake._connected, "the stop sync must not silently reconnect"
+
+
+def test_sell_refuses_when_live_position_unconfirmed(executors):
+    """A sell must never be sized from the last-good position cache."""
+    fake = FakeIB(positions=[_ko_position(10, 60.0)], fill_price=58.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+    ex.positions_snapshot()          # populate the last-good cache
+    fake._connected = False
+
+    async def _refuse(*a, **k):
+        raise ConnectionRefusedError("TWS down")
+    fake.connectAsync = _refuse
+
+    order = ex.sell("KO", 10, 58.0, reason="STOP_LOSS_HIT")
+
+    assert order.status == OrderStatus.REJECTED
+    assert _market_orders(fake) == []
+
+
+def test_sell_after_reconnect_uses_live_position_not_cache(executors):
+    """CVX-style: the broker already closed the position (a stop filled
+    while the bot was disconnected) but the cache still shows it held.
+    After reconnecting, the sell must see the live zero and not sell again
+    (which would open a short)."""
+    fake = FakeIB(positions=[_ko_position(3, 211.17)], fill_price=200.5)
+    ex = make_executor(fake)
+    executors.append(ex)
+    ex.positions_snapshot()          # cache: 3 held
+    fake._connected = False
+    fake._positions = []             # broker-side stop already sold them
+
+    order = ex.sell("KO", 3, 200.5, reason="STOP_LOSS_HIT")
+
+    assert order.status == OrderStatus.REJECTED
+    assert _market_orders(fake) == [], "selling here would have opened a short"
+
+
+def test_sell_aborts_when_native_stop_cancel_unconfirmed(executors):
+    """If the resting stop's cancel doesn't land, the stop and our market
+    sell could both fill the same shares — the sell must wait a cycle."""
+    fake = FakeIB(positions=[_ko_position(10, 60.0)], fill_price=58.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+    ex.sync_protective_stop("KO", 55.0)
+    fake.cancelOrder = lambda order: fake.cancelled.append(order)   # never lands
+
+    order = ex.sell("KO", 10, 58.0, reason="STOP_LOSS_HIT")
+
+    assert order.status == OrderStatus.REJECTED
+    assert _market_orders(fake) == []
+    assert "KO" in ex._native_stops, "still-live stop must stay tracked for fill detection"
+
+
+def test_sell_does_not_sell_again_when_stop_fills_during_cancel(executors):
+    """The stop fills in the instant we try to cancel it: record that fill
+    once, and do NOT follow it with our own market sell of the same shares."""
+    fake = FakeIB(positions=[_ko_position(10, 60.0)], fill_mode="on_cancel", fill_price=54.80)
+    ex = make_executor(fake)
+    executors.append(ex)
+    ex.sync_protective_stop("KO", 55.0)
+
+    order = ex.sell("KO", 10, 58.0, reason="STOP_LOSS_HIT")
+
+    assert order.status == OrderStatus.REJECTED
+    assert _market_orders(fake) == []
+    assert ex.realized_pnl() == pytest.approx((54.80 - 60.0) * 10), "stop fill recorded exactly once"
+
+
+def test_sell_refuses_to_open_a_short(executors):
+    fake = FakeIB(positions=[_ko_position(-3, 200.57)], fill_price=205.0)
+    ex = make_executor(fake)
+    executors.append(ex)
+
+    order = ex.sell("KO", 3, 205.0, reason="test")
+
+    assert order.status == OrderStatus.REJECTED
+    assert _market_orders(fake) == []
 
 
 def test_check_native_stop_fills_detects_and_records_broker_triggered_exit(executors):
