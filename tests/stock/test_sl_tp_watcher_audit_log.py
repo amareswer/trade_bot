@@ -32,6 +32,7 @@ def _executor(positions: dict[str, tuple[float, float]]) -> MagicMock:
         status=main_mod.OrderStatus.FILLED, quantity=4.0, price=200.0, total_value=800.0,
     )
     ex.check_native_stop_fills.return_value = []   # realistic default — no broker-side fills
+    ex.reconcile_missed_fills.return_value = []    # realistic default — nothing missed
     del ex.get_position_stop_pct   # hasattr(executor, "get_position_stop_pct") is False
     return ex
 
@@ -145,6 +146,23 @@ def test_native_stop_fill_is_alerted_and_precedes_the_price_based_check(monkeypa
     call_args = notifier.fill.call_args
     assert call_args[0][:2] == ("SELL", "RY")
     assert call_args[1]["pnl"] == -42.0
+
+
+def test_reconciled_broker_fill_is_alerted(monkeypatch):
+    """A fill the bot never recorded (e.g. a stop that fired while TWS was
+    restarting) must reach the notifier once reconcile_missed_fills finds it."""
+    monkeypatch.setattr(main_mod, "get_live_price", lambda sym: 100.0)
+    ex = _executor({})
+    ex.reconcile_missed_fills.return_value = [
+        {"symbol": "CVX", "side": "SELL", "shares": 3.0, "price": 200.6, "pnl": -31.71},
+    ]
+    notifier = MagicMock()
+
+    main_mod._check_open_positions_sl_tp(ex, _cfg(), notifier=notifier)
+
+    notifier.fill.assert_called_once()
+    assert notifier.fill.call_args[0][:2] == ("SELL", "CVX")
+    assert notifier.fill.call_args[1]["pnl"] == -31.71
 
 
 def test_zero_share_positions_excluded_from_count(monkeypatch, caplog):

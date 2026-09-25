@@ -176,7 +176,7 @@ narrative behind any decision below, and `.memory/decisions/*.md` for the deepes
 
 ## Test Suite Manifest
 
-**Expected total: 1723 tests** (`pytest --collect-only -q`, re-counted 2026-09-25 after the TWS-reconnect fix). If the count
+**Expected total: 1732 tests** (`pytest --collect-only -q`, re-counted 2026-09-25 after the TWS-reconnect fix). If the count
 disagrees: a file has an import error, was deleted, was added without a manifest bump, or was
 excluded from the runner — investigate before trusting a green suite. Suite runtime ~85s; many
 minutes means a test is reading live `.env` config. **The per-row counts in the table below are
@@ -185,7 +185,7 @@ accounting and ledger-observer work of 2026-09-13 → 09-24 — were not bumped 
 table as a map of what each file covers, and `--collect-only` as the source of truth for counts.
 Count-delta history: `CLAUDE_HISTORY.md` → "CLAUDE.md trim, 2026-09-01" → "count-delta history".
 
-Run: `python -m pytest --tb=short -q` — must show **1723 passed**.
+Run: `python -m pytest --tb=short -q` — must show **1732 passed**.
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -468,9 +468,14 @@ disconnected/cached view":
   `_cancel_native_stop()` returns `"clear"` (now also rejects on `"filled"` / `"unconfirmed"` —
   previously it proceeded "best-effort"). `positions_snapshot()` keeps its cache for
   display/risk gates only.
-- **Still open:** a stop that fills while the bot isn't tracking it gets no CSV row
-  (CVX + AMZN exits missing from `ibkr_trades.csv`) — broker-execution reconciliation not built.
-+6 tests in `test_ibkr_executor.py` (4 fail on the pre-fix code). Needs a stock-bot restart.
+- **Missed broker fills — `IBKRExecutor.reconcile_missed_fills()`:** called from the SL/TP
+  watcher (self-throttled to 5 min). Compares IBKR's execution report (~1-day window) for
+  THIS client's orders against shares already recorded per orderId (`recorded_fills`,
+  persisted in `ibkr_state.json`) and writes only the unrecorded remainder as
+  `BROKER_FILL_RECONCILED` (P&L via `last_known_cost`). Skips manual/other-client trades,
+  still-working orders, tracked native stops, and fills <120s old. First run only baselines.
+  The historical CVX + AMZN exits predate it — they need a manual CSV backfill.
++15 tests (4 of the first 6 fail on the pre-fix code). Needs a stock-bot restart.
 
 ### Currency-aware cash check + accurate fill reporting (stock bot — fixed 2026-09-12)
 - `IBKRExecutor.buy()` affordability now uses `shares * self._price_in_cad(sym, price)` (was

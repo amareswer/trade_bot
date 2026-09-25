@@ -612,6 +612,25 @@ def _check_open_positions_sl_tp(executor, cfg, notifier=None, stuck_detector=Non
         except Exception as exc:
             logger.warning("check_native_stop_fills failed: %s", exc)
 
+    # Any other broker fill of this bot's orders that never got recorded
+    # (stop filled while disconnected/restarting, late fill after an
+    # unconfirmed cancel). Self-throttled to one broker query per ~5 min.
+    if hasattr(executor, "reconcile_missed_fills"):
+        try:
+            for hit in executor.reconcile_missed_fills():
+                print(
+                    f"  🧾 BROKER FILL RECONCILED: {hit['side']} {hit['symbol']} "
+                    f"{hit['shares']:g} @ ${hit['price']:.2f} (was never recorded)"
+                )
+                if notifier:
+                    notifier.fill(
+                        hit["side"], hit["symbol"], hit["shares"], hit["price"],
+                        round(hit["shares"] * hit["price"], 2), pnl=hit["pnl"],
+                        reason="broker fill reconciled (missed by the bot)",
+                    )
+        except Exception as exc:
+            logger.warning("reconcile_missed_fills failed: %s", exc)
+
     _checked = 0
     _priced  = 0
     for symbol, (shares, avg_cost) in list(executor.positions_snapshot().items()):

@@ -68,6 +68,7 @@ import json
 import logging
 import os
 import threading
+import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Optional
@@ -158,6 +159,17 @@ _NATIVE_STOP_PRICE_TOLERANCE = 0.005   # dollars — below this, treat as "alrea
 # let a query failure or ambiguity be read as "nothing exists", placing a
 # duplicate on top of a stop that was, in fact, already there).
 _NATIVE_STOP_LOOKUP_AMBIGUOUS = object()
+
+# Broker-fill reconciliation (reconcile_missed_fills, 2026-09-25). IBKR's
+# execution report only covers roughly the current day, so this must run
+# well inside that window; 5 min is cheap and catches a missed stop fill
+# the same session. The grace window keeps it off a fill that its own
+# buy()/sell() call is still in the middle of recording. Recorded-order
+# entries older than the TTL are pruned — far past anything the execution
+# report can still return.
+_RECONCILE_INTERVAL_S = 300.0
+_RECONCILE_FILL_GRACE_S = 120.0
+_RECORDED_FILL_TTL_S = 7 * 86400.0
 
 
 def _default_ib_factory():
@@ -268,6 +280,19 @@ class IBKRExecutor(StockExecutorBase):
         # so a restart adopts an already-resting order instead of
         # duplicating it, with no separate reconciliation pass needed.
         self._native_stops: dict[str, dict] = {}
+
+        # Broker-fill reconciliation (reconcile_missed_fills). Shares already
+        # written to ibkr_trades.csv per broker orderId — {str(orderId):
+        # {"qty": float, "ts": epoch}} — so a fill is never recorded twice,
+        # and a LATE fill on an order (e.g. after an unconfirmed cancel) is
+        # still picked up as the unrecorded remainder. Persisted. Seeded (not
+        # recorded) on the first run so pre-existing executions don't get
+        # duplicated. _last_known_cost keeps each symbol's broker avg cost
+        # after the position closes, so a missed SELL can still get its P&L.
+        self._recorded_fills: dict[str, dict] = {}
+        self._reconcile_seeded: bool = False
+        self._last_known_cost: dict[str, float] = {}
+        self._last_reconcile_at: float = 0.0
 
         # Last-good caches for the two TWS-queried views. A transient
         # accountValues()/positions() timeout used to return a fabricated
@@ -482,10 +507,10 @@ class IBKRExecutor(StockExecutorBase):
 
     async def _place_market_async(
         self, symbol: str, action: str, qty: int,
-    ) -> tuple[str, float, float]:
+    ) -> tuple[str, float, float, int]:
         """
         Place a market order and wait for a terminal state.
-        Returns (status, filled_qty, avg_fill_price).
+        Returns (status, filled_qty, avg_fill_price, broker_order_id).
         """
         from ib_async import MarketOrder
 
@@ -604,14 +629,14 @@ class IBKRExecutor(StockExecutorBase):
             filled_qty = sum(f.execution.shares for f in trade.fills)
             total = sum(f.execution.shares * f.execution.price for f in trade.fills)
             avg_px = total / filled_qty if filled_qty else 0.0
-        return status, filled_qty, avg_px
+        return status, filled_qty, avg_px, int(getattr(order, "orderId", 0) or 0)
 
-    def _execute(self, symbol: str, side: OrderSide, shares: int) -> tuple[float, float]:
+    def _execute(self, symbol: str, side: OrderSide, shares: int) -> tuple[float, float, int]:
         """
-        Blocking wrapper: place market order, return (filled_qty, avg_price).
-        Raises RuntimeError when nothing filled.
+        Blocking wrapper: place market order, return (filled_qty, avg_price,
+        broker_order_id). Raises RuntimeError when nothing filled.
         """
-        status, filled_qty, avg_px = self._call(
+        status, filled_qty, avg_px, order_id = self._call(
             self._place_market_async(symbol, side.value, shares),
             timeout=self._fill_timeout_s + self._connect_timeout_s + 30,
         )
@@ -622,7 +647,7 @@ class IBKRExecutor(StockExecutorBase):
                 "IBKR PARTIAL FILL %s %s: %d of %d shares — recording actual",
                 side.value, symbol, int(filled_qty), shares,
             )
-        return filled_qty, avg_px
+        return filled_qty, avg_px, order_id
 
     # ── core trading operations (StockExecutorBase) ──────────────────────────
 
@@ -748,7 +773,7 @@ class IBKRExecutor(StockExecutorBase):
 
         order = self._new_order(sym, OrderSide.BUY, shares, price)
         try:
-            filled_qty, fill_px = self._execute(sym, OrderSide.BUY, shares)
+            filled_qty, fill_px, broker_oid = self._execute(sym, OrderSide.BUY, shares)
         except Exception as exc:
             order.status = OrderStatus.REJECTED
             order.reject_reason = f"IBKR order failed: {exc}"
@@ -763,7 +788,8 @@ class IBKRExecutor(StockExecutorBase):
         order.filled_at = datetime.now(timezone.utc)
         self._orders.append(order)
 
-        self._record_trade("BUY", sym, filled_qty, fill_px, reason, confidence)
+        self._record_trade("BUY", sym, filled_qty, fill_px, reason, confidence,
+                           order_id=broker_oid)
         logger.info(
             "IBKR BUY FILLED    %s  %d shares @ $%.2f  cash=$%.2f",
             sym, int(filled_qty), fill_px, self.cash,
@@ -835,7 +861,7 @@ class IBKRExecutor(StockExecutorBase):
             shares = int(shares)
             order = self._new_order(sym, OrderSide.SELL, shares, price)
             try:
-                filled_qty, fill_px = self._execute(sym, OrderSide.SELL, shares)
+                filled_qty, fill_px, broker_oid = self._execute(sym, OrderSide.SELL, shares)
             except Exception as exc:
                 order.status = OrderStatus.REJECTED
                 order.reject_reason = f"IBKR order failed: {exc}"
@@ -858,7 +884,7 @@ class IBKRExecutor(StockExecutorBase):
             order.filled_at = datetime.now(timezone.utc)
             self._orders.append(order)
 
-            self._record_trade("SELL", sym, filled_qty, fill_px, reason)
+            self._record_trade("SELL", sym, filled_qty, fill_px, reason, order_id=broker_oid)
             logger.info(
                 "IBKR SELL FILLED   %s  %d shares @ $%.2f  trade_pnl=$%.2f  "
                 "total_realized=$%.2f  cash=$%.2f",
@@ -1226,7 +1252,10 @@ class IBKRExecutor(StockExecutorBase):
             with self._state_lock:
                 self._realized_pnl += pnl
             self._position_stop_pct.pop(sym, None)
-            self._record_trade("SELL", sym, filled_qty, fill_px, "NATIVE_STOP_HIT")
+            self._record_trade(
+                "SELL", sym, filled_qty, fill_px, "NATIVE_STOP_HIT",
+                order_id=getattr(trade.order, "orderId", None),
+            )
             logger.warning(
                 "NATIVE STOP FILLED [%s]: %d shares @ $%.2f — broker triggered "
                 "this independently of the bot's own SL/TP watcher",
@@ -1256,11 +1285,9 @@ class IBKRExecutor(StockExecutorBase):
         nor in this dict (fresh after a restart) — check_native_stop_fills
         has nothing to inspect for it. That fill still correctly updates
         the broker's own position (positions_snapshot() self-corrects), but
-        its P&L/CSV row is permanently missed. Closing this needs
-        persisted order tracking plus startup reconciliation against the
-        broker's execution history (with duplicate-record protection
-        against fills already captured via the normal sell() path) — not
-        yet built; a real follow-up, not a same-day patch."""
+        its P&L/CSV row would be missed here — reconcile_missed_fills()
+        (2026-09-25) closes that gap from the broker's execution report,
+        as long as it runs within the report's ~1-day window."""
         filled: list[dict] = []
         for sym, tracked in list(self._native_stops.items()):
             trade = tracked.get("trade")
@@ -1278,6 +1305,140 @@ class IBKRExecutor(StockExecutorBase):
                 if result is not None:
                     filled.append(result)
         return filled
+
+    def _pruned_recorded_fills(self) -> dict[str, dict]:
+        cutoff = time.time() - _RECORDED_FILL_TTL_S
+        self._recorded_fills = {
+            k: v for k, v in self._recorded_fills.items() if v.get("ts", 0.0) >= cutoff
+        }
+        return self._recorded_fills
+
+    def reconcile_missed_fills(self, force: bool = False) -> list[dict]:
+        """Record any broker execution of THIS bot's orders that never made
+        it into ibkr_trades.csv (2026-09-25: CVX and AMZN native-stop exits
+        filled with no CSV row, leaving Gate 3's round-trip count and P&L
+        wrong). Covers the gaps check_native_stop_fills() can't: a stop that
+        filled while the bot was restarting/disconnected, a stop adopted
+        from a prior session, and a late fill after an unconfirmed cancel.
+
+        Source of truth is the broker's execution report, compared per
+        orderId against the shares already recorded (_recorded_fills) —
+        only the unrecorded remainder is written, so nothing is recorded
+        twice. Skips: other clients' orders (manual TWS trades are not the
+        bot's track record — logged, not recorded), orders still working,
+        stops check_native_stop_fills() is still tracking, and fills newer
+        than _RECONCILE_FILL_GRACE_S (their own buy()/sell() may be mid-
+        record). Throttled to _RECONCILE_INTERVAL_S unless force=True.
+        Returns [{symbol, side, shares, price, pnl}] for the caller to alert
+        on. Never raises."""
+        now = time.monotonic()
+        if not force and now - self._last_reconcile_at < _RECONCILE_INTERVAL_S:
+            return []
+        self._last_reconcile_at = now
+        try:
+            async def _fetch():
+                if not self._ib.isConnected():
+                    raise ConnectionError("IBKR client reports disconnected")
+                fills = await self._ib.reqExecutionsAsync()
+                open_ids = {
+                    int(t.order.orderId) for t in self._ib.openTrades() if not t.isDone()
+                }
+                return list(fills), open_ids
+            fills, open_ids = self._call(_fetch(), timeout=30)
+        except Exception as exc:
+            logger.warning("Broker-fill reconciliation skipped: %s", exc)
+            return []
+
+        groups: dict[int, dict] = {}
+        foreign = 0
+        for f in fills:
+            try:
+                ex = f.execution
+                if self._account and ex.acctNumber and ex.acctNumber != self._account:
+                    continue
+                if int(ex.clientId) != int(self._client_id):
+                    foreign += 1
+                    continue
+                oid = int(ex.orderId)
+                g = groups.setdefault(oid, {
+                    "symbol": self.from_contract(f.contract),
+                    "side": "BUY" if str(ex.side).upper() in ("BOT", "BUY") else "SELL",
+                    "shares": 0.0, "notional": 0.0, "last_time": None,
+                })
+                g["shares"] += float(ex.shares)
+                g["notional"] += float(ex.shares) * float(ex.price)
+                t = ex.time
+                if isinstance(t, datetime) and (g["last_time"] is None or t > g["last_time"]):
+                    g["last_time"] = t
+            except Exception as exc:
+                logger.warning("Skipping unreadable execution in reconciliation: %s", exc)
+        if foreign:
+            logger.info(
+                "Broker-fill reconciliation: %d execution(s) from other clients "
+                "(e.g. manual TWS trades) not recorded as bot trades", foreign,
+            )
+
+        if not self._reconcile_seeded:
+            # First run with this feature: everything the broker currently
+            # reports predates the tracking, and may already be in the CSV
+            # via the normal paths — baseline it rather than risk a duplicate.
+            for oid, g in groups.items():
+                self._recorded_fills[str(oid)] = {"qty": g["shares"], "ts": time.time()}
+            self._reconcile_seeded = True
+            self.save_state()
+            logger.info(
+                "Broker-fill reconciliation baselined %d existing order(s) — "
+                "only fills from here on are reconciled", len(groups),
+            )
+            return []
+
+        results: list[dict] = []
+        tracked_stop_ids = {
+            int(getattr(v["trade"].order, "orderId", 0) or 0)
+            for v in list(self._native_stops.values()) if v.get("trade") is not None
+        }
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=_RECONCILE_FILL_GRACE_S)
+        for oid, g in groups.items():
+            if oid in open_ids or oid in tracked_stop_ids or g["shares"] <= 0:
+                continue
+            last = g["last_time"]
+            if last is not None:
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                if last > cutoff:
+                    continue
+            sym = g["symbol"]
+            with self._position_lock(sym):
+                done = self._recorded_fills.get(str(oid), {}).get("qty", 0.0)
+                missing = round(g["shares"] - done, 6)
+                if missing <= 1e-9:
+                    continue
+                px = g["notional"] / g["shares"]
+                pnl = None
+                if g["side"] == "SELL":
+                    cost = self._last_known_cost.get(sym)
+                    if cost:
+                        pnl = round((px - cost) * missing, 2)
+                        with self._state_lock:
+                            self._realized_pnl += pnl
+                    else:
+                        logger.error(
+                            "RECONCILED SELL [%s] has no known cost basis — CSV row "
+                            "written, realized P&L NOT updated", sym,
+                        )
+                self._record_trade(
+                    g["side"], sym, missing, px, "BROKER_FILL_RECONCILED", order_id=oid,
+                )
+                logger.warning(
+                    "BROKER FILL RECONCILED [%s]: %s %s shares @ $%.2f (order %d) — "
+                    "filled at the broker but was never recorded by the bot",
+                    sym, g["side"], f"{missing:g}", px, oid,
+                )
+                results.append({
+                    "symbol": sym, "side": g["side"], "shares": missing,
+                    "price": px, "pnl": pnl,
+                })
+        return results
 
     # ── portfolio state (queried from IBKR) ──────────────────────────────────
 
@@ -1446,6 +1607,8 @@ class IBKRExecutor(StockExecutorBase):
             sym = self.from_contract(p.contract)
             # IBKR avgCost is per share and includes commission
             snapshot[sym] = (float(p.position), round(float(p.avgCost), 6))
+            if p.position > 0:
+                self._last_known_cost[sym] = round(float(p.avgCost), 6)
         self._positions_cache = dict(snapshot)
         self._positions_cache_valid = True
         return snapshot
@@ -1759,6 +1922,16 @@ class IBKRExecutor(StockExecutorBase):
                 sym.upper(): float(pct)
                 for sym, pct in (state.get("position_stop_pct") or {}).items()
             }
+            self._recorded_fills = {
+                str(k): {"qty": float(v.get("qty", 0.0)), "ts": float(v.get("ts", 0.0))}
+                for k, v in (state.get("recorded_fills") or {}).items()
+                if isinstance(v, dict)
+            }
+            self._reconcile_seeded = bool(state.get("reconcile_seeded", False))
+            self._last_known_cost = {
+                sym.upper(): float(c)
+                for sym, c in (state.get("last_known_cost") or {}).items()
+            }
             logger.info(
                 "IBKR state restored | realized_pnl=$%.2f | starting_cash=$%.2f",
                 realized, starting,
@@ -1790,6 +1963,9 @@ class IBKRExecutor(StockExecutorBase):
             "day_start_iso": self._day_start_iso,
             "kill_switch_tripped": self._kill_switch_tripped,
             "position_stop_pct": self._position_stop_pct,
+            "recorded_fills": self._pruned_recorded_fills(),
+            "reconcile_seeded": self._reconcile_seeded,
+            "last_known_cost": self._last_known_cost,
             "last_updated": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         }
         try:
@@ -1835,8 +2011,14 @@ class IBKRExecutor(StockExecutorBase):
 
     def _record_trade(
         self, side: str, sym: str, shares: float, fill_px: float,
-        reason: str, confidence: int = 0,
+        reason: str, confidence: int = 0, order_id: int | None = None,
     ) -> None:
+        if order_id:
+            # Marked before save_state() below persists it — the broker-fill
+            # reconciler must see these shares as already recorded.
+            entry = self._recorded_fills.setdefault(str(order_id), {"qty": 0.0, "ts": 0.0})
+            entry["qty"] += float(shares)
+            entry["ts"] = time.time()
         trade = PaperTrade(
             timestamp      = datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             symbol         = sym,

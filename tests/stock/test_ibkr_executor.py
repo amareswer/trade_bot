@@ -17,6 +17,7 @@ import csv
 import json
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -93,6 +94,8 @@ class FakeIB:
         self._connected = False
         self.placed = []
         self.cancelled = []
+        self.executions = []       # broker execution report (reqExecutionsAsync)
+        self._next_order_id = 1000
 
     async def connectAsync(self, host, port, clientId, timeout=10):
         self._connected = True
@@ -120,7 +123,13 @@ class FakeIB:
     async def qualifyContractsAsync(self, contract):
         return [contract]
 
+    async def reqExecutionsAsync(self):
+        return list(self.executions)
+
     def placeOrder(self, contract, order):
+        if not getattr(order, "orderId", 0):
+            self._next_order_id += 1
+            order.orderId = self._next_order_id
         trade = FakeTrade(contract, order)
         self.placed.append((contract, order, trade))
         # A resting protective stop (orderType STP) must never auto-fill
@@ -1825,3 +1834,149 @@ def test_ibkr_position_stop_pct_cleared_on_full_close(executors):
     order = ex.sell("CM.TO", 10, 110.0, reason="test")
     assert order.status == OrderStatus.FILLED
     assert ex.get_position_stop_pct("CM.TO", 0.05) == 0.05
+
+
+# ---------------------------------------------------------------------------
+# reconcile_missed_fills — broker executions the bot never recorded (2026-09-25)
+# ---------------------------------------------------------------------------
+
+def _execution(symbol, side, shares, price, order_id, client_id=7,
+               age_s=600.0, account="DUQ273338"):
+    return SimpleNamespace(
+        contract=FakeContract(symbol, "USD"),
+        execution=SimpleNamespace(
+            acctNumber=account, clientId=client_id, orderId=order_id,
+            side="SLD" if side == "SELL" else "BOT", shares=float(shares),
+            price=float(price),
+            time=datetime.now(timezone.utc) - timedelta(seconds=age_s),
+        ),
+    )
+
+
+def _csv_rows(sandbox):
+    path = sandbox / "ibkr_trades.csv"
+    with open(path, newline="") as f:
+        return [r for r in csv.reader(f)][1:]
+
+
+def _seeded(fake, **kwargs):
+    ex = make_executor(fake, **kwargs)
+    ex.reconcile_missed_fills(force=True)      # first run only baselines
+    assert ex._reconcile_seeded
+    return ex
+
+
+def test_reconcile_first_run_baselines_without_recording(executors, sandbox):
+    fake = FakeIB()
+    fake.executions = [_execution("KO", "SELL", 10, 55.0, order_id=500)]
+    ex = make_executor(fake)
+    executors.append(ex)
+
+    assert ex.reconcile_missed_fills(force=True) == []
+    assert _csv_rows(sandbox) == [], "pre-existing executions may already be in the CSV"
+    assert ex.reconcile_missed_fills(force=True) == []
+
+
+def test_reconcile_records_a_missed_stop_fill_exactly_once(executors, sandbox):
+    """The CVX/AMZN case: a stop placed in an earlier session fills while the
+    bot isn't tracking it — no CSV row, no P&L, until now."""
+    fake = FakeIB(positions=[_ko_position(3, 211.17)])
+    ex = _seeded(fake)
+    executors.append(ex)
+    ex.positions_snapshot()                     # learns the cost basis
+    fake._positions = []                        # broker stop sold them
+    fake.executions = [_execution("KO", "SELL", 3, 200.60, order_id=777)]
+
+    hits = ex.reconcile_missed_fills(force=True)
+
+    assert len(hits) == 1
+    assert hits[0]["side"] == "SELL" and hits[0]["shares"] == 3
+    assert hits[0]["pnl"] == pytest.approx((200.60 - 211.17) * 3, abs=0.01)
+    rows = _csv_rows(sandbox)
+    assert len(rows) == 1 and rows[0][1] == "KO" and rows[0][2] == "SELL"
+    assert rows[0][7] == "BROKER_FILL_RECONCILED"
+
+    assert ex.reconcile_missed_fills(force=True) == [], "must never record the same fill twice"
+    assert len(_csv_rows(sandbox)) == 1
+
+
+def test_reconcile_skips_fills_the_bot_already_recorded(executors, sandbox):
+    fake = FakeIB(positions=[_ko_position(10, 60.0)], fill_price=58.0)
+    ex = _seeded(fake)
+    executors.append(ex)
+    order = ex.sell("KO", 10, 58.0, reason="STOP_LOSS_HIT")
+    assert order.status == OrderStatus.FILLED
+    oid = [o for _, o, _ in fake.placed][-1].orderId
+    fake.executions = [_execution("KO", "SELL", 10, 58.0, order_id=oid)]
+
+    assert ex.reconcile_missed_fills(force=True) == []
+    assert len(_csv_rows(sandbox)) == 1
+
+
+def test_reconcile_records_only_the_unrecorded_remainder(executors, sandbox):
+    """Late fill after an unconfirmed cancel: sell() recorded 6, the broker
+    ended up filling 10 on the same order — only the extra 4 are missing."""
+    fake = FakeIB(positions=[_ko_position(10, 60.0)])
+    ex = _seeded(fake)
+    executors.append(ex)
+    ex.positions_snapshot()
+    ex._record_trade("SELL", "KO", 6, 58.0, "STOP_LOSS_HIT", order_id=900)
+    fake.executions = [
+        _execution("KO", "SELL", 6, 58.0, order_id=900),
+        _execution("KO", "SELL", 4, 57.5, order_id=900),
+    ]
+
+    hits = ex.reconcile_missed_fills(force=True)
+
+    assert len(hits) == 1 and hits[0]["shares"] == pytest.approx(4)
+    assert len(_csv_rows(sandbox)) == 2
+
+
+def test_reconcile_ignores_other_clients_and_still_working_or_fresh_orders(executors, sandbox):
+    fake = FakeIB(positions=[_ko_position(10, 60.0)])
+    ex = _seeded(fake)
+    executors.append(ex)
+    ex.sync_protective_stop("KO", 55.0)                 # tracked, still resting
+    stop_id = [o for _, o, _ in fake.placed][-1].orderId
+    fake.executions = [
+        _execution("CVX", "BUY", 3, 205.0, order_id=1, client_id=0),     # manual TWS trade
+        _execution("KO", "SELL", 2, 55.0, order_id=stop_id),             # still-working stop
+        _execution("GM", "SELL", 8, 82.0, order_id=950, age_s=10),       # too fresh
+    ]
+
+    assert ex.reconcile_missed_fills(force=True) == []
+    assert _csv_rows(sandbox) == []
+
+
+def test_reconcile_never_raises_when_disconnected(executors):
+    fake = FakeIB()
+    ex = _seeded(fake)
+    executors.append(ex)
+    fake._connected = False
+    assert ex.reconcile_missed_fills(force=True) == []
+
+
+def test_reconcile_is_throttled(executors, sandbox):
+    fake = FakeIB()
+    ex = _seeded(fake)
+    executors.append(ex)
+    fake.executions = [_execution("KO", "SELL", 3, 50.0, order_id=801)]
+    assert ex.reconcile_missed_fills() == [], "within the interval — must not query again"
+    assert len(ex.reconcile_missed_fills(force=True)) == 1
+
+
+def test_recorded_fills_survive_a_restart(executors, sandbox):
+    fake = FakeIB(positions=[_ko_position(3, 211.17)])
+    ex = _seeded(fake)
+    executors.append(ex)
+    ex.positions_snapshot()
+    fake.executions = [_execution("KO", "SELL", 3, 200.60, order_id=777)]
+    assert len(ex.reconcile_missed_fills(force=True)) == 1
+    executors.remove(ex)
+    ex.disconnect()
+
+    ex2 = make_executor(fake)                   # restart: state reloaded from disk
+    executors.append(ex2)
+    assert ex2._reconcile_seeded
+    assert ex2.reconcile_missed_fills(force=True) == []
+    assert len(_csv_rows(sandbox)) == 1
