@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from bot.backtest.engine import run
 from bot.data.historical_feed import Candle
 
@@ -221,3 +223,124 @@ def test_unknown_fill_model_is_rejected():
     import pytest
     with pytest.raises(ValueError):
         run([_candle(0, 1, 1, 1, 1)], symbol="T", timeframe="4h", fill_model="bogus")
+
+
+# ── next_open execution-time risk handling (review of 22635de, 2026-09-26) ──
+
+def _flat(hours: int, px: float, low: float | None = None) -> Candle:
+    return _candle(hours, px, px, px if low is None else low, px)
+
+
+_CAP_KW = dict(
+    symbol="TEST/USD", timeframe="4h", strategy_mode="threshold", fill_model="next_open",
+    fee_pct=0.0, cooldown_ticks=0, buy_threshold=101.0, sell_threshold=999.0,
+    stop_loss_pct=0.02, take_profit_pct=0.0, max_trades_per_day=2,
+)
+
+
+def test_cross_midnight_pending_fill_counts_toward_the_execution_day():
+    """Review repro: BUY decided Jan 1 20:00 fills at the Jan 2 00:00 open and
+    is stopped out on that same candle — both fills belong to Jan 2, so with
+    max_trades_per_day=2 no further BUY may happen on Jan 2. The old code
+    counted the BUY on Jan 1, then the date reset erased it."""
+    candles = [
+        _flat(20, 100.0),               # Jan 1 20:00 — BUY decided
+        _flat(24, 100.0, low=97.0),     # Jan 2 00:00 — BUY @100 open, SL @98
+        _flat(28, 100.0),               # Jan 2 04:00
+        _flat(32, 100.0),               # Jan 2 08:00
+    ]
+    result = run(candles, **_CAP_KW)
+    assert [(f.side, f.candle_index, f.reason) for f in result.fills] == [
+        ("BUY", 1, "strategy"), ("SELL", 1, "stop_loss"),
+    ], "the third BUY must be blocked by Jan 2's cap"
+
+
+def test_same_day_cap_still_enforced():
+    candles = [_flat(0, 100.0), _flat(4, 100.0, low=97.0), _flat(8, 100.0), _flat(12, 100.0)]
+    result = run(candles, **_CAP_KW)
+    assert [f.side for f in result.fills] == ["BUY", "SELL"]
+
+
+def test_protective_stop_fires_even_when_the_daily_cap_is_used_up():
+    candles = [_flat(20, 100.0), _flat(24, 100.0, low=97.0), _flat(28, 100.0)]
+    result = run(candles, **{**_CAP_KW, "max_trades_per_day": 1})
+    assert [(f.side, f.reason) for f in result.fills] == [("BUY", "strategy"), ("SELL", "stop_loss")]
+
+
+def test_pending_buy_rejected_when_the_open_gaps_past_the_position_cap():
+    """Review repro: 1 unit approved at $100 (10% of $1000) must not fill at a
+    $200 open, where it would be 20% of the account — rejected, not resized."""
+    candles = [_flat(0, 100.0), _flat(4, 200.0)]
+    result = run(
+        candles, symbol="TEST/USD", timeframe="4h", strategy_mode="threshold",
+        fill_model="next_open", starting_cash=1000.0, risk_per_trade_pct=0.10,
+        max_position_pct=0.10, fee_pct=0.0, buy_threshold=101.0, sell_threshold=999.0,
+        stop_loss_pct=0.0, take_profit_pct=0.0,
+    )
+    assert result.fills == []
+
+
+def test_pending_buy_within_the_cap_after_a_small_gap_still_fills():
+    candles = [_flat(0, 100.0), _flat(4, 99.0)]
+    result = run(
+        candles, symbol="TEST/USD", timeframe="4h", strategy_mode="threshold",
+        fill_model="next_open", starting_cash=1000.0, risk_per_trade_pct=0.10,
+        max_position_pct=0.10, fee_pct=0.0, buy_threshold=101.0, sell_threshold=999.0,
+        stop_loss_pct=0.0, take_profit_pct=0.0,
+    )
+    assert [(f.side, f.price) for f in result.fills] == [("BUY", 99.0)]
+
+
+def test_pending_buy_rejected_when_cash_cannot_cover_notional_plus_fee():
+    """All cash sized at $100; at a $100 open the 1% fee makes it unaffordable.
+    The old code filled it and drove cash negative."""
+    candles = [_flat(0, 100.0), _flat(4, 100.0)]
+    result = run(
+        candles, symbol="TEST/USD", timeframe="4h", strategy_mode="threshold",
+        fill_model="next_open", starting_cash=1000.0, risk_per_trade_pct=1.0,
+        max_position_pct=1.0, fee_pct=0.01, buy_threshold=101.0, sell_threshold=999.0,
+        stop_loss_pct=0.0, take_profit_pct=0.0,
+    )
+    assert result.fills == []
+    assert result.final_value == 1000.0
+
+
+def test_pending_buy_slippage_applied_exactly_once():
+    candles = [_flat(0, 100.0), _flat(4, 100.0)]
+    result = run(
+        candles, symbol="TEST/USD", timeframe="4h", strategy_mode="threshold",
+        fill_model="next_open", starting_cash=100_000.0, risk_per_trade_pct=0.01,
+        max_position_pct=0.5, fee_pct=0.0, slippage_pct=0.01,
+        buy_threshold=101.0, sell_threshold=999.0, stop_loss_pct=0.0, take_profit_pct=0.0,
+    )
+    assert len(result.fills) == 1
+    assert result.fills[0].price == pytest.approx(101.0), "100 × 1.01 once — not 102.01"
+
+
+def test_pending_strategy_sell_executes_despite_buy_only_breakers():
+    """A deep drawdown trips BUY-only breakers; the strategy exit decided at
+    the prior close must still reach the market at the next open."""
+    candles = [
+        _flat(0, 100.0),     # BUY decided
+        _flat(4, 100.0),     # BUY @100
+        _flat(8, 1000.0),    # price rockets -> close > sell_threshold -> SELL decided
+        _flat(12, 900.0),    # SELL @900 open
+    ]
+    result = run(
+        candles, symbol="TEST/USD", timeframe="4h", strategy_mode="threshold",
+        fill_model="next_open", starting_cash=1000.0, risk_per_trade_pct=0.5,
+        max_position_pct=1.0, fee_pct=0.0, cooldown_ticks=0, max_drawdown_pct=0.01,
+        buy_threshold=101.0, sell_threshold=500.0, stop_loss_pct=0.0, take_profit_pct=0.0,
+    )
+    assert [(f.side, f.price) for f in result.fills] == [("BUY", 100.0), ("SELL", 900.0)]
+
+
+def test_close_model_unchanged_by_the_pending_path():
+    candles = [_flat(0, 100.0), _flat(4, 200.0)]
+    result = run(
+        candles, symbol="TEST/USD", timeframe="4h", strategy_mode="threshold",
+        fill_model="close", starting_cash=1000.0, risk_per_trade_pct=0.10,
+        max_position_pct=0.10, fee_pct=0.0, buy_threshold=101.0, sell_threshold=999.0,
+        stop_loss_pct=0.0, take_profit_pct=0.0,
+    )
+    assert [(f.side, f.price, f.candle_index) for f in result.fills] == [("BUY", 100.0, 0)]

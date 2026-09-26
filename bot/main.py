@@ -3246,8 +3246,17 @@ def _apply_four_way_result(state, report) -> None:
     state.four_way_reason = reason
 
 
+def _accounting_max_age_ms_for(accounting_cfg) -> int:
+    """THE accounting-evidence freshness limit: reconcile_interval + stale
+    grace. Shared by the BUY gate (BlockState.blocked_for_buy) and the daily
+    digest so the two can never disagree about whether evidence is stale —
+    they did until 2026-09-26 (digest allowed 2 × interval + grace). A state
+    is stale once its age is strictly GREATER than this (BlockState.is_stale)."""
+    return int((accounting_cfg.reconcile_interval_s + accounting_cfg.stale_grace_s) * 1000)
+
+
 def _digest_accounting_attention(
-    enabled: bool, status_path: str, now_utc: datetime, max_age_s: float,
+    enabled: bool, status_path: str, now_utc: datetime, max_age_ms: int,
 ) -> list[str]:
     """Attention items for the execution-accounting reconciliation state
     (2026-09-26 review finding: the digest said "all systems normal" while
@@ -3267,7 +3276,7 @@ def _digest_accounting_attention(
     try:
         computed = datetime.strptime(st.computed_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_tz.utc)
         age_s = (now_utc - computed).total_seconds()
-        if age_s > max_age_s:
+        if age_s * 1000 > max_age_ms:      # same strict ">" as BlockState.is_stale
             items.append(f"accounting status is stale ({age_s / 3600:.1f}h old)")
     except (TypeError, ValueError):
         items.append("accounting status has no valid timestamp — age UNKNOWN")
@@ -3365,8 +3374,7 @@ def _maybe_send_health_digest(
             accounting_enabled,
             os.path.join(_STATE_LOG_DIR, "accounting_cycle_status.json"),
             datetime.now(_tz.utc),
-            # two missed cycles plus the configured grace before calling it stale
-            2 * cfg.accounting.reconcile_interval_s + cfg.accounting.stale_grace_s,
+            _accounting_max_age_ms_for(cfg.accounting),   # same limit the BUY gate uses
         )
         if risk.config.halt:
             attention.append("manual HALT is engaged")
@@ -3788,7 +3796,7 @@ def run():
     # state stops authorizing BUYs once it is older than this, checked
     # against REAL wall-clock time at every consult (BlockState.is_stale),
     # independent of the tick loop's own reconcile_interval_s scheduling.
-    _accounting_max_age_ms  = int((cfg.accounting.reconcile_interval_s + cfg.accounting.stale_grace_s) * 1000)
+    _accounting_max_age_ms  = _accounting_max_age_ms_for(cfg.accounting)
     if cfg.accounting.enabled and not _accounting_enabled:
         logger.info(
             "Accounting reconciliation: ACCOUNTING_ENABLED=true but not applicable "

@@ -315,13 +315,37 @@ def run(
         if _pending is not None:
             _p_sig, _p_qty, _ = _pending
             _pending = None
+            _exec_date = candle.timestamp.date()
+            # Advance the risk state to the EXECUTION date first, valued at
+            # this candle's OPEN (its close/high/low are not yet known at the
+            # open). Without this, a fill across midnight was counted on the
+            # previous day and then erased by the date reset on this candle's
+            # later evaluate() — the daily trade cap under-counted (2026-09-26).
+            risk.mark_valuation(executor.portfolio.total_value(candle.open), _exec_date)
             if _p_sig == Signal.SELL:
                 _p_qty = executor.position      # whatever is actually held now
             if _p_qty > 0:
                 _p_px = candle.open
-                if slippage_pct > 0:
+                if slippage_pct > 0:            # the only place slippage is applied to this order
                     _p_px *= (1 + slippage_pct) if _p_sig == Signal.BUY else (1 - slippage_pct)
-                _apply_fill(_p_sig, _p_px, _p_qty, i, candle, "strategy")
+                _p_ok = True
+                if _p_sig == Signal.BUY:
+                    # Execution-time revalidation (2026-09-26): the quantity
+                    # was approved at the previous close; the order only
+                    # reaches the market at this open. Re-run the same risk
+                    # gate at the actual fill price — position cap, daily cap,
+                    # loss/drawdown breakers — plus affordability including
+                    # the fee. Policy matches the close model: an order that
+                    # fails is REJECTED, never resized. SELLs skip this — no
+                    # BUY-only restriction may ever hold up an exit.
+                    _p_ok = bool(risk.evaluate(
+                        Signal.BUY, _p_px, executor.portfolio, _p_qty, _exec_date,
+                        account_value=executor.portfolio.total_value(candle.open),
+                    ))
+                    if _p_ok and _p_qty * _p_px * (1 + fee_pct) > executor.cash + 1e-9:
+                        _p_ok = False
+                if _p_ok:
+                    _apply_fill(_p_sig, _p_px, _p_qty, i, candle, "strategy")
 
         raw_signal = strategy.evaluate(candle) if is_indicator else strategy.evaluate(price)
 

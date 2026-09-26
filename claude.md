@@ -176,7 +176,7 @@ narrative behind any decision below, and `.memory/decisions/*.md` for the deepes
 
 ## Test Suite Manifest
 
-**Expected total: 1760 tests** (`pytest --collect-only -q`, re-counted 2026-09-26 after the external-review fixes). If the count
+**Expected total: 1775 tests** (`pytest --collect-only -q`, re-counted 2026-09-26 after the 22635de review fixes). If the count
 disagrees: a file has an import error, was deleted, was added without a manifest bump, or was
 excluded from the runner — investigate before trusting a green suite. Suite runtime ~85s; many
 minutes means a test is reading live `.env` config. **The per-row counts in the table below are
@@ -185,7 +185,7 @@ accounting and ledger-observer work of 2026-09-13 → 09-24 — were not bumped 
 table as a map of what each file covers, and `--collect-only` as the source of truth for counts.
 Count-delta history: `CLAUDE_HISTORY.md` → "CLAUDE.md trim, 2026-09-01" → "count-delta history".
 
-Run: `python -m pytest --tb=short -q` — must show **1760 passed**.
+Run: `python -m pytest --tb=short -q` — must show **1775 passed**.
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -478,6 +478,13 @@ wiring tests, 5 price-guard tests), suite 918→935. Both require a stock bot re
   Measured: 4h crypto candles open at the prior close (max gap 0.008% over 5000 BTC candles) —
   BTC pinned/rolling results IDENTICAL (27 trades, net PF 0.82 / 29, 1.18), SOL within $0.01.
   `"close"` reproduces the old engine byte-for-byte. Reports now print fill model/fee/slippage.
+- **Follow-up review of 22635de (same day):** (1) a `next_open` fill across UTC midnight was
+  recorded before RiskManager rolled to the execution date, so the reset erased it from the
+  daily trade cap — now `risk.mark_valuation(open value, exec date)` runs first; (2) a pending
+  BUY now re-runs `risk.evaluate()` at the actual (slipped-once) fill price + a notional+fee
+  affordability check — failing orders are REJECTED, never resized; pending SELLs are never
+  re-gated; (3) digest and BUY gate share `_accounting_max_age_ms_for()` = interval + grace
+  (digest had 2×interval + grace). Re-ran BTC/SOL pinned+rolling: fills identical to 22635de.
 - **Stale reports (P2):** 49 pre-2026-09-12 crypto research reports (42 `logs/`, 7
   `.memory/decisions/`) carry an "OBSOLETE NUMBERS" banner (gross PF, close fills).
 - **Not done (P2 refactor of main.py/live_executor.py):** deliberately skipped — restructuring

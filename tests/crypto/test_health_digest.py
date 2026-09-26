@@ -285,11 +285,11 @@ def _status(tmp_path, **kw):
 
 
 def test_accounting_attention_off_when_disabled(tmp_path):
-    assert bot_main._digest_accounting_attention(False, str(tmp_path / "x.json"), _UTC_NOW, 3600) == []
+    assert bot_main._digest_accounting_attention(False, str(tmp_path / "x.json"), _UTC_NOW, 3_600_000) == []
 
 
 def test_accounting_attention_missing_status_is_flagged(tmp_path):
-    items = bot_main._digest_accounting_attention(True, str(tmp_path / "none.json"), _UTC_NOW, 3600)
+    items = bot_main._digest_accounting_attention(True, str(tmp_path / "none.json"), _UTC_NOW, 3_600_000)
     assert items and "no reconciliation cycle has completed" in items[0]
 
 
@@ -297,33 +297,33 @@ def test_accounting_attention_unreconciled_is_flagged(tmp_path):
     p = _status(tmp_path, block_state_ok=False,
                 block_state_explain="coverage incomplete (observation phase raised)",
                 four_way_ran=False, four_way_ready=None)
-    items = bot_main._digest_accounting_attention(True, p, datetime.now(_utc_tz.utc), 3600)
+    items = bot_main._digest_accounting_attention(True, p, datetime.now(_utc_tz.utc), 3_600_000)
     assert any("NOT reconciled" in i and "coverage incomplete" in i for i in items)
 
 
 def test_accounting_attention_four_way_not_ready_is_flagged(tmp_path):
     p = _status(tmp_path, four_way_ready=False, four_way_explain="cash mismatch")
-    items = bot_main._digest_accounting_attention(True, p, datetime.now(_utc_tz.utc), 3600)
+    items = bot_main._digest_accounting_attention(True, p, datetime.now(_utc_tz.utc), 3_600_000)
     assert any("cash mismatch" in i for i in items)
 
 
 def test_accounting_attention_stale_status_is_flagged(tmp_path):
     p = _status(tmp_path)          # reconciled — but judged 10h later
     later = datetime.now(_utc_tz.utc) + timedelta(hours=10)
-    items = bot_main._digest_accounting_attention(True, p, later, 3600)
+    items = bot_main._digest_accounting_attention(True, p, later, 3_600_000)
     assert any("stale" in i for i in items)
 
 
 def test_accounting_attention_in_progress_is_flagged(tmp_path):
     p = str(tmp_path / "s.json")
     _cs.write_in_progress(p, requested_symbols=["BTC/CAD"])
-    items = bot_main._digest_accounting_attention(True, p, datetime.now(_utc_tz.utc), 3600)
+    items = bot_main._digest_accounting_attention(True, p, datetime.now(_utc_tz.utc), 3_600_000)
     assert any("never completed" in i for i in items)
 
 
 def test_accounting_attention_healthy_and_fresh_is_silent(tmp_path):
     p = _status(tmp_path)
-    assert bot_main._digest_accounting_attention(True, p, datetime.now(_utc_tz.utc), 3600) == []
+    assert bot_main._digest_accounting_attention(True, p, datetime.now(_utc_tz.utc), 3_600_000) == []
 
 
 def test_digest_reports_accounting_failure_in_the_real_message(monkeypatch, tmp_path):
@@ -343,3 +343,95 @@ def test_digest_reports_accounting_failure_in_the_real_message(monkeypatch, tmp_
 def test_run_passes_accounting_state_to_digest():
     src = inspect.getsource(bot_main.run)
     assert "accounting_enabled=_accounting_enabled" in src
+
+
+# ── Shared freshness policy: digest must agree with the BUY gate (2026-09-26) ──
+
+import json as _json
+from types import SimpleNamespace as _NS
+
+from bot.accounting.reconciliation import BlockState as _BlockState
+
+_ACCT_CFG = _NS(reconcile_interval_s=3600.0, stale_grace_s=300.0)
+_T0 = datetime(2026, 9, 26, 12, 0, 0, tzinfo=_utc_tz.utc)
+
+
+def _ok_status_at(tmp_path, when: datetime) -> str:
+    p = tmp_path / "accounting_cycle_status.json"
+    p.write_text(_json.dumps({
+        "computed_at": when.strftime("%Y-%m-%dT%H:%M:%SZ"), "requested_symbols": ["BTC/CAD"],
+        "block_state_ok": True, "block_state_explain": "ok", "four_way_ran": True,
+        "four_way_ready": True, "four_way_explain": None, "in_progress": False,
+    }))
+    return str(p)
+
+
+def _gate_is_stale(age_s: float) -> bool:
+    st = _BlockState(reconciled=True, computed_at_ms=int(_T0.timestamp() * 1000))
+    return st.is_stale(now_ms=int((_T0.timestamp() + age_s) * 1000),
+                       max_age_ms=bot_main._accounting_max_age_ms_for(_ACCT_CFG))
+
+
+def _digest_is_stale(tmp_path, age_s: float) -> bool:
+    items = bot_main._digest_accounting_attention(
+        True, _ok_status_at(tmp_path, _T0), _T0 + timedelta(seconds=age_s),
+        bot_main._accounting_max_age_ms_for(_ACCT_CFG),
+    )
+    return any("stale" in i for i in items)
+
+
+def test_shared_max_age_is_interval_plus_grace():
+    assert bot_main._accounting_max_age_ms_for(_ACCT_CFG) == 3_900_000
+
+
+def test_review_repro_3960s_is_stale_for_both_gate_and_digest(tmp_path):
+    assert _gate_is_stale(3960)
+    assert _digest_is_stale(tmp_path, 3960), "digest must not report healthy evidence the BUY gate rejects"
+
+
+def test_exactly_at_the_deadline_both_treat_evidence_as_fresh(tmp_path):
+    assert not _gate_is_stale(3900)
+    assert not _digest_is_stale(tmp_path, 3900)
+
+
+def test_just_after_the_deadline_both_treat_evidence_as_stale(tmp_path):
+    assert _gate_is_stale(3901)
+    assert _digest_is_stale(tmp_path, 3901)
+
+
+def test_gate_and_digest_both_use_the_shared_helper():
+    src = inspect.getsource(bot_main)
+    assert "_accounting_max_age_ms  = _accounting_max_age_ms_for(cfg.accounting)" in src
+    digest_src = inspect.getsource(bot_main._maybe_send_health_digest)
+    assert "_accounting_max_age_ms_for(cfg.accounting)" in digest_src
+    assert "2 * cfg.accounting.reconcile_interval_s" not in digest_src
+
+
+def test_real_digest_reports_3960s_old_evidence_as_stale(monkeypatch, tmp_path):
+    """End-to-end review reproduction through the REAL composition path
+    (_maybe_send_health_digest → message text), using only interfaces that
+    existed before the fix — so it fails on the old 2×interval+grace policy
+    by behavior, not because a helper is missing. interval=3600s, grace=300s:
+    the BUY gate expires evidence after 3900s, so a successful status 3960s
+    old must produce NEEDS ATTENTION, not "all systems normal"."""
+    risk, alerter, execs = _mk(monkeypatch, tmp_path)
+    monkeypatch.setattr(bot_main, "_STATE_LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(bot_main.cfg.accounting, "reconcile_interval_s", 3600.0)
+    monkeypatch.setattr(bot_main.cfg.accounting, "stale_grace_s", 300.0)
+    written = datetime.now(_utc_tz.utc) - timedelta(seconds=3960)
+    (tmp_path / "accounting_cycle_status.json").write_text(_json.dumps({
+        "computed_at": written.strftime("%Y-%m-%dT%H:%M:%SZ"), "requested_symbols": ["BTC/CAD"],
+        "block_state_ok": True, "block_state_explain": "ok", "four_way_ran": True,
+        "four_way_ready": True, "four_way_explain": None, "in_progress": False,
+    }))
+    monkeypatch.setenv("HEALTH_DIGEST_TIME", "08:00")
+
+    bot_main._maybe_send_health_digest(
+        execs, {}, risk, alerter, True, False, datetime(2026, 8, 27, 9, 0),
+        accounting_enabled=True,
+    )
+
+    body = alerter.message.call_args[0][0]
+    assert "NEEDS ATTENTION" in body
+    assert "accounting status is stale" in body
+    assert "all systems normal" not in body
