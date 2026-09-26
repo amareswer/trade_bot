@@ -349,7 +349,8 @@ class FourWayReport:
         evidence comes from tests/crypto/test_production_pnl_reporting_paths.py
         exercising the real reporting paths (PositionManager, live_comparison.py,
         the dashboard renderer) directly, not from this report passing."""
-        if self.block_state.account_cash_blocked or self.block_state.coverage_blocked:
+        if (self.block_state.account_cash_blocked or self.block_state.coverage_blocked
+                or getattr(self.block_state, "four_way_blocked", False)):
             return False
         if any(self.block_state.symbol_blocked.values()):
             return False

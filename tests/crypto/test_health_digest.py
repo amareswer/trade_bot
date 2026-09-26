@@ -246,3 +246,100 @@ def test_wired_into_run_loop():
     assert "stuck_detector=stuck_detector" in src   # passed into _execute_approved_signal AND the digest
     exec_src = inspect.getsource(bot_main._execute_approved_signal)
     assert "stuck_detector.record(" in exec_src
+
+
+# ── 2026-09-26 review findings: failures must never read as "normal" ─────
+
+def test_digest_open_orders_query_failure_is_unknown_not_none(monkeypatch, tmp_path):
+    risk, alerter, execs = _mk(monkeypatch, tmp_path)
+    execs["BTC/CAD"]._exchange.fetch_open_orders.side_effect = RuntimeError("kraken timeout")
+    monkeypatch.setenv("HEALTH_DIGEST_TIME", "08:00")
+    bot_main._maybe_send_health_digest(
+        execs, {}, risk, alerter, True, False, datetime(2026, 8, 27, 9, 0),
+    )
+    body = alerter.message.call_args[0][0]
+    assert "NEEDS ATTENTION" in body
+    assert "Open exchange orders: UNKNOWN" in body
+    assert "Open exchange orders: none" not in body
+    assert "open-order query failed (kraken timeout)" in body
+
+
+def test_digest_text_distinguishes_unknown_from_empty():
+    assert "UNKNOWN" in bot_main._health_digest_text(_NOW, "c", "s", None, 0, 0, ["x"])
+    assert "Open exchange orders: none" in bot_main._health_digest_text(_NOW, "c", "s", [], 0, 0, [])
+
+
+from datetime import timezone as _utc_tz
+from bot.accounting import cycle_status as _cs
+
+_UTC_NOW = datetime(2026, 9, 26, 14, 0, tzinfo=_utc_tz.utc)
+
+
+def _status(tmp_path, **kw):
+    p = str(tmp_path / "accounting_cycle_status.json")
+    fields = dict(requested_symbols=["BTC/CAD"], block_state_ok=True,
+                  block_state_explain="ok", four_way_ran=True, four_way_ready=True)
+    fields.update(kw)
+    _cs.write(p, **fields)
+    return p
+
+
+def test_accounting_attention_off_when_disabled(tmp_path):
+    assert bot_main._digest_accounting_attention(False, str(tmp_path / "x.json"), _UTC_NOW, 3600) == []
+
+
+def test_accounting_attention_missing_status_is_flagged(tmp_path):
+    items = bot_main._digest_accounting_attention(True, str(tmp_path / "none.json"), _UTC_NOW, 3600)
+    assert items and "no reconciliation cycle has completed" in items[0]
+
+
+def test_accounting_attention_unreconciled_is_flagged(tmp_path):
+    p = _status(tmp_path, block_state_ok=False,
+                block_state_explain="coverage incomplete (observation phase raised)",
+                four_way_ran=False, four_way_ready=None)
+    items = bot_main._digest_accounting_attention(True, p, datetime.now(_utc_tz.utc), 3600)
+    assert any("NOT reconciled" in i and "coverage incomplete" in i for i in items)
+
+
+def test_accounting_attention_four_way_not_ready_is_flagged(tmp_path):
+    p = _status(tmp_path, four_way_ready=False, four_way_explain="cash mismatch")
+    items = bot_main._digest_accounting_attention(True, p, datetime.now(_utc_tz.utc), 3600)
+    assert any("cash mismatch" in i for i in items)
+
+
+def test_accounting_attention_stale_status_is_flagged(tmp_path):
+    p = _status(tmp_path)          # reconciled — but judged 10h later
+    later = datetime.now(_utc_tz.utc) + timedelta(hours=10)
+    items = bot_main._digest_accounting_attention(True, p, later, 3600)
+    assert any("stale" in i for i in items)
+
+
+def test_accounting_attention_in_progress_is_flagged(tmp_path):
+    p = str(tmp_path / "s.json")
+    _cs.write_in_progress(p, requested_symbols=["BTC/CAD"])
+    items = bot_main._digest_accounting_attention(True, p, datetime.now(_utc_tz.utc), 3600)
+    assert any("never completed" in i for i in items)
+
+
+def test_accounting_attention_healthy_and_fresh_is_silent(tmp_path):
+    p = _status(tmp_path)
+    assert bot_main._digest_accounting_attention(True, p, datetime.now(_utc_tz.utc), 3600) == []
+
+
+def test_digest_reports_accounting_failure_in_the_real_message(monkeypatch, tmp_path):
+    risk, alerter, execs = _mk(monkeypatch, tmp_path)
+    monkeypatch.setattr(bot_main, "_STATE_LOG_DIR", str(tmp_path))
+    _status(tmp_path, block_state_ok=False, block_state_explain="cash unreconciled",
+            four_way_ran=False, four_way_ready=None)
+    monkeypatch.setenv("HEALTH_DIGEST_TIME", "08:00")
+    bot_main._maybe_send_health_digest(
+        execs, {}, risk, alerter, True, False, datetime(2026, 8, 27, 9, 0),
+        accounting_enabled=True,
+    )
+    body = alerter.message.call_args[0][0]
+    assert "NEEDS ATTENTION" in body and "cash unreconciled" in body
+
+
+def test_run_passes_accounting_state_to_digest():
+    src = inspect.getsource(bot_main.run)
+    assert "accounting_enabled=_accounting_enabled" in src

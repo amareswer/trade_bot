@@ -176,7 +176,7 @@ narrative behind any decision below, and `.memory/decisions/*.md` for the deepes
 
 ## Test Suite Manifest
 
-**Expected total: 1732 tests** (`pytest --collect-only -q`, re-counted 2026-09-25 after the TWS-reconnect fix). If the count
+**Expected total: 1760 tests** (`pytest --collect-only -q`, re-counted 2026-09-26 after the external-review fixes). If the count
 disagrees: a file has an import error, was deleted, was added without a manifest bump, or was
 excluded from the runner — investigate before trusting a green suite. Suite runtime ~85s; many
 minutes means a test is reading live `.env` config. **The per-row counts in the table below are
@@ -185,7 +185,7 @@ accounting and ledger-observer work of 2026-09-13 → 09-24 — were not bumped 
 table as a map of what each file covers, and `--collect-only` as the source of truth for counts.
 Count-delta history: `CLAUDE_HISTORY.md` → "CLAUDE.md trim, 2026-09-01" → "count-delta history".
 
-Run: `python -m pytest --tb=short -q` — must show **1732 passed**.
+Run: `python -m pytest --tb=short -q` — must show **1760 passed**.
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -453,6 +453,35 @@ the day's actual range and is still rejected. Fails toward the old conservative 
 
 +17 tests total (9 `IBKRExecutor` native-stop unit tests, 3 `_check_open_positions_sl_tp`
 wiring tests, 5 price-guard tests), suite 918→935. Both require a stock bot restart.
+
+### External review fixes (2026-09-26)
+- **Secret redaction (P0):** the live Telegram token was in local logs ~106k times —
+  `requests` errors embed the URL (`.../bot<token>/getUpdates`), incl. an Aug-21 DNS-failure
+  hot loop (~21k lines/min) and a 09:20 2026-09-26 network drop. `bot/alerts/redact.py`:
+  `RedactingFormatter` on every root handler of BOTH bots + `redact()` at the Telegram/retry
+  call sites; also scrubs any `*_TOKEN/*_SECRET/*_API_KEY/*_PASSWORD` env value. Existing local
+  logs scrubbed in place. `logs/` was never committed. **Rotate the token** (BotFather) anyway.
+- **Health digest (P1):** a failed open-orders fetch is now "UNKNOWN" + an attention item (was
+  silently "none"); `_digest_accounting_attention()` flags missing/in-progress/unreconciled/
+  stale (>2×interval+grace) accounting status when `ACCOUNTING_ENABLED`.
+- **Accounting mislabel (P1):** a four-way failure was folded into `account_cash_blocked`
+  and the report (sharing that state) explained itself after the mutation → every cycle logged
+  "account cash unreconciled (… account cash unreconciled ())" although cash had PASSED.
+  Now `BlockState.four_way_blocked/four_way_reason` via `_apply_four_way_result()`; BUY blocking
+  unchanged. **Real remaining diffs (diagnosed, not "fixed"):** BTC/CAD = the 2026-06-26 external
+  deposit of 0.00037766 BTC (see `asset_movement_analysis.py`); SOL/CAD = Kraken **staking
+  rewards** (0.0000035775 SOL dust — Aug-28 reward on the bot's 20h hold + weekly accruals,
+  proven from the ledger observer's `staking` entries). Both are non-trade ledger movements the
+  trade-only position fold can't see — folding them in is a deliberate design decision, pending.
+- **Backtest execution model (P1):** `engine.run(fill_model=...)`, default now `"next_open"`
+  (strategy orders fill at the next candle's open; SL/TP stay intra-candle, gap-aware).
+  Measured: 4h crypto candles open at the prior close (max gap 0.008% over 5000 BTC candles) —
+  BTC pinned/rolling results IDENTICAL (27 trades, net PF 0.82 / 29, 1.18), SOL within $0.01.
+  `"close"` reproduces the old engine byte-for-byte. Reports now print fill model/fee/slippage.
+- **Stale reports (P2):** 49 pre-2026-09-12 crypto research reports (42 `logs/`, 7
+  `.memory/decisions/`) carry an "OBSOLETE NUMBERS" banner (gross PF, close fills).
+- **Not done (P2 refactor of main.py/live_executor.py):** deliberately skipped — restructuring
+  money-handling code during a trial period is its own risk; revisit at the 2027-03-12 review.
 
 ### TWS-restart duplicate stop + CVX short (stock bot — fixed 2026-09-25)
 A mid-session TWS restart (11:58) exposed two IBKR-executor bugs, both "acted on a

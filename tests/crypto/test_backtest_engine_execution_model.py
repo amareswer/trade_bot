@@ -62,6 +62,7 @@ def test_gap_through_stop_loss_fills_at_the_open_not_the_stale_level():
         candles, symbol="TEST/USD", timeframe="4h", strategy_mode="threshold",
         buy_threshold=105.0, sell_threshold=999.0,
         stop_loss_pct=0.02, take_profit_pct=0.0,
+        fill_model="close",   # premise: entered at the $100 signal close (next_open would enter at $80)
     )
     assert len(result.fills) == 2
     sl_fill = result.fills[1]
@@ -154,3 +155,69 @@ def test_partial_tp_deferred_when_same_candle_also_stops_out():
         "before it would have left only half this quantity"
     )
     assert sell.price == 98.0   # theoretical level — candle's open (100) didn't gap through it
+
+
+# ── fill_model="next_open" (2026-09-26 review finding) ─────────────────────
+
+def test_next_open_fills_strategy_buy_at_the_following_candles_open():
+    candles = [
+        _candle(0, 100.0, 101.0, 99.0, 100.0),    # closes at 100 -> BUY decided here
+        _candle(1, 100.5, 102.0, 100.0, 101.0),   # ...and filled at THIS open
+    ]
+    result = run(
+        candles, symbol="TEST/USD", timeframe="4h", strategy_mode="threshold",
+        buy_threshold=100.5, sell_threshold=999.0,
+        stop_loss_pct=0.0, take_profit_pct=0.0, fill_model="next_open",
+    )
+    assert len(result.fills) == 1
+    assert result.fills[0].candle_index == 1
+    assert result.fills[0].price == 100.5
+
+
+def test_next_open_signal_on_the_last_candle_is_never_filled():
+    candles = [_candle(0, 101.0, 101.0, 99.0, 100.0)]     # BUY on the final candle
+    result = run(
+        candles, symbol="TEST/USD", timeframe="4h", strategy_mode="threshold",
+        buy_threshold=105.0, sell_threshold=999.0, fill_model="next_open",
+    )
+    assert result.fills == [], "no later candle exists to trade at"
+
+
+def test_next_open_entry_can_be_stopped_out_on_its_own_entry_candle():
+    """The position exists from the open, so that same candle's low can hit
+    the stop — the gap-aware SL logic still applies to the new entry."""
+    candles = [
+        _candle(0, 100.0, 101.0, 99.0, 100.0),    # BUY decided
+        _candle(1, 80.0, 81.0, 70.0, 75.0),       # entry at 80, stop 78.4 hit same candle
+    ]
+    result = run(
+        candles, symbol="TEST/USD", timeframe="4h", strategy_mode="threshold",
+        buy_threshold=105.0, sell_threshold=999.0,
+        stop_loss_pct=0.02, take_profit_pct=0.0, fill_model="next_open",
+    )
+    assert [f.side for f in result.fills] == ["BUY", "SELL"]
+    assert result.fills[0].price == 80.0
+    assert result.fills[1].reason == "stop_loss"
+    assert result.fills[1].price == 78.4
+
+
+def test_next_open_strategy_sell_exits_at_next_open():
+    candles = [
+        _candle(0, 100.0, 101.0, 99.0, 100.0),    # BUY decided
+        _candle(1, 100.0, 111.0, 99.5, 110.0),    # BUY filled @100; closes 110 -> SELL decided
+        _candle(2, 108.0, 109.0, 107.0, 108.5),   # SELL filled @108 (open)
+    ]
+    result = run(
+        candles, symbol="TEST/USD", timeframe="4h", strategy_mode="threshold",
+        buy_threshold=100.5, sell_threshold=105.0, cooldown_ticks=0,
+        stop_loss_pct=0.0, take_profit_pct=0.0, fill_model="next_open",
+    )
+    assert [(f.side, f.candle_index, f.price) for f in result.fills] == [
+        ("BUY", 1, 100.0), ("SELL", 2, 108.0),
+    ]
+
+
+def test_unknown_fill_model_is_rejected():
+    import pytest
+    with pytest.raises(ValueError):
+        run([_candle(0, 1, 1, 1, 1)], symbol="T", timeframe="4h", fill_model="bogus")

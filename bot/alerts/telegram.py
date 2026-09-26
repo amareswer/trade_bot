@@ -28,6 +28,7 @@ import time
 from datetime import datetime
 from typing import Optional
 
+from bot.alerts.redact import redact
 from bot.exchanges.retry import fetch_with_retry
 
 logger = logging.getLogger(__name__)
@@ -185,4 +186,4 @@ class TelegramAlerter:
         try:
             fetch_with_retry(_post, label="Telegram send")
         except Exception as exc:
-            logger.warning("Telegram send error: %s", exc)
+            logger.warning("Telegram send error: %s", redact(exc))

@@ -96,10 +96,14 @@ def _setup_logging() -> None:
         backupCount=7,
     )
     _fh.setLevel(logging.INFO)
-    _fh.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+    # Same secret scrubbing as the crypto bot (2026-09-26) — the stock bot
+    # relays through the same Telegram token.
+    from bot.alerts.redact import RedactingFormatter
+    _fh.setFormatter(RedactingFormatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
 
     _ch = logging.StreamHandler(sys.stderr)
     _ch.setLevel(logging.WARNING)
+    _ch.setFormatter(RedactingFormatter("%(message)s"))
 
     _root = logging.getLogger()
     _root.handlers.clear()

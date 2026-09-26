@@ -5,6 +5,9 @@ metadata:
   type: project
 ---
 
+> **⚠️ OBSOLETE NUMBERS (marked 2026-09-26).** Produced before 2026-09-12. Until then the crypto backtest engine's profit factor / win rate (`bot/backtest/metrics.py`) were computed GROSS of fees (e.g. BTC/USDT pinned window: 1.87 gross → 0.82 net), and strategy fills used the signal candle's close. Any crypto PF/win-rate figure below is not comparable to current results — re-run on current code before relying on it. See CLAUDE.md → "PF/win-rate are NET of fees".
+
+
 **Why:** during a quiet trading stretch the user asked, repeatedly, "are there other ways to
 trade / can the bots be more active / what methods are we missing." This is the consolidated
 record of the strategy search that followed. Read it before building or proposing another

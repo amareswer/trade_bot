@@ -50,9 +50,13 @@ def _setup_logging() -> None:
         backupCount=5,
     )
     _file_handler.setLevel(logging.INFO)
-    _file_handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+    # RedactingFormatter: request exceptions carry the Telegram token in
+    # their URL — scrub every secret before it reaches a file (2026-09-26).
+    from bot.alerts.redact import RedactingFormatter
+    _file_handler.setFormatter(RedactingFormatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
     _console_handler = logging.StreamHandler()
     _console_handler.setLevel(logging.WARNING)
+    _console_handler.setFormatter(RedactingFormatter("%(message)s"))
     _root_logger = logging.getLogger()
     _root_logger.handlers.clear()
     _root_logger.setLevel(logging.INFO)
@@ -89,6 +93,7 @@ from bot.accounting import reconciliation as accounting_reconciliation
 from bot.accounting import four_way as accounting_four_way
 from bot.accounting import live_observe as accounting_live_observe
 from bot.accounting import cycle_status as accounting_cycle_status
+from bot.alerts.redact import redact
 from bot.accounting.reconciliation import BlockState as AccountingBlockState
 from bot.accounting.kraken_adapter import KrakenAccountingAdapter
 
@@ -3224,13 +3229,64 @@ def _recent_error_count(log_path: str, ref: datetime, hours: int = 24,
     return n
 
 
+def _apply_four_way_result(state, report) -> None:
+    """Record a four-way verification outcome on the accounting block state.
+
+    The report's explanation is captured BEFORE the state is mutated: the
+    report holds a reference to this same state object, and the old inline
+    code set account_cash_blocked first and then asked the report to explain
+    itself — which re-read the half-updated state and logged
+    "account cash unreconciled ()" every cycle (2026-09-26), making a passed
+    cash check look failed. A failure now sets its own four_way_* flag
+    rather than masquerading as a cash problem; BUY blocking is unchanged."""
+    if report.ready:
+        return
+    reason = report.explain()
+    state.four_way_blocked = True
+    state.four_way_reason = reason
+
+
+def _digest_accounting_attention(
+    enabled: bool, status_path: str, now_utc: datetime, max_age_s: float,
+) -> list[str]:
+    """Attention items for the execution-accounting reconciliation state
+    (2026-09-26 review finding: the digest said "all systems normal" while
+    every accounting cycle was failing). Empty only when accounting is off,
+    or the latest cycle concluded fully reconciled AND is fresh. A missing,
+    unreadable, in-progress or stale status is reported, never treated as
+    healthy by omission."""
+    if not enabled:
+        return []
+    try:
+        st = accounting_cycle_status.read(status_path)
+    except Exception as exc:
+        return [f"accounting status unreadable ({exc}) — reconciliation state UNKNOWN"]
+    if st is None:
+        return ["accounting: no reconciliation cycle has completed yet — new BUYs blocked"]
+    items: list[str] = []
+    try:
+        computed = datetime.strptime(st.computed_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_tz.utc)
+        age_s = (now_utc - computed).total_seconds()
+        if age_s > max_age_s:
+            items.append(f"accounting status is stale ({age_s / 3600:.1f}h old)")
+    except (TypeError, ValueError):
+        items.append("accounting status has no valid timestamp — age UNKNOWN")
+    if st.in_progress:
+        items.append("accounting: last reconciliation cycle never completed")
+    elif not st.ready:
+        why = st.block_state_explain if not st.block_state_ok else (st.four_way_explain or "four-way check not ready")
+        items.append(f"accounting NOT reconciled — new BUYs blocked: {why}")
+    return items
+
+
 def _health_digest_text(
     now: datetime, crypto_status: str, stock_status: str,
-    open_orders: list, crypto_errs: int, stock_errs: int,
+    open_orders: "list | None", crypto_errs: int, stock_errs: int,
     attention: list[str],
 ) -> str:
     """Pure composer for the daily digest — attention header + both bots +
-    open-order list + 24h error counts."""
+    open-order list + 24h error counts. open_orders=None means the exchange
+    query FAILED — shown as UNKNOWN, never as "none" (2026-09-26 finding)."""
     head = "⚠️ NEEDS ATTENTION" if attention else "✅ all systems normal"
     parts = [
         "📋 DAILY HEALTH DIGEST",
@@ -3240,7 +3296,9 @@ def _health_digest_text(
     if attention:
         parts.append("• " + "\n• ".join(attention))
     parts += ["", crypto_status]
-    if open_orders:
+    if open_orders is None:
+        parts.append("\nOpen exchange orders: UNKNOWN (exchange query failed)")
+    elif open_orders:
         parts.append("")
         parts.append(f"Open exchange orders ({len(open_orders)}):")
         for o in open_orders[:8]:
@@ -3258,7 +3316,7 @@ def _health_digest_text(
 def _maybe_send_health_digest(
     executors: dict, symbol_state: dict, risk, alerter,
     live_trading: bool, dry_run: bool, now: datetime,
-    stuck_detector=None,
+    stuck_detector=None, accounting_enabled: bool = False,
 ) -> None:
     """Once/day at HEALTH_DIGEST_TIME (local, default 08:00; 'off' disables).
     Records the run date BEFORE composing so a send failure can't re-fire every
@@ -3285,17 +3343,31 @@ def _maybe_send_health_digest(
             executors, symbol_state, risk, live_trading, dry_run,
         )
         stock_status = _status_stock_text()
+        open_orders_error = None
         try:
             _ex = next(iter(executors.values()))._exchange
             open_orders = _ex.fetch_open_orders() or []
-        except Exception:
-            open_orders = []
+        except Exception as exc:
+            open_orders = None    # unknown — NOT "no orders"
+            open_orders_error = exc
         crypto_errs = _recent_error_count(os.path.join(_log_dir, "trade_bot.log"), now)
         stock_errs  = _recent_error_count(
             os.path.join(os.path.dirname(_log_dir), "logs", "stock_bot.log"), now,
         )
 
         attention: list[str] = []
+        if open_orders is None:
+            attention.append(
+                f"open-order query failed ({redact(open_orders_error)}) — "
+                f"exchange order state UNKNOWN"
+            )
+        attention += _digest_accounting_attention(
+            accounting_enabled,
+            os.path.join(_STATE_LOG_DIR, "accounting_cycle_status.json"),
+            datetime.now(_tz.utc),
+            # two missed cycles plus the configured grace before calling it stale
+            2 * cfg.accounting.reconcile_interval_s + cfg.accounting.stale_grace_s,
+        )
         if risk.config.halt:
             attention.append("manual HALT is engaged")
         if risk.kill_switch_tripped:
@@ -4535,12 +4607,7 @@ def run():
                         _four_way_ran_this_cycle = True
                         _four_way_ready_this_cycle = _fw_report.ready
                         _four_way_explain_this_cycle = _fw_report.explain()
-                        if not _fw_report.ready:
-                            _accounting_state.account_cash_blocked = True
-                            _accounting_state.account_cash_reason = (
-                                (_accounting_state.account_cash_reason + "; ")
-                                if _accounting_state.account_cash_reason else ""
-                            ) + f"four-way verification: {_fw_report.explain()}"
+                        _apply_four_way_result(_accounting_state, _fw_report)
                     _acct_explain = _accounting_state.explain()
                     logger.info("Accounting reconciliation cycle: %s", _acct_explain)
                     if _acct_explain != "ok":
@@ -5865,7 +5932,7 @@ def run():
         _maybe_send_health_digest(
             executors, symbol_state, risk, alerter,
             cfg.exchange.live_trading, cfg.exchange.dry_run, datetime.now(),
-            stuck_detector=stuck_detector,
+            stuck_detector=stuck_detector, accounting_enabled=_accounting_enabled,
         )
 
     display.stopped(

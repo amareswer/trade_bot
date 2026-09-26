@@ -10,6 +10,8 @@ just see fewer transient blips reach it.
 import logging
 import time
 
+from bot.alerts.redact import redact
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_ATTEMPTS = 3
@@ -32,7 +34,7 @@ def fetch_with_retry(
             if attempt < attempts:
                 logger.warning(
                     "%s failed (attempt %d/%d): %s — retrying in %.1fs",
-                    label, attempt, attempts, exc, delay_s,
+                    label, attempt, attempts, redact(exc), delay_s,
                 )
                 time.sleep(delay_s)
     raise last_exc

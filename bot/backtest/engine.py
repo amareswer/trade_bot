@@ -58,6 +58,8 @@ class BacktestResult:
     warmup_ticks:     int
     rejection_stats:  dict[str, int] = field(default_factory=dict)
     entry_snapshots:  list[dict]     = field(default_factory=list)
+    fill_model:       str            = "close"   # execution model this result was produced under
+    slippage_pct:     float          = 0.0
 
 
 def run(
@@ -146,8 +148,20 @@ def run(
     mtf_slow_period:  int = 21,
     fng_by_date:      dict | None = None,
     fng_bear_max:     float = 75.0,
+    # Execution model for STRATEGY-driven orders (2026-09-26 review finding).
+    #   "close"     — fill at the close of the very candle whose close produced
+    #                 the signal (historical default; every validation number on
+    #                 record uses it). Optimistic: that price was already
+    #                 observed when the decision was made.
+    #   "next_open" — queue the order and fill it at the NEXT candle's open,
+    #                 before the strategy sees that candle. No look-ahead.
+    # Forced SL/TP/trailing exits are resting orders and keep their intra-
+    # candle, gap-aware fills under both models.
+    fill_model:       str = "next_open",
 ) -> BacktestResult:
     """Run a full backtest and return the result."""
+    if fill_model not in ("close", "next_open"):
+        raise ValueError(f"fill_model must be 'close' or 'next_open', got {fill_model!r}")
 
     # ── Build components (same as main.py) ───────────────────────────
     if strategy_mode == "indicator":
@@ -205,6 +219,8 @@ def run(
     entry_snapshots: list[dict] = []
     _overlay_rej:    dict[str, int] = {}   # live-only BUY overlays: veto counts
 
+    _pending: "tuple | None" = None   # next_open: (signal, qty, decision candle index)
+
     _overlays_on = mtf_daily_closes is not None or fng_by_date is not None
     _mtf_sorted  = (
         sorted(mtf_daily_closes, key=lambda dc: dc[0]) if mtf_daily_closes is not None else None
@@ -219,11 +235,93 @@ def run(
         _prior = [dd for dd in fng_by_date if dd <= d]
         return fng_by_date[max(_prior)] if _prior else None
 
+    def _apply_fill(signal, fill_at, qty, idx, at_candle, reason) -> None:
+        """Execute one order and book everything that follows from a fill
+        (fees, position/P&L, entry state). Shared by both fill models."""
+        nonlocal total_fees, entry_price, _trail_peak, _partial_tp_done, _entry_atr
+        order = executor.execute(signal, fill_at, quantity=qty)
+        if not (order and order.status == OrderStatus.FILLED):
+            return
+        risk.record_fill()
+        state_machine.on_fill(signal, order.price)
+
+        fee  = round(order.total_value * fee_pct, 4)
+        total_fees += fee
+        executor._portfolio.cash -= fee
+
+        pnl = None
+        if order.side == OrderSide.BUY:
+            position_manager.on_buy(order.price, order.quantity)
+            entry_price = order.price
+            _trail_peak = 0.0  # activates once activation_pct profit is reached
+            _partial_tp_done = False
+            # Indicator-only snapshot (2026-09-14 fix): last_atr,
+            # _closes, and config.*_ema_period only exist on
+            # IndicatorStrategy — ThresholdStrategy is a bare
+            # buy_threshold/sell_threshold dataclass with none of
+            # them. This block used to run unconditionally on every
+            # BUY fill, so strategy_mode="threshold" crashed with an
+            # AttributeError on its very first BUY. entry_snapshots
+            # is attribution/research tooling for the indicator
+            # strategy only (bot/backtest/attribution.py,
+            # vol_regime_experiment.py) — nothing downstream expects
+            # a threshold-mode BUY to have contributed one.
+            if is_indicator:
+                _entry_atr = strategy.last_atr or 0.0
+                _adx  = strategy.last_adx
+                _rsi  = strategy.last_rsi
+                _trnd = strategy.last_trend
+                _closes_snap = list(strategy._closes)
+                _ema_fast = _ema(_closes_snap, strategy.config.fast_ema_period)
+                _ema_slow = _ema(_closes_snap, strategy.config.slow_ema_period)
+                entry_snapshots.append({
+                    "candle_index": idx,
+                    "adx":      _adx,
+                    "rsi":      _rsi,
+                    "ema_fast": _ema_fast,
+                    "ema_slow": _ema_slow,
+                    "trend":    _trnd,
+                })
+            else:
+                _entry_atr = 0.0
+        else:
+            pnl = position_manager.on_sell(order.price, order.quantity)
+            entry_price = 0.0
+            _trail_peak = 0.0
+            _partial_tp_done = False
+            _entry_atr = 0.0
+
+        fills.append(FillRecord(
+            candle_index = idx,
+            timestamp    = at_candle.timestamp.strftime("%Y-%m-%d %H:%M"),
+            side         = order.side.value,
+            price        = order.price,
+            quantity     = order.quantity,
+            total_value  = order.total_value,
+            pnl          = pnl,
+            fee          = fee,
+            reason       = reason if order.side == OrderSide.SELL else "strategy",
+        ))
+
     # ── Main loop ─────────────────────────────────────────────────────
     for i, candle in enumerate(candles):
         price = candle.close
 
         state_machine.tick()
+
+        # next_open: fill the order decided on the previous candle's close at
+        # THIS candle's open — before the strategy sees this candle, so the
+        # entry ATR snapshot is still the decision-time value.
+        if _pending is not None:
+            _p_sig, _p_qty, _ = _pending
+            _pending = None
+            if _p_sig == Signal.SELL:
+                _p_qty = executor.position      # whatever is actually held now
+            if _p_qty > 0:
+                _p_px = candle.open
+                if slippage_pct > 0:
+                    _p_px *= (1 + slippage_pct) if _p_sig == Signal.BUY else (1 - slippage_pct)
+                _apply_fill(_p_sig, _p_px, _p_qty, i, candle, "strategy")
 
         raw_signal = strategy.evaluate(candle) if is_indicator else strategy.evaluate(price)
 
@@ -427,68 +525,12 @@ def run(
                     fill_at = (exit_price if filtered_signal == Signal.SELL else price) * (1 - slippage_pct)
             else:
                 fill_at = exit_price if filtered_signal == Signal.SELL else price
-            order   = executor.execute(filtered_signal, fill_at, quantity=trade_qty)
-            if order and order.status == OrderStatus.FILLED:
-                risk.record_fill()
-                state_machine.on_fill(filtered_signal, order.price)
-
-                fee  = round(order.total_value * fee_pct, 4)
-                total_fees += fee
-                executor._portfolio.cash -= fee
-
-                pnl = None
-                if order.side == OrderSide.BUY:
-                    position_manager.on_buy(order.price, order.quantity)
-                    entry_price = order.price
-                    _trail_peak = 0.0  # activates once activation_pct profit is reached
-                    _partial_tp_done = False
-                    # Indicator-only snapshot (2026-09-14 fix): last_atr,
-                    # _closes, and config.*_ema_period only exist on
-                    # IndicatorStrategy — ThresholdStrategy is a bare
-                    # buy_threshold/sell_threshold dataclass with none of
-                    # them. This block used to run unconditionally on every
-                    # BUY fill, so strategy_mode="threshold" crashed with an
-                    # AttributeError on its very first BUY. entry_snapshots
-                    # is attribution/research tooling for the indicator
-                    # strategy only (bot/backtest/attribution.py,
-                    # vol_regime_experiment.py) — nothing downstream expects
-                    # a threshold-mode BUY to have contributed one.
-                    if is_indicator:
-                        _entry_atr = strategy.last_atr or 0.0
-                        _adx  = strategy.last_adx
-                        _rsi  = strategy.last_rsi
-                        _trnd = strategy.last_trend
-                        _closes_snap = list(strategy._closes)
-                        _ema_fast = _ema(_closes_snap, strategy.config.fast_ema_period)
-                        _ema_slow = _ema(_closes_snap, strategy.config.slow_ema_period)
-                        entry_snapshots.append({
-                            "candle_index": i,
-                            "adx":      _adx,
-                            "rsi":      _rsi,
-                            "ema_fast": _ema_fast,
-                            "ema_slow": _ema_slow,
-                            "trend":    _trnd,
-                        })
-                    else:
-                        _entry_atr = 0.0
-                else:
-                    pnl = position_manager.on_sell(order.price, order.quantity)
-                    entry_price = 0.0
-                    _trail_peak = 0.0
-                    _partial_tp_done = False
-                    _entry_atr = 0.0
-
-                fills.append(FillRecord(
-                    candle_index = i,
-                    timestamp    = candle.timestamp.strftime("%Y-%m-%d %H:%M"),
-                    side         = order.side.value,
-                    price        = order.price,
-                    quantity     = order.quantity,
-                    total_value  = order.total_value,
-                    pnl          = pnl,
-                    fee          = fee,
-                    reason       = exit_reason if order.side == OrderSide.SELL else "strategy",
-                ))
+            if fill_model == "next_open" and not forced_exit:
+                # Decided on this candle's close; tradable only from the next
+                # candle's open (applied at the top of the next iteration).
+                _pending = (filtered_signal, trade_qty, i)
+            else:
+                _apply_fill(filtered_signal, fill_at, trade_qty, i, candle, exit_reason)
 
         equity_curve.append(executor.portfolio.total_value(price))
 
@@ -521,4 +563,6 @@ def run(
         warmup_ticks    = warmup_ticks,
         rejection_stats = rej_stats,
         entry_snapshots = entry_snapshots,
+        fill_model      = fill_model,
+        slippage_pct    = slippage_pct,
     )

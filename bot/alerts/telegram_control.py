@@ -57,6 +57,7 @@ import threading
 import time
 from typing import Callable, Optional
 
+from bot.alerts.redact import redact
 from bot.exchanges.retry import fetch_with_retry
 
 logger = logging.getLogger(__name__)
@@ -137,7 +138,7 @@ class TelegramCommandPoller:
         try:
             updates = self._get_updates(offset=self._offset, timeout=self._poll_timeout)
         except Exception as exc:
-            logger.warning("Telegram control: getUpdates failed: %s", exc)
+            logger.warning("Telegram control: getUpdates failed: %s", redact(exc))
             # A fast-failing error (e.g. a 502 returned immediately, not after
             # the long-poll timeout) has no natural pacing — without this the
             # outer poll loop would hot-loop against Telegram's API for as
@@ -218,7 +219,7 @@ class TelegramCommandPoller:
         try:
             fetch_with_retry(_post, label="Telegram control reply")
         except Exception as exc:
-            logger.warning("Telegram control: reply send error: %s", exc)
+            logger.warning("Telegram control: reply send error: %s", redact(exc))
 
 
 def start_telegram_control_thread(

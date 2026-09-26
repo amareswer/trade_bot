@@ -42,6 +42,11 @@ def print_report(metrics: BacktestMetrics, result: BacktestResult) -> None:
     print(f"  {_B}BACKTEST REPORT{_R}")
     print(f"  {_CY}{result.symbol}{_R}  ·  {result.timeframe}  ·  {metrics.candle_count} candles")
     print(f"  {_DIM}{metrics.period_start}  →  {metrics.period_end}{_R}")
+    # Execution-model stamp (2026-09-26) — so a saved report always says how
+    # its numbers were produced. PF / win rate below are NET of fees.
+    print(f"  {_DIM}fills: {getattr(result, 'fill_model', 'close')}  ·  "
+          f"fee {result.fee_pct * 100:.2f}%/side  ·  "
+          f"slippage {getattr(result, 'slippage_pct', 0.0) * 100:.2f}%  ·  PF/win rate net of fees{_R}")
     print(f"{_DIM}{bar}{_R}")
 
     print(f"\n  {_B}PERFORMANCE{_R}")

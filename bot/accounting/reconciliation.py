@@ -110,6 +110,13 @@ class BlockState:
     symbol_reason:         dict = field(default_factory=dict)   # symbol -> str
     coverage_blocked:      bool = False   # a fetch itself was incomplete this cycle
     coverage_reason:       str  = ""
+    # Four-way verification failure (ledger/delivery or position-fold diff).
+    # Its own flag since 2026-09-26: it used to be folded into
+    # account_cash_blocked, so a BTC deposit / SOL staking-dust fold diff was
+    # logged as "account cash unreconciled" while the cash check had passed.
+    # Blocks every symbol's BUYs, exactly as that fold-in did.
+    four_way_blocked:      bool = False
+    four_way_reason:       str  = ""
     last_cycle_at:         str  = ""
     computed_at_ms:        int  = 0       # wall-clock ms this state became valid — see is_stale()
     scope_results:         list = field(default_factory=list)   # list[ScopeResult]
@@ -139,6 +146,7 @@ class BlockState:
         return (
             not self.reconciled
             or self.account_cash_blocked
+            or self.four_way_blocked
             or self.coverage_blocked
             or self.symbol_blocked.get(symbol, False)
         )
@@ -154,6 +162,8 @@ class BlockState:
             parts.append(f"coverage incomplete ({self.coverage_reason})")
         if self.account_cash_blocked:
             parts.append(f"account cash unreconciled ({self.account_cash_reason})")
+        if self.four_way_blocked:
+            parts.append(f"four-way verification failed ({self.four_way_reason})")
         for sym, blocked in self.symbol_blocked.items():
             if blocked:
                 parts.append(f"{sym} unreconciled ({self.symbol_reason.get(sym, '')})")
